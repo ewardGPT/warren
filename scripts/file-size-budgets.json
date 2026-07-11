@@ -6,6 +6,8 @@
 		"src/db/schema/sqlite.ts": 564,
 		"src/plots/aggregate.ts": 506,
 		"src/runs/pr.ts": 659,
+		"src/runs/spawn/dispatch.test.ts": 543,
+		"src/runs/spawn/dispatch.ts": 520,
 		"src/server/handlers/agents.test.ts": 533,
 		"src/server/handlers/plan-runs.ts": 505,
 		"src/server/main/index.ts": 548,

@@ -34,8 +34,10 @@ services:
     cap_add:
       - SYS_ADMIN
 
-    ports:
-      - "8080:8080"
+    # Sapling's provider endpoint is the host-side Bifrost listener. Host
+    # networking keeps the built-in Sapling runtime on the same loopback
+    # namespace as Bifrost (localhost:8085).
+    network_mode: host
 
     # Cap and rotate container logs (warren-26c2 / pl-f700 step 4) so the
     # per-request access log can't fill the host disk. json-file is the
@@ -52,6 +54,9 @@ services:
 
     volumes:
       - warren_data:/data
+      # Local Warren uses the host Sapling build, which includes the OpenAI
+      # backend needed for the configured Bifrost provider.
+      - /home/ubuntu/.bun/install/global/node_modules/@os-eco/sapling-cli/src:/usr/local/install/global/node_modules/@os-eco/sapling-cli/src:ro
       # Local-dev bind mount so warren can clone a host-side canopy repo
       # via `CANOPY_REPO_URL=file:///canopy-source`. Read-only — warren
       # only ever reads from this path; clones land under /data.
