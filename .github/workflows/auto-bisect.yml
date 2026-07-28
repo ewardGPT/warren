@@ -17,6 +17,10 @@ on:
         default: 'bun test'
         type: string
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   bisect:
     runs-on: ubuntu-latest
