@@ -1,0 +1,11 @@
+# Default owner for everything
+* @ewardGPT
+
+# CI/CD configs require review
+.github/workflows/* @ewardGPT
+.github/dependabot.yml @ewardGPT
+
+# Root config files
+.gitignore @ewardGPT
+.pre-commit-config.yaml @ewardGPT
+commitlint.config.js @ewardGPT
