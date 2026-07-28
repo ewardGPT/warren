@@ -21,7 +21,7 @@ import { mergeMulch } from "./mulch.ts";
 import { mergePlot } from "./plot-merge.ts";
 import { runPrOpen } from "./pr-open.ts";
 import { runPreviewAnnotate, runPreviewLaunch } from "./preview.ts";
-import { closeRunSeedId, mirrorPlans, mirrorSeeds } from "./seeds.ts";
+import { closeRunSeedId, closeReferencedSeeds, mirrorPlans, mirrorSeeds } from "./seeds.ts";
 import { stagePlotForCommit, stageSeedsForCommit } from "./stage.ts";
 import type { ReapExec, ReapFs, ReapRunInput, ReapStep } from "./types.ts";
 import { isWorkspaceDirty } from "./util.ts";
@@ -274,6 +274,29 @@ async function seedIdCloseStep(ctx: ReapPipelineContext, state: ReapPipelineStat
 	}
 }
 
+/**
+ * Close extra seeds referenced in commit footers (flywheel integration).
+ * Scans recent commits for `(closes <seed-id>)` and closes those seeds.
+ * Runs after the main seed close so multi-seed branches are handled.
+ */
+async function extraSeedCloseStep(ctx: ReapPipelineContext, _state: ReapPipelineState): Promise<void> {
+	const { seedsCli } = ctx.input;
+	if (!ctx.project.hasSeeds || seedsCli === undefined || ctx.exec === undefined) return;
+	try {
+		const closed = await closeReferencedSeeds({
+			projectPath: ctx.project.localPath,
+			seedsCli,
+			emit: ctx.emit,
+			run: ctx.exec.run,
+		});
+		if (closed > 0) {
+			await ctx.emit("extra_seeds_closed", { count: closed });
+		}
+	} catch {
+		// Non-fatal — extra seed close is a best-effort integration.
+	}
+}
+
 async function seedsCommitStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
 	if (!ctx.project.hasSeeds) return;
 	try {
@@ -483,6 +506,7 @@ export async function runReapPipeline(
 	await plotCommitStep(ctx, state);
 	const workspacePlans = await snapshotWorkspacePlans(ctx, baselinePlanIds);
 	await seedIdCloseStep(ctx, state);
+	await extraSeedCloseStep(ctx, state);
 	await seedsCommitStep(ctx, state);
 	await autoDispatchStep(ctx, state, {
 		ids: workspacePlans.ids,

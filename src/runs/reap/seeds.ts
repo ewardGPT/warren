@@ -213,3 +213,64 @@ export async function closeRunSeedId(input: CloseRunSeedIdInput): Promise<boolea
 	await emit("seeds.seed_id_closed", { id: seedId, mode: "host_side" });
 	return true;
 }
+
+/* ----------------------------------------------------------------------- */
+/* Close extra seeds referenced in commit footers (flywheel integration)    */
+/* ----------------------------------------------------------------------- */
+
+const CLOSES_RE = /\(closes\s+([a-zA-Z0-9_-]+)\)/g;
+
+export interface CloseReferencedSeedsInput {
+	readonly projectPath: string;
+	readonly seedsCli: SeedsCliDeps;
+	readonly emit: (kind: string, payload: unknown) => Promise<EventRow>;
+	/**
+	 * Run a shell command. Takes (cmd, args[], { cwd }).
+	 * Returns { stdout, stderr }. Rejects on non-zero exit.
+	 */
+	readonly run?: (cmd: string, args: readonly string[], opts: { cwd: string }) => Promise<{ stdout: string; stderr: string }>;
+}
+
+/**
+ * Scan recent commit messages for `(closes <seed-id>)` footers and close
+ * any referenced seeds that are still open. Runs after `closeRunSeedId` so
+ * the main seed is already handled; this catches cross-seed references
+ * from multi-seed branches.
+ *
+ * Flywheel: agent commits with `(closes ubuntu-XXXX)` → reap auto-closes
+ * that seed → no manual seed close needed after PR merge.
+ */
+export async function closeReferencedSeeds(input: CloseReferencedSeedsInput): Promise<number> {
+	const { projectPath, seedsCli, emit, run } = input;
+	if (run === undefined) return 0;
+
+	let stdout: string;
+	try {
+		const result = await run("git", ["log", "--format=%B", "HEAD~10..HEAD"], { cwd: projectPath });
+		stdout = result.stdout;
+	} catch {
+		// If git log fails (shallow clone, no commits), skip silently.
+		return 0;
+	}
+
+	const referencedIds = new Set<string>();
+	let m: RegExpExecArray | null;
+	CLOSES_RE.lastIndex = 0;
+	while ((m = CLOSES_RE.exec(stdout)) !== null) {
+		referencedIds.add(m[1]!);
+	}
+
+	if (referencedIds.size === 0) return 0;
+
+	let closed = 0;
+	for (const id of referencedIds) {
+		try {
+			await closeSeed(seedsCli, projectPath, id);
+			await emit("seeds.seed_id_closed", { id, mode: "commit_footer" });
+			closed++;
+		} catch {
+			// closeSeed fails silently for unknown/already-closed seeds.
+		}
+	}
+	return closed;
+}
