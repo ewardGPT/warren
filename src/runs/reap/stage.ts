@@ -48,10 +48,13 @@ interface StageSeedsForCommitInput {
  * `issues.jsonl`. Copying the union back into the workspace gives
  * `git push` a single canonical view to ship to origin.
  *
- * `git add .seeds/` honors a project-level `.gitignore` of `.seeds/`
- * — a project that gitignored the directory has opted out of
- * committing seeds state, and the staged-changes check below sees no
- * entries.
+ * A project-level `.gitignore` of `.seeds/` is a deliberate opt-out of
+ * committing seeds state. `git add` on an ignored path exits non-zero, so
+ * the add below is preceded by a `git check-ignore` probe: when the
+ * carriers are ignored this returns `false` (a clean no-op — no commit,
+ * no `reap_failed`), while a REAL staging failure (permissions, a corrupt
+ * index, …) still rejects and surfaces via finalize's `seeds_commit`
+ * `reap_failed`.
  */
 export async function stageSeedsForCommit(input: StageSeedsForCommitInput): Promise<boolean> {
 	const { workspacePath, projectPath, fs, exec, emit } = input;
@@ -68,20 +71,33 @@ export async function stageSeedsForCommit(input: StageSeedsForCommitInput): Prom
 	}
 	if (copied === 0) return false;
 
-	// warren-23dd: scrub the inherited repo-context GIT_* on every git call in
-	// this flow (mirrors clone-apply.ts) so a leaked
-	// GIT_DIR / GIT_INDEX_FILE can't divert the add/diff/commit out of
-	// `workspacePath` into the parent repo.
-	await exec.run("git", ["add", "--", ".seeds/"], {
+	const seedsPathspecs = SEEDS_COMMITTABLE_FILES.map((name) => join(".seeds", name));
+
+	// warren-23dd: scrub repo-context GIT_* on every git call here so a
+	// leaked GIT_DIR / GIT_INDEX_FILE can't divert the calls out of
+	// `workspacePath` (mirrors clone-apply.ts). `check-ignore --quiet`
+	// exits 0 when the path is gitignored — a deliberate opt-out — so we
+	// return cleanly (no commit, no reap_failed); a non-ignored tree falls
+	// through to the real `git add`, where a genuine staging failure still
+	// rejects and surfaces via finalize's `seeds_commit` reap_failed.
+	let ignored: boolean;
+	try {
+		await exec.run("git", ["check-ignore", "--quiet", "--", ...seedsPathspecs], {
+			cwd: workspacePath,
+			timeoutMs: 10_000,
+			env: gitRepoContextScrubEnv(),
+		});
+		ignored = true;
+	} catch {
+		ignored = false;
+	}
+	if (ignored) return false;
+
+	await exec.run("git", ["add", "--", ...seedsPathspecs], {
 		cwd: workspacePath,
 		timeoutMs: 10_000,
 		env: gitRepoContextScrubEnv(),
 	});
-
-	// warren-be12 (#420): narrow the staged-delta guard to the two
-	// committable carriers (symmetry with the `--only` pathspecs below) so
-	// an unrelated pre-staged file under `.seeds/` can't spoof a delta.
-	const seedsPathspecs = SEEDS_COMMITTABLE_FILES.map((name) => join(".seeds", name));
 	let hasStagedDelta: boolean;
 	try {
 		await exec.run("git", ["diff", "--cached", "--quiet", "--", ...seedsPathspecs], {
