@@ -92,7 +92,7 @@ ENV BUN_INSTALL=/usr/local
 # The registered Warren repository is bare, so Burrow must clone its configured
 # base branch before creating each per-run branch (burrow-46bd).
 RUN bun install -g \
-    github:ewardGPT/burrow#b132b95 \
+    github:ewardGPT/burrow#dc267692af25f56c8d4a5632be684a9d059fbc50 \
     @os-eco/canopy-cli@0.2.4 \
     @os-eco/seeds-cli@0.5.13 \
     @os-eco/mulch-cli@0.10.7 \

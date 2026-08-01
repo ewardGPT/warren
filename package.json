@@ -79,7 +79,7 @@
 		"yaml": "^2.8.2"
 	},
 	"dependencies": {
-		"@os-eco/burrow-cli": "github:ewardGPT/burrow#b132b95",
+		"@os-eco/burrow-cli": "github:ewardGPT/burrow#dc267692af25f56c8d4a5632be684a9d059fbc50",
 		"@os-eco/plot-cli": "^0.4.0",
 		"@sentry/bun": "^10.59.0",
 		"commander": "^15.0.0",
