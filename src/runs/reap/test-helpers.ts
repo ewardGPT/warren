@@ -161,6 +161,19 @@ export interface FakeExecOpts {
 	gitStatus?: string;
 	/** Throw on `git status --porcelain` calls (default: succeed). */
 	failGitStatus?: string;
+	/**
+	 * Throw ONLY on `git add` calls, leaving check-ignore / diff / commit /
+	 * rev-list intact — models a real staging failure (permissions, corrupt
+	 * index) that must surface as a `reap_failed` rather than a silent opt-out.
+	 */
+	failAdd?: string;
+	/**
+	 * When `true`, `git check-ignore --quiet …` exits 0 (path ignored),
+	 * modeling a project that gitignored the seeds/ plot carriers —
+	 * `stageSeedsForCommit` then opts out cleanly. Default `false`
+	 * (not ignored → the `git add` path runs normally).
+	 */
+	ignoredPaths?: boolean;
 }
 
 /** Match a `git <sub> …` invocation for the fakeExec command router. */
@@ -185,6 +198,36 @@ function handleDiffCached(stagedDelta: boolean): ExecResult {
 	return { stdout: "", stderr: "" };
 }
 
+interface FakeExecConfig {
+	fail: { reason: string } | null;
+	failPush: string | null;
+	failRevList: string | null;
+	failAdd: string | null;
+	revListCount: string;
+	stagedDelta: boolean;
+	gitStatus: string;
+	failGitStatus: string | null;
+	ignoredPaths: boolean;
+}
+
+function routeGit(cmd: string, args: readonly string[], cfg: FakeExecConfig): ExecResult {
+	if (isGitSub(cmd, args, "rev-list")) return handleRevList(cfg.failRevList, cfg.revListCount);
+	if (isGitSub(cmd, args, "check-ignore") && args.includes("--quiet")) {
+		if (cfg.ignoredPaths) return { stdout: "", stderr: "" };
+		throw new Error("not ignored");
+	}
+	if (isGitSub(cmd, args, "status") && args.includes("--porcelain")) {
+		return handleStatus(cfg.failGitStatus, cfg.gitStatus);
+	}
+	if (isGitSub(cmd, args, "diff") && args.includes("--cached") && args.includes("--quiet")) {
+		return handleDiffCached(cfg.stagedDelta);
+	}
+	if (cfg.failAdd !== null && isGitSub(cmd, args, "add")) throw new Error(cfg.failAdd);
+	if (cfg.failPush !== null && isGitSub(cmd, args, "push")) throw new Error(cfg.failPush);
+	if (cfg.fail !== null) throw new Error(cfg.fail.reason);
+	return { stdout: "", stderr: "" };
+}
+
 export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 	const calls: {
 		cmd: string;
@@ -192,29 +235,24 @@ export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 		cwd: string;
 		env?: Record<string, string | undefined>;
 	}[] = [];
-	const fail = opts.fail !== undefined ? { reason: opts.fail } : null;
-	const failPush = opts.failPush ?? null;
-	const failRevList = opts.failRevList ?? null;
-	const revListCount = opts.revListCount ?? "1";
-	const stagedDelta = opts.stagedDelta === true;
-	const gitStatus = opts.gitStatus ?? "";
-	const failGitStatus = opts.failGitStatus ?? null;
+	const cfg: FakeExecConfig = {
+		fail: opts.fail !== undefined ? { reason: opts.fail } : null,
+		failPush: opts.failPush ?? null,
+		failRevList: opts.failRevList ?? null,
+		failAdd: opts.failAdd ?? null,
+		revListCount: opts.revListCount ?? "1",
+		stagedDelta: opts.stagedDelta === true,
+		gitStatus: opts.gitStatus ?? "",
+		failGitStatus: opts.failGitStatus ?? null,
+		ignoredPaths: opts.ignoredPaths === true,
+	};
 	const exec: ReapExec = {
 		run: async (cmd, args, opt) => {
 			calls.push({ cmd, args, cwd: opt.cwd, env: opt.env });
-			if (isGitSub(cmd, args, "rev-list")) return handleRevList(failRevList, revListCount);
-			if (isGitSub(cmd, args, "status") && args.includes("--porcelain")) {
-				return handleStatus(failGitStatus, gitStatus);
-			}
-			if (isGitSub(cmd, args, "diff") && args.includes("--cached") && args.includes("--quiet")) {
-				return handleDiffCached(stagedDelta);
-			}
-			if (failPush !== null && isGitSub(cmd, args, "push")) throw new Error(failPush);
-			if (fail !== null) throw new Error(fail.reason);
-			return { stdout: "", stderr: "" };
+			return routeGit(cmd, args, cfg);
 		},
 	};
-	return { exec, calls, fail };
+	return { exec, calls, fail: cfg.fail };
 }
 
 export interface FakeBurrowClientOpts {

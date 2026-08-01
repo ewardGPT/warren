@@ -90,7 +90,7 @@ describe("reapRun commit-through-reap sub-steps (warren-7ecc)", () => {
 			expect(f.files.get("/data/burrow/ws/.seeds/issues.jsonl")).toContain("warren-1234");
 			expect(f.files.get("/data/burrow/ws/.seeds/plans.jsonl")).toContain("pl-abcd");
 			const gitArgs = e.calls.filter((c) => c.cmd === "git").map((c) => c.args);
-			expect(gitArgs).toContainEqual(["add", "--", ".seeds/"]);
+			expect(gitArgs).toContainEqual(["add", "--", ".seeds/issues.jsonl", ".seeds/plans.jsonl"]);
 			expect(gitArgs).toContainEqual([
 				"diff",
 				"--cached",
@@ -279,5 +279,85 @@ describe("reapRun commit-through-reap sub-steps (warren-7ecc)", () => {
 		const gitArgs = e.calls.filter((c) => c.cmd === "git").map((c) => c.args);
 		expect(gitArgs.find((a) => a.includes("add") && a.includes(".seeds/"))).toBeUndefined();
 		expect(gitArgs.find((a) => a.includes("commit"))).toBeUndefined();
+	});
+
+	test("gitignored .seeds/ opts out cleanly: no reap_failed, no commit (warren-a41f)", async () => {
+		const seedsCtx = await setupWithSeeds();
+		try {
+			const f = fakeFs({
+				"/data/projects/x/y/.seeds/issues.jsonl":
+					'{"id":"warren-1234","status":"open","updatedAt":"2026-05-22T10:00:00Z"}\n',
+				"/data/projects/x/y/.seeds/plans.jsonl":
+					'{"id":"pl-abcd","status":"open","updatedAt":"2026-05-22T10:00:00Z"}\n',
+			});
+			const e = fakeExec({ stagedDelta: true, ignoredPaths: true });
+
+			const result = await reapRun({
+				runId: seedsCtx.runId,
+				outcome: "succeeded",
+				repos: seedsCtx.repos,
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
+				fs: f.fs,
+				exec: e.exec,
+			});
+
+			expect(result.seedsCommitted).toBe(false);
+			const gitArgs = e.calls.filter((c) => c.cmd === "git").map((c) => c.args);
+			expect(gitArgs).toContainEqual([
+				"check-ignore",
+				"--quiet",
+				"--",
+				".seeds/issues.jsonl",
+				".seeds/plans.jsonl",
+			]);
+			expect(gitArgs.find((a) => a[0] === "add")).toBeUndefined();
+			expect(gitArgs.find((a) => a.includes("commit"))).toBeUndefined();
+			const events = await seedsCtx.repos.events.listByRun(seedsCtx.runId);
+			expect(events.find((ev) => ev.kind === "reap.seeds_committed")).toBeUndefined();
+			expect(
+				events.find(
+					(ev) =>
+						ev.kind === "reap_failed" &&
+						(ev.payloadJson as { step?: string } | null)?.step === "seeds_commit",
+				),
+			).toBeUndefined();
+		} finally {
+			await seedsCtx.db.close();
+		}
+	});
+
+	test("a real git-add staging failure still surfaces as reap_failed step=seeds_commit (warren-a41f)", async () => {
+		const seedsCtx = await setupWithSeeds();
+		try {
+			const f = fakeFs({
+				"/data/projects/x/y/.seeds/issues.jsonl":
+					'{"id":"warren-1234","status":"open","updatedAt":"2026-05-22T10:00:00Z"}\n',
+				"/data/projects/x/y/.seeds/plans.jsonl":
+					'{"id":"pl-abcd","status":"open","updatedAt":"2026-05-22T10:00:00Z"}\n',
+			});
+			const e = fakeExec({ stagedDelta: true, failAdd: "fatal: unable to stage" });
+
+			const result = await reapRun({
+				runId: seedsCtx.runId,
+				outcome: "succeeded",
+				repos: seedsCtx.repos,
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
+				fs: f.fs,
+				exec: e.exec,
+			});
+
+			expect(result.seedsCommitted).toBe(false);
+			expect(result.errors.map((x) => x.step)).toContain("seeds_commit");
+			const events = await seedsCtx.repos.events.listByRun(seedsCtx.runId);
+			expect(
+				events.find(
+					(ev) =>
+						ev.kind === "reap_failed" &&
+						(ev.payloadJson as { step?: string } | null)?.step === "seeds_commit",
+				),
+			).toBeDefined();
+		} finally {
+			await seedsCtx.db.close();
+		}
 	});
 });

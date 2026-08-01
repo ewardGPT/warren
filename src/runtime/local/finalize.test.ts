@@ -439,7 +439,9 @@ describe("finalize — commit decoupling", () => {
 			intent({ artifacts: ["seeds"], commit: ["seeds"], push: false }),
 		);
 		expect(result.stages.map((s) => s.stage)).toContain("seeds_commit");
-		expect(exec.calls.some((c) => c.cmd === "git" && c.args.includes(".seeds/"))).toBe(true);
+		expect(exec.calls.some((c) => c.cmd === "git" && c.args.includes(".seeds/issues.jsonl"))).toBe(
+			true,
+		);
 	});
 });
 
