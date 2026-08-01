@@ -1,11 +1,11 @@
 ---
 name: ratchetwatch
 description: "Ratchet-slack auditor: measures coverage slack, grandfather burn-down, bundle creep; plans mechanical tightenings only"
-runtime: pi
+runtime: sapling
 provider: anthropic
 model: claude-sonnet-4-6
 auto_plan_run: true
-auto_plan_run_agent: pi
+auto_plan_run_agent: sapling
 ---
 
 ## system
@@ -79,4 +79,3 @@ For each finding you record this patrol (planned tightening or report-only seed)
 
 [sandbox]
 network = "open"
-

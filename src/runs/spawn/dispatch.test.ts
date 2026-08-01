@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	BurrowClient,
 	BurrowClientPool,
@@ -93,7 +96,6 @@ describe("spawnRun: end-to-end + placement", () => {
 		const reread = await repos.runs.require(result.run.id);
 		expect(reread.burrowId).toBe("bur_aaaaaaaaaaaa");
 		expect(reread.burrowRunId).toBe("run_zzzzzzzzzzzz");
-
 		const stored = reread.renderedAgentJson as { name: string; sections: Record<string, string> };
 		expect(stored.name).toBe("refactor-bot");
 		expect(stored.sections.system).toBe("be a refactor agent");
@@ -106,7 +108,7 @@ describe("spawnRun: end-to-end + placement", () => {
 			method: "POST",
 			path: "/burrows/bur_aaaaaaaaaaaa/runs",
 			body: {
-				agentId: "pi",
+				agentId: "sapling",
 				prompt: "be a refactor agent\n\n---\n\nfix the flaky test",
 				metadata: { frontmatter: {} },
 			},
@@ -115,15 +117,16 @@ describe("spawnRun: end-to-end + placement", () => {
 		const upBody = calls[0]?.body as {
 			projectRoot: string;
 			originUrl: string;
+			baseBranch: string;
 			agents: readonly string[];
 			seed?: { files: ReadonlyArray<{ path: string; contents: string }> };
 		};
 		expect(upBody.projectRoot).toBe("/data/projects/x/y");
 		expect(upBody.originUrl).toBe("https://github.com/x/y.git");
-		expect(upBody.agents).toEqual(["pi"]);
+		expect(upBody.baseBranch).toBe("main");
+		expect(upBody.agents).toEqual(["sapling"]);
 		const seededPaths = (upBody.seed?.files ?? []).map((f) => f.path);
 		expect(seededPaths).toContain(".canopy/agent.json");
-
 		expect(reread.workerId).toBe("local");
 		const burrowRow = await repos.burrows.require("bur_aaaaaaaaaaaa");
 		expect(burrowRow.workerId).toBe("local");
@@ -201,15 +204,15 @@ describe("spawnRun: burrow_config + runtime + metadata", () => {
 				projectRoot: "/data/projects/x/y",
 				originUrl: "https://github.com/x/y.git",
 				network: "restricted",
-				// refactor-bot pins no runtime → pi default (warren-16f8).
-				agents: ["pi"],
+				// refactor-bot pins no runtime → Sapling default.
+				agents: ["sapling"],
 			},
 		});
 		expect(calls[1]).toMatchObject({
 			method: "POST",
 			path: "/burrows/bur_aaaaaaaaaaaa/runs",
 			body: {
-				agentId: "pi",
+				agentId: "sapling",
 				prompt: "s\n\n---\n\np",
 				metadata: { runByOperator: "alice", frontmatter: {} },
 			},
@@ -249,9 +252,9 @@ describe("spawnRun: burrow_config + runtime + metadata", () => {
 		expect((up?.body as { agents: readonly string[] }).agents).toEqual(["claude-code"]);
 	});
 
-	test("dispatch falls back to the pi default when frontmatter.runtime is unset (warren-16f8)", async () => {
-		// pi is the preferred default: an agent that pins no runtime
-		// resolves to `pi` via readRuntimeId rather than its canopy name.
+	test("dispatch falls back to the sapling default when frontmatter.runtime is unset", async () => {
+		// Sapling is the preferred default: an agent that pins no runtime
+		// resolves to `sapling` via readRuntimeId rather than its canopy name.
 		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: makeAgentJson({ frontmatter: {} }),
@@ -265,7 +268,7 @@ describe("spawnRun: burrow_config + runtime + metadata", () => {
 			prompt: "p",
 		});
 		const dispatch = calls.find((c) => c.path === "/burrows/bur_aaaaaaaaaaaa/runs");
-		expect((dispatch?.body as { agentId: string }).agentId).toBe("pi");
+		expect((dispatch?.body as { agentId: string }).agentId).toBe("sapling");
 	});
 
 	test("forwards agent.frontmatter as burrow run metadata so piRuntime gets provider/model (warren-d34e)", async () => {
@@ -386,6 +389,46 @@ describe("spawnRun: sandbox env (warren-b893)", () => {
 		expect(env?.BUN_INSTALL_CACHE_DIR).toBe("/tmp/bun-install-cache");
 		expect(env?.PLOT_ID).toBe("plt_001");
 		expect(env?.PLOT_ACTOR).toMatch(/^agent:refactor-bot:run_/);
+	});
+
+	test("injects Cortex env vars and seeds .mcp.json when cortex.yaml is present", async () => {
+		const projectPath = await mkdtemp(join(tmpdir(), "warren-cortex-"));
+		await writeFile(
+			join(projectPath, "cortex.yaml"),
+			"bus:\n  nats_url: nats://cortex-host:4222\nagent:\n  role: researcher\n",
+			"utf8",
+		);
+		await repos.projects.create({
+			id: "prj_cortex",
+			gitUrl: "https://github.com/x/cortex.git",
+			localPath: projectPath,
+			defaultBranch: "main",
+		});
+		const { client, calls } = makeBurrowClient();
+		await spawnRun({
+			repos,
+			burrowClientPool: await makePool(repos, client),
+			agentName: "refactor-bot",
+			projectId: "prj_cortex",
+			prompt: "fix it",
+			serverEnv: { WARREN_CORTEX_API_URL: "http://cortex-api:8999" },
+		});
+		const up = calls.find((c) => c.path === "/burrows");
+		const body = up?.body as {
+			env?: Record<string, string>;
+			seed?: { files?: { path: string; contents: string }[] };
+		};
+		expect(body.env?.CORTEX_NATS_URL).toBe("nats://cortex-host:4222");
+		expect(body.env?.CORTEX_API_URL).toBe("http://cortex-api:8999");
+		expect(body.env?.CORTEX_ROLE).toBe("researcher");
+		expect(body.env?.CORTEX_SCOPE).toBe("prj_cortex");
+		expect(body.env?.CORTEX_AGENT_ID).toMatch(/^warren:refactor-bot:run_/);
+		const mcp = body.seed?.files?.find((f) => f.path === ".mcp.json");
+		expect(mcp).toBeDefined();
+		const parsed = JSON.parse(mcp?.contents ?? "{}") as {
+			mcpServers?: { cortex?: { command?: string } };
+		};
+		expect(parsed.mcpServers?.cortex?.command).toBe("cortex-mcp");
 	});
 });
 

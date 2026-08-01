@@ -21,7 +21,7 @@ import { mergeMulch } from "./mulch.ts";
 import { mergePlot } from "./plot-merge.ts";
 import { runPrOpen } from "./pr-open.ts";
 import { runPreviewAnnotate, runPreviewLaunch } from "./preview.ts";
-import { closeRunSeedId, closeReferencedSeeds, mirrorPlans, mirrorSeeds } from "./seeds.ts";
+import { closeReferencedSeeds, closeRunSeedId, mirrorPlans, mirrorSeeds } from "./seeds.ts";
 import { stagePlotForCommit, stageSeedsForCommit } from "./stage.ts";
 import type { ReapExec, ReapFs, ReapRunInput, ReapStep } from "./types.ts";
 import { isWorkspaceDirty } from "./util.ts";
@@ -279,7 +279,7 @@ async function seedIdCloseStep(ctx: ReapPipelineContext, state: ReapPipelineStat
  * Scans recent commits for `(closes <seed-id>)` and closes those seeds.
  * Runs after the main seed close so multi-seed branches are handled.
  */
-async function extraSeedCloseStep(ctx: ReapPipelineContext, _state: ReapPipelineState): Promise<void> {
+async function extraSeedCloseStep(ctx: ReapPipelineContext, _s: ReapPipelineState): Promise<void> {
 	const { seedsCli } = ctx.input;
 	if (!ctx.project.hasSeeds || seedsCli === undefined || ctx.exec === undefined) return;
 	try {

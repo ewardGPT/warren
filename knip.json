@@ -7,6 +7,7 @@
 		"src/ui/dist/**",
 		"src/db/migrations/**"
 	],
+	"ignoreDependencies": ["@commitlint/cli"],
 	"workspaces": {
 		".": {
 			"entry": [

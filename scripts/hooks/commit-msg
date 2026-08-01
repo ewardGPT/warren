@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Warren commit-msg hook — conventional commits + seed references
+# Installed at scripts/hooks/commit-msg per warren's core.hooksPath
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# Skip merge, fixup, squash
+echo "$COMMIT_MSG" | grep -qE '^Merge |^fixup! |^squash! ' && exit 0
+
+# 1. Conventional commit format check (via commitlint)
+if command -v npx &>/dev/null && [ -f commitlint.config.js ]; then
+    npx --no -- commitlint < "$COMMIT_MSG_FILE" 2>/dev/null || {
+        echo ""
+        echo "  ⚠ Commit message does not follow conventional commit format."
+        echo "  Expected: feat|fix|chore|docs|refactor|test|ci(scope?): description"
+        echo "  Example:  feat(auth): add token refresh endpoint"
+        echo ""
+        exit 1
+    }
+fi
+
+# 2. Seed reference check (warning only)
+if ! echo "$COMMIT_MSG" | grep -qE '\((refs|closes) [a-zA-Z0-9_-]+\)'; then
+    OPEN_SEEDS=$(cd "$(git rev-parse --show-toplevel)" && sd ready --format compact 2>/dev/null | head -5)
+    if [ -n "$OPEN_SEEDS" ]; then
+        echo ""
+        echo "  ⚠ Consider adding a seed reference to your commit footer:"
+        echo "     (refs ubuntu-XXXX)   — in-progress work"
+        echo "     (closes ubuntu-XXXX) — completing a task"
+        echo ""
+        echo "  Open seeds:"
+        echo "$OPEN_SEEDS" | sed 's/^/    /'
+        echo ""
+    fi
+fi

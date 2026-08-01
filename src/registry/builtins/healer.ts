@@ -10,8 +10,7 @@
  * applies a minimal fix, runs the project's quality gate locally, and
  * commits. Warren reaps the branch and opens the PR.
  *
- * Runs on the pi runtime (the design review pinned a dedicated pi-runtime
- * agent, NOT claude-code). Guard rails (per-fingerprint max retries,
+ * Runs on the Sapling runtime. Guard rails (per-fingerprint max retries,
  * cooldown, per-project opt-in) live on the warren side; this agent only
  * does the repair work.
  *
@@ -74,7 +73,7 @@ export const HEALER_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		runtime: "pi",
+		runtime: "sapling",
 		// Opus tier (model-tiers.ts): diagnosing a production fault from a
 		// terse alert is open-ended root-cause work, not a known-failure
 		// patch — worth the stronger model.

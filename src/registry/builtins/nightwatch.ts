@@ -84,12 +84,12 @@ export const NIGHTWATCH_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		runtime: "pi",
+		runtime: "sapling",
 		auto_plan_run: true,
-		auto_plan_run_agent: "pi",
+		auto_plan_run_agent: "sapling",
 		// Opus tier (model-tiers.ts): subtle defect/security scanning
 		// benefits from the strongest reasoning; the cheaper plan-run
-		// children it spawns (auto_plan_run_agent "pi") execute on Sonnet.
+		// children it spawns execute on the Sapling runtime.
 		...MODEL_TIERS.opus,
 	},
 };

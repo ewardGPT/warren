@@ -119,8 +119,8 @@ describe("readRuntimeId", () => {
 		frontmatter: { source: "builtin" },
 	};
 
-	test("falls back to the pi default when frontmatter.runtime is absent (warren-16f8)", () => {
-		expect(readRuntimeId(NAME_MATCH)).toBe("pi");
+	test("falls back to the sapling default when frontmatter.runtime is absent", () => {
+		expect(readRuntimeId(NAME_MATCH)).toBe("sapling");
 	});
 
 	test("prefers frontmatter.runtime over agent.name", () => {

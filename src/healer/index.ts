@@ -1,7 +1,7 @@
 /**
  * Public surface for the closed-loop healer (warren-3db0, Phase 2).
  *
- * The healer wakes a dedicated pi-runtime agent when a production alert
+ * The healer wakes a dedicated Sapling-runtime agent when a production alert
  * (Sentry / Grafana) resolves to a warren-managed project. Intake lives
  * in `src/server/handlers/alerts.ts`; this module owns the pure pieces:
  * webhook normalization (`alert.ts`), the dispatch guard rails +

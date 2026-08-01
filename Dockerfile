@@ -88,8 +88,11 @@ RUN apt-get update \
 # pointing into /root/.bun would dangle for the UID-1000 agent (warren-1eaa).
 # /usr/local sits under /usr so the symlink targets resolve inside the sandbox.
 ENV BUN_INSTALL=/usr/local
+# Pin Burrow to the reviewed clone-fallback fix until it is released upstream.
+# The registered Warren repository is bare, so Burrow must clone its configured
+# base branch before creating each per-run branch (burrow-46bd).
 RUN bun install -g \
-    @os-eco/burrow-cli@0.3.14 \
+    github:ewardGPT/burrow#b132b95 \
     @os-eco/canopy-cli@0.2.4 \
     @os-eco/seeds-cli@0.5.13 \
     @os-eco/mulch-cli@0.10.7 \

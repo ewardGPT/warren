@@ -100,9 +100,9 @@ export const BUGWATCH_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		runtime: "pi",
+		runtime: "sapling",
 		auto_plan_run: true,
-		auto_plan_run_agent: "pi",
+		auto_plan_run_agent: "sapling",
 		// Sonnet tier (model-tiers.ts): bounded triage (≤3 well-specified
 		// bugs per run).
 		...MODEL_TIERS.sonnet,

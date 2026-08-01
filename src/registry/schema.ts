@@ -66,11 +66,10 @@ export interface AgentDefinition {
  *              decides how to interpret it.
  *   runtime  — burrow runtime id this canopy agent dispatches onto
  *              (e.g. "claude-code", "sapling", "pi"). When unset,
- *              warren falls back to `DEFAULT_RUNTIME_ID` ("pi") —
- *              the multi-provider runtime is the preferred default
- *              (warren-16f8). claude-code stays available but is now
- *              opt-in: pin it via this field. Built-in agents that
- *              want a non-pi runtime (claude-code / sapling) declare
+ *              warren falls back to `DEFAULT_RUNTIME_ID` ("sapling") —
+ *              Sapling is the preferred default execution runtime;
+ *              claude-code stays available but is opt-in: pin it via this
+ *              field. Built-in agents that want a specific runtime declare
  *              it here explicitly; interactive system-prompt-only
  *              agents like `brainstorm` / `planner` (warren-ebca) do
  *              the same so they compose onto a real burrow runtime.
@@ -243,13 +242,11 @@ function assignToolFlag(
 }
 
 /**
- * Default burrow runtime id warren dispatches onto when an agent pins
- * none (warren-16f8). Pi is the multi-provider runtime — cost streams
- * in-band, the unified provider matrix works, and it's what most
- * dogfood runs use — so it's the preferred default; claude-code is
- * opt-in via `frontmatter.runtime`.
+ * Default burrow runtime id Warren dispatches onto when an agent pins
+ * none. Sapling is the standard coding runtime; Burrow remains the
+ * transport/worker layer and explicit runtime pins remain supported.
  */
-export const DEFAULT_RUNTIME_ID = "pi";
+export const DEFAULT_RUNTIME_ID = "sapling";
 
 /**
  * Resolve the burrow runtime id this canopy agent should dispatch onto.
@@ -261,8 +258,8 @@ export const DEFAULT_RUNTIME_ID = "pi";
  *      specific runtime (claude-code / sapling) or compose a system
  *      prompt onto an existing runtime (planner,
  *      warren-ebca)
- *   3. `DEFAULT_RUNTIME_ID` ("pi") — the preferred default when
- *      nothing pins a runtime; claude-code is opt-in
+ *   3. `DEFAULT_RUNTIME_ID` ("sapling") — the preferred default when
+ *      nothing pins a runtime; claude-code and pi are opt-in
  */
 export function readRuntimeId(agent: AgentDefinition, configOverride?: string): string {
 	if (typeof configOverride === "string" && configOverride.length > 0) return configOverride;

@@ -32,6 +32,7 @@ describe("refreshProjectClone", () => {
 		});
 		expect(calls.map((c) => c.cmd[1])).toEqual([
 			"fetch",
+			"rev-parse",
 			"checkout",
 			"reset",
 			"config",
@@ -39,11 +40,35 @@ describe("refreshProjectClone", () => {
 			"rev-parse",
 		]);
 		expect(calls[0]?.cmd).toEqual(["git", "fetch", "--prune", "origin"]);
-		expect(calls[1]?.cmd).toEqual(["git", "checkout", "--force", "main"]);
-		expect(calls[2]?.cmd).toEqual(["git", "reset", "--hard", "origin/main"]);
-		expect(calls[3]?.cmd).toEqual(["git", "config", "--local", "--unset-all", "user.name"]);
-		expect(calls[4]?.cmd).toEqual(["git", "config", "--local", "--unset-all", "user.email"]);
+		expect(calls[1]?.cmd).toEqual(["git", "rev-parse", "--is-bare-repository"]);
+		expect(calls[2]?.cmd).toEqual(["git", "checkout", "--force", "main"]);
+		expect(calls[3]?.cmd).toEqual(["git", "reset", "--hard", "origin/main"]);
+		expect(calls[4]?.cmd).toEqual(["git", "config", "--local", "--unset-all", "user.name"]);
+		expect(calls[5]?.cmd).toEqual(["git", "config", "--local", "--unset-all", "user.email"]);
 		expect(calls.every((c) => c.cwd === "/data/projects/x/y")).toBe(true);
+	});
+
+	test("skips working-tree refresh for a bare repository used by Burrow clone fallback", async () => {
+		const sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+		const { spawn, calls } = recorder((cmd) => {
+			if (cmd[1] === "rev-parse" && cmd.includes("--is-bare-repository")) return ok("true\n");
+			if (cmd[1] === "rev-parse") return ok(`${sha}\n`);
+			return ok();
+		});
+		const result = await refreshProjectClone({
+			config: CFG,
+			localPath: "/data/projects/bare",
+			ref: "main",
+			spawn,
+			exists: () => true,
+		});
+
+		expect(result).toEqual({
+			headSha: sha,
+			ref: "main",
+			features: { hasPlot: false, hasSeeds: false },
+		});
+		expect(calls.map((c) => c.cmd[1])).toEqual(["fetch", "rev-parse", "rev-parse"]);
 	});
 
 	test("tolerates the user identity scrub exiting non-zero when keys are absent (warren-9f70)", async () => {

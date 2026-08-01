@@ -164,6 +164,19 @@ export async function refreshProjectClone(
 		timeoutMs,
 	});
 
+	// Warren can be registered against a bare repository. It is a valid
+	// source for Burrow's clone-backed workspace, but it has no working tree
+	// for checkout/reset/hooks or feature-directory probes. Leave the fetched
+	// bare repository untouched and let Burrow materialize the requested ref.
+	const bareProbe = await trySpawn(spawn, [config.gitBinary, "rev-parse", "--is-bare-repository"], {
+		cwd: localPath,
+		timeoutMs,
+	});
+	if (bareProbe.exitCode === 0 && bareProbe.stdout.trim() === "true") {
+		const headSha = await readHead(spawn, config.gitBinary, localPath, timeoutMs);
+		return { headSha, ref, features: { hasPlot: false, hasSeeds: false } };
+	}
+
 	// Probe `.plot/` BEFORE the working-tree-touching commands so the
 	// preserve wrapper knows whether to snapshot. Must run before
 	// `git checkout --force` (the next step) because checkout discards

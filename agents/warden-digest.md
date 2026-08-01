@@ -1,7 +1,7 @@
 ---
 name: warden-digest
 description: "Weekly digest driver: re-wakes the standing Audit Warden conversation if idled, then posts a synthesis message asking Leveret to triage accumulated auditor findings and propose plans"
-runtime: pi
+runtime: sapling
 provider: anthropic
 model: claude-sonnet-4-6
 ---

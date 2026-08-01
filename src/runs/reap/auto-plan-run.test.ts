@@ -127,7 +127,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 		}
 	});
 
-	test("uses auto_plan_run_agent override instead of parent agent name (warren-65b2)", async () => {
+	test("normalizes the legacy pi auto-plan override to sapling", async () => {
 		const ctx = await setupAutoPlanRun({
 			frontmatter: { auto_plan_run: true, auto_plan_run_agent: "pi" },
 		});
@@ -151,7 +151,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 
 			expect(result.autoPlanRunCreated).toBe(true);
 			const planRun = await ctx.repos.planRuns.require(result.autoPlanRunId as string);
-			expect(planRun.agentName).toBe("pi");
+			expect(planRun.agentName).toBe("sapling");
 		} finally {
 			await ctx.db.close();
 		}

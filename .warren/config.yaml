@@ -10,10 +10,10 @@
 # ── Active defaults ─────────────────────────────────────────────────────
 # These were migrated from .warren/defaults.json. Edit freely.
 
-defaultRole: pi
+defaultRole: sapling
 defaultBranch: main
-defaultProvider: zai
-defaultModel: glm-5.2
+defaultProvider: opencode-go
+defaultModel: opencode-go/glm-5.2
 
 # ── Optional knobs (uncomment to set) ───────────────────────────────────
 

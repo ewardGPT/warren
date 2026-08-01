@@ -1,11 +1,11 @@
 ---
 name: gatewatch
 description: "Gate-integrity auditor: verifies merged history was honest (title/diff truth, red-gate language, ratchet exceptions, mandate protection)"
-runtime: pi
+runtime: sapling
 provider: anthropic
 model: claude-sonnet-4-6
 auto_plan_run: true
-auto_plan_run_agent: pi
+auto_plan_run_agent: sapling
 ---
 
 ## system
@@ -81,4 +81,3 @@ For each finding you file this patrol, after the seed lands, post a concise mess
 
 [sandbox]
 network = "open"
-

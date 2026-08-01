@@ -228,7 +228,11 @@ export interface CloseReferencedSeedsInput {
 	 * Run a shell command. Takes (cmd, args[], { cwd }).
 	 * Returns { stdout, stderr }. Rejects on non-zero exit.
 	 */
-	readonly run?: (cmd: string, args: readonly string[], opts: { cwd: string }) => Promise<{ stdout: string; stderr: string }>;
+	readonly run?: (
+		cmd: string,
+		args: readonly string[],
+		opts: { cwd: string },
+	) => Promise<{ stdout: string; stderr: string }>;
 }
 
 /**
@@ -254,10 +258,12 @@ export async function closeReferencedSeeds(input: CloseReferencedSeedsInput): Pr
 	}
 
 	const referencedIds = new Set<string>();
-	let m: RegExpExecArray | null;
 	CLOSES_RE.lastIndex = 0;
-	while ((m = CLOSES_RE.exec(stdout)) !== null) {
-		referencedIds.add(m[1]!);
+	while (true) {
+		const match = CLOSES_RE.exec(stdout);
+		if (match === null) break;
+		const id = match[1];
+		if (id !== undefined) referencedIds.add(id);
 	}
 
 	if (referencedIds.size === 0) return 0;

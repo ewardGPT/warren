@@ -38,10 +38,13 @@ export function resolveAutoPlanRunAgent(run: {
 		const fm = (json as Record<string, unknown>).frontmatter;
 		if (fm !== null && typeof fm === "object" && !Array.isArray(fm)) {
 			const override = readAutoPlanRunAgent(fm as Record<string, unknown>);
-			if (override !== undefined) return override;
+			// Warren's plan children execute through the Sapling runtime on
+			// Burrow. Older patrol definitions pinned the former `pi` agent;
+			// normalize that stale value so reap cannot create new pi children.
+			if (override !== undefined) return override === "pi" ? "sapling" : override;
 		}
 	}
-	return run.agentName;
+	return run.agentName === "pi" ? "sapling" : run.agentName;
 }
 
 export function parsePlanIds(body: string): Set<string> {

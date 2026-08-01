@@ -37,9 +37,8 @@ export const SAPLING_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		// The default runtime flipped to pi (warren-16f8); pin sapling
-		// explicitly so this built-in keeps dispatching onto the sapling
-		// burrow runtime instead of inheriting the pi default.
+		// Pin sapling explicitly so this built-in remains stable if the
+		// operator changes Warren's global runtime default.
 		runtime: "sapling",
 		// Sonnet tier (model-tiers.ts): alternate coding harness, scoped work.
 		...MODEL_TIERS.sonnet,
