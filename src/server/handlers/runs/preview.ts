@@ -5,25 +5,37 @@ import { jsonResponse } from "../../response.ts";
 import type { RouteHandler, ServerDeps } from "../../types.ts";
 import { optionalString, readJsonBodyOrEmpty, requireParam } from "../index.ts";
 
+type ValidatedPreviewConfig =
+	| { mode: "subdomain"; previewAuth: PreviewAuth; previewHost: string }
+	| { mode: "path"; previewAuth: PreviewAuth };
+
 /**
- * Validate that the preview surface is configured for `mode` and return the
- * narrowed {@link PreviewAuth}, so callers avoid non-null assertions on the
- * optional `deps.previewAuth`.
+ * Validate that the preview surface is configured for `mode` and return a
+ * narrowed {@link PreviewAuth} (plus the guaranteed-defined `previewHost` in
+ * subdomain mode), so callers avoid non-null assertions on the optional
+ * `deps.previewAuth` / `deps.previewHost`.
  */
-function validatePreviewConfig(deps: ServerDeps, mode: "subdomain" | "path"): PreviewAuth {
+function validatePreviewConfig(
+	deps: ServerDeps,
+	mode: "subdomain" | "path",
+): ValidatedPreviewConfig {
 	if (deps.previewAuth === undefined) {
 		throw new ValidationError("preview surface is not configured on this warren", {
 			recoveryHint:
 				"ensure WARREN_API_TOKEN is set (and WARREN_PREVIEW_HOST when WARREN_PREVIEW_MODE=subdomain) to enable per-run previews",
 		});
 	}
-	if (mode === "subdomain" && deps.previewHost === undefined) {
-		throw new ValidationError("preview surface is not configured on this warren", {
-			recoveryHint:
-				"set WARREN_PREVIEW_HOST to enable subdomain-mode previews, or switch to WARREN_PREVIEW_MODE=path",
-		});
+	if (mode === "subdomain") {
+		const previewHost = deps.previewHost;
+		if (previewHost === undefined) {
+			throw new ValidationError("preview surface is not configured on this warren", {
+				recoveryHint:
+					"set WARREN_PREVIEW_HOST to enable subdomain-mode previews, or switch to WARREN_PREVIEW_MODE=path",
+			});
+		}
+		return { mode, previewAuth: deps.previewAuth, previewHost };
 	}
-	return deps.previewAuth;
+	return { mode, previewAuth: deps.previewAuth };
 }
 
 /**
@@ -67,7 +79,8 @@ export function previewLoginHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const runId = requireParam(ctx, "id");
 		const mode: "subdomain" | "path" = deps.previewMode ?? "subdomain";
-		const previewAuth = validatePreviewConfig(deps, mode);
+		const config = validatePreviewConfig(deps, mode);
+		const { previewAuth } = config;
 
 		// 404 fast if the run isn't known — issuing a cookie for a nonexistent
 		// run would let an attacker pre-seed a session keyed off a future id.
@@ -76,14 +89,14 @@ export function previewLoginHandler(deps: ServerDeps): RouteHandler {
 		const body = await readJsonBodyOrEmpty(ctx);
 		const redirect = body !== null ? (optionalString(body, "redirect") ?? null) : null;
 		const redirectTarget =
-			mode === "path"
+			config.mode === "path"
 				? resolvePathPreviewRedirect(redirect, runId, ctx.url.origin)
-				: resolveSubdomainPreviewRedirect(redirect, runId, deps.previewHost as string);
+				: resolveSubdomainPreviewRedirect(redirect, runId, config.previewHost);
 		if (redirectTarget === null) {
 			const hint =
-				mode === "path"
+				config.mode === "path"
 					? `redirect must be a same-origin URL under ${ctx.url.origin}/p/${runId}/`
-					: `redirect must be an absolute URL under https://run-${runId}.${deps.previewHost}/`;
+					: `redirect must be an absolute URL under https://run-${runId}.${config.previewHost}/`;
 			return jsonResponse(400, {
 				error: {
 					code: "preview_redirect_invalid",

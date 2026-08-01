@@ -30,6 +30,7 @@ export async function depsFor(
 	previewAuth: PreviewAuth | undefined,
 	db?: AnyWarrenDb,
 	previewMode: "subdomain" | "path" = "subdomain",
+	opts?: { omitPreviewHost?: boolean },
 ): Promise<{ deps: ServerDeps; bridges: BridgeRegistry }> {
 	const burrowClient = makeBurrowClient();
 	const broker = new RunEventBroker();
@@ -44,7 +45,9 @@ export async function depsFor(
 			? {}
 			: previewMode === "path"
 				? { previewAuth, previewMode: "path" as const }
-				: { previewAuth, previewMode: "subdomain" as const, previewHost: HOST };
+				: opts?.omitPreviewHost
+					? { previewAuth, previewMode: "subdomain" as const }
+					: { previewAuth, previewMode: "subdomain" as const, previewHost: HOST };
 	const deps: ServerDeps = {
 		repos,
 		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),

@@ -316,4 +316,41 @@ describe("POST /runs/:id/preview/login", () => {
 			expect(res.status).toBe(200);
 		});
 	});
+
+	describe("validatePreviewConfig narrowing (warren-2141)", () => {
+		test("400 when subdomain mode is set but WARREN_PREVIEW_HOST is missing", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, { secure: false });
+			const { deps } = await depsFor(repos, previewAuth, undefined, "subdomain", {
+				omitPreviewHost: true,
+			});
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await login(handle, runId);
+			expect(res.status).toBe(400);
+			const body = (await res.json()) as { error: { code: string } };
+			expect(body.error.code).toBe("validation_error");
+		});
+
+		test("200 in path mode with previewAuth set and previewHost unset (path-mode narrowing)", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			expect(deps.previewHost).toBeUndefined();
+			expect(deps.previewMode).toBe("path");
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await login(handle, runId);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { url: string };
+			expect(body.url).toBe(`${tcpUrl(handle)}/p/${runId}/`);
+		});
+	});
 });
