@@ -262,10 +262,16 @@ export const DEFAULT_RUNTIME_ID = "sapling";
  *      nothing pins a runtime; claude-code and pi are opt-in
  */
 export function readRuntimeId(agent: AgentDefinition, configOverride?: string): string {
-	if (typeof configOverride === "string" && configOverride.length > 0) return configOverride;
-	const r = agent.frontmatter.runtime;
-	if (typeof r === "string" && r.length > 0) return r;
-	return DEFAULT_RUNTIME_ID;
+	const configured =
+		typeof configOverride === "string" && configOverride.length > 0
+			? configOverride
+			: typeof agent.frontmatter.runtime === "string" && agent.frontmatter.runtime.length > 0
+				? agent.frontmatter.runtime
+				: DEFAULT_RUNTIME_ID;
+	// Pi was the former execution runtime. Keep legacy agent definitions
+	// dispatchable, but route them through the supported Sapling/Burrow path.
+	if (configured === "pi" || configured === "pi-chat") return DEFAULT_RUNTIME_ID;
+	return configured;
 }
 
 /**
