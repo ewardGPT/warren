@@ -225,8 +225,19 @@ export function buildProgram(context: CliContext): Command {
 				const projects = (await repos.projects.listAll()).map((p) => ({
 					id: p.id,
 					localPath: p.localPath,
+					gitUrl: p.gitUrl,
+					hasSeeds: p.hasSeeds,
 				}));
-				const result = await runDoctor(context, { projects, db }, { noAuth: opts.auth === false });
+				const result = await runDoctor(
+					context,
+					{
+						projects,
+						db,
+						repos,
+						seedsCli: { sdBinary: context.env.WARREN_SD_BINARY ?? "sd", spawn: context.spawn },
+					},
+					{ noAuth: opts.auth === false },
+				);
 				return result.exitCode;
 			});
 			process.exit(exitCode);

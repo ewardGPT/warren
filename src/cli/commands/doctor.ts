@@ -22,12 +22,15 @@ import { loadBurrowClientConfigFromEnv } from "../../burrow-client/config.ts";
 import { ValidationError } from "../../core/errors.ts";
 import type { AnyWarrenDb } from "../../db/client.ts";
 import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
+import type { Repos } from "../../db/repos/index.ts";
 import { createRepos } from "../../db/repos/index.ts";
 import {
+	type CrossRepoCheckProject,
 	checkBurrowReachable,
 	checkBwrap,
 	checkCanopyClean,
 	checkCanopyClone,
+	checkCrossRepoPlanTargets,
 	checkDatabaseReachable,
 	checkPreviewAuthStrength,
 	checkPreviewPortAllocator,
@@ -41,6 +44,7 @@ import { checkStaleBurrowWorkspaces } from "../../diagnostics/stale-workspaces.t
 import { loadPreviewPortRangeFromEnv, PreviewPortAllocator } from "../../preview/port-allocator.ts";
 import { loadProjectsConfigFromEnv } from "../../projects/config.ts";
 import { loadWorkspaceGcConfigFromEnv } from "../../runs/reap/gc.ts";
+import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
 import type { CliContext, EnvLike } from "../output.ts";
 import { writeJsonLine } from "../output.ts";
 
@@ -62,13 +66,17 @@ export interface DoctorDeps {
 	 * empty the warren_config check still runs and reports an
 	 * informational `ok: true`.
 	 */
-	readonly projects?: ReadonlyArray<WarrenConfigCheckProject>;
+	readonly projects?: ReadonlyArray<WarrenConfigCheckProject & Partial<CrossRepoCheckProject>>;
+	/** Seeds CLI used to inspect open plans for unresolved repo targets. */
+	readonly seedsCli?: SeedsCliDeps;
 	/**
 	 * Live db handle for the `db_reachable` probe (R-13 pl-f17e step 5,
 	 * warren-e2ea). `main.ts` wires this from `withCliDb`; tests omit
 	 * and the check degrades to an informational `ok: true`.
 	 */
 	readonly db?: AnyWarrenDb;
+	/** Live project registry used to resolve cross-repo plan targets. */
+	readonly repos?: Pick<Repos, "projects">;
 }
 
 export interface DoctorResult {
@@ -99,6 +107,13 @@ export async function runDoctor(
 
 	checks.push(await checkWarrenConfig({ projects: deps.projects ?? [] }));
 	checks.push(await checkWarrenConfigDeprecations({ projects: deps.projects ?? [] }));
+	checks.push(
+		await checkCrossRepoPlanTargets({
+			projects: deps.projects ?? [],
+			...(deps.seedsCli !== undefined ? { seedsCli: deps.seedsCli } : {}),
+			...(deps.repos !== undefined ? { repos: deps.repos } : {}),
+		}),
+	);
 
 	checks.push(await previewPortAllocatorCheck(context.env, deps.db));
 

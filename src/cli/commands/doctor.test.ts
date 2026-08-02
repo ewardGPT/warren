@@ -214,6 +214,7 @@ describe("runDoctor", () => {
 			"bwrap",
 			"warren_config",
 			"warren_config_deprecations",
+			"cross_repo_plan_targets",
 			"preview_port_allocator",
 			"stale_burrow_workspaces",
 			"preview_auth_strength",

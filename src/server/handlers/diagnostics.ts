@@ -12,6 +12,7 @@ import {
 	checkBwrap,
 	checkCanopyClean,
 	checkCanopyClone,
+	checkCrossRepoPlanTargets,
 	checkDatabaseReachable,
 	checkPreviewAuthStrength,
 	checkPreviewMaxLive,
@@ -61,6 +62,8 @@ export function readyzHandler(deps: ServerDeps): RouteHandler {
 		const warrenConfigProjects = (await deps.repos.projects.listAll()).map((p) => ({
 			id: p.id,
 			localPath: p.localPath,
+			gitUrl: p.gitUrl,
+			hasSeeds: p.hasSeeds,
 		}));
 		const warrenConfigArgs = {
 			projects: warrenConfigProjects,
@@ -68,6 +71,13 @@ export function readyzHandler(deps: ServerDeps): RouteHandler {
 		};
 		checks.push(await checkWarrenConfig(warrenConfigArgs));
 		checks.push(await checkWarrenConfigDeprecations(warrenConfigArgs));
+		checks.push(
+			await checkCrossRepoPlanTargets({
+				projects: warrenConfigProjects,
+				seedsCli: deps.seedsCli,
+				repos: { projects: deps.repos.projects },
+			}),
+		);
 		checks.push(await previewPortAllocatorReadyzCheck(deps));
 		checks.push(await previewMaxLiveReadyzCheck(deps));
 		checks.push(await staleBurrowWorkspacesReadyzCheck(deps));
