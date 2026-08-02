@@ -42,6 +42,10 @@ interface RawTemplateYaml {
 		readonly glob?: string;
 		readonly max?: number;
 		readonly seed_id?: string;
+		readonly maker_model?: string;
+		readonly checker_agent?: string;
+		readonly checker_model?: string;
+		readonly stop_check_model?: string;
 	};
 	readonly executor_prompt?: string;
 	readonly verifier_prompt?: string;
@@ -94,6 +98,12 @@ function parseScope(raw: RawTemplateYaml, glob: string): GraphRunScopeJson {
 		glob,
 		...(raw.scope?.max !== undefined ? { max: raw.scope.max } : {}),
 		...(raw.scope?.seed_id !== undefined ? { seedId: raw.scope.seed_id } : {}),
+		...(raw.scope?.maker_model !== undefined ? { makerModel: raw.scope.maker_model } : {}),
+		...(raw.scope?.checker_agent !== undefined ? { checkerAgent: raw.scope.checker_agent } : {}),
+		...(raw.scope?.checker_model !== undefined ? { checkerModel: raw.scope.checker_model } : {}),
+		...(raw.scope?.stop_check_model !== undefined
+			? { stopCheckModel: raw.scope.stop_check_model }
+			: {}),
 	};
 }
 

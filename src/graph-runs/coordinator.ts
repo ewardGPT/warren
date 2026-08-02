@@ -16,6 +16,11 @@ import {
 	type RunRow,
 	type RunTerminalState,
 } from "../db/schema.ts";
+import {
+	DEFAULT_CHECKER_AGENT,
+	DEFAULT_STOP_CHECK_MODEL,
+	resolveMakerChecker,
+} from "./maker-checker.ts";
 
 export type CoordinatorRepos = Pick<Repos, "graphRuns" | "runs" | "events">;
 
@@ -25,6 +30,9 @@ export interface CoordinatorSpawnInput {
 	readonly graphRun: GraphRunRow;
 	readonly child: GraphRunChildRow;
 	readonly prompt: string;
+	readonly purpose?: "executor" | "verifier" | "synthesizer";
+	readonly agentName?: string;
+	readonly model?: string;
 }
 
 export interface CoordinatorSpawnResult {
@@ -166,6 +174,8 @@ async function advanceVerify(
 	input: AdvanceGraphRunInput & { readonly graphRun: GraphRunRow; readonly nowFn: () => Date },
 ): Promise<AdvanceGraphRunResult> {
 	let children = await input.repos.graphRuns.listChildrenByPhase(input.graphRun.id, "verify");
+	await syncVerifyChildren(input, children);
+	children = await input.repos.graphRuns.listChildrenByPhase(input.graphRun.id, "verify");
 	const pending = children.filter((c) => c.state === "pending");
 
 	for (const child of pending) {
@@ -174,15 +184,34 @@ async function advanceVerify(
 			await input.repos.graphRuns.updateChild({ id: child.id, patch: { state: "failed" } });
 			continue;
 		}
+		const checker = resolveChecker(input.graphRun);
 		const prompt = buildVerifyPrompt(finding);
 		try {
-			const ok = await input.checkStop(prompt, JSON.stringify(finding));
+			// Legacy graph rows have no checker identity. Keep their existing
+			// stop-check path; newly declared templates use the independent
+			// verifier dispatch below.
+			if (!hasExplicitChecker(input.graphRun)) {
+				const ok = await input.checkStop(prompt, JSON.stringify(finding));
+				await input.repos.graphRuns.updateChild({
+					id: child.id,
+					patch: { state: ok ? "succeeded" : "failed" },
+				});
+				continue;
+			}
+			const spawned = await input.spawn({
+				graphRun: input.graphRun,
+				child,
+				prompt,
+				purpose: "verifier",
+				agentName: checker.checkerAgent,
+				model: checker.checkerModel,
+			});
 			await input.repos.graphRuns.updateChild({
 				id: child.id,
-				patch: { state: ok ? "succeeded" : "failed" },
+				patch: { runId: spawned.runId, state: "dispatched" },
 			});
 		} catch (err) {
-			return failGraphRun(input, `verify_check_failed:${formatError(err)}`);
+			return failGraphRun(input, `verify_dispatch_failed:${formatError(err)}`);
 		}
 	}
 
@@ -197,6 +226,60 @@ async function advanceVerify(
 		.filter((f): f is GraphRunFindingJson => f !== null);
 
 	return enterSynthesizeOrSucceed(input, findings, "verifying");
+}
+
+function hasExplicitChecker(graphRun: GraphRunRow): boolean {
+	return (
+		graphRun.scopeJson.checkerAgent !== undefined ||
+		graphRun.scopeJson.checkerModel !== undefined ||
+		graphRun.scopeJson.stopCheckModel !== undefined
+	);
+}
+
+async function syncVerifyChildren(
+	input: AdvanceGraphRunInput,
+	children: readonly GraphRunChildRow[],
+): Promise<void> {
+	for (const child of children) {
+		if (child.state !== "dispatched" || child.runId === null) continue;
+		const run = await input.repos.runs.get(child.runId);
+		if (run === null || !isRunTerminal(run.state)) continue;
+		if (run.state !== "succeeded") {
+			await input.repos.graphRuns.updateChild({ id: child.id, patch: { state: "failed" } });
+			continue;
+		}
+		const output = await input.readRunOutput(child.runId);
+		if (!parseVerifierVerdict(output)) {
+			await input.repos.graphRuns.updateChild({ id: child.id, patch: { state: "failed" } });
+			continue;
+		}
+		const stopOk = await input.checkStop(buildStopCheckPrompt(child.findingJson), output);
+		await input.repos.graphRuns.updateChild({
+			id: child.id,
+			patch: { state: stopOk ? "succeeded" : "failed" },
+		});
+	}
+}
+
+function resolveChecker(graphRun: GraphRunRow) {
+	return resolveMakerChecker({
+		makerAgent: graphRun.agentName,
+		...(graphRun.scopeJson.makerModel !== undefined
+			? { makerModel: graphRun.scopeJson.makerModel }
+			: {}),
+		checkerAgent: graphRun.scopeJson.checkerAgent ?? DEFAULT_CHECKER_AGENT,
+		...(graphRun.scopeJson.checkerModel !== undefined
+			? { checkerModel: graphRun.scopeJson.checkerModel }
+			: {}),
+		stopCheckModel: graphRun.scopeJson.stopCheckModel ?? DEFAULT_STOP_CHECK_MODEL,
+	});
+}
+
+function parseVerifierVerdict(output: string): boolean {
+	return (
+		/\b(true|approve|approved|confirmed)\b/i.test(output) &&
+		!/\b(false|reject|rejected)\b/i.test(output)
+	);
 }
 
 async function advanceSynthesize(
@@ -372,7 +455,11 @@ function buildFanOutPrompt(graphRun: GraphRunRow, filePath: string): string {
 }
 
 function buildVerifyPrompt(finding: GraphRunFindingJson): string {
-	return `Finding: ${JSON.stringify(finding)}\nCriterion: route handler calls auth middleware or documents public exemption.\nAnswer true only if finding is confirmed by reading the file.\nOutput: true or false only.`;
+	return `You are an independent verifier. Inspect only the artifact and criterion below; do not rely on the implementer's explanation.\nFinding: ${JSON.stringify(finding)}\nCriterion: route handler calls auth middleware or documents public exemption.\nOutput APPROVE or REJECT only.`;
+}
+
+function buildStopCheckPrompt(finding: GraphRunFindingJson | null): string {
+	return `Confirm that the independent verifier's verdict is justified for finding ${JSON.stringify(finding)}. Answer true only when the verdict is supported by the artifact.`;
 }
 
 function buildSynthesizePrompt(findings: readonly GraphRunFindingJson[]): string {

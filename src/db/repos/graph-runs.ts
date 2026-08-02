@@ -101,7 +101,7 @@ export class GraphRunsRepo {
 			id,
 			projectId: input.projectId,
 			template: input.template,
-			agentName: input.agentName ?? "claude-code",
+			agentName: input.agentName ?? "sapling",
 			state: input.state ?? "pending",
 			scopeJson: input.scopeJson,
 			verifyEnabled: input.verifyEnabled,

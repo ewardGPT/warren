@@ -27,17 +27,18 @@ export interface CreateGraphRunSpawnInput {
 
 export function createGraphRunSpawn(input: CreateGraphRunSpawnInput): CoordinatorSpawnFn {
 	const spawnRunFn = input.spawnRunFn ?? spawnRun;
-	return async ({ graphRun, child, prompt }) => {
+	return async ({ graphRun, child, prompt, agentName, model }) => {
 		const project = await input.repos.projects.require(graphRun.projectId);
 		const result = await spawnRunFn({
 			repos: input.repos,
 			burrowClientPool: input.burrowClientPool,
-			agentName: graphRun.agentName,
+			agentName: agentName ?? graphRun.agentName,
 			projectId: graphRun.projectId,
 			prompt,
 			trigger: "graph-run",
 			ref: project.defaultBranch,
 			...(graphRun.scopeJson.seedId !== undefined ? { seedId: graphRun.scopeJson.seedId } : {}),
+			...(model !== undefined ? { modelOverride: model } : {}),
 			metadata: {
 				graphRunId: graphRun.id,
 				childId: child.id,

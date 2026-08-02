@@ -26,6 +26,14 @@ export {
 	createGraphRunSpawn,
 } from "./dispatch.ts";
 export {
+	DEFAULT_CHECKER_AGENT,
+	DEFAULT_CHECKER_MODEL,
+	DEFAULT_STOP_CHECK_MODEL,
+	type MakerCheckerConfig,
+	type MakerCheckerInput,
+	resolveMakerChecker,
+} from "./maker-checker.ts";
+export {
 	type BootGraphRunCoordinatorInput,
 	bootGraphRunCoordinator,
 	type GraphRunAdvanceLog,

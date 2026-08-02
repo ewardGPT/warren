@@ -51,6 +51,7 @@ import {
 	sendOffConversationHandler,
 } from "./conversations.ts";
 import { readyzHandler } from "./diagnostics.ts";
+import { createGraphRunHandler, getGraphRunHandler } from "./graph-runs.ts";
 import { healthzHandler, previewConfigHandler, versionHandler } from "./meta.ts";
 import { metricsHandler } from "./metrics.ts";
 import {
@@ -317,6 +318,9 @@ const ROUTE_TABLE: readonly RouteEntry[] = [
 	{ method: "POST", pattern: "/plan-runs/:id/resume", build: resumePlanRunHandler },
 	{ method: "GET", pattern: "/plan-runs/:id/events", build: streamPlanRunEventsHandler },
 
+	{ method: "POST", pattern: "/graph-runs", build: createGraphRunHandler },
+	{ method: "GET", pattern: "/graph-runs/:id", build: getGraphRunHandler },
+
 	{ method: "GET", pattern: "/conversations", build: listConversationsHandler },
 	{ method: "POST", pattern: "/conversations", build: createConversationHandler },
 	{ method: "GET", pattern: "/conversations/:id", build: getConversationHandler },
@@ -412,6 +416,7 @@ export const API_PREFIXES: readonly string[] = [
 	"/metrics",
 	"/preview",
 	"/plan-runs",
+	"/graph-runs",
 	"/plot-plan-runs",
 	"/plots",
 ];
