@@ -27,8 +27,16 @@ describe("GraphRun handlers", () => {
 				graphRuns: {
 					create: async (input: Record<string, unknown>) => {
 						created = input;
-						return { graphRun: { id: "graph_1" }, children: [] };
+						return {
+							graphRun: {
+								id: "graph_1",
+								projectId: "project_1",
+								template: "security-sweep",
+								agentName: "sapling",
+							},
+						};
 					},
+					listChildren: async () => [],
 				},
 			} as never,
 		} as never;

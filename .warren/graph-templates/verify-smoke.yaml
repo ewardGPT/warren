@@ -1,0 +1,30 @@
+# GraphRun template: verify-path smoke (staging only)
+# Exercises fan_out → verifying with a deterministic synthetic finding.
+
+name: verify-smoke
+description: Staging smoke — one file, synthetic finding, verify enabled, synthesize off.
+
+defaults:
+  agent: sapling
+  verify: true
+  synthesize: false
+  max_fan_out: 1
+  max_concurrent: 1
+
+scope:
+  glob: "src/graph-runs/fixtures/verify-smoke-target.ts"
+  maker_model: deepseek-chat
+  checker_agent: sapling
+  checker_model: deepseek-reasoner
+  stop_check_model: deepseek-chat
+
+executor_prompt: |
+  Read {file}. Output exactly this JSON array (no prose):
+  [{"file":"src/graph-runs/fixtures/verify-smoke-target.ts","claim":"synthetic verify smoke"}]
+  Do not modify any files.{seed_suffix}
+
+verifier_prompt: |
+  Finding: {finding}
+  Criterion: claim matches the synthetic verify-smoke fixture.
+  Answer true only if finding is present in output.
+  Output: true or false only.

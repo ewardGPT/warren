@@ -115,3 +115,14 @@
     conversation (well-known title "Audit Warden") over
     POST /conversations/:id/messages — the existing 202 steering channel,
     report-only, no dispatch or new path. Today's date is {{date}}.
+
+# Graph-engineering phase 4: scheduled security sweep (read-only fan-out).
+- id: security-sweep-weekly
+  kind: graph-run
+  cron: '0 6 * * 1'
+  template: security-sweep
+  timezone: America/Los_Angeles
+  scope:
+    max: 15
+  verify: true
+  synthesize: true

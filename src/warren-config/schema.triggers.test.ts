@@ -25,8 +25,8 @@ describe("TriggersConfigSchema", () => {
 	test("accepts an optional positive maxCostUsd spend cap", () => {
 		const parsed = TriggersConfigSchema.safeParse([{ ...VALID_TRIGGER, maxCostUsd: 5 }]);
 		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data[0]?.maxCostUsd).toBe(5);
+		if (parsed.success && parsed.data[0]?.kind === "cron") {
+			expect(parsed.data[0].maxCostUsd).toBe(5);
 		}
 	});
 

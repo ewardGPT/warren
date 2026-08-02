@@ -42,6 +42,7 @@ import type { ScheduledSeed, WarrenExtensions } from "../seeds-cli/index.ts";
 import type {
 	CronTrigger,
 	GoalTrigger,
+	GraphRunTrigger,
 	LoadedWarrenConfig,
 	LoopTrigger,
 } from "../warren-config/index.ts";
@@ -54,6 +55,10 @@ import {
 	dispatchScheduledSeed,
 } from "./dispatch.ts";
 import { dispatchGoalTrigger, dispatchLoopTrigger } from "./goal-loop.ts";
+import {
+	dispatchGraphRunTrigger,
+	type DispatchGraphRunTriggerResult,
+} from "./graph-run-dispatch.ts";
 import { runTriageInboxPass, type TriageCollector } from "./triage-inbox.ts";
 
 export type {
@@ -96,7 +101,7 @@ export interface TriageSchedulerDeps {
 }
 
 export interface TickDeps {
-	readonly repos: Pick<Repos, "projects" | "triggers" | "runs" | "events">;
+	readonly repos: Pick<Repos, "projects" | "triggers" | "runs" | "events" | "graphRuns" | "agents">;
 	readonly loadWarrenConfig: LoadWarrenConfigFn;
 	readonly listScheduledSeeds: ListScheduledSeedsFn;
 	readonly updateExtensions: UpdateSeedExtensionsFn;
@@ -171,6 +176,7 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 	}
 
 	await dispatchCronTriggers({ deps, project, config, now, cron });
+	await dispatchGraphRunTriggers({ deps, project, config, now });
 	await dispatchGoalTriggers({ deps, project, config, now });
 	await dispatchLoopTriggers({ deps, project, config, now });
 
@@ -262,6 +268,46 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 			}
 		}
 	}
+}
+
+async function dispatchGraphRunTriggers(input: {
+	readonly deps: TickDeps;
+	readonly project: ProjectRow;
+	readonly config: LoadedWarrenConfig;
+	readonly now: Date;
+}): Promise<void> {
+	for (const trigger of (input.config.triggers ?? []).filter(
+		(candidate): candidate is GraphRunTrigger => candidate.kind === "graph-run",
+	)) {
+		const result = await dispatchGraphRunTrigger({
+			projectId: input.project.id,
+			trigger,
+			now: input.now,
+			repos: input.deps.repos,
+		});
+		logGraphRunTriggerResult(input.deps.logger, input.project.id, trigger.id, result);
+	}
+}
+
+function logGraphRunTriggerResult(
+	logger: TickLogger | undefined,
+	projectId: string,
+	triggerId: string,
+	result: DispatchGraphRunTriggerResult,
+): void {
+	if (result.kind === "fired") {
+		logger?.info(
+			{
+				projectId,
+				triggerId,
+				graphRunId: result.graphRunId,
+				nextFireAt: result.nextFireAt?.toISOString(),
+			},
+			"scheduler.graph_run_fired",
+		);
+		return;
+	}
+	logger?.info({ projectId, triggerId, kind: result.kind }, "scheduler.graph_run_trigger");
 }
 
 async function dispatchCronTriggers(input: {

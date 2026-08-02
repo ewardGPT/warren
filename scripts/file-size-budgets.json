@@ -11,6 +11,9 @@
 		"src/server/handlers/plan-runs.ts": 505,
 		"src/server/server.test.ts": 536,
 		"src/server/types.ts": 508,
-		"src/graph-runs/coordinator.ts": 520
+		"src/graph-runs/coordinator.ts": 520,
+		"src/triggers/tick.ts": 540,
+		"src/warren-config/schema.ts": 520,
+		"src/server/integration.multi-worker.test.ts": 560
 	}
 }

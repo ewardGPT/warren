@@ -181,6 +181,7 @@ export const triggers = pgTable(
 		nextFireAt: text("next_fire_at"),
 		lastRunId: text("last_run_id").references(() => runs.id, { onDelete: "set null" }),
 		fireCount: integer("fire_count").notNull().default(0),
+		completedAt: text("completed_at"),
 	},
 	(t) => [index(INDEX_NAMES.triggersProject).on(t.projectId)],
 );
