@@ -24,6 +24,25 @@ interface StagePlotForCommitInput {
 	readonly emit: (kind: string, payload: unknown) => Promise<EventRow>;
 }
 
+async function filterIgnoredPathspecs(
+	exec: ReapExec,
+	workspacePath: string,
+	pathspecs: readonly string[],
+): Promise<string[]> {
+	const stageable: string[] = [];
+	for (const pathspec of pathspecs) {
+		try {
+			await exec.run("git", ["check-ignore", "--quiet", "--", pathspec], {
+				cwd: workspacePath,
+				timeoutMs: 10_000,
+			});
+		} catch {
+			stageable.push(pathspec);
+		}
+	}
+	return stageable;
+}
+
 /**
  * Replicate every committable `.plot/` file from the project clone into
  * the burrow workspace, then stage `.plot/` and author a
@@ -60,6 +79,7 @@ export async function stagePlotForCommit(input: StagePlotForCommitInput): Promis
 	const workspacePlotDir = join(workspacePath, ".plot");
 
 	const entries = await fs.readdir(projectPlotDir);
+	await fs.mkdirp(workspacePlotDir);
 	const copiedPathspecs: string[] = [];
 	for (const name of entries) {
 		if (name.startsWith(PLOT_INDEX_SKIP_PREFIX)) continue;
@@ -67,14 +87,16 @@ export async function stagePlotForCommit(input: StagePlotForCommitInput): Promis
 		if (!name.endsWith(".json") && !name.endsWith(".events.jsonl")) continue;
 		const contents = await fs.readFile(join(projectPlotDir, name));
 		if (contents === null) continue;
-		if (copiedPathspecs.length === 0) await fs.mkdirp(workspacePlotDir);
 		await fs.writeFile(join(workspacePlotDir, name), contents);
 		copiedPathspecs.push(join(".plot", name));
 	}
 	const copied = copiedPathspecs.length;
 	if (copied === 0) return false;
 
-	await exec.run("git", ["add", "--", ...copiedPathspecs], {
+	const stageablePathspecs = await filterIgnoredPathspecs(exec, workspacePath, copiedPathspecs);
+	if (stageablePathspecs.length === 0) return false;
+
+	await exec.run("git", ["add", "--", ...stageablePathspecs], {
 		cwd: workspacePath,
 		timeoutMs: 10_000,
 	});
@@ -88,7 +110,7 @@ export async function stagePlotForCommit(input: StagePlotForCommitInput): Promis
 	// already committed".
 	let hasStagedDelta: boolean;
 	try {
-		await exec.run("git", ["diff", "--cached", "--quiet", "--", ...copiedPathspecs], {
+		await exec.run("git", ["diff", "--cached", "--quiet", "--", ...stageablePathspecs], {
 			cwd: workspacePath,
 			timeoutMs: 10_000,
 		});
@@ -116,13 +138,13 @@ export async function stagePlotForCommit(input: StagePlotForCommitInput): Promis
 			"-m",
 			"chore(warren): plot state",
 			"--",
-			...copiedPathspecs,
+			...stageablePathspecs,
 		],
 		{ cwd: workspacePath, timeoutMs: 10_000 },
 	);
 	await emit("reap.plot_committed", {
 		message: "chore(warren): plot state",
-		filesStaged: copied,
+		filesStaged: stageablePathspecs.length,
 	});
 	return true;
 }

@@ -126,6 +126,8 @@ export interface FakeExecOpts {
 	gitStatus?: string;
 	/** Throw on `git status --porcelain` calls (default: succeed). */
 	failGitStatus?: string;
+	/** Treat Plot carriers as ignored for `git check-ignore --quiet`. */
+	ignoredPaths?: boolean;
 }
 
 /** Match a `git <sub> …` invocation for the fakeExec command router. */
@@ -150,6 +152,11 @@ function handleDiffCached(stagedDelta: boolean): ExecResult {
 	return { stdout: "", stderr: "" };
 }
 
+function handleCheckIgnore(ignoredPaths: boolean): ExecResult {
+	if (ignoredPaths) return { stdout: "", stderr: "" };
+	throw new Error("not ignored");
+}
+
 export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 	const calls: { cmd: string; args: readonly string[]; cwd: string }[] = [];
 	const fail = opts.fail !== undefined ? { reason: opts.fail } : null;
@@ -162,6 +169,9 @@ export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 		run: async (cmd, args, opt) => {
 			calls.push({ cmd, args, cwd: opt.cwd });
 			if (isGitSub(cmd, args, "rev-list")) return handleRevList(failRevList, revListCount);
+			if (isGitSub(cmd, args, "check-ignore") && args.includes("--quiet")) {
+				return handleCheckIgnore(opts.ignoredPaths === true);
+			}
 			if (isGitSub(cmd, args, "status") && args.includes("--porcelain")) {
 				return handleStatus(failGitStatus, gitStatus);
 			}
