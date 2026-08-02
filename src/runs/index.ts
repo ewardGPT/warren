@@ -85,6 +85,17 @@ export {
 	tickConversationMergePoller,
 } from "./conversation-merge-poller.ts";
 export {
+	buildCortexEnv,
+	buildCortexHooksJsonSeed,
+	buildCortexMcpSeed,
+	buildCortexOntologyHookSeed,
+	buildCortexWorkspaceSeeds,
+	CORTEX_MARKER_FILE,
+	type CortexSpawnConfig,
+	projectHasCortex,
+	resolveCortexSpawnConfig,
+} from "./cortex.ts";
+export {
 	buildCostAnalytics,
 	type CostAnalytics,
 	type CostAnalyticsRow,
@@ -141,6 +152,12 @@ export {
 	buildSeedFiles,
 	type HttpWorkspaceFile,
 } from "./seed.ts";
+export {
+	type SessionEvent,
+	type SessionEventClass,
+	type SessionSnapshot,
+	wakeSession,
+} from "./session.ts";
 export {
 	DEFAULT_DISPATCHER_HANDLE,
 	resolveDispatcherHandle,
