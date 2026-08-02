@@ -1,52 +1,7 @@
-# .warren/config.yaml — per-project warren defaults (warren-5840 layout).
-#
-# Supersedes the legacy .warren/defaults.json. All fields are optional.
-# See docs/design/warren-config.md for the schema. Every key here matches DefaultsConfigSchema
-# in src/warren-config/schema.ts.
-#
-# Precedence at spawn time: operator override (per-run) > project default
-# (this file) > agent frontmatter > built-in.
-
-# ── Active defaults ─────────────────────────────────────────────────────
-# These were migrated from .warren/defaults.json. Edit freely.
-
-defaultRole: pi
+# .warren/config.yaml — per-project warren defaults.
+defaultRole: sapling
 defaultBranch: main
-# kimi-k3 is reachable only through the pi harness (defaultRole above);
-# agent pods need OPENROUTER_API_KEY (warren-openrouter-key Secret on k8s).
-defaultProvider: openrouter
-defaultModel: moonshotai/kimi-k3
-
-# ── Optional knobs (uncomment to set) ───────────────────────────────────
-
-# Pre-fills the NewRun UI prompt textarea and is used as the prompt for
-# scheduled runs that don't carry their own. Free-form multi-line ok.
-# defaultPrompt: |
-#   Read the seed, plan in <= 5 steps, execute, push a branch.
-
-# Prefix for the burrow branch warren passes to `burrows.up`. The full
-# branch is `<runBranchPrefix>/<run.id>` (e.g. warren/run_abc123).
-# Must be kebab/snake-case (lowercase, digits, dots, dashes, underscores;
-# no slashes). Precedence: this field > WARREN_RUN_BRANCH_PREFIX env >
-# built-in "burrow".
+defaultProvider: deepseek
+defaultModel: deepseek-reasoner
 runBranchPrefix: warren
-
-# Canonical green-tree command for this repo. Surfaced to agents via
-# $WARREN_QUALITY_GATE (composeRunEnv in src/runs/spawn.ts) so the
-# built-in claude-code / sapling / pi prompts don't fall back to the
-# fuzzy "look for it in CLAUDE.md" heuristic. Must mirror CI — see
-# warren-57cd / pl-da5b step 4 and AGENTS.md "Quality gates".
 qualityGate: bun run check:all
-
-# Per-run preview environment. CANONICAL home is .warren/preview.yaml
-# (top-level document = the preview block itself). The nested form below
-# is still accepted here for smooth migration; preview.yaml wins on
-# conflict. See preview.yaml in this dir for a fully-documented stub.
-# preview:
-#   type: server          # only 'server' implemented in V1; 'static' deferred
-#   mode: path            # 'path' | 'subdomain'  (operator WARREN_PREVIEW_MODE wins)
-#   command: bun run dev
-#   port: 3000
-#   readiness_path: /healthz
-#   idle_ttl: 30m         # <number><unit> pairs, units: ms, s, m, h, d
-#   max_lifetime: 8h
