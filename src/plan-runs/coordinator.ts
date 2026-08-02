@@ -162,11 +162,16 @@ export interface AdvancePlanRunInput {
 	readonly mergeTimeoutMs?: number;
 	/** warren-22de: PR-(re)open seam. See {@link CoordinatorReopenPrFn}. */
 	readonly reopenPr?: CoordinatorReopenPrFn;
+	/** warren-guard: max dispatch rounds per advance call; 0 disables (default 100). */
+	readonly maxRounds?: number;
 	readonly now?: () => Date;
 }
 
 /** Default merge-wait budget: 30 minutes (warren-3937). */
 export const DEFAULT_MERGE_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** Default per-advance dispatch cap: 100 rounds (warren-guard). */
+export const DEFAULT_MAX_ROUNDS = 100;
 
 const IN_FLIGHT_STATES: readonly PlanRunChildState[] = ["dispatched", "running", "pr_open"];
 
@@ -198,10 +203,20 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 	}
 
 	let mergedChildSeq: number | undefined;
+	const maxRounds = input.maxRounds ?? DEFAULT_MAX_ROUNDS;
 
 	// Loop until we hit a terminal/waiting decision. Each iteration reloads
 	// children so a merge/skip can fall through to the dispatch arm.
-	for (;;) {
+	for (let round = 0; ; round += 1) {
+		if (maxRounds > 0 && round >= maxRounds) {
+			const reason = `plan-run advance exceeded max rounds (${maxRounds})`;
+			const endedAt = nowFn().toISOString();
+			await input.repos.planRuns.transitionTo(planRun.id, "failed", {
+				endedAt,
+				failureReason: reason,
+			});
+			return { kind: "plan_failed", failedSeq: round, reason };
+		}
 		const children = await input.repos.planRuns.listChildren(planRun.id);
 		const inFlight = children.find((c) => IN_FLIGHT_STATES.includes(c.state));
 

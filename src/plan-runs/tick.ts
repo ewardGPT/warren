@@ -75,6 +75,11 @@ export interface PlanRunTickDeps {
 	 * on a child that succeeded with no prUrl and no empty-push event.
 	 */
 	readonly reopenPr?: CoordinatorReopenPrFn;
+	/**
+	 * Max dispatch rounds per advance call (warren-guard). Omit to use the
+	 * coordinator default ({@link DEFAULT_MAX_ROUNDS}); 0 disables the cap.
+	 */
+	readonly maxRounds?: number;
 }
 
 export interface PlanRunAdvanceLog {
@@ -95,19 +100,7 @@ export async function runPlanRunTick(deps: PlanRunTickDeps): Promise<PlanRunTick
 	const active: PlanRunRow[] = await deps.repos.planRuns.listActive();
 	for (const planRun of active) {
 		try {
-			const result = await advancePlanRun({
-				planRun,
-				repos: deps.repos as CoordinatorRepos,
-				showSeed: deps.showSeed,
-				checkPrMerged: deps.checkPrMerged,
-				spawn: deps.spawn,
-				...(deps.resolveExecution !== undefined ? { resolveExecution: deps.resolveExecution } : {}),
-				emit,
-				...(deps.transitionPlot !== undefined ? { transitionPlot: deps.transitionPlot } : {}),
-				...(deps.mergeTimeoutMs !== undefined ? { mergeTimeoutMs: deps.mergeTimeoutMs } : {}),
-				...(deps.reopenPr !== undefined ? { reopenPr: deps.reopenPr } : {}),
-				...(deps.now !== undefined ? { now: deps.now } : {}),
-			});
+			const result = await advanceOne(planRun, deps, emit);
 			advances.push({ planRunId: planRun.id, result });
 			logAdvance(deps.logger, planRun.id, result);
 		} catch (err) {
@@ -118,6 +111,28 @@ export async function runPlanRunTick(deps: PlanRunTickDeps): Promise<PlanRunTick
 	}
 
 	return { advances, errors };
+}
+
+function advanceOne(
+	planRun: PlanRunRow,
+	deps: PlanRunTickDeps,
+	emit: CoordinatorEmitFn,
+): Promise<AdvanceResult> {
+	const advanceArgs: Parameters<typeof advancePlanRun>[0] = {
+		planRun,
+		repos: deps.repos as CoordinatorRepos,
+		showSeed: deps.showSeed,
+		checkPrMerged: deps.checkPrMerged,
+		spawn: deps.spawn,
+		emit,
+		...(deps.resolveExecution !== undefined ? { resolveExecution: deps.resolveExecution } : {}),
+		...(deps.transitionPlot !== undefined ? { transitionPlot: deps.transitionPlot } : {}),
+		...(deps.mergeTimeoutMs !== undefined ? { mergeTimeoutMs: deps.mergeTimeoutMs } : {}),
+		...(deps.reopenPr !== undefined ? { reopenPr: deps.reopenPr } : {}),
+		...(deps.maxRounds !== undefined ? { maxRounds: deps.maxRounds } : {}),
+		...(deps.now !== undefined ? { now: deps.now } : {}),
+	};
+	return advancePlanRun(advanceArgs);
 }
 
 function logAdvance(
