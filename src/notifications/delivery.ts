@@ -1,4 +1,5 @@
 import type { RunFailureReason, RunRow, RunTerminalState } from "../db/schema.ts";
+import { loadNotificationEndpoints } from "./config.ts";
 import type { TerminalNotificationEnvelope } from "./signature.ts";
 import { buildSignedNotification } from "./signature.ts";
 
@@ -55,7 +56,7 @@ export interface NotificationStore {
 	readonly persistAttempt: (attempt: NotificationAttempt) => Promise<void>;
 }
 
-interface NotificationEventLog {
+export interface NotificationEventLog {
 	readonly maxSeqForRun: (runId: string) => Promise<number | null>;
 	readonly listByRun: (runId: string) => Promise<readonly { kind: string; payloadJson: unknown }[]>;
 	readonly append: (input: {
@@ -252,4 +253,32 @@ export class TerminalNotificationDispatcher {
 			nextAttemptAt: attempt >= this.maxAttempts ? null : nextAttemptAt,
 		});
 	}
+}
+
+/** Build the production emitter; absent configuration disables delivery. */
+export function createTerminalNotificationEmitter(
+	events: NotificationEventLog,
+	env: Readonly<Record<string, string | undefined>>,
+	fetchImpl: typeof fetch = fetch,
+): { readonly emit: (event: TerminalNotificationEnvelope) => Promise<void> } | undefined {
+	const endpoints = loadNotificationEndpoints(env);
+	if (endpoints.length === 0) return undefined;
+	const dispatcher = new TerminalNotificationDispatcher(
+		createEventLogNotificationStore(events),
+		{
+			post: async (request) => {
+				const response = await fetchImpl(request.url, {
+					method: "POST",
+					headers: request.headers,
+					body: request.body,
+				});
+				return { status: response.status };
+			},
+		},
+		{
+			now: () => new Date(),
+			sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+		},
+	);
+	return { emit: async (event) => void (await dispatcher.deliver(event, endpoints)) };
 }

@@ -33,6 +33,7 @@ import { BurrowClientPool } from "../../burrow-client/index.ts";
 import { openDatabase } from "../../db/client.ts";
 import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import { createRepos } from "../../db/repos/index.ts";
+import { createTerminalNotificationEmitter } from "../../notifications/delivery.ts";
 import {
 	loadPreviewEvictionConfigFromEnv,
 	startPreviewEvictionWorker,
@@ -187,6 +188,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	// child-seed validation) and the plan-run coordinator below.
 	const schedulerConfig = loadTriggerSchedulerConfigFromEnv(env);
 	const seedsCli = { sdBinary: schedulerConfig.sdBinary, spawn: defaultSpawn };
+	const terminalNotification = createTerminalNotificationEmitter(repos.events, env);
 
 	const bridgesBoot = await bootBridges({
 		repos,
@@ -198,6 +200,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		portAllocator,
 		previewLaunchConfig,
 		seedsCli,
+		...(terminalNotification !== undefined ? { terminalNotification } : {}),
 	});
 	if (bridgesBoot.resumed.length > 0) {
 		logger.info(
@@ -292,23 +295,29 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	// idle-timeout coordinator (warren-005d, finalizes an idle conversation's
 	// anchoring run; the conversation itself stays active). See
 	// detector-wiring.ts.
-	const { pauseDetector, watchdog, mergePoller, conversationIdleDetector, opsStatsWorker } =
-		bootBackgroundDetectors({
-			env,
-			adapter,
-			repos,
-			burrowClientPool,
-			broker,
-			bridges: bridgesBoot.registry,
-			warrenConfigs,
-			projectsConfig,
-			projectSpawn: defaultSpawn,
-			seedsCli,
-			autoOpenPr,
-			...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
-			logger,
-			...(opts.now !== undefined ? { now: opts.now } : {}),
-		});
+	const {
+		pauseDetector,
+		watchdog,
+		mergePoller,
+		conversationIdleDetector,
+		opsStatsWorker,
+		graphRunCoordinator,
+	} = bootBackgroundDetectors({
+		env,
+		adapter,
+		repos,
+		burrowClientPool,
+		broker,
+		bridges: bridgesBoot.registry,
+		warrenConfigs,
+		projectsConfig,
+		projectSpawn: defaultSpawn,
+		seedsCli,
+		autoOpenPr,
+		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
+		logger,
+		...(opts.now !== undefined ? { now: opts.now } : {}),
+	});
 
 	// Preview TTL + LRU eviction worker (R-19 / SPEC §11.L, warren-ea6b).
 	// Dialect-polymorphic since warren-adfb (createRunPreviewsRepo runs on
@@ -406,6 +415,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			// spawnRun before bridges/burrow/db disappear under it.
 			await handle.stop();
 			await planRunCoordinator.stop();
+			await graphRunCoordinator.stop();
 			await pauseDetector.stop();
 			await watchdog.stop();
 			await mergePoller.stop();

@@ -12,6 +12,7 @@
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { EventRow, RunFailureReason, RunMode, RunState } from "../db/schema.ts";
+import type { TerminalNotificationEnvelope } from "../notifications/signature.ts";
 import type { PreviewLaunchConfig } from "../preview/launch/index.ts";
 import type { PreviewPortAllocator } from "../preview/port-allocator.ts";
 import {
@@ -82,6 +83,9 @@ export interface RunWithReconnectInput {
 	 * before dispatching a plan-run.
 	 */
 	readonly seedsCli?: SeedsCliDeps;
+	readonly terminalNotification?: {
+		readonly emit: (event: TerminalNotificationEnvelope) => Promise<void>;
+	};
 }
 
 /**
@@ -191,6 +195,9 @@ export async function runWithReconnect(
 						: {}),
 					...(prTemplate !== undefined ? { prTemplate } : {}),
 					...(input.seedsCli !== undefined ? { seedsCli: input.seedsCli } : {}),
+					...(input.terminalNotification !== undefined
+						? { terminalNotification: input.terminalNotification }
+						: {}),
 				});
 			} catch (err) {
 				log.error(

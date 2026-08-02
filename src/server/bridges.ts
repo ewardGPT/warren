@@ -46,6 +46,7 @@ import { withTransportMapping } from "../burrow-client/client.ts";
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { RunMode } from "../db/schema.ts";
+import type { TerminalNotificationEnvelope } from "../notifications/signature.ts";
 import type { PreviewLaunchConfig } from "../preview/launch/index.ts";
 import type { PreviewPortAllocator } from "../preview/port-allocator.ts";
 import {
@@ -187,6 +188,10 @@ export interface CreateBridgeRegistryInput {
 	 * `propose_intent` patches. Tests inject a stub.
 	 */
 	readonly conversationTurn?: ConversationTurnHandler;
+	/** Optional best-effort terminal notification emitter. */
+	readonly terminalNotification?: {
+		readonly emit: (event: TerminalNotificationEnvelope) => Promise<void>;
+	};
 }
 
 export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRegistry {
@@ -231,6 +236,9 @@ export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRe
 				? { previewLaunchConfig: input.previewLaunchConfig }
 				: {}),
 			...(input.seedsCli !== undefined ? { seedsCli: input.seedsCli } : {}),
+			...(input.terminalNotification !== undefined
+				? { terminalNotification: input.terminalNotification }
+				: {}),
 		});
 		const entry: BridgeEntry = { burrowRunId, abort, done };
 		live.set(runId, entry);
