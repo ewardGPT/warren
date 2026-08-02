@@ -1,4 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export type TriageSource = "ci" | "issue" | "commit";
 export type TriageFindingStatus = "open" | "triaged" | "archived";
@@ -31,6 +32,19 @@ export interface TriageMergeResult {
 	readonly added: number;
 	readonly updated: number;
 	readonly archivedEmpty: boolean;
+}
+
+export interface TriageCollectorInput {
+	readonly projectId: string;
+	readonly projectPath: string;
+	readonly now: Date;
+}
+
+export type TriageCollector = (input: TriageCollectorInput) => Promise<readonly TriageFinding[]>;
+
+export interface TriagePassInput extends TriageCollectorInput {
+	readonly collect: TriageCollector;
+	readonly fs?: TriageInboxFs;
 }
 
 export const DEFAULT_TRIAGE_INBOX_PATH = ".warren/triage-inbox.json";
@@ -105,6 +119,20 @@ export async function saveTriageInbox(
 	fs: TriageInboxFs = defaultTriageInboxFs,
 ): Promise<void> {
 	await fs.writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+/** Run one collector pass and persist its merge for a project. */
+export async function runTriageInboxPass(input: TriagePassInput): Promise<TriageMergeResult> {
+	const fs = input.fs ?? defaultTriageInboxFs;
+	const path = join(input.projectPath, DEFAULT_TRIAGE_INBOX_PATH);
+	const current = await loadTriageInbox(path, fs);
+	const incoming = await input.collect(input);
+	const result = mergeTriageFindings(current, incoming, {
+		now: input.now,
+		runId: `triage-${input.projectId}-${input.now.getTime()}`,
+	});
+	await saveTriageInbox(result.state, path, fs);
+	return result;
 }
 
 const defaultTriageInboxFs: TriageInboxFs = {

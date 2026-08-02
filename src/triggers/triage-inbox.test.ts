@@ -3,6 +3,7 @@ import {
 	emptyTriageInbox,
 	loadTriageInbox,
 	mergeTriageFindings,
+	runTriageInboxPass,
 	saveTriageInbox,
 } from "./triage-inbox.ts";
 
@@ -64,5 +65,24 @@ describe("triage inbox", () => {
 		expect(stored).toContain('"version": 1');
 		stored = "not-json";
 		expect((await loadTriageInbox("inbox.json", fs)).findings).toEqual([]);
+	});
+
+	test("runs an injected collector and persists the project inbox", async () => {
+		const files = new Map<string, string>();
+		const fs = {
+			readFile: async (path: string) => files.get(path) ?? null,
+			writeFile: async (path: string, contents: string) => {
+				files.set(path, contents);
+			},
+		};
+		const result = await runTriageInboxPass({
+			projectId: "project-1",
+			projectPath: "/tmp/project-1",
+			now: new Date("2026-08-02T03:00:00Z"),
+			collect: async () => [finding("ci-1")],
+			fs,
+		});
+		expect(result.added).toBe(1);
+		expect(files.has("/tmp/project-1/.warren/triage-inbox.json")).toBe(true);
 	});
 });

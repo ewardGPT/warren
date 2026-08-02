@@ -54,6 +54,7 @@ import {
 	dispatchScheduledSeed,
 } from "./dispatch.ts";
 import { dispatchGoalTrigger, dispatchLoopTrigger } from "./goal-loop.ts";
+import { runTriageInboxPass, type TriageCollector } from "./triage-inbox.ts";
 
 export type {
 	TickCiFixerDeps,
@@ -90,6 +91,10 @@ export interface TickLogger {
 	error(obj: Record<string, unknown>, msg?: string): void;
 }
 
+export interface TriageSchedulerDeps {
+	readonly collect: TriageCollector;
+}
+
 export interface TickDeps {
 	readonly repos: Pick<Repos, "projects" | "triggers" | "runs" | "events">;
 	readonly loadWarrenConfig: LoadWarrenConfigFn;
@@ -97,6 +102,8 @@ export interface TickDeps {
 	readonly updateExtensions: UpdateSeedExtensionsFn;
 	readonly spawn: DispatchSpawnFn;
 	readonly ciFixer?: TickCiFixerDeps;
+	/** Optional daily/project triage collector; absent projects retain legacy behavior. */
+	readonly triage?: TriageSchedulerDeps;
 	readonly now?: () => Date;
 	readonly logger?: TickLogger;
 }
@@ -178,6 +185,24 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 			now,
 			...(deps.logger !== undefined ? { logger: deps.logger } : {}),
 		});
+	}
+
+	if (deps.triage !== undefined) {
+		const triage = await runTriageInboxPass({
+			projectId: project.id,
+			projectPath: project.localPath,
+			now,
+			collect: deps.triage.collect,
+		});
+		deps.logger?.info(
+			{
+				projectId: project.id,
+				added: triage.added,
+				updated: triage.updated,
+				archivedEmpty: triage.archivedEmpty,
+			},
+			"scheduler.triage_completed",
+		);
 	}
 
 	let seedsResult: Awaited<ReturnType<ListScheduledSeedsFn>>;
@@ -275,6 +300,7 @@ async function dispatchGoalTriggers(input: {
 			trigger,
 			now: input.now,
 			spawn: input.deps.spawn,
+			repos: input.deps.repos,
 		});
 		input.deps.logger?.info(
 			{ projectId: input.project.id, triggerId: trigger.id, kind: result.kind },
@@ -302,16 +328,8 @@ async function dispatchLoopTriggers(input: {
 			now: input.now,
 			iterationsRun,
 			spawn: input.deps.spawn,
+			repos: input.deps.repos,
 		});
-		if (result.kind === "spawned") {
-			await input.deps.repos.triggers.recordFire({
-				projectId: input.project.id,
-				triggerId: trigger.id,
-				firedAt: input.now,
-				nextFireAt: null,
-				runId: result.runId,
-			});
-		}
 		input.deps.logger?.info(
 			{ projectId: input.project.id, triggerId: trigger.id, kind: result.kind },
 			"scheduler.loop_dispatched",

@@ -60,6 +60,7 @@ export {
 	type TickCiFixerSpawnInput,
 	type TickDeps,
 	type TickLogger,
+	type TriageSchedulerDeps,
 	type UpdateSeedExtensionsFn,
 } from "./tick.ts";
 export {
@@ -67,11 +68,15 @@ export {
 	emptyTriageInbox,
 	loadTriageInbox,
 	mergeTriageFindings,
+	runTriageInboxPass,
 	saveTriageInbox,
+	type TriageCollector,
+	type TriageCollectorInput,
 	type TriageFinding,
 	type TriageFindingStatus,
 	type TriageInboxFs,
 	type TriageInboxState,
 	type TriageMergeResult,
+	type TriagePassInput,
 	type TriageSource,
 } from "./triage-inbox.ts";
