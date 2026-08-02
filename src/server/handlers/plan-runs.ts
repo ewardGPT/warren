@@ -12,6 +12,7 @@
 
 import { join } from "node:path";
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
+import { resolveChildExecution } from "../../plan-runs/dispatch.ts";
 import {
 	PlanHasNoOpenChildrenError,
 	ProjectLacksPlotError,
@@ -162,19 +163,18 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 				recoveryHint: "run `sd plan submit <seed-id>` to populate the plan's children",
 			});
 		}
-		// Probe every child seed's status — if all are already closed there is
-		// nothing to dispatch. Each child is read in parallel since the seeds
-		// CLI is shell-out + filesystem read, not network.
 		const seedsCli = deps.seedsCli;
-		const childStatuses = await Promise.all(
+		const childSeeds = await Promise.all(
 			plan.children.map((seedId) =>
-				showSeed(seedsCli, dispatchProject.localPath, seedId).then((s) => ({
-					seedId,
-					status: s.status,
-				})),
+				showSeed(seedsCli, dispatchProject.localPath, seedId).then((seed) => ({ seedId, seed })),
 			),
 		);
-		const hasOpenChild = childStatuses.some((c) => c.status !== "closed");
+		await Promise.all(
+			childSeeds.map(({ seed }) =>
+				resolveChildExecution(deps.repos, { projectId: project.id }, seed.extensions),
+			),
+		);
+		const hasOpenChild = childSeeds.some(({ seed }) => seed.status !== "closed");
 		if (!hasOpenChild) {
 			throw new PlanHasNoOpenChildrenError(
 				`plan ${planId} has no open children; every child seed is closed`,

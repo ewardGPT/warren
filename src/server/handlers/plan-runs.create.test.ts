@@ -159,6 +159,43 @@ describe("POST /plan-runs", () => {
 		expect(body.error.code).toBe("plan_has_no_open_children");
 	});
 
+	test("rejects an unresolved cross-repo child before creating the plan-run", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-cross-repo", "active", ["wa-cross"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-cross",
+					result: seedShowResult("wa-cross", "open", { repo: "unknown-owner/unknown-repo" }),
+				},
+			],
+		);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-cross-repo",
+				agent: "claude-code",
+			}),
+		});
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { error: { code: string; hint?: string } };
+		expect(body.error.code).toBe("target_project_unresolved");
+		expect(body.error.hint).toContain("register the repo");
+		expect(await repos.planRuns.listByProjectAndState(seedyProjectId)).toHaveLength(0);
+	});
+
 	test("persists plot_id when supplied against a plotted project", async () => {
 		const calls: SdCall[] = [];
 		const sdSpawn = makeSdSpawn(calls, [

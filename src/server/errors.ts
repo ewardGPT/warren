@@ -56,7 +56,7 @@ import {
 	PlotQuestionAlreadyAnsweredError,
 	PlotQuestionNotFoundError,
 } from "../plots/errors.ts";
-import { ProjectUnavailableError } from "../projects/errors.ts";
+import { ProjectUnavailableError, TargetProjectUnresolvedError } from "../projects/errors.ts";
 import { AgentSchemaError, CanopyUnavailableError } from "../registry/errors.ts";
 import { RunSpawnError } from "../runs/errors.ts";
 import { NoEligibleWorkerError, StickyWorkerUnreachableError } from "../runs/placement.ts";
@@ -124,6 +124,7 @@ function warrenStatusFor(err: WarrenError): number {
 	if (err instanceof ValidationError) return 400;
 	if (err instanceof ProjectLacksSeedsError) return 400;
 	if (err instanceof ProjectLacksPlotError) return 400;
+	if (err instanceof TargetProjectUnresolvedError) return 400;
 	if (err instanceof PlanHasNoOpenChildrenError) return 400;
 	if (err instanceof NoDispatchableSeedsError) return 400;
 	if (err instanceof SdPlanSynthesisError) return 500;
