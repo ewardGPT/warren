@@ -36,6 +36,7 @@ import {
 	type RefreshProjectAgentsResult,
 	type RefreshProjectInput,
 	type RefreshProjectResponse,
+	type ResumePlanRunResponse,
 	type RunEvent,
 	type RunRow,
 	type SpawnRunResponse,
@@ -395,6 +396,14 @@ export class WarrenClient {
 	async cancelPlanRun(planRunId: string): Promise<CancelPlanRunResponse> {
 		return this.request<CancelPlanRunResponse>(
 			`/plan-runs/${encodeURIComponent(planRunId)}/cancel`,
+			{ method: "POST" },
+		);
+	}
+
+	/** Resume a plan-run stopped by a child/parent PR merge timeout. */
+	async resumePlanRun(planRunId: string): Promise<ResumePlanRunResponse> {
+		return this.request<ResumePlanRunResponse>(
+			`/plan-runs/${encodeURIComponent(planRunId)}/resume`,
 			{ method: "POST" },
 		);
 	}

@@ -147,6 +147,7 @@ export class RunsRepo {
 			failureReason: null,
 			startedAt: null,
 			endedAt: null,
+			mergeWaitStartedAt: null,
 			prompt: input.prompt,
 			trigger: input.trigger,
 			prUrl: null,
@@ -369,13 +370,8 @@ export class RunsRepo {
 	}
 
 	/**
-	 * Persist per-run preview environment fields (R-19 / SPEC §11.L). Mirrors
-	 * `attachStats`'s partial-input semantics (mx-49272e): omitted fields
-	 * preserve existing values, explicit `null` clears. Throws ValidationError
-	 * when called with no fields, matching `attachBurrow` / `attachStats`.
-	 * Used by reap's `preview_launch` sub-step, the readiness probe, the host
-	 * reverse proxy (debounced `previewLastHitAt`), the eviction worker, and
-	 * the manual teardown route.
+	 * Persist per-run preview environment fields (R-19 / SPEC §11.L).
+	 * Omitted fields preserve existing values.
 	 */
 	async attachPreview(id: string, input: AttachPreviewInput): Promise<RunRow> {
 		const keys: (keyof AttachPreviewInput)[] = [
@@ -399,18 +395,23 @@ export class RunsRepo {
 		return { ...current, ...patch };
 	}
 
-	/**
-	 * Persist the PR URL reap's `pr_open` sub-step opened (warren-f6af).
-	 * Last write wins; passing `null` clears the field. Separate from
-	 * `finalize` because reap fires this *before* the terminal transition
-	 * (so the URL lands on the `reap.completed` event payload too).
-	 */
+	/** Persist the PR URL opened by reap; null clears it. */
 	async setPrUrl(id: string, prUrl: string | null): Promise<RunRow> {
 		const current = await this.require(id);
 		await this.adapter.runWrite(
 			this.db.update(this.runs).set({ prUrl }).where(eq(this.runs.id, id)),
 		);
 		return { ...current, prUrl };
+	}
+
+	/** Re-arm PR merge waiting without changing terminal history. */
+	async rearmMergeWait(id: string, now: Date = new Date()): Promise<RunRow> {
+		const current = await this.require(id);
+		const mergeWaitStartedAt = now.toISOString();
+		await this.adapter.runWrite(
+			this.db.update(this.runs).set({ mergeWaitStartedAt }).where(eq(this.runs.id, id)),
+		);
+		return { ...current, mergeWaitStartedAt };
 	}
 
 	/**

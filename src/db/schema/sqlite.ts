@@ -148,14 +148,13 @@ export const runs = sqliteTable(
 		// in warren's database, and the seed-id space is per-project.
 		seedId: text("seed_id"),
 		// Optional back-link to the Plot this run was dispatched against
-		// (warren-a8c3, parent warren-000b). Gated on the owning project's
+		// (warren-a8c3). Gated on the owning project's
 		// `hasPlot` flag at handler-level — POST /runs rejects a plot_id when
-		// the project has no `.plot/` directory. When set, the spawn flow
 		// (warren-e26f) injects PLOT_ID + PLOT_ACTOR into the sandbox env,
 		// emits a `run_dispatched` event into the Plot (warren-e848), and
 		// reap mirrors plot deltas back into warren's event stream tagged
 		// with this plot_id (warren-7e0f). Nullable: legacy rows and runs
-		// dispatched without a plot leave it null. Plain text, no FK — Plots
+		// dispatched without a plot leave it null. Plain text, no FK.
 		// live in the project workspace, not in warren's database.
 		plotId: text("plot_id"),
 		renderedAgentJson: text("rendered_agent_json", { mode: "json" }).notNull(),
@@ -163,6 +162,7 @@ export const runs = sqliteTable(
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
+		mergeWaitStartedAt: text("merge_wait_started_at"),
 		prompt: text("prompt").notNull(),
 		trigger: text("trigger").notNull(),
 		// PR URL filled in by reap's pr_open sub-step (warren-f6af) when the

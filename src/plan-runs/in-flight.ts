@@ -271,7 +271,7 @@ async function handleOpenPr(
 	effectivePrUrl: string,
 ): Promise<HandleInFlightDecision> {
 	const { emit, planRun, child, mergeTimeoutMs, now } = input;
-	if (mergeDeadlineExceeded(run.endedAt, now, mergeTimeoutMs)) {
+	if (mergeDeadlineExceeded(run.mergeWaitStartedAt ?? run.endedAt, now, mergeTimeoutMs)) {
 		return await failChild(input, run, "child_pr_merge_timeout", { prUrl: effectivePrUrl });
 	}
 	await emit(run.id, "plan_run.waiting_for_merge", {

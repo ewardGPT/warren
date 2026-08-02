@@ -110,6 +110,9 @@ export const runs = pgTable(
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
+		// Mirror of sqlite runs.merge_wait_started_at. Null preserves legacy
+		// ended_at semantics for rows created before resumable plan-runs.
+		mergeWaitStartedAt: text("merge_wait_started_at"),
 		prompt: text("prompt").notNull(),
 		trigger: text("trigger").notNull(),
 		prUrl: text("pr_url"),

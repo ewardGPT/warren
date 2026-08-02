@@ -2373,8 +2373,18 @@ POST   /plan-runs                 dispatch (rejects without project.hasSeeds)
 GET    /plan-runs                 list (filter by project / state)
 GET    /plan-runs/:id             detail + fanned-out child runs[]
 POST   /plan-runs/:id/cancel      sets state='cancelled', cancels in-flight run
+POST   /plan-runs/:id/resume      resumes a child/parent PR merge-timeout failure
 GET    /plan-runs/:id/events      tails the union of every child run's events
 ```
+
+`POST /plan-runs/:id/resume` is accepted only for a failed plan-run whose
+`failure_reason` is `child_pr_merge_timeout` or `parent_pr_merge_timeout`.
+For a child timeout it restores that failed child to `pr_open`, preserving its
+linked run and PR URL; for a parent timeout it re-arms the parent PR gate.
+Both paths persist a fresh merge-wait baseline, clear the plan failure, and
+transition `failed → running`. Other terminal failures are rejected without
+changing state. If the PR has already merged, the next coordinator tick
+advances immediately; otherwise it waits under the fresh timeout.
 
 The dispatch handler rejects in this order: (1) project not found →
 404; (2) `!project.hasSeeds` → `ProjectLacksSeedsError` (typed 400,

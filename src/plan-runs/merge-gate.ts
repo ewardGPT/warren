@@ -33,12 +33,22 @@ export type ChildPrReopenResult =
  * pr_open fall-through, or noop-and-retry respectively.
  */
 export async function resolveChildPrReopen(input: {
-	readonly run: { readonly id: string; readonly endedAt: string | null };
+	readonly run: {
+		readonly id: string;
+		readonly endedAt: string | null;
+		readonly mergeWaitStartedAt?: string | null;
+	};
 	readonly reopenPr: CoordinatorReopenPrFn | undefined;
 	readonly mergeTimeoutMs: number;
 	readonly now: () => Date;
 }): Promise<ChildPrReopenResult> {
-	if (mergeDeadlineExceeded(input.run.endedAt, input.now, input.mergeTimeoutMs)) {
+	if (
+		mergeDeadlineExceeded(
+			input.run.mergeWaitStartedAt ?? input.run.endedAt,
+			input.now,
+			input.mergeTimeoutMs,
+		)
+	) {
 		return { kind: "expired" };
 	}
 	if (input.reopenPr !== undefined) {
@@ -98,7 +108,9 @@ export async function checkParentRunMerged(input: {
 		// checks, BLOCKED mergeStateStatus, stuck auto-merge) would otherwise
 		// block the plan forever. Bound the wait by a wall-clock budget that
 		// starts when the parent run ended (PR-open time), then fail.
-		if (mergeDeadlineExceeded(parentRun.endedAt, now, mergeTimeoutMs)) {
+		if (
+			mergeDeadlineExceeded(parentRun.mergeWaitStartedAt ?? parentRun.endedAt, now, mergeTimeoutMs)
+		) {
 			return failParentGate({
 				planRun,
 				repos,

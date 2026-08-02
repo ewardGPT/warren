@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { Repos as WarrenRepos } from "../../db/repos/index.ts";
 import {
 	autoTransitionPlotToDone,
 	bootPlanRunCoordinator,
@@ -20,7 +21,7 @@ import type { EnvLike } from "../config.ts";
 import { planRunLoggerFromPino } from "./logging.ts";
 
 type PlanRunSpawnArgs = Parameters<typeof createPlanRunSpawn>[0];
-type Repos = Parameters<typeof createResolveExecution>[0];
+type Repos = WarrenRepos;
 type Logger = Parameters<typeof planRunLoggerFromPino>[0];
 type AutoOpenPr = Parameters<typeof createPrMergeChecker>[0] & {
 	enabled: boolean;

@@ -25,10 +25,10 @@ describe("assertPlanRunTransition", () => {
 		expect(() => assertPlanRunTransition("queued", "succeeded")).toThrow(StateTransitionError);
 	});
 
-	test("terminal states are sticky", () => {
+	test("succeeded and cancelled are sticky; failed can resume", () => {
 		expect(() => assertPlanRunTransition("succeeded", "running")).toThrow(StateTransitionError);
-		expect(() => assertPlanRunTransition("failed", "running")).toThrow(StateTransitionError);
 		expect(() => assertPlanRunTransition("cancelled", "running")).toThrow(StateTransitionError);
+		expect(() => assertPlanRunTransition("failed", "running")).not.toThrow();
 	});
 });
 

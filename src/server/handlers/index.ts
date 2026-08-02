@@ -60,6 +60,7 @@ import {
 	listPlanRunsHandler,
 	streamPlanRunEventsHandler,
 } from "./plan-runs.ts";
+import { resumePlanRunHandler } from "./plan-runs-resume.ts";
 import { createPlotPlanRunHandler } from "./plot-plan-runs.ts";
 import {
 	answerPlotQuestionHandler,
@@ -313,6 +314,7 @@ const ROUTE_TABLE: readonly RouteEntry[] = [
 	{ method: "POST", pattern: "/plot-plan-runs", build: createPlotPlanRunHandler },
 	{ method: "GET", pattern: "/plan-runs/:id", build: getPlanRunHandler },
 	{ method: "POST", pattern: "/plan-runs/:id/cancel", build: cancelPlanRunHandler },
+	{ method: "POST", pattern: "/plan-runs/:id/resume", build: resumePlanRunHandler },
 	{ method: "GET", pattern: "/plan-runs/:id/events", build: streamPlanRunEventsHandler },
 
 	{ method: "GET", pattern: "/conversations", build: listConversationsHandler },
