@@ -13,6 +13,7 @@ import { Spinner } from "@/components/ui/spinner.tsx";
 import { formatError } from "@/lib/format-error.ts";
 import { formatTimestamp, relativeTime } from "@/lib/utils.ts";
 import { PlanRunChildTable } from "./plan-run-detail/child-table.tsx";
+import { PlanRunGraphView } from "./plan-run-detail/graph-view.tsx";
 import { formatCostUsd } from "./RunDetail.tsx";
 
 const ACTIVE_STATES = new Set<PlanRunRow["state"]>(["queued", "running"]);
@@ -47,7 +48,7 @@ export function PlanRunDetailPage() {
 		);
 	}
 	if (!detail.data) return null;
-	const { planRun, children, runs } = detail.data;
+	const { planRun, children, runs, graph } = detail.data;
 	const canCancel = ACTIVE_STATES.has(planRun.state);
 	const cost = summarizeRunCost(runs);
 
@@ -152,6 +153,7 @@ export function PlanRunDetailPage() {
 			</Card>
 
 			<PlanRunChildTable children={children} runs={runs} />
+			<PlanRunGraphView graph={graph} />
 		</div>
 	);
 }

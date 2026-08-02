@@ -666,6 +666,26 @@ export interface PlanRunDetailResponse {
 	planRun: PlanRunRow;
 	children: PlanRunChildRow[];
 	runs: RunRow[];
+	graph: PlanRunGraph;
+}
+
+export interface PlanRunGraph {
+	nodes: PlanRunGraphNode[];
+	edges: PlanRunGraphEdge[];
+}
+
+export interface PlanRunGraphNode {
+	id: string;
+	kind: "plan" | "parent-run" | "child";
+	label: string;
+	state: string;
+	seq?: number;
+}
+
+export interface PlanRunGraphEdge {
+	from: string;
+	to: string;
+	kind: "parent-gate" | "dispatch" | "sequential-dependency";
 }
 
 /** `POST /plan-runs/:id/cancel` envelope. */

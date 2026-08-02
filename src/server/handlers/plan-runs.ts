@@ -1,6 +1,5 @@
 /**
  * PlanRun HTTP handlers (warren-f923 / pl-a258 step 6).
- *
  * Extracted from `src/server/handlers/index.ts` (warren-a2b4 /
  * pl-9088 step 2). Shared parsing helpers and the
  * `assertPlotIdDispatchable` gate are re-imported from the index
@@ -9,7 +8,6 @@
  * so the plan-run stream handler stays byte-identical to the
  * pre-split shape.
  */
-
 import { join } from "node:path";
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
 import { resolveChildExecution } from "../../plan-runs/dispatch.ts";
@@ -18,6 +16,7 @@ import {
 	ProjectLacksPlotError,
 	ProjectLacksSeedsError,
 } from "../../plan-runs/errors.ts";
+import { buildPlanRunGraph } from "../../plan-runs/graph.ts";
 import {
 	defaultPlanRunPlotActivator,
 	defaultPlanRunPlotAppender,
@@ -281,11 +280,7 @@ export function listPlanRunsHandler(deps: ServerDeps): RouteHandler {
 	};
 }
 
-/**
- * `GET /plan-runs/:id` — full detail page payload: row + children + the
- * fanned-out `runs[]` from runs.listByIds(child.runId for each non-null)
- * so the UI's detail page renders in one round-trip.
- */
+/** `GET /plan-runs/:id` returns rows, child runs, and the truthful execution graph. */
 export function getPlanRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
@@ -293,7 +288,12 @@ export function getPlanRunHandler(deps: ServerDeps): RouteHandler {
 		const children = await deps.repos.planRuns.listChildren(id);
 		const runIds = children.map((c) => c.runId).filter((v): v is string => v !== null);
 		const runs = await deps.repos.runs.listByIds(runIds);
-		return jsonResponse(200, { planRun, children, runs });
+		return jsonResponse(200, {
+			planRun,
+			children,
+			runs,
+			graph: buildPlanRunGraph(planRun, children),
+		});
 	};
 }
 
