@@ -13,6 +13,7 @@ import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { RunMode, RunTerminalState } from "../../db/schema.ts";
 import type { RunEventBroker } from "../events.ts";
+import type { TokenBudgetConfig } from "../token-budget.ts";
 import type { ConversationTurnHandler } from "./conversation-turn.ts";
 
 /**
@@ -163,6 +164,8 @@ export interface BridgeRunStreamInput {
 	 * enforcement without seeding a run row.
 	 */
 	readonly costCapUsd?: number;
+	/** Effective token budget; resolved from frozen agent frontmatter when omitted. */
+	readonly tokenBudget?: TokenBudgetConfig;
 	/**
 	 * Override the graceful-cancel seam used when the spend cap trips
 	 * (warren-a63d, tests). Production defaults to a closure over the

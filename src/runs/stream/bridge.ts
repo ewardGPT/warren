@@ -23,6 +23,7 @@ import { withTransportMapping } from "../../burrow-client/client.ts";
 import type { EventStream, RunTerminalState } from "../../db/schema.ts";
 import { EVENT_STREAMS } from "../../db/schema.ts";
 import { resolveCostCapUsd } from "../cost-cap.ts";
+import { TokenBudgetLedger } from "../token-budget.ts";
 import {
 	accumulatePiUsage,
 	extractClaudeUsage,
@@ -34,6 +35,7 @@ import { extractAssistantText, extractIntentPatch } from "./conversation-turn.ts
 import { defaultRunStateProbe, runStatePoller } from "./run-state-poller.ts";
 import { persistInStreamUsage, persistPiStatsDelta, snapshotStats } from "./stats.ts";
 import { detectRuntimeTerminal, isPiAgentEnd } from "./terminal-detect.ts";
+import { emitTokenBudgetEvent, resolveBridgeTokenBudget, tokenUsageDelta } from "./token-budget.ts";
 import {
 	type BridgeLogger,
 	type BridgeRunStreamInput,
@@ -77,6 +79,9 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 	// `runs.rendered_agent_json` (per-trigger override already folded over
 	// the per-agent value at dispatch). A null cap disables enforcement.
 	const costCapUsd = input.costCapUsd ?? (await resolveBridgeCostCap(repos, runId, input.logger));
+	const tokenBudget =
+		input.tokenBudget ?? (await resolveBridgeTokenBudget(repos, runId, input.logger));
+	const tokenLedger = tokenBudget === null ? null : new TokenBudgetLedger(tokenBudget);
 	const cancelBurrowRun: CancelBurrowRunFn =
 		input.cancelBurrowRun ??
 		defaultCancelBurrowRun(sourceClient as BurrowClient | null, burrowRunId);
@@ -166,6 +171,18 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 
 			accumulatePiUsage(piUsage, event);
 			extractClaudeUsage(claudeUsage, event);
+			if (tokenLedger !== null) {
+				const usage = tokenUsageDelta(event);
+				if (usage !== null) {
+					const decision = tokenLedger.record(usage);
+					if (decision === "exhausted" || decision === "bad_attempt_cap") {
+						await emitTokenBudgetEvent(repos, broker, runId, decision, tokenLedger.snapshot());
+						await cancelBurrowRun(`token budget ${decision}`);
+						terminalDetected = { outcome: "cancelled" };
+						break;
+					}
+				}
+			}
 
 			// warren-a63d: enforce the spend cap as cumulative cost crosses it.
 			// On exceed, the helper persists usage + emits `budget.exceeded` +
