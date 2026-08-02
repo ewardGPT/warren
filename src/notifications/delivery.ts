@@ -39,6 +39,7 @@ export interface NotificationEndpoint {
 
 export interface NotificationAttempt {
 	readonly eventId: string;
+	readonly runId: string;
 	readonly endpointId: string;
 	readonly attempt: number;
 	readonly status: "delivered" | "retrying" | "dead_letter";
@@ -52,6 +53,50 @@ export interface NotificationStore {
 	/** Must be idempotent on eventId and complete before the first POST. */
 	readonly persistEvent: (event: TerminalNotificationEnvelope) => Promise<boolean>;
 	readonly persistAttempt: (attempt: NotificationAttempt) => Promise<void>;
+}
+
+interface NotificationEventLog {
+	readonly maxSeqForRun: (runId: string) => Promise<number | null>;
+	readonly listByRun: (runId: string) => Promise<readonly { kind: string; payloadJson: unknown }[]>;
+	readonly append: (input: {
+		runId: string;
+		burrowEventSeq: number;
+		ts: string;
+		kind: string;
+		stream: "system";
+		payload: unknown;
+	}) => Promise<unknown>;
+}
+
+/** Durable store backed by Warren's append-only run event log. */
+export function createEventLogNotificationStore(events: NotificationEventLog): NotificationStore {
+	const append = async (runId: string, kind: string, payload: unknown): Promise<void> => {
+		const next = ((await events.maxSeqForRun(runId)) ?? 0) + 1;
+		await events.append({
+			runId,
+			burrowEventSeq: next,
+			ts: new Date().toISOString(),
+			kind,
+			stream: "system",
+			payload,
+		});
+	};
+	return {
+		persistEvent: async (event) => {
+			const rows = await events.listByRun(event.runId);
+			const exists = rows.some((row) => {
+				if (row.kind !== "notification.event" || row.payloadJson === null) return false;
+				const payload = row.payloadJson as { eventId?: unknown };
+				return payload.eventId === event.eventId;
+			});
+			if (exists) return false;
+			await append(event.runId, "notification.event", event);
+			return true;
+		},
+		persistAttempt: async (attempt) => {
+			await append(attempt.runId, "notification.attempt", attempt);
+		},
+	};
 }
 
 export interface NotificationTransportRequest {
@@ -147,6 +192,7 @@ export class TerminalNotificationDispatcher {
 				if (response.status >= 200 && response.status < 300) {
 					await this.store.persistAttempt({
 						eventId: event.eventId,
+						runId: event.runId,
 						endpointId: endpoint.id,
 						attempt,
 						status: "delivered",
@@ -160,6 +206,7 @@ export class TerminalNotificationDispatcher {
 				if (response.status >= 400 && response.status < 500) {
 					await this.store.persistAttempt({
 						eventId: event.eventId,
+						runId: event.runId,
 						endpointId: endpoint.id,
 						attempt,
 						status: "dead_letter",
@@ -194,6 +241,7 @@ export class TerminalNotificationDispatcher {
 		).toISOString();
 		await this.store.persistAttempt({
 			eventId: event.eventId,
+			runId: event.runId,
 			endpointId: endpoint.id,
 			attempt,
 			status: attempt >= this.maxAttempts ? "dead_letter" : "retrying",

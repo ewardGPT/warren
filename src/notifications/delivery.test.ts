@@ -68,6 +68,7 @@ describe("TerminalNotificationDispatcher", () => {
 		expect(result).toEqual([{ endpointId: "endpoint_1", status: "delivered", attempts: 3 }]);
 		expect(h.eventPersisted).toBe(1);
 		expect(h.attempts.map((a) => a.status)).toEqual(["retrying", "retrying", "delivered"]);
+		expect(h.attempts.every((a) => a.runId === event.runId)).toBe(true);
 		expect(h.sleeps).toEqual([10, 20]);
 	});
 
