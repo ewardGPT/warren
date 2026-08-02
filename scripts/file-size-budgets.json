@@ -2,10 +2,8 @@
 	"_comment": "Per-file line-count budgets (warren-4553). New files default to `threshold`. Listed files are grandfathered at their commit-time line count and may not grow beyond it. Refactor + lower budgets over time; ratchet only goes down.",
 	"threshold": 500,
 	"budgets": {
-		"src/client/client.ts": 569,
 		"src/db/schema/sqlite.ts": 564,
 		"src/plots/aggregate.ts": 506,
-		"src/runs/pr.ts": 659,
 		"src/runs/spawn/dispatch.test.ts": 543,
 		"src/runs/spawn/dispatch.ts": 520,
 		"src/server/handlers/agents.test.ts": 533,
