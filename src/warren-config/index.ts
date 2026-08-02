@@ -42,6 +42,7 @@ export {
 	type DefaultsConfig,
 	DefaultsConfigSchema,
 	type GoalTrigger,
+	type GraphRunTrigger,
 	type HealerConfig,
 	type InteractiveAgentsConfig,
 	interactiveRuntimeOverride,

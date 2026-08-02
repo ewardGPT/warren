@@ -37,7 +37,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import yaml from "js-yaml";
+import { dump as yamlDump } from "js-yaml";
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
 import type { AgentsRepo } from "../../db/repos/agents.ts";
 import type { ProjectsRepo } from "../../db/repos/projects.ts";
@@ -222,5 +222,5 @@ function renderConfigYaml(defaults: DefaultsConfig): string {
 	if (Object.keys(defaults).length === 0) {
 		return "{}\n";
 	}
-	return yaml.dump(defaults, { lineWidth: 100, noRefs: true });
+	return yamlDump(defaults, { lineWidth: 100, noRefs: true });
 }

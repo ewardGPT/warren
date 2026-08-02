@@ -352,10 +352,33 @@ const CronTriggerSchema = z
 	})
 	.strict();
 
+const GraphRunScopeOverrideSchema = z
+	.object({
+		glob: z.string().min(1).optional(),
+		max: z.number().int().positive().optional(),
+	})
+	.strict();
+
+const GraphRunTriggerSchema = z
+	.object({
+		id: TriggerIdSchema,
+		kind: z.literal("graph-run"),
+		cron: CronExpressionSchema,
+		template: z.string().min(1, "template must be non-empty"),
+		seed: SeedRefSchema.optional(),
+		timezone: TimezoneSchema.optional(),
+		agent: RoleNameSchema.optional(),
+		scope: GraphRunScopeOverrideSchema.optional(),
+		verify: z.boolean().optional(),
+		synthesize: z.boolean().optional(),
+	})
+	.strict();
+
 export const TriggerSchema = z.discriminatedUnion("kind", [
 	CronTriggerSchema,
 	GoalTriggerSchema,
 	LoopTriggerSchema,
+	GraphRunTriggerSchema,
 ]);
 export const TriggersConfigSchema = z.array(TriggerSchema).superRefine((list, ctx) => {
 	const seen = new Set<string>();
@@ -372,6 +395,7 @@ export const TriggersConfigSchema = z.array(TriggerSchema).superRefine((list, ct
 });
 
 export type CronTrigger = z.infer<typeof CronTriggerSchema>;
+export type GraphRunTrigger = z.infer<typeof GraphRunTriggerSchema>;
 export type Trigger = z.infer<typeof TriggerSchema>;
 export type TriggersConfig = z.infer<typeof TriggersConfigSchema>;
 

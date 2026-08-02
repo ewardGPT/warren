@@ -1,0 +1,34 @@
+# GraphRun template: file size budget audit (read-only fan-out)
+
+name: file-size-audit
+description: Flag source files exceeding scripts/file-size-budgets.json thresholds.
+
+defaults:
+  agent: sapling
+  verify: true
+  synthesize: true
+  max_fan_out: 20
+  max_concurrent: 16
+
+scope:
+  glob: "src/**/*.ts"
+  max: 10
+  maker_model: deepseek-chat
+  checker_agent: sapling
+  checker_model: deepseek-reasoner
+  stop_check_model: deepseek-chat
+
+executor_prompt: |
+  Check {file} against scripts/file-size-budgets.json line budgets.
+  Output: JSON array of findings [{file, lineCount, budget, claim}].
+  Report only — do not edit files.{seed_suffix}
+
+verifier_prompt: |
+  Finding: {finding}
+  Criterion: line count exceeds a listed budget or default threshold.
+  Answer true only if verified by reading the file and budgets JSON.
+  Output: true or false only.
+
+synthesize_prompt: |
+  Given verified size-budget findings, write a markdown report to
+  .warren/reports/file-size-audit-report.md. Commit only that report.

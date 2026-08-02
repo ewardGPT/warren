@@ -20,6 +20,8 @@ describe("startScheduler", () => {
 			disabled: true,
 			repos: {
 				projects: { listAll: () => [] } as never,
+				agents: {} as never,
+				graphRuns: {} as never,
 				triggers: {} as never,
 				runs: {} as never,
 				events: {} as never,
@@ -50,6 +52,8 @@ describe("startScheduler", () => {
 			tickMs: 100_000,
 			repos: {
 				projects: { listAll: () => [projectRow] } as never,
+				agents: {} as never,
+				graphRuns: {} as never,
 				triggers: {} as never,
 				runs: {} as never,
 				events: {} as never,
@@ -82,6 +86,8 @@ describe("startScheduler", () => {
 			tickMs: 1,
 			repos: {
 				projects: { listAll: () => [] } as never,
+				agents: {} as never,
+				graphRuns: {} as never,
 				triggers: {} as never,
 				runs: {} as never,
 				events: {} as never,

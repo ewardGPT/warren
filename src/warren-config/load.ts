@@ -35,7 +35,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import yaml from "js-yaml";
+import { load as yamlLoad } from "js-yaml";
 import { formatError } from "../core/errors.ts";
 import { type PrTemplateOverrides, parsePrTemplate } from "../runs/pr-template.ts";
 import { WARREN_CONFIG_DIR, WARREN_CONFIG_FILES, warrenConfigRelativePath } from "./config.ts";
@@ -174,18 +174,23 @@ async function loadTriggers(input: LoadOneInput): Promise<TriggersConfig | null>
 	}
 
 	let document: unknown;
-	try {
-		document = yaml.load(raw, { filename: relPath });
-	} catch (err) {
-		input.errors.push({
-			file: relPath,
-			code: WARREN_CONFIG_FILE_ERROR_CODES.parseError,
-			message: `YAML parse error: ${formatError(err)}`,
-		});
-		return null;
+	if (raw.trim().length === 0) {
+		// js-yaml throws on empty input; an empty triggers file means "no triggers".
+		document = [];
+	} else {
+		try {
+			document = yamlLoad(raw, { filename: relPath });
+		} catch (err) {
+			input.errors.push({
+				file: relPath,
+				code: WARREN_CONFIG_FILE_ERROR_CODES.parseError,
+				message: `YAML parse error: ${formatError(err)}`,
+			});
+			return null;
+		}
 	}
 
-	const result = parseTriggersConfig(document);
+	const result = parseTriggersConfig(document ?? []);
 	if (!result.ok) {
 		input.errors.push({
 			file: relPath,
@@ -280,7 +285,7 @@ async function loadConfigYaml(
 		document = undefined;
 	} else {
 		try {
-			document = yaml.load(raw, { filename: relPath });
+			document = yamlLoad(raw, { filename: relPath });
 		} catch (err) {
 			input.errors.push({
 				file: relPath,
@@ -383,7 +388,7 @@ async function loadPreviewFile(input: LoadOneInput): Promise<DefaultsConfig["pre
 		document = undefined;
 	} else {
 		try {
-			document = yaml.load(raw, { filename: relPath });
+			document = yamlLoad(raw, { filename: relPath });
 		} catch (err) {
 			input.errors.push({
 				file: relPath,

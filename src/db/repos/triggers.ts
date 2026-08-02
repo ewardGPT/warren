@@ -36,7 +36,7 @@ export interface UpsertTriggerInput extends TriggerKey {
 export interface RecordFireInput extends TriggerKey {
 	firedAt: Date;
 	nextFireAt: Date | null;
-	runId: string;
+	runId: string | null;
 }
 
 export class TriggersRepo {
@@ -80,6 +80,7 @@ export class TriggersRepo {
 				nextFireAt: input.nextFireAt ?? null,
 				lastRunId: input.lastRunId ?? null,
 				fireCount: input.fireCount ?? 0,
+				completedAt: null,
 			};
 			await tx.runWrite(txDb.insert(triggers).values(row));
 			return row;
@@ -151,5 +152,16 @@ export class TriggersRepo {
 	async delete(key: TriggerKey): Promise<void> {
 		const id = makeTriggerRowId(key.projectId, key.triggerId);
 		await this.adapter.runWrite(this.db.delete(this.triggers).where(eq(this.triggers.id, id)));
+	}
+
+	async markCompleted(key: TriggerKey, now: string | Date): Promise<void> {
+		const id = makeTriggerRowId(key.projectId, key.triggerId);
+		const completedAt = typeof now === "string" ? now : now.toISOString();
+		await this.adapter.runWrite(
+			this.db
+				.update(this.triggers)
+				.set({ completedAt })
+				.where(eq(this.triggers.id, id)),
+		);
 	}
 }

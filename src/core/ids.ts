@@ -23,6 +23,8 @@ const PREFIXES = {
 	planRun: "plnr",
 	conversation: "conv",
 	message: "msg",
+	graphRun: "grun",
+	graphRunChild: "grch",
 } as const;
 
 export type IdKind = keyof typeof PREFIXES;
