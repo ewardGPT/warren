@@ -273,40 +273,6 @@ export interface ListRunsResponse {
 	offset: number;
 }
 
-/**
- * Body for `POST /runs/:id/messages` (pl-0344 step 4 / warren-b3b9).
- * Sends a follow-up user turn on an interactive conversation. `:id` is
- * any prior interactive run row that shares the conversation's plotId
- * — the server resolves Plot context from disk, not from this row.
- */
-export interface SendRunMessageInput {
-	message: string;
-	ref?: string;
-	providerOverride?: string;
-	modelOverride?: string;
-	dispatcherHandle?: string;
-}
-
-/**
- * Wire envelope of `POST /runs/:id/messages`. The server returns 202
- * Accepted with the freshly-spawned turn row + the persisted
- * user_message event; the matching `agent_message` event lands later on
- * the events stream when reap fires.
- */
-export interface SendRunMessageResponse {
-	run: RunRow;
-	burrow: BurrowSummary;
-	userMessageEvent: {
-		id: number;
-		runId: string;
-		seq: number;
-		ts: string;
-		kind: string;
-	};
-	priorRunId: string;
-	plotContextDegraded: boolean;
-}
-
 export interface CancelRunResponse {
 	state: RunState;
 	alreadyTerminal: boolean;
@@ -1292,4 +1258,3 @@ export interface RewakeConversationResponse {
 	conversation: ConversationRow;
 	run: { id: string; mode: string };
 }
-

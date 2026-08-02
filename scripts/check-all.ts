@@ -45,6 +45,7 @@ export const CANONICAL_GATES: readonly CanonicalGate[] = [
 	{ name: "check:bundle-size", conditional: true },
 	{ name: "gen:docs:check", conditional: true },
 	{ name: "gen:openapi:check", conditional: true },
+	{ name: "check:client-contract", conditional: true },
 	{ name: "check:coverage", conditional: false },
 	{ name: "check:ci-parity", conditional: false },
 ];

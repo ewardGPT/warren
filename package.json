@@ -52,6 +52,7 @@
 		"gen:docs:check": "bun run scripts/generate-docs.ts --check",
 		"gen:openapi": "bun run scripts/generate-openapi.ts",
 		"gen:openapi:check": "bun run scripts/generate-openapi.ts --check",
+		"check:client-contract": "bun run scripts/check-client-contract.ts",
 		"check:ci-parity": "bun scripts/check-ci-parity.ts",
 		"check:all": "bun scripts/check-all.ts",
 		"verify": "bun run check:all",

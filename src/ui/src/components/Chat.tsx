@@ -16,15 +16,8 @@
  *   - User turn  → event kind `user_message`  with payload `{actor, content}`
  *   - Agent turn → event kind `agent_message` with payload `{actor, content}`
  *
- * Sending a message calls `POST /runs/:id/messages`; the conversation
- * handle (`runId`) is forwarded to the new turn's run id via
- * `onTurnSpawned` so the parent surface (PlotDetail in warren-444c) can
- * re-anchor its event stream onto the latest turn. The default behavior
- * — when `onTurnSpawned` is not provided — is to render messages from
- * the conversation handle the parent supplied and not re-anchor; the
- * server appends both user_message and (later) agent_message onto the
- * spawned turn's run id, so a parent that wants to follow the live
- * agent reply must rebind its stream.
+ * Sending a message is supplied by the conversation surface so the UI
+ * cannot drift from the server's canonical conversation route.
  *
  * Non-goals here: persisting draft text, optimistic user-bubble render
  * (the server-appended user_message lands fast enough), or
@@ -33,7 +26,6 @@
  */
 
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { runsApi } from "@/api/client.ts";
 import type { MessageRow } from "@/api/types.ts";
 import {
 	buildChatMessages,
@@ -74,23 +66,9 @@ export interface ChatProps {
 	/** Optional header slot rendered above the message list. */
 	readonly header?: React.ReactNode;
 	/**
-	 * Fired after `POST /runs/:id/messages` succeeds with the new turn's
-	 * run id. Parents that want to re-anchor their event stream onto the
-	 * fresh turn pass a handler; otherwise the chat continues streaming
-	 * from the original `runId` (the user_message lands on the new
-	 * turn's id, so the original stream won't see it without a parent
-	 * re-anchor).
+	 * Deliver the user turn through the owning conversation route.
 	 */
-	readonly onTurnSpawned?: (turnRunId: string) => void;
-	/**
-	 * Override the default `POST /runs/:id/messages` send path. When
-	 * provided, the chat calls this instead — used by the Leveret
-	 * conversation split-view (warren-01c8), which delivers turns over
-	 * `POST /conversations/:id/messages` (persist + steer the long-lived
-	 * anchoring run) and keeps its stream anchored on `runId` rather than
-	 * re-anchoring onto a fresh turn. Resolves when the turn is accepted.
-	 */
-	readonly sendMessage?: (message: string) => Promise<void>;
+	readonly sendMessage: (message: string) => Promise<void>;
 	/** Optional className passthrough for the outer wrapper. */
 	readonly className?: string;
 }
@@ -102,7 +80,6 @@ export function Chat({
 	disabled = false,
 	placeholder = "Type a message…",
 	header,
-	onTurnSpawned,
 	sendMessage,
 	className,
 }: ChatProps): JSX.Element {
@@ -131,14 +108,8 @@ export function Chat({
 		setSending(true);
 		setSendError(null);
 		try {
-			if (sendMessage) {
-				await sendMessage(trimmed);
-				setDraft("");
-			} else {
-				const res = await runsApi.sendMessage(runId, { message: trimmed });
-				setDraft("");
-				if (onTurnSpawned) onTurnSpawned(res.run.id);
-			}
+			await sendMessage(trimmed);
+			setDraft("");
 		} catch (err) {
 			setSendError(formatError(err));
 		} finally {
