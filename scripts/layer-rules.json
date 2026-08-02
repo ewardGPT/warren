@@ -26,6 +26,10 @@
 			"forbidImports": ["@os-eco/burrow-cli"],
 			"allow": [
 				{ "path": "src/burrow-client/", "why": "the facade itself" },
+				{
+					"path": "src/runs/stream/token-budget.ts",
+					"why": "type-only RunEvent import for the bridge token ledger; no runtime burrow dependency"
+				},
 				{ "path": "src/runtime/local/", "why": "the LocalProvider and its seams" },
 				{ "path": "src/supervisor/", "why": "local-topology by definition" },
 				{

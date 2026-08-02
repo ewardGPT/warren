@@ -42,6 +42,7 @@ import {
 	type TickLogger,
 	type TriggerSchedulerConfig,
 } from "../triggers/index.ts";
+import { createGithubTriageCollector } from "../triggers/triage-collectors.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
 import type { BridgeRegistry } from "./types.ts";
 
@@ -212,6 +213,9 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 				? { runBranchPrefixDefault: input.runBranchPrefixDefault }
 				: {}),
 		},
+		...(input.githubToken !== undefined
+			? { triage: { collect: createGithubTriageCollector({ githubToken: input.githubToken }) } }
+			: {}),
 		...(input.logger !== undefined ? { logger: input.logger } : {}),
 		...(input.now !== undefined ? { now: input.now } : {}),
 		...(input.setInterval !== undefined ? { setInterval: input.setInterval } : {}),

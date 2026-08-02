@@ -28,11 +28,9 @@
 import { NotFoundError as BurrowNotFoundError, type RunEvent } from "@os-eco/burrow-cli";
 import type { BurrowClient } from "../../burrow-client/index.ts";
 import { withTransportMapping } from "../../burrow-client/index.ts";
+import { EVENT_STREAMS } from "../../core/wire.ts";
 import type { NormalizedEvent, StreamOpts } from "../contract.ts";
 import { RuntimeRunNotFoundError } from "../errors.ts";
-
-/** The three stream tags the seam recognizes; anything else coerces to `null`. */
-const NORMALIZED_STREAMS = ["stdout", "stderr", "system"] as const;
 
 /**
  * Stream burrow's run events as `NormalizedEvent`s. Sync-returns the generator
@@ -89,25 +87,34 @@ async function* pumpLocalEvents(
 	}
 }
 
-/** Re-shape a burrow `RunEvent` onto the seam's `NormalizedEvent` (payload lossless). */
+/**
+ * Re-shape a burrow `RunEvent` onto the seam's `NormalizedEvent` (payload
+ * lossless). Origin is `"warren"` (warren-6646): these events come off the
+ * host-side burrow daemon's own stream, which classifies each transcript line
+ * with its runtime parser — the sandbox never gets to pick `kind`/`stream`
+ * itself, so the envelope keeps system-stream authority.
+ */
 function normalizeEvent(event: RunEvent): NormalizedEvent {
 	return {
 		seq: event.seq,
 		ts: toIsoString(event.ts),
 		kind: event.kind,
 		stream: normalizeStream(event.stream),
+		origin: "warren",
 		payload: event.payload,
 	};
 }
 
 /**
- * Coerce burrow's `stream` tag onto the seam's `"stdout"|"stderr"|"system"|null`.
- * An unrecognized value (a forward-compatible burrow shipping a new tag) coerces
+ * Coerce burrow's `stream` tag onto the seam's `EventStream | null`. An
+ * unrecognized value (a forward-compatible burrow shipping a new tag) coerces
  * to `null` rather than crashing — same tolerance `bridge.ts`'s `normalizeStream`
- * has, kept local so the runtime seam does not couple to warren's db schema.
+ * has. The tag list is the canonical `EVENT_STREAMS` (`src/core/wire.ts`), not a
+ * local copy: `src/core/` is the dependency-free kernel, so importing it couples
+ * the runtime seam to no db schema at all (warren-7b7a).
  */
 function normalizeStream(value: unknown): NormalizedEvent["stream"] {
-	return typeof value === "string" && (NORMALIZED_STREAMS as readonly string[]).includes(value)
+	return typeof value === "string" && (EVENT_STREAMS as readonly string[]).includes(value)
 		? (value as NormalizedEvent["stream"])
 		: null;
 }

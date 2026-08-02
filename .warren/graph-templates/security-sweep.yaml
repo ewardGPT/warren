@@ -1,0 +1,38 @@
+# GraphRun template: security sweep (graph-engineering pilot)
+# Loaded by src/graph-runs/templates.ts when POST /graph-runs template=security-sweep
+
+name: security-sweep
+description: Audit route handlers for missing auth checks — fan-out per file, verify findings, synthesize report.
+
+defaults:
+  agent: sapling
+  verify: true
+  synthesize: true
+  max_fan_out: 20
+  max_concurrent: 16
+  per_run_cost_usd: 5
+
+scope:
+  glob: "src/server/handlers/!(*.test).ts"
+  maker_model: deepseek-chat
+  checker_agent: sapling
+  checker_model: deepseek-reasoner
+  stop_check_model: deepseek-chat
+
+executor_prompt: |
+  Audit {file} for missing auth checks on mutating routes.
+  Output: JSON array of findings [{file, line, route, claim, evidence}].
+  Do not fix — report only.{seed_suffix}
+
+verifier_prompt: |
+  Finding: {finding}
+  Criterion: route handler calls auth middleware or documents public exemption.
+  Answer true only if finding is confirmed by reading the file.
+  Output: true or false only.
+
+synthesize_prompt: |
+  Given verified findings (array may be empty), write a markdown report to
+  .warren/reports/warren-auth-sweep-report.md summarizing each hit and any
+  recommended fix seeds. Create parent directories if needed. Commit only that
+  report file with message "docs(warren): graph-run auth sweep report".
+  Do not modify handler source files.

@@ -79,5 +79,28 @@ export {
 	type TickCiFixerSpawnInput,
 	type TickDeps,
 	type TickLogger,
+	type TriageSchedulerDeps,
 	type UpdateSeedExtensionsFn,
 } from "./tick.ts";
+export {
+	createGithubTriageCollector,
+	type GithubTriageCollectorOptions,
+	type TriageCommandRunner,
+} from "./triage-collectors.ts";
+export {
+	DEFAULT_TRIAGE_INBOX_PATH,
+	emptyTriageInbox,
+	loadTriageInbox,
+	mergeTriageFindings,
+	runTriageInboxPass,
+	saveTriageInbox,
+	type TriageCollector,
+	type TriageCollectorInput,
+	type TriageFinding,
+	type TriageFindingStatus,
+	type TriageInboxFs,
+	type TriageInboxState,
+	type TriageMergeResult,
+	type TriagePassInput,
+	type TriageSource,
+} from "./triage-inbox.ts";

@@ -100,6 +100,9 @@ export const runs = pgTable(
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
+		// Mirror of sqlite runs.merge_wait_started_at. Null preserves legacy
+		// ended_at semantics for rows created before resumable plan-runs.
+		mergeWaitStartedAt: text("merge_wait_started_at"),
 		prompt: text("prompt").notNull(),
 		trigger: text("trigger").notNull(),
 		prUrl: text("pr_url"),
@@ -170,6 +173,8 @@ export const triggers = pgTable(
 		lastFiredAt: text("last_fired_at"),
 		nextFireAt: text("next_fire_at"),
 		lastRunId: text("last_run_id").references(() => runs.id, { onDelete: "set null" }),
+		fireCount: integer("fire_count").notNull().default(0),
+		completedAt: text("completed_at"),
 	},
 	(t) => [index(INDEX_NAMES.triggersProject).on(t.projectId)],
 );

@@ -1,9 +1,10 @@
 /**
- * SQLite physical schema for warren's durable state (SPEC §9).
+ * SQLite physical schema for warren's durable state (docs/design/runtime-and-supervisor.md).
  *
  * Tables: agents (canopy registry cache), projects (cloned repos), runs
  * (warren-side run rows that mirror burrow's lifecycle), events (write-through
- * cache of burrow's stream — see SPEC §9 "event durability rationale"), triggers
+ * cache of burrow's stream — see the event-durability rationale in
+ * docs/design/runtime-and-supervisor.md), triggers
  * (R-06 scheduler bookkeeping), planRuns + planRunChildren, and
  * runInbox. The plots projection table was dropped in warren-0b13 (0031)
  * as part of the plot deletion pass (pl-3a79). The conversations + messages
@@ -48,6 +49,7 @@ import {
 	RUN_STATES,
 	TABLE_NAMES,
 } from "./columns.ts";
+import { createSqliteGraphTables } from "./sqlite-graph.ts";
 
 /**
  * Agent registry cache. Rows are identified by `name` alone — the global
@@ -141,6 +143,7 @@ export const runs = sqliteTable(
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
+		mergeWaitStartedAt: text("merge_wait_started_at"),
 		prompt: text("prompt").notNull(),
 		trigger: text("trigger").notNull(),
 		// PR URL filled in by reap's pr_open sub-step (warren-f6af) when the
@@ -170,7 +173,7 @@ export const runs = sqliteTable(
 		tokensOutput: integer("tokens_output"),
 		tokensCacheRead: integer("tokens_cache_read"),
 		tokensCacheWrite: integer("tokens_cache_write"),
-		// Per-run preview environment columns (R-19 / SPEC §11.L). All nullable
+		// Per-run preview environment columns (R-19 / docs/design/preview-environments.md). All nullable
 		// because only projects that opt in via `.warren/defaults.json`'s
 		// `preview` block exercise this path; non-opted-in runs leave every
 		// field null. Populated by reap's `preview_launch` sub-step, the
@@ -262,6 +265,8 @@ export const triggers = sqliteTable(
 		lastFiredAt: text("last_fired_at"),
 		nextFireAt: text("next_fire_at"),
 		lastRunId: text("last_run_id").references(() => runs.id, { onDelete: "set null" }),
+		fireCount: integer("fire_count").notNull().default(0),
+		completedAt: text("completed_at"),
 	},
 	(t) => [index(INDEX_NAMES.triggersProject).on(t.projectId)],
 );
@@ -406,3 +411,10 @@ export type PlanRunChildRow = typeof planRunChildren.$inferSelect;
 export type PlanRunChildInsert = typeof planRunChildren.$inferInsert;
 export type RunInboxRow = typeof runInbox.$inferSelect;
 export type RunInboxInsert = typeof runInbox.$inferInsert;
+
+const graphTables = createSqliteGraphTables({ projects, runs });
+export const { graphRuns, graphRunChildren } = graphTables;
+export type GraphRunRow = typeof graphRuns.$inferSelect;
+export type GraphRunInsert = typeof graphRuns.$inferInsert;
+export type GraphRunChildRow = typeof graphRunChildren.$inferSelect;
+export type GraphRunChildInsert = typeof graphRunChildren.$inferInsert;

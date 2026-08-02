@@ -1,6 +1,6 @@
 /**
  * Schemas for canopy `cn render` output and warren's normalized agent
- * definition (SPEC §4.2).
+ * definition (docs/design/agent-composition.md).
  *
  * `RenderResponseSchema` mirrors the wire shape canopy 0.2.x emits with
  * `--format json` — `{success, command, name, version, sections, ...}`.
@@ -12,7 +12,7 @@
  * map (the rest of warren never cares about ordering — `cn render` already
  * resolved inheritance + mixins). It also enforces warren's semantic rule:
  * an agent prompt MUST include a `system` section. Other sections from
- * SPEC §4.2 (`skills`, `expertise_seed`, `burrow_config`, `workflow`) are
+ * docs/design/agent-composition.md (`skills`, `expertise_seed`, `burrow_config`, `workflow`) are
  * optional — they are consumed at run-spawn time (Phase 5), not now, and
  * canopy's own per-prompt schema is the right place to enforce richer
  * structural rules.
@@ -66,11 +66,10 @@ export interface AgentDefinition {
  *              decides how to interpret it.
  *   runtime  — burrow runtime id this canopy agent dispatches onto
  *              (e.g. "claude-code", "sapling", "pi"). When unset,
- *              warren falls back to `DEFAULT_RUNTIME_ID` ("pi") —
- *              the multi-provider runtime is the preferred default
- *              (warren-16f8). claude-code stays available but is now
- *              opt-in: pin it via this field. Built-in agents that
- *              want a non-pi runtime (claude-code / sapling) declare
+ *              warren falls back to `DEFAULT_RUNTIME_ID` ("sapling") —
+ *              Sapling is the preferred default execution runtime;
+ *              claude-code stays available but is opt-in: pin it via this
+ *              field. Built-in agents that want a specific runtime declare
  *              it here explicitly; interactive system-prompt-only
  *              agents like `brainstorm` / `planner` (warren-ebca) do
  *              the same so they compose onto a real burrow runtime.
@@ -93,7 +92,7 @@ export interface AgentDefinition {
  *              `--no-builtin-tools` / `--no-tools`. Read + normalized by
  *              `readToolsFrontmatter`; gives reviewer / patrol agents a
  *              hard read-only guarantee at the harness level (paired
- *              warren↔burrow change, SPEC §11.K).
+ *              warren↔burrow change, docs/design/agent-composition.md).
  *
  * Both stay in the open `frontmatter` bag (no schema rev) so a canopy
  * author can set them inline. `POST /runs` accepts the same two fields
@@ -121,7 +120,7 @@ export function readProviderFrontmatter(frontmatter: Readonly<Record<string, unk
  *   noTools    — expose no tools at all → pi's `--no-tools`
  *
  * Only the `pi` runtime consumes this in V1 (paired warren↔burrow change,
- * SPEC §11.K); other runtimes ignore the field. The policy rides the open
+ * docs/design/agent-composition.md); other runtimes ignore the field. The policy rides the open
  * `frontmatter` bag, so a canopy / `.warren` agent author declares it inline
  * with no schema rev, and it forwards to burrow on run metadata via the same
  * `composeBurrowMetadata` seam as `provider` / `model`.
@@ -243,13 +242,11 @@ function assignToolFlag(
 }
 
 /**
- * Default burrow runtime id warren dispatches onto when an agent pins
- * none (warren-16f8). Pi is the multi-provider runtime — cost streams
- * in-band, the unified provider matrix works, and it's what most
- * dogfood runs use — so it's the preferred default; claude-code is
- * opt-in via `frontmatter.runtime`.
+ * Default burrow runtime id Warren dispatches onto when an agent pins
+ * none. Sapling is the standard coding runtime; Burrow remains the
+ * transport/worker layer and explicit runtime pins remain supported.
  */
-export const DEFAULT_RUNTIME_ID = "pi";
+export const DEFAULT_RUNTIME_ID = "sapling";
 
 /**
  * Resolve the burrow runtime id this canopy agent should dispatch onto.
@@ -261,14 +258,20 @@ export const DEFAULT_RUNTIME_ID = "pi";
  *      specific runtime (claude-code / sapling) or compose a system
  *      prompt onto an existing runtime (planner,
  *      warren-ebca)
- *   3. `DEFAULT_RUNTIME_ID` ("pi") — the preferred default when
- *      nothing pins a runtime; claude-code is opt-in
+ *   3. `DEFAULT_RUNTIME_ID` ("sapling") — the preferred default when
+ *      nothing pins a runtime; claude-code and pi are opt-in
  */
 export function readRuntimeId(agent: AgentDefinition, configOverride?: string): string {
-	if (typeof configOverride === "string" && configOverride.length > 0) return configOverride;
-	const r = agent.frontmatter.runtime;
-	if (typeof r === "string" && r.length > 0) return r;
-	return DEFAULT_RUNTIME_ID;
+	const configured =
+		typeof configOverride === "string" && configOverride.length > 0
+			? configOverride
+			: typeof agent.frontmatter.runtime === "string" && agent.frontmatter.runtime.length > 0
+				? agent.frontmatter.runtime
+				: DEFAULT_RUNTIME_ID;
+	// Pi was the former execution runtime. Keep legacy agent definitions
+	// dispatchable, but route them through the supported Sapling/Burrow path.
+	if (configured === "pi" || configured === "pi-chat") return DEFAULT_RUNTIME_ID;
+	return configured;
 }
 
 /**

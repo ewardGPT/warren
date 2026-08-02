@@ -32,6 +32,17 @@
  *   2. `ALLOW` is an explicit, commented escape hatch for a deliberate local
  *      declaration. It is empty today; every entry needs a reason.
  *
+ * Known blind spot (warren-7b7a): the guard matches on NAMES, so a parallel
+ * copy spelled differently is invisible to it — `src/runtime/contract.ts` once
+ * declared `RunPhase` (a hand-listed `RUN_STATES`), `MessagePriority` (an
+ * `INBOX_PRIORITIES` copy), an inline `Message.state` union (`INBOX_STATES`),
+ * and both stream adapters carried a private `NORMALIZED_STREAMS`
+ * (`EVENT_STREAMS`). Those are now type aliases over the canonical names, which
+ * is the convention for a seam that wants its own vocabulary word: alias, never
+ * re-list. Widening DOMAIN_STEMS would not have caught them — every canonical
+ * export in `src/core/wire.ts` already carries a stem — so the defence against
+ * an aliased re-list stays review plus this note.
+ *
  * Scope note: this guard walks ALL of `src/` INCLUDING `src/ui/`, which biome,
  * `check:size` and `check:debt` all exclude — the UI is a separate
  * `@os-eco/warren-ui` package, and it is also where two of the three
@@ -77,8 +88,17 @@ export const DOMAIN_STEMS = [
  * Files (repo-relative POSIX) allowed to declare a canonical name anyway.
  * Empty on purpose — add an entry only with a comment saying why the copy is
  * deliberate and how it is kept in sync.
+ *
+ * `src/db/schema/sqlite-types.ts` — the local drizzle row-type hub: `AgentRow`
+ * here is `typeof agents.$inferSelect` (the DB row), a different declaration
+ * from wire.ts's API-facing `AgentRow` interface. Same name, distinct shapes;
+ * the DB type is derived from the table schema, the wire type is hand-maintained
+ * against the SDK contract, so they cannot share one declaration site.
  */
-const ALLOW: readonly string[] = [];
+const ALLOW: readonly string[] = [
+	// DB row types ($inferSelect) vs wire interfaces — deliberate, schema-derived.
+	"src/db/schema/sqlite-types.ts",
+];
 
 /** `export const X` / `export type X` / … in the canonical home. */
 const CANONICAL_EXPORT_RE =

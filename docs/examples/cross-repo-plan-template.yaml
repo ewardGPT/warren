@@ -1,0 +1,12 @@
+name: cross-repo-plan
+version: 1
+description: Serial cross-repo plan; every step becomes a child seed in the coordination project.
+steps:
+  - title: Implement the coordination-project change
+    repo: coordination-project-slug
+    description: Describe the change and verification commands.
+    blocks: []
+  - title: Implement the execution-project change
+    repo: execution-project-slug
+    description: Describe the change and verification commands.
+    blocks: []

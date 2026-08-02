@@ -91,6 +91,12 @@ export interface CancelPlanRunResponse {
 	alreadyTerminal: boolean;
 }
 
+/** `POST /plan-runs/:id/resume` response envelope. */
+export interface ResumePlanRunResponse {
+	planRun: PlanRunRow;
+	resumed: true;
+}
+
 /**
  * Options for {@link WarrenClient.streamPlanRunEvents}.
  *

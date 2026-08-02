@@ -54,6 +54,7 @@ export {
 	checkWarrenDb,
 	type WarrenConfigCheckProject,
 } from "./checks-config.ts";
+export { type CrossRepoCheckProject, checkCrossRepoPlanTargets } from "./checks-cross-repo.ts";
 export {
 	checkPreviewAuthStrength,
 	checkPreviewMaxLive,

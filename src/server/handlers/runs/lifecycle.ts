@@ -51,6 +51,7 @@ export const PUBLIC_RUN_FIELDS = [
 	"previewPort",
 	"previewStartedAt",
 	"previewLastHitAt",
+	"mergeWaitStartedAt",
 ] as const satisfies readonly (keyof RunRow)[];
 
 /**

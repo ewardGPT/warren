@@ -108,7 +108,7 @@ describe("spawnRun: provider-neutral dispatch (k8s-shaped backend)", () => {
 		expect(spec.originUrl).toBe("https://github.com/x/y.git");
 		expect(spec.baseBranch).toBe("main");
 		expect(spec.branch).toContain(result.run.id);
-		expect(spec.runtimeId).toBe("pi");
+		expect(spec.runtimeId).toBe("sapling");
 		expect(spec.prompt).toContain("do the thing");
 		expect(spec.network).toBe("none");
 		expect(spec.seedFiles.map((f) => f.path)).toContain(".warren/agent.json");

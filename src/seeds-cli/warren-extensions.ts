@@ -63,3 +63,17 @@ export const WarrenExtensionsSchema = z
 	})
 	.strict();
 export type WarrenExtensions = z.infer<typeof WarrenExtensionsSchema>;
+
+/**
+ * Read the `repo` target from a seed's extensions. A missing/non-string
+ * value, or an empty/whitespace-only string all read as `undefined` — the
+ * caller's signal to fall back to the coordination project.
+ */
+export function readTargetRepo(
+	extensions: Record<string, unknown> | undefined | null,
+): string | undefined {
+	const raw = extensions?.repo;
+	if (typeof raw !== "string") return undefined;
+	const trimmed = raw.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}

@@ -79,6 +79,30 @@ describe("scrubSecrets — fixture corpus (warren-1cb7)", () => {
 		expect(scrubSecrets(line, null)).toBe(`a=${REDACTED_MARKER} b=${REDACTED_MARKER}`);
 	});
 
+	test("censors the burrowId runtime handle on the key alone (warren-5f59)", () => {
+		const payload = {
+			kind: "reap.workspace_destroyed",
+			payload: { archived: false, burrowId: "run-run_abc123", nested: { burrowId: "x" } },
+		};
+		const scrubbed = scrubSecrets(payload, null) as typeof payload;
+		expect(scrubbed.payload.burrowId).toBe(REDACTED_MARKER);
+		expect(scrubbed.payload.nested.burrowId).toBe(REDACTED_MARKER);
+		// The spectator-visible facts around the handle survive.
+		expect(scrubbed.payload.archived).toBe(false);
+	});
+
+	test("censors the burrowRunId runtime handle on the key alone (warren-d8f4)", () => {
+		const payload = {
+			kind: "watchdog.terminal_reconciled",
+			payload: { outcome: "succeeded", burrowRunId: "0f1e2d3c-pod-uid", idleMs: 42 },
+		};
+		const scrubbed = scrubSecrets(payload, null) as typeof payload;
+		expect(scrubbed.payload.burrowRunId).toBe(REDACTED_MARKER);
+		// The spectator-visible facts around the handle survive.
+		expect(scrubbed.payload.outcome).toBe("succeeded");
+		expect(scrubbed.payload.idleMs).toBe(42);
+	});
+
 	test("walks arrays and nested objects", () => {
 		const scrubbed = scrubSecrets(
 			{ content: [{ text: "AKIAIOSFODNN7EXAMPLE" }, { deep: { text: "AKIAIOSFODNN7EXAMPLE" } }] },
@@ -161,6 +185,56 @@ describe("projectEvent (warren-1cb7)", () => {
 		}
 	});
 
+	test("reap.workspace_destroyed stays on the stream but its burrowId is censored (warren-5f59)", () => {
+		const reap = {
+			kind: "reap.workspace_destroyed",
+			payloadJson: { archived: false, burrowId: "run-run_xh5pk5jgep8a" },
+		};
+		const projected = projectEvent(reap, ANONYMOUS_ACTOR);
+		expect(projected).not.toBeNull();
+		expect(JSON.stringify(projected)).not.toContain("run-run_xh5pk5jgep8a");
+		expect(projected?.payloadJson.archived).toBe(false);
+		expect(projectEvent(reap, undefined)).toBe(reap);
+	});
+
+	test("reap_failed keeps step but drops path and redacts stderr message (warren-cbd8)", () => {
+		const reap = {
+			kind: "reap_failed",
+			payloadJson: {
+				step: "mulch_merge",
+				message: "cp: /data/warren/projects/x/.mulch/expertise/a.jsonl: I/O error",
+				path: "/data/warren/projects/x/.mulch/expertise/a.jsonl",
+			},
+		};
+		const projected = projectEvent(reap, ANONYMOUS_ACTOR);
+		expect(projected).not.toBeNull();
+		expect(projected?.payloadJson.step).toBe("mulch_merge");
+		expect(projected?.payloadJson.message).toBe(REDACTED_MARKER);
+		expect("path" in (projected?.payloadJson ?? {})).toBe(false);
+		expect(JSON.stringify(projected)).not.toContain("/data/");
+		// The stored row is never mutated — the operator stream still reads it.
+		expect(projectEvent(reap, undefined)).toBe(reap);
+	});
+
+	test("spawn_failed redacts its subprocess stderr message (warren-cbd8)", () => {
+		const spawn = {
+			kind: "spawn_failed",
+			payloadJson: {
+				step: "spawn",
+				message: "git clone failed: could not read from /home/operator/.ssh/id_rsa",
+			},
+		};
+		const projected = projectEvent(spawn, ANONYMOUS_ACTOR);
+		expect(projected?.payloadJson).toEqual({ step: "spawn", message: REDACTED_MARKER });
+		expect(JSON.stringify(projected)).not.toContain("/home/");
+		expect(projectEvent(spawn, undefined)).toBe(spawn);
+	});
+
+	test("a failure payload with no path/message survives sanitize untouched", () => {
+		const reap = { kind: "reap_failed", payloadJson: { step: "seed_close" } };
+		expect(projectEvent(reap, ANONYMOUS_ACTOR)?.payloadJson).toEqual({ step: "seed_close" });
+	});
+
 	test("the drop set is exactly the internal handles warren-946f already redacts", () => {
 		expect([...INTERNAL_EVENT_KINDS].sort()).toEqual([
 			"bridge_fatal",
@@ -225,6 +299,15 @@ describe("GET /runs/:id/events under WARREN_AUTH=public (warren-1cb7)", () => {
 			stream: "system",
 			payload: { burrowRunId: "burun_1", reason: "burrow_unreachable", finalized: true },
 		});
+		seq += 1;
+		await repos.events.append({
+			runId,
+			burrowEventSeq: seq,
+			ts: "2026-07-27T12:00:02.000Z",
+			kind: "reap.workspace_destroyed",
+			stream: "system",
+			payload: { archived: false, burrowId: "run-run_xh5pk5jgep8a" },
+		});
 		handle = startServer(await depsFor(repos, inertBurrowClient()), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: publicReadAuth(bearerAuth(TOKEN)),
@@ -264,10 +347,20 @@ describe("GET /runs/:id/events under WARREN_AUTH=public (warren-1cb7)", () => {
 
 	test("the anonymous stream drops internal bridge events and nothing else", async () => {
 		const { lines } = await stream();
-		expect(lines).toHaveLength(CORPUS.length);
+		expect(lines).toHaveLength(CORPUS.length + 1);
 		const kinds = lines.map((l) => (JSON.parse(l) as { kind: string }).kind);
 		expect(kinds).not.toContain("bridge_lost");
-		expect(new Set(kinds)).toEqual(new Set(["tool_use"]));
+		expect(new Set(kinds)).toEqual(new Set(["tool_use", "reap.workspace_destroyed"]));
+	});
+
+	test("the anonymous stream censors burrowId on reap.workspace_destroyed (warren-5f59)", async () => {
+		const { text, lines } = await stream();
+		expect(text).not.toContain("run-run_xh5pk5jgep8a");
+		const reap = lines
+			.map((l) => JSON.parse(l) as { kind: string; payload: Record<string, unknown> })
+			.find((l) => l.kind === "reap.workspace_destroyed");
+		expect(reap?.payload.burrowId).toBe(REDACTED_MARKER);
+		expect(reap?.payload.archived).toBe(false);
 	});
 
 	test("a dropped event leaves no blank line on the wire", async () => {
@@ -286,11 +379,12 @@ describe("GET /runs/:id/events under WARREN_AUTH=public (warren-1cb7)", () => {
 
 	test("the operator stream is unscrubbed and complete", async () => {
 		const { text, lines } = await stream(TOKEN);
-		expect(lines).toHaveLength(CORPUS.length + 1);
+		expect(lines).toHaveLength(CORPUS.length + 2);
 		expect(text).not.toContain(REDACTED_MARKER);
 		for (const fixture of CORPUS) {
 			expect(text).toContain(fixture.secret);
 		}
 		expect(text).toContain("burun_1");
+		expect(text).toContain("run-run_xh5pk5jgep8a");
 	});
 });

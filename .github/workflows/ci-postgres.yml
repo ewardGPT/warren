@@ -21,6 +21,10 @@ on:
       - "bun.lock"
       - ".github/workflows/ci-postgres.yml"
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   ci-postgres:
     runs-on: ubuntu-latest

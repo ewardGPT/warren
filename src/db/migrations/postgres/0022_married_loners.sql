@@ -1,0 +1,1 @@
+ALTER TABLE "runs" ADD COLUMN "merge_wait_started_at" text;

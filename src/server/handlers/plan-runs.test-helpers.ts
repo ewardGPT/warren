@@ -58,11 +58,15 @@ export function planShowResult(planId: string, status: string, children: string[
 	};
 }
 
-export function seedShowResult(id: string, status: "open" | "closed"): SpawnResult {
+export function seedShowResult(
+	id: string,
+	status: "open" | "closed",
+	extensions?: Record<string, unknown>,
+): SpawnResult {
 	return {
 		stdout: JSON.stringify({
 			success: true,
-			issue: { id, status, blockedBy: [] },
+			issue: { id, status, blockedBy: [], ...(extensions !== undefined ? { extensions } : {}) },
 		}),
 		stderr: "",
 		exitCode: 0,

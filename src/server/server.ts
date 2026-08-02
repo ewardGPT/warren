@@ -31,7 +31,7 @@ import { NO_AUTH, policyAllows } from "./auth.ts";
 import { errorLogFields, forbidden, methodNotAllowed, notFound, renderError } from "./errors.ts";
 import { buildApiRoutes, isApiPath, isAuthExempt } from "./handlers/index.ts";
 import { bindRequestIdLogger, extractOrGenerateRequestId, stampRequestId } from "./request-id.ts";
-import { jsonResponse } from "./response.ts";
+import { jsonResponse, withSecurityHeaders } from "./response.ts";
 import { matchRoute, pathExists } from "./router.ts";
 import type {
 	Actor,
@@ -221,14 +221,17 @@ async function handleRequest(
 ): Promise<Response> {
 	const url = new URL(request.url);
 
-	// Preview proxy preamble (R-19 / SPEC §11.L, warren-8a10) runs BEFORE the
+	// Preview proxy preamble (R-19 / docs/design/preview-environments.md, warren-8a10) runs BEFORE the
 	// auth gate: previews use signed-cookie auth keyed off Host, not the
 	// bearer header the API gate inspects. Returns null when the request
 	// isn't for a preview subdomain — the standard pipeline takes over.
 	if (previewProxy !== undefined) {
 		try {
 			const proxied = await previewProxy(request, url);
-			if (proxied !== null) return proxied;
+			// The preamble builds its own envelopes below the shared
+			// constructors, so stamp the warren-e2a4 security-header
+			// baseline on here (warren-b0bd: scenario 39 asserts it).
+			if (proxied !== null) return withSecurityHeaders(proxied);
 		} catch (err) {
 			const rendered = renderError(err, requestId);
 			logger.error(

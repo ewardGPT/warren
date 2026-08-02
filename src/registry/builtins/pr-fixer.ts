@@ -73,7 +73,7 @@ export const PR_FIXER_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		runtime: "pi",
+		runtime: "sapling",
 		// Sonnet tier (model-tiers.ts): smallest correct fix to a known CI
 		// failure, gated by the PR's re-run CI.
 		...MODEL_TIERS.sonnet,

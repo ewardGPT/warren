@@ -35,8 +35,7 @@ The brake on all three is PHILOSOPHY rule 1: features pay for seams. Work with n
 
 ## Now — in flight
 
-- **Hygiene residue** — what remains of the v0.13.1 truth-and-hygiene pass. Delete `closeSeedId` per rule 8 if it is in fact dead. Generalize the finalize holdouts (`commit?: "seeds"[]`, the `FinalizeStage` union) in one contract touch.
-- **Self-host hardening residue** `[plan: pl-1c02, outcome: success]`. Two durability items stay open after the batch shipped in v0.13.0–v0.13.1: fetch-before-carve (warren-b94b) and the tracker-integrity gate (warren-a71f part 1).
+- **Hygiene residue** — what remains of the v0.13.1 truth-and-hygiene pass. `closeSeedId` deleted per rule 8 (warren-11e4). The finalize holdouts generalized in one contract touch (warren-357c). `commit` now takes opaque artifact keys. The merge and commit stage names derive from them.
 - **Agent-facing CLI + npm publish** `[plan: not yet filed]`. Step 5 of that plan is also `AgentRuntimeAdapter` phase 1 item 10: one event-envelope extractor in `src/core`, three consumers. The docker-build CI gate shipped in v0.13.0, so the npm publish step no longer inherits the release-before-artifact failure.
 
 ## Next — planned, in order
@@ -81,7 +80,7 @@ Honest replacements for old sequencing steps with no payer. Each entry names its
 
 ## Deliberately not in core
 
-PHILOSOPHY mandates a public entry for every refusal, with a recipe that names the extension tier. Tier 0 is in-repo skills. Tier 1 is container plugins on the event bus. Tier 2 is operator hooks.
+PHILOSOPHY mandates a public entry for every refusal, with a recipe that names the extension tier. The tier definitions live in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 
 - **Issues UI** (old R-04) — **Tier 0**. The agent already runs `sd` inside the sandbox against the project's own repo. A browser CRUD surface over the tracker buys a sync problem and little else.
 - **Per-harness UI surfaces** (old R-07) — **Tier 1**. A new harness is an agent image plus a registry entry. What a runtime's events mean belongs behind `AgentRuntimeAdapter`, not in a page per harness.
@@ -118,7 +117,7 @@ Choices locked earlier, recorded so that nobody relitigates them when an item be
 
 - The database holds runtime state only. Issues, expertise, and trigger config stay git-tracked in the project repo under `.seeds/`, `.mulch/`, and `.warren/`. **Amended 2026-07-29:** a warren-side sidecar table keyed by `(project_id, issue_id)`, which holds only warren's own run bookkeeping, counts as permitted runtime state. It is not an issues mirror.
 - **Amended 2026-07-29:** the project's tracker is the source of truth for issues. Seeds is `IssueTracker` implementation #1, not a structural dependency. Warren still keeps no issues table (see the sidecar amendment above).
-- The kernel's guaranteed output is a pushed workspace branch. Everything past that point is extension behavior.
+- The kernel's guaranteed output is a pushed workspace branch. Everything past it is extension behavior ([PHILOSOPHY](docs/PHILOSOPHY.md)).
 - Warren stays self-hostable, not SaaS. One warren deploy serves one team. Seams declare a single-org scope explicitly.
 - `claude-code` is the public default agent, and `WARREN_DEFAULT_AGENT` picks another one without a source change.
 - GitHub webhook triggers stay out of the current phase. The `.warren/triggers.yaml` schema leaves room for another `kind:` entry later.

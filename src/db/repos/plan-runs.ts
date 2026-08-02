@@ -35,7 +35,7 @@ const ALLOWED_TRANSITIONS: Record<PlanRunState, readonly PlanRunState[]> = {
 	queued: ["running", "cancelled"],
 	running: ["succeeded", "failed", "cancelled"],
 	succeeded: [],
-	failed: [],
+	failed: ["running"],
 	cancelled: [],
 };
 

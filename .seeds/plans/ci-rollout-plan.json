@@ -1,0 +1,18 @@
+{
+  "name": "CI rollout — Warren fleet dispatch",
+  "template": "feature",
+  "sections": {
+    "context": "Serial CI rollout for all Warren-registered projects. Parent: ubuntu-6a44 at workspace root. Each child adds or verifies CI for one stack batch.",
+    "approach": "Audit github.com/ewardGPT/* repos for missing .github/workflows. Apply standard templates per stack. Commit, push branch, let Warren reap. Close child seed when CI file exists and is valid YAML.",
+    "alternatives": [],
+    "steps": [
+      {"title": "Audit CI coverage across all Warren projects", "type": "task", "priority": 0},
+      {"title": "Add Node/TypeScript CI template to projects missing it", "type": "task", "priority": 1},
+      {"title": "Add Python CI template to projects missing it", "type": "task", "priority": 1},
+      {"title": "Add Go CI template to projects missing it", "type": "task", "priority": 1},
+      {"title": "Verify workflows and record mulch deployment expertise", "type": "task", "priority": 2}
+    ],
+    "risks": ["Permission denied on jayminwest/warren"],
+    "acceptance": ["ci.yml present on default branch for each targeted repo", "Warren plan-run children close sequentially"]
+  }
+}

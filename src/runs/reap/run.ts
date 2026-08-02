@@ -284,6 +284,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state: finalState,
 		failureReason,
 		providerError: failedFromProviderError ? providerErrorMessage : null,
+		completionSignal: null,
+		resumeFeedback: null,
 		mulch: {
 			updated: state.mulchUpdated,
 			skipped: state.mulchSkipped,
@@ -398,6 +400,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state: finalState,
 		failureReason,
 		providerError: failedFromProviderError ? providerErrorMessage : null,
+		completionSignal: null,
+		resumeFeedback: null,
 		mulchUpdated: state.mulchUpdated,
 		mulchSkipped: state.mulchSkipped,
 		mulchAppended: state.mulchAppended,

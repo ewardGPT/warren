@@ -103,7 +103,7 @@ describe("spawnRun: end-to-end", () => {
 			method: "POST",
 			path: "/burrows/bur_aaaaaaaaaaaa/runs",
 			body: {
-				agentId: "pi",
+				agentId: "sapling",
 				prompt: "be a refactor agent\n\n---\n\nfix the flaky test",
 				metadata: { frontmatter: {} },
 			},
@@ -117,7 +117,7 @@ describe("spawnRun: end-to-end", () => {
 		};
 		expect(upBody.projectRoot).toBe("/data/projects/x/y");
 		expect(upBody.originUrl).toBe("https://github.com/x/y.git");
-		expect(upBody.agents).toEqual(["pi"]);
+		expect(upBody.agents).toEqual(["sapling"]);
 		const seededPaths = (upBody.seed?.files ?? []).map((f) => f.path);
 		expect(seededPaths).toContain(".warren/agent.json");
 
@@ -182,15 +182,15 @@ describe("spawnRun: burrow_config + runtime + metadata", () => {
 				projectRoot: "/data/projects/x/y",
 				originUrl: "https://github.com/x/y.git",
 				network: "restricted",
-				// refactor-bot pins no runtime → pi default (warren-16f8).
-				agents: ["pi"],
+				// refactor-bot pins no runtime → sapling default (local default).
+				agents: ["sapling"],
 			},
 		});
 		expect(calls[1]).toMatchObject({
 			method: "POST",
 			path: "/burrows/bur_aaaaaaaaaaaa/runs",
 			body: {
-				agentId: "pi",
+				agentId: "sapling",
 				prompt: "s\n\n---\n\np",
 				metadata: { runByOperator: "alice", frontmatter: {} },
 			},
@@ -246,7 +246,7 @@ describe("spawnRun: burrow_config + runtime + metadata", () => {
 			prompt: "p",
 		});
 		const dispatch = calls.find((c) => c.path === "/burrows/bur_aaaaaaaaaaaa/runs");
-		expect((dispatch?.body as { agentId: string }).agentId).toBe("pi");
+		expect((dispatch?.body as { agentId: string }).agentId).toBe("sapling");
 	});
 
 	test("forwards agent.frontmatter as burrow run metadata so piRuntime gets provider/model (warren-d34e)", async () => {

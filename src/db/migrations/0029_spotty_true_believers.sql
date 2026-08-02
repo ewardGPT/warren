@@ -1,0 +1,1 @@
+ALTER TABLE `triggers` ADD `fire_count` integer DEFAULT 0 NOT NULL;

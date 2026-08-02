@@ -50,6 +50,7 @@ import {
 } from "./dispatch.ts";
 import type { EnsureProjectCloneFn } from "./project-heal.ts";
 import { runScheduledSeedsPass } from "./scheduled-pass.ts";
+import type { TriageCollector } from "./triage-inbox.ts";
 
 export type {
 	TickCiFixerDeps,
@@ -97,6 +98,10 @@ export interface SchedulerNoticeGate {
 	clearNotice(key: string): void;
 }
 
+export interface TriageSchedulerDeps {
+	readonly collect: TriageCollector;
+}
+
 export interface TickDeps {
 	readonly repos: Pick<Repos, "projects" | "triggers" | "runs" | "events">;
 	readonly loadWarrenConfig: LoadWarrenConfigFn;
@@ -130,6 +135,7 @@ export interface TickDeps {
 	 * `project_failed`, `sd_list_failed`). Omitted ⇒ every notice logs.
 	 */
 	readonly noticeGate?: SchedulerNoticeGate;
+	readonly triage?: TriageSchedulerDeps;
 	readonly now?: () => Date;
 	readonly logger?: TickLogger;
 }

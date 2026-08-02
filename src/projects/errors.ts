@@ -13,6 +13,14 @@
 
 import { WarrenError } from "../core/errors.ts";
 
+/**
+ * Cross-repo diagnostics / plan-run targeting used a `repo` extension that
+ * names an unregistered project (local graph-engineering work, map #29).
+ */
+export class TargetProjectUnresolvedError extends WarrenError {
+	readonly code = "target_project_unresolved";
+}
+
 export class ProjectUnavailableError extends WarrenError {
 	readonly code = "project_unavailable";
 }

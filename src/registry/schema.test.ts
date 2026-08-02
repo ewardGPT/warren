@@ -119,16 +119,21 @@ describe("readRuntimeId", () => {
 		frontmatter: { source: "builtin" },
 	};
 
-	test("falls back to the pi default when frontmatter.runtime is absent (warren-16f8)", () => {
-		expect(readRuntimeId(NAME_MATCH)).toBe("pi");
+	test("falls back to the sapling default when frontmatter.runtime is absent", () => {
+		expect(readRuntimeId(NAME_MATCH)).toBe("sapling");
 	});
 
-	test("prefers frontmatter.runtime over agent.name", () => {
-		expect(readRuntimeId(INTERACTIVE)).toBe("pi");
+	test("routes legacy pi runtime declarations through sapling", () => {
+		expect(readRuntimeId(INTERACTIVE)).toBe("sapling");
 	});
 
 	test("config override wins over frontmatter.runtime (warren-b802)", () => {
 		expect(readRuntimeId(INTERACTIVE, "claude-code")).toBe("claude-code");
+	});
+
+	test("routes legacy pi config overrides through sapling", () => {
+		expect(readRuntimeId(NAME_MATCH, "pi")).toBe("sapling");
+		expect(readRuntimeId(NAME_MATCH, "pi-chat")).toBe("sapling");
 	});
 
 	test("config override wins over agent.name fallback", () => {
@@ -136,8 +141,8 @@ describe("readRuntimeId", () => {
 	});
 
 	test("ignores empty / undefined config override", () => {
-		expect(readRuntimeId(INTERACTIVE, undefined)).toBe("pi");
-		expect(readRuntimeId(INTERACTIVE, "")).toBe("pi");
+		expect(readRuntimeId(INTERACTIVE, undefined)).toBe("sapling");
+		expect(readRuntimeId(INTERACTIVE, "")).toBe("sapling");
 	});
 });
 

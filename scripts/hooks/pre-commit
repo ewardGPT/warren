@@ -4,4 +4,17 @@
 # recreate the gate-drift that warren-5797 was opened to kill. If a check
 # is too slow for the hook, fix the check — don't carve out a subset.
 set -euo pipefail
-exec bun run check:all
+
+# .gitignore does not protect paths that were already tracked. Keep Pi
+# session transcripts (prompts, tool calls, and model output) out of every
+# future commit as well as out of fresh worktrees.
+if git diff --cached --name-only --diff-filter=ACMRTUXB | grep -q '^\.pi/sessions/'; then
+	echo "pre-commit: refusing tracked .pi/sessions transcript(s); remove them from the index" >&2
+	exit 1
+fi
+
+bun run check:all
+
+# Secret scan — mirrors the gitleaks step in .github/workflows/ci.yml so
+# the local gate matches CI (git-mode scan; empty diff = no-op success).
+gitleaks git --pre-commit --redact --staged --no-banner

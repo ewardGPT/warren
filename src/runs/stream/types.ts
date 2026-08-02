@@ -28,6 +28,13 @@ export interface StreamEventView {
 	readonly ts: Date | string;
 	readonly kind: string;
 	readonly stream: string | null;
+	/**
+	 * Parse-boundary provenance (warren-6646). `"agent"` marks an unattributed
+	 * line warren re-parsed off a transport the agent can write to; those never
+	 * carry terminal authority. Optional because burrow's `RunEvent` (still fed by
+	 * test `source` overrides) predates the tag — absent reads as warren-authored.
+	 */
+	readonly origin?: string;
 	readonly payload: unknown;
 }
 
@@ -48,7 +55,7 @@ export interface BridgeLogger {
 }
 
 /**
- * Session-cumulative cost + token snapshot (warren-a7dc, SPEC §pi). Pi
+ * Session-cumulative cost + token snapshot (warren-a7dc, docs/design/agent-composition.md). Pi
  * v0.74 reports cost in USD computed against the same models.json it
  * dispatched against; warren persists the raw number rather than
  * re-pricing tokens itself (plan alternative #5).

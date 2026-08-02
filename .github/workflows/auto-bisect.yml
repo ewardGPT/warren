@@ -1,0 +1,48 @@
+name: Auto Bisect Regression
+on:
+  workflow_dispatch:
+    inputs:
+      good_commit:
+        description: 'Last known good commit SHA'
+        required: true
+        type: string
+      bad_commit:
+        description: 'Known bad commit SHA (default: main)'
+        required: false
+        default: 'main'
+        type: string
+      test_command:
+        description: 'Command that exits 0 on good, non-zero on bad'
+        required: true
+        default: 'bun test'
+        type: string
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.bad_commit }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - run: bun install
+
+      - name: Run git bisect
+        run: |
+          echo "Bisecting from ${{ inputs.good_commit }} to ${{ inputs.bad_commit }}"
+          echo "Test command: ${{ inputs.test_command }}"
+          git bisect start ${{ inputs.bad_commit }} ${{ inputs.good_commit }} --
+          git bisect run bash -c "${{ inputs.test_command }}" 2>&1 || true
+          echo "---"
+          echo "First bad commit:"
+          git log --oneline -1
+          git bisect reset

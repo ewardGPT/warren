@@ -105,6 +105,8 @@ export async function depsFor(
 		streamLimiter?: import("../stream-limits.ts").EventStreamLimiter;
 		/** Salvage-bundle intake dir (warren-cd3b). Omitted ⇒ the route 500s. */
 		salvageDir?: string;
+		/** Seeds CLI wiring (cross-repo seed routing, map #29). */
+		seedsCli?: import("../../seeds-cli/index.ts").SeedsCliDeps;
 	},
 ): Promise<ServerDeps> {
 	const broker = new RunEventBroker();
@@ -113,6 +115,7 @@ export async function depsFor(
 		repos,
 		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
 		broker,
+		seedsCli: extras?.seedsCli,
 		bridges:
 			bridges ??
 			createBridgeRegistry({

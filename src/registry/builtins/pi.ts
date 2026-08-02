@@ -31,6 +31,7 @@ Operating contract:
 - Quality gates are terminal, not advisory. You are NOT done until the gate exits zero. Resolve the command in this order: \`$WARREN_QUALITY_GATE\` if set, otherwise the command documented in CLAUDE.md / AGENTS.md, otherwise fall back to \`bun run check:all\` or \`npm run lint && npm run typecheck && npm test\`. Run it before committing and again before reporting completion. Do not declare the task complete, hand off, or end the session with a red gate — fix failures (including lint warnings, which CI treats as errors) until it is green. If the gate is genuinely unfixable in this run, say so explicitly and leave the work open rather than claiming success.
 - Use git as you normally would. Commit your changes; warren reaps the branch and pushes upstream.
 - Committing is mandatory, not the same as staging. \`git add\` ALONE IS NOT ENOUGH — you must run \`git commit\` so the work lands as a real commit. A run that ends with staged-but-uncommitted changes is treated as a FAILURE (\`dropped_commit\`), not a success. Before you report completion, run \`git status\`/\`git log\` and confirm your changes are in a commit, not just staged. The only exception is when you have genuinely made no file changes at all.
+- Include the seed identifier \`{seed_id}\` in commit footers: use \`(refs {seed_id})\` for in-progress commits and \`(closes {seed_id})\` for the commit that completes the task. This creates a traceable link from code to task.
 - Do not run \`git push\` yourself — warren handles the push host-side after the run terminates.
 `;
 

@@ -38,6 +38,8 @@ export const TABLE_NAMES = {
 	planRuns: "plan_runs",
 	planRunChildren: "plan_run_children",
 	runInbox: "run_inbox",
+	graphRuns: "graph_runs",
+	graphRunChildren: "graph_run_children",
 } as const;
 
 /**
@@ -79,7 +81,64 @@ export const INDEX_NAMES = {
 	// undelivered-per-run claim a covered index scan instead of a full-table
 	// filter, and FIFO ordering within the claimed set is done in-app by seq.
 	runInboxRunState: "run_inbox_run_state_idx",
+	graphRunsProjectState: "graph_runs_project_state_idx",
+	graphRunsState: "graph_runs_state_idx",
+	graphRunChildrenGraphRun: "graph_run_children_graph_run_idx",
+	graphRunChildrenRun: "graph_run_children_run_idx",
 } as const;
+
+/**
+ * Graph-run lifecycle (graph-engineering pilot). One row per POST /graph-runs
+ * dispatch; the coordinator walks fan_out → verify → synthesize phases.
+ */
+export const GRAPH_RUN_STATES = [
+	"pending",
+	"fan_out",
+	"verifying",
+	"synthesizing",
+	"succeeded",
+	"failed",
+] as const;
+export type GraphRunState = (typeof GRAPH_RUN_STATES)[number];
+
+export const GRAPH_RUN_TERMINAL_STATES = [
+	"succeeded",
+	"failed",
+] as const satisfies readonly GraphRunState[];
+export type GraphRunTerminalState = (typeof GRAPH_RUN_TERMINAL_STATES)[number];
+
+export const GRAPH_RUN_CHILD_PHASES = ["fan_out", "verify", "synthesize"] as const;
+export type GraphRunChildPhase = (typeof GRAPH_RUN_CHILD_PHASES)[number];
+
+export const GRAPH_RUN_CHILD_STATES = ["pending", "dispatched", "succeeded", "failed"] as const;
+export type GraphRunChildState = (typeof GRAPH_RUN_CHILD_STATES)[number];
+
+export const GRAPH_RUN_CHILD_TERMINAL_STATES = [
+	"succeeded",
+	"failed",
+] as const satisfies readonly GraphRunChildState[];
+export type GraphRunChildTerminalState = (typeof GRAPH_RUN_CHILD_TERMINAL_STATES)[number];
+
+/** Scope payload stored in graph_runs.scope_json. */
+export interface GraphRunScopeJson {
+	readonly glob: string;
+	readonly max?: number;
+	readonly seedId?: string;
+	readonly makerModel?: string;
+	readonly checkerAgent?: string;
+	readonly checkerModel?: string;
+	readonly stopCheckModel?: string;
+	readonly synthesizePrompt?: string;
+}
+
+/** Finding payload stored in graph_run_children.finding_json. */
+export interface GraphRunFindingJson {
+	readonly file: string;
+	readonly line?: number;
+	readonly route?: string;
+	readonly claim: string;
+	readonly evidence?: string;
+}
 
 /**
  * Build the composite PK from a project + trigger pair. The colon separator

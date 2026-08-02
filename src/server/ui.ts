@@ -1,5 +1,5 @@
 /**
- * Static SPA serving from `src/ui/dist` (SPEC §6, §7).
+ * Static SPA serving from `src/ui/dist`.
  *
  * Phase 9's UI surface is just the file server: Phase 10 builds the
  * actual React app. The wiring here lets warren ship the dist dir
@@ -23,6 +23,7 @@
 
 import { existsSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
+import { SECURITY_HEADERS } from "./response.ts";
 import type { RouteContext, RouteHandler } from "./types.ts";
 
 const CONTENT_TYPES: Readonly<Record<string, string>> = {
@@ -72,7 +73,7 @@ export function createUiHandler(opts: UiHandlerOptions): RouteHandler {
 		if (!index.exists) {
 			return new Response("ui dist missing", {
 				status: 500,
-				headers: { "content-type": "text/plain" },
+				headers: { "content-type": "text/plain", ...SECURITY_HEADERS },
 			});
 		}
 		return await renderFile(indexPath, index);
@@ -116,6 +117,9 @@ async function renderFile(path: string, file: { bytes(): Promise<Uint8Array> }):
 		headers: {
 			"content-type": contentTypeFor(path),
 			"cache-control": "no-store",
+			// The SPA holds the operator token in browser storage on this
+			// origin, so the baseline headers matter most here (warren-e2a4).
+			...SECURITY_HEADERS,
 		},
 	});
 }

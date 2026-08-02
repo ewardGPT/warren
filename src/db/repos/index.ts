@@ -7,6 +7,7 @@ import type { AnyWarrenDb } from "../client.ts";
 import { AgentsRepo } from "./agents.ts";
 import { DrizzleAdapter } from "./drizzle-adapter.ts";
 import { EventsRepo } from "./events.ts";
+import { GraphRunsRepo } from "./graph-runs.ts";
 import { PlanRunsRepo } from "./plan-runs.ts";
 import { ProjectsRepo } from "./projects.ts";
 import { RunInboxRepo } from "./run-inbox.ts";
@@ -19,6 +20,7 @@ export interface Repos {
 	runs: RunsRepo;
 	events: EventsRepo;
 	triggers: TriggersRepo;
+	graphRuns: GraphRunsRepo;
 	planRuns: PlanRunsRepo;
 	runInbox: RunInboxRepo;
 }
@@ -31,6 +33,7 @@ export function createRepos(db: AnyWarrenDb): Repos {
 		runs: new RunsRepo(adapter),
 		events: new EventsRepo(adapter),
 		triggers: new TriggersRepo(adapter),
+		graphRuns: new GraphRunsRepo(adapter),
 		planRuns: new PlanRunsRepo(adapter),
 		runInbox: new RunInboxRepo(adapter),
 	};

@@ -1,9 +1,14 @@
 import { ValidationError } from "../../../core/errors.ts";
+import { resolveTargetProject } from "../../../projects/resolve-target.ts";
 import { readProviderFrontmatter } from "../../../registry/schema.ts";
+import { buildDispatchPrompt } from "../../../runs/dispatch-prompt.ts";
 import { spawnRun } from "../../../runs/index.ts";
+import { showSeed } from "../../../seeds-cli/show.ts";
+import { readTargetRepo } from "../../../seeds-cli/warren-extensions.ts";
 import type { IdempotentDispatch } from "../../idempotency.ts";
 import { jsonResponse } from "../../response.ts";
 import type { RouteHandler, ServerDeps } from "../../types.ts";
+import { optionalObject } from "../body-fields.ts";
 import { defaultSpawn, optionalString, readJsonBody, requireString } from "../index.ts";
 
 /**
@@ -66,6 +71,40 @@ interface ResolvedDispatchFields {
 	readonly cloneKind?: "replicate";
 }
 
+interface SeedDispatchFields {
+	readonly projectId: string;
+	readonly prompt: string;
+	readonly seedProjectId: string;
+	readonly executionRepo?: string;
+}
+
+async function resolveSeedDispatch(
+	deps: ServerDeps,
+	seedId: string | undefined,
+	projectId: string,
+	prompt: string,
+): Promise<SeedDispatchFields> {
+	if (seedId === undefined || deps.seedsCli === undefined) {
+		return { projectId, prompt, seedProjectId: projectId };
+	}
+	const seedProject = await deps.repos.projects.require(projectId);
+	const seed = await showSeed(deps.seedsCli, seedProject.localPath, seedId);
+	const repoRef = readTargetRepo(seed.extensions);
+	if (repoRef === undefined) return { projectId, prompt, seedProjectId: projectId };
+	const executionProjectId = await resolveTargetProject(deps.repos, repoRef);
+	const crossRepo = executionProjectId !== projectId;
+	return {
+		projectId: executionProjectId,
+		prompt: buildDispatchPrompt({
+			template: prompt,
+			seed: { id: seed.id, title: seed.title, body: seed.description },
+			crossRepo,
+		}),
+		seedProjectId: projectId,
+		...(crossRepo ? { executionRepo: repoRef } : {}),
+	};
+}
+
 async function resolveDispatchFields(
 	deps: ServerDeps,
 	body: Record<string, unknown>,
@@ -120,6 +159,7 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 			parentRunId,
 			cloneKind,
 		} = await resolveDispatchFields(deps, body);
+		const seedDispatch = await resolveSeedDispatch(deps, seedId, projectId, prompt);
 
 		const options: Parameters<typeof spawnRun>[0] = {
 			repos: deps.repos,
@@ -129,13 +169,18 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 			// dispatch 503'd `burrow_unreachable`. Mirrors conversations.ts.
 			runtimeProvider: deps.runtimeProvider,
 			agentName,
-			projectId,
-			prompt,
+			projectId: seedDispatch.projectId,
+			prompt: seedDispatch.prompt,
+			...(seedDispatch.executionRepo !== undefined
+				? { executionRepo: seedDispatch.executionRepo }
+				: {}),
 			mode: "batch",
 			projectsConfig: deps.projectsConfig,
 			projectSpawn: deps.spawn ?? defaultSpawn,
 			githubToken: deps.autoOpenPr?.gitToken,
-			metadata: body.metadata as Record<string, unknown> | undefined,
+			// warren-b27c: shape-checked, not cast. An array or scalar `metadata`
+			// used to sail through the cast and reach persistence typed as a record.
+			metadata: optionalObject(body, "metadata"),
 			now: deps.now,
 			ref,
 			providerOverride,

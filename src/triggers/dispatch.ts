@@ -43,6 +43,8 @@ export interface DispatchSpawnInput {
 	readonly projectId: string;
 	readonly prompt: string;
 	readonly trigger: string;
+	readonly seedId?: string;
+	readonly now?: Date;
 	readonly metadata?: unknown;
 	/**
 	 * Per-trigger spend cap (warren-a63d). Forwarded to the spawn flow as

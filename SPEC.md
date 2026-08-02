@@ -17,11 +17,9 @@ V1 scope is the **manual run path** plus the **cron half of the scheduler**: con
 
 Warren is a self-hostable control plane for ephemeral coding agents. A user points it at a GitHub repo, picks an agent, writes a prompt; warren spawns the agent inside a sandbox, streams events back to the UI, lets the user steer mid-run, then pushes the workspace branch. **One container, one volume, one HTTP API, one UI.**
 
-The fresh-install path is standalone: the built-in `claude-code` agent ships inline, so a user with a GitHub URL and an Anthropic key can dispatch a run end-to-end with no other tooling. Two additional coding-agent runtimes ship inline alongside it — `sapling` (steerable harness) and `pi` (multi-provider, with per-run cost reporting). Warren also bundles a small set of [os-eco](https://github.com/jayminwest/os-eco) tools as opt-in built-in features — persistent agent memory via mulch, an integrated issue queue via seeds — each surfaced only when the project opts in. (Warren once bundled canopy, for versioned prompt libraries, and plot, for shared coordination. Warren dropped both in the deletion pass — see §4.2 and §11.O.)
+The fresh-install path is standalone: the built-in `claude-code` agent ships inline, so a user with a GitHub URL and an Anthropic key can dispatch a run end-to-end with no other tooling. Two additional coding-agent runtimes ship inline alongside it — `sapling` (steerable harness) and `pi` (multi-provider, with per-run cost reporting). Warren also bundles a small set of [os-eco](https://github.com/jayminwest/os-eco) tools as opt-in built-in features — versioned prompt libraries via canopy, persistent agent memory via mulch, an integrated issue queue via seeds, and a shared coordination substrate via plot (§11.O) — each surfaced only when the project or operator opts in. The runtime substrate is [burrow](https://github.com/jayminwest/burrow), a sibling process inside the container that warren talks to over a unix socket.
 
-Warren dispatches through a swappable **runtime provider**, chosen once at boot by `WARREN_RUNTIME` behind the `RuntimeProvider` contract (post-V1; `src/runtime/`, design docs under `docs/design/`). The default `local` provider uses [burrow](https://github.com/jayminwest/burrow) as its sandbox substrate — a sibling process inside the container that warren talks to over a unix socket — which is the topology this document describes throughout. A second `k8s` provider runs each agent as its own Kubernetes pod with no burrow, for cluster scale-out ([`docs/RUNBOOK-K8S.md`](docs/RUNBOOK-K8S.md)); it supersedes the multi-worker burrow model §5.4 originally sketched. Burrow is thus the LocalProvider's substrate, not a hard warren dependency.
-
-V1 is single-user, single-host: clone warren, `docker compose up`, browser at `localhost:8080`. The same image scales out onto a Kubernetes cluster (GKE Autopilot is the hosted target) under the `k8s` runtime — see [`docs/RUNBOOK-K8S.md`](docs/RUNBOOK-K8S.md). No cross-tenant story, no SaaS, no auth beyond a bearer token.
+V1 is single-user, single-host: clone warren, `docker compose up`, browser at `localhost:8080`. The same image runs on Fly.io with a volume and three secrets. No cross-tenant story, no SaaS, no auth beyond a bearer token.
 
 ---
 
@@ -31,13 +29,13 @@ V1 is single-user, single-host: clone warren, `docker compose up`, browser at `l
 
 ```
 $ git clone https://github.com/jayminwest/warren && cd warren
-$ cp .env.example .env && $EDITOR .env   # WARREN_API_TOKEN, BURROW_API_TOKEN, WARREN_BURROW_TOKEN, ANTHROPIC_API_KEY, GITHUB_TOKEN
+$ cp .env.example .env && $EDITOR .env   # WARREN_API_TOKEN, BURROW_API_TOKEN, WARREN_BURROW_TOKEN, ANTHROPIC_API_KEY, GITHUB_TOKEN (CANOPY_REPO_URL optional)
 $ docker compose up -d
 $ open http://homeserver.local:8080
 ```
 
 In the UI:
-1. **Pick an agent** — Warren ships three built-in agents inline (`src/registry/builtins/`): `pi` (multi-provider harness with first-class cost reporting, and the default runtime when an agent pins none — warren-16f8), `claude-code` (single-provider Anthropic harness, opt-in via `frontmatter.runtime`), and `sapling` (alternative steerable harness). A fresh install can dispatch a run against any of them without further setup.
+1. **Pick an agent** — Warren ships three built-in agents inline (`src/registry/builtins/`): `pi` (multi-provider harness with first-class cost reporting, and the default runtime when an agent pins none — warren-16f8), `claude-code` (single-provider Anthropic harness, opt-in via `frontmatter.runtime`), and `sapling` (alternative steerable harness). A fresh install can dispatch a run against any of them without further setup. Power users who want a custom prompt library set `CANOPY_REPO_URL`; warren clones the repo and every prompt tagged `agent` becomes a library-source agent that overrides any same-named built-in.
 2. **Add project** — paste a GitHub URL. Warren clones it under `/data/projects/`.
 3. **Spawn run** — pick agent + project + prompt. Warren provisions a sandbox, seeds the rendered agent into it, dispatches the run, streams events to the UI.
 4. **Watch and steer** — live event tail, send steering messages, cancel cleanly. If the project opted into the agent-memory feature, the UI also surfaces mulch records the agent recorded; if it opted into the issue-queue feature, it surfaces seeds the agent filed or closed.
@@ -46,12 +44,12 @@ In the UI:
 ### 2.2 What Warren is
 
 - The **control plane**: one process, one HTTP API, one volume.
-- The **agent registry**: built-in agents seeded inline on boot (`src/registry/builtins/`).
+- The **agent registry**: built-in agents inline, plus optional canopy library on top, plus per-project `.canopy/` tier (R-03; precedence project > library > built-in).
 - The **dispatcher**: provisions sandboxes via the runtime, streams events back, reaps results.
 - The **UI**: web frontend served from the same process.
 - The **scheduler**: in-process cron tick + scheduled-seed dispatch (V1, §11.I). Webhook/event-triggered runs deferred to V2.
 
-Warren bundles three os-eco data-plane tools (mulch, seeds, sapling) as built-in features, but a fresh install does not require a user to adopt any of them — `claude-code` ships inline and reads/writes nothing outside the sandbox. The integrations light up when a project contains `.mulch/` / `.seeds/`. (Warren dropped plot and canopy, two former bundled tools, in the deletion pass — see §11.O and §4.2.)
+Warren bundles five os-eco data-plane tools (canopy, mulch, seeds, sapling, plot) as built-in features, but a fresh install does not require a user to adopt any of them — `claude-code` ships inline and reads/writes nothing outside the sandbox. The integrations light up when the operator sets `CANOPY_REPO_URL`, or when a project contains `.mulch/` / `.seeds/` / `.plot/`.
 
 ### 2.3 What Warren is not
 
@@ -68,7 +66,7 @@ Warren is a thin coordinator — most of the value is in the runtime plus whiche
 
 ### 3.1 V1 Goals
 
-- Single-image deploy: `docker compose up` on a home server, `kubectl apply -k` on a cluster (GKE Autopilot), same Dockerfile.
+- Single-image deploy: `docker compose up` on a home server, `fly deploy` on Fly.io, same Dockerfile.
 - Web UI for: agent registry, project list, run dispatch, live event tail, basic settings.
 - HTTP API mirroring the UI's surface so external scripts can drive warren.
 - Custom-agent-as-canopy-prompt: an agent is a single canopy prompt with required sections; warren auto-discovers from a connected canopy repo.
@@ -95,8 +93,7 @@ Warren is a thin coordinator — most of the value is in the runtime plus whiche
 
 ### 3.3 The seams that matter
 
-- **RuntimeProvider contract** (post-V1; `src/runtime/contract.ts`) — the load-bearing seam for *where* a run executes. Warren's domain (`src/runs/*`) speaks only this eight-method contract; the backend (burrow-backed `LocalProvider` or pod-per-run `K8sProvider`) is selected at boot by `WARREN_RUNTIME`. No burrow-id, pod name, socket, or host path crosses it. This generalizes the original "Burrow HTTP API" seam below into a provider abstraction.
-- **Burrow HTTP API** (burrow's `pl-5b40` / `burrow-1d64`) — how the `local` runtime provider talks to its sandbox: warren never imports burrow as a library, HTTP only, so warren and burrow can be independent processes inside one container. Under the `k8s` provider this seam is absent (the pod boundary + K8s API replace it).
+- **Burrow HTTP API** (burrow's `pl-5b40` / `burrow-1d64`) — warren never imports burrow as a library. HTTP only, so warren and burrow can be independent processes inside one container.
 - **Canopy as agent source** — agents are not warren records, they are canopy prompts. Warren is a read-mostly consumer of canopy.
 - **CLI shell-out for mulch/seeds/canopy** — these tools are git-native, file-locked, atomic. Warren does not embed their state; it shells out.
 - **HTTP API for warren itself** — the UI is one consumer; ad-hoc scripts and future orchestrators are others.
@@ -118,20 +115,7 @@ Burrow is the cell the agent runs in. Warren is the operator that picks who runs
 
 ### 4.2 The bundle, expressed in canopy
 
-> **RETIRED (in part) — the deletion pass removed the external canopy
-> library integration (pl-3a79, phase C, 2026-07).** Warren no longer
-> reads the `CANOPY_REPO_URL` knob, runs the `cn render` spawn step,
-> ships the `warren register-agent` CLI, or serves the `/agents/refresh`
-> routes. Warren seeds agents from the inline built-ins in
-> `src/registry/builtins/` (§4.1) and freezes their rendered envelopes
-> on the run row. The envelope **shape** below — the schema-validated
-> section set — survives as warren's internal `AgentDefinition` format
-> (`src/registry/schema.ts`). A fresh install needs no canopy tooling.
-> The canopy tool itself lives on in os-eco to author prompt libraries.
-> Read the rest of this section as the anatomy of that envelope, not as
-> a live external integration.
-
-An agent is a single agent-envelope with a schema-validated set of sections:
+An agent is a single canopy prompt with a schema-validated set of sections:
 
 ```yaml
 name: refactor-bot
@@ -195,14 +179,14 @@ The agent's worklist (seeds) belongs to the project, not the agent. Same project
 ## 5. Architecture Overview
 
 ```
-┌─────── HOME SERVER (Linux container, Mac Pro / cloud VM / etc.) ──────┐
+┌─────── HOME SERVER (Linux container, Mac Pro / Fly.io / etc.) ────────┐
 │                                                                        │
 │   ┌────────────────────────┐                                           │
 │   │ warren                 │                                           │
 │   │ ─ HTTP API + UI        │                                           │
 │   │ ─ scheduler (cron)     │                                           │
 │   │ ─ webhook receiver     │                                           │
-│   │ ─ shells out: sd/ml    │                                           │
+│   │ ─ shells out: cn/sd/ml │                                           │
 │   │ ─ HTTP: burrow         │                                           │
 │   └────┬───────────────────┘                                           │
 │        │                                                               │
@@ -213,9 +197,10 @@ The agent's worklist (seeds) belongs to the project, not the agent. Same project
 │        │     │ owns SQLite + sandboxes        │                        │
 │        │     └────────────────────────────────┘                        │
 │        │                                                               │
-│        └─── shell: sd list / git                                       │
+│        └─── shell: cn render / sd list / git                           │
 │                                                                        │
 │   /data/                                                               │
+│   ├── canopy-repo/         ← cloned agent library                      │
 │   ├── projects/<owner>/<name>/  ← cloned project repos                 │
 │   ├── burrow/              ← burrow's home: SQLite, workspaces         │
 │   └── warren.db            ← warren's SQLite: schedules, run history   │
@@ -242,9 +227,7 @@ Warren restarts shouldn't kill in-flight agent runs. Burrow's SQLite + run loop 
 
 ### 5.3 Sandbox nesting
 
-> **Scope: the `local` runtime provider only.** Nested bwrap and its four flags exist to let burrow's user-namespace sandboxes come up inside the outer container. The `k8s` provider has no nested sandbox — the pod boundary *is* the isolation, kubelet enforces resources via cgroups v2, and all four flags disappear (`runAsNonRoot`, `drop: [ALL]`, `seccompProfile: RuntimeDefault` instead). See [`docs/RUNBOOK-K8S.md`](docs/RUNBOOK-K8S.md) and `docs/design/k8s-migration.md` §2.
-
-Under the `local` provider, burrow runs `bwrap`-isolated agents inside the warren container. The container needs the four flags from `mulch:mx-94901b` / `mulch:mx-c085ba`:
+Burrow runs `bwrap`-isolated agents inside the warren container. The container needs the four flags from `mulch:mx-94901b` / `mulch:mx-c085ba`:
 
 ```yaml
 security_opt:
@@ -254,24 +237,9 @@ security_opt:
 cap_add: [SYS_ADMIN]
 ```
 
-Verified empirically on Docker 28.4 / Ubuntu 24.04. (These container flags apply to the `local` topology only; the `k8s` runtime has no bwrap — the pod boundary is the sandbox.)
+Verified empirically on Docker 28.4 / Ubuntu 24.04. Same recipe applies to Fly.io machines.
 
 ### 5.4 Multi-worker model
-
-> **RETIRED — superseded by the `k8s` runtime provider (post-V1).** The
-> multi-worker burrow model below (a `[[workers]]` registry, `BurrowClientPool`,
-> placement rules, fan-out reads, the `workers` + `burrows` tables, the
-> `/workers` + `/burrows` HTTP surface, `src/server/probe.ts`) was the original
-> answer to "lift the single-host ceiling." It was **removed** during the K8s
-> migration: horizontal scale is now the `k8s` provider (each run a pod,
-> cluster-scheduled, with admission caps in §3.3-of-the-K8s-design instead of
-> placement heuristics). The code, tables, and endpoints described here no
-> longer exist on the branch; `runs.burrow_id` / `burrow_run_id` / `worker_id`
-> are nullified for new rows and kept only for historical ones. The subsection
-> is preserved verbatim below as a V1 design record — do not treat it as current
-> behavior. See [`docs/RUNBOOK-K8S.md`](docs/RUNBOOK-K8S.md) and
-> `docs/design/k8s-migration.md` (§1.1, §3.3) for the
-> supersession.
 
 Zero-config deployment is unchanged: one warren container, one
 in-container `burrow serve` over `/var/run/burrow.sock` (§5.1).
@@ -440,7 +408,7 @@ warren/
 ├── CLAUDE.md
 ├── Dockerfile                  # extends ghcr.io/jayminwest/burrow-base
 ├── docker-compose.yml          # default home-server compose file
-├── deploy/k8s/                 # kustomize manifests (GKE Autopilot + kind)
+├── fly.toml                    # default Fly deploy template
 ├── src/
 │   ├── index.ts                # public library entry
 │   ├── core/
@@ -448,8 +416,8 @@ warren/
 │   │   ├── errors.ts
 │   │   └── ids.ts              # ag_xxx, prj_xxx, run_xxx, sched_xxx
 │   ├── registry/
-│   │   ├── builtins/           # inline built-in agent defs seeded on boot
-│   │   └── schema.ts           # AgentDefinition schema (canopy-shaped envelope)
+│   │   ├── canopy.ts           # cn render — turn canopy prompts into AgentDefs
+│   │   └── schema.ts           # canopy schema validating "agent: true" prompts
 │   ├── projects/
 │   │   ├── clone.ts            # git clone <url> → /data/projects/...
 │   │   └── repo.ts             # discovery, .seeds/.mulch/ presence checks
@@ -478,6 +446,7 @@ warren/
 │   ├── cli/
 │   │   ├── main.ts             # `warren` CLI for ops/admin
 │   │   └── commands/
+│   │       ├── register-agent.ts
 │   │       ├── add-project.ts
 │   │       ├── run.ts
 │   │       └── doctor.ts
@@ -503,18 +472,11 @@ warren/
 
 ### 8.1 HTTP API (top-level resources)
 
-> **RETIRED (in part) — the deletion pass removed the canopy library
-> routes (pl-3a79, phase C, 2026-07).** `POST /agents/refresh` and
-> `POST /projects/:id/agents/refresh` are gone. Warren seeds agents from
-> the inline built-ins on boot, so no library remains to re-clone and no
-> per-project `.canopy/` tier remains to scan. `GET /agents` still lists
-> the registered defs and `GET /agents/:name` still returns the rendered
-> envelope.
-
 ```
 # V1 — manual run path
-GET    /agents                  — list registered agent defs (built-ins seeded on boot)
-GET    /agents/:name            — full rendered agent envelope
+GET    /agents                  — list registered agent defs (built-ins + library); `?projectId=<id>` adds that project's `.canopy/` tier (R-03)
+POST   /agents/refresh          — re-clone canopy library AND scan every project's `.canopy/` (per-project errors collected, never fatal — R-03)
+GET    /agents/:name            — full rendered agent (cn render output); `?projectId=<id>` resolves project-first with global fallback (R-03)
 
 GET    /projects                — list cloned project repos
 POST   /projects                — { gitUrl, defaultBranch? } → clone
@@ -522,6 +484,7 @@ DELETE /projects/:id            — remove project
 GET    /projects/:id/warren-config — parsed .warren/ envelope (§11.H, R-02)
 GET    /projects/:id/triggers   — parsed triggers.yaml joined with last/next-fire state (§11.I, R-06)
 POST   /projects/:id/triggers/:triggerId/run — Run Now: dispatch trigger inline with trigger='manual'
+POST   /projects/:id/agents/refresh — refresh one project's `.canopy/` tier (R-03)
 
 POST   /runs                    — { agent, project, prompt } → spawn
 GET    /runs                    — list with filters (status, agent, project)
@@ -531,29 +494,23 @@ POST   /runs/:id/steer          — send steering message (proxies to burrow inb
 POST   /runs/:id/cancel         — graceful cancel (proxies to burrow)
 
 GET    /healthz                 — liveness
-GET    /readyz                  — readiness (burrow reachable)
+GET    /readyz                  — readiness (canopy reachable, burrow reachable)
 
 # V2 — deferred
 POST   /webhooks/github         — GitHub webhook target (event-driven trigger half of the scheduler)
 ```
 
-Auth: `Authorization: Bearer ${WARREN_API_TOKEN}` on every route except `/healthz`. Warren expects HTTPS termination at a reverse proxy (Caddy on a home server, the cluster ingress on GKE); it does not terminate TLS itself. Token is single-user, single-value, no rotation in V1 — see §11 for the security posture.
+Auth: `Authorization: Bearer ${WARREN_API_TOKEN}` on every route except `/healthz`. Warren expects HTTPS termination at a reverse proxy (Caddy on home server, Fly's edge on Fly.io); it does not terminate TLS itself. Token is single-user, single-value, no rotation in V1 — see §11 for the security posture.
 
 ### 8.2 CLI (admin-only)
 
-The CLI covers ops/admin (`add-project`, `doctor`, `serve`) and one-shot
-run dispatch (`warren run`); the UI remains the primary interactive
-surface. An agent-facing CLI + npm publish is a roadmap item (see
-[`ROADMAP.md`](ROADMAP.md)).
-
-> **RETIRED (in part) — the deletion pass removed `warren register-agent`
-> (pl-3a79, phase C, 2026-07).** Agents ship inline as built-ins. No
-> canopy library remains to refresh.
+The CLI is for ops, not daily use — the UI is daily.
 
 ```
+warren register-agent <name>       — refresh canopy and register one agent
 warren add-project <git-url>       — clone a project
 warren run <agent> <project> -p "..."  — one-shot, no UI
-warren doctor                       — burrow reachable? bwrap working?
+warren doctor                       — burrow reachable? canopy clean? bwrap working?
 warren serve                        — start the HTTP server (default in docker entrypoint)
 
 # V2 — deferred
@@ -646,7 +603,7 @@ webhook_secrets (
 ### 10.1 Home server (canonical)
 
 ```bash
-git clone https://github.com/jayminwest/warren && cd warren
+git clone https://github.com/jaymin/warren && cd warren
 cp .env.example .env && $EDITOR .env
 docker compose up -d
 open http://localhost:8080
@@ -654,25 +611,36 @@ open http://localhost:8080
 
 `docker-compose.yml` mounts a single named volume at `/data` and applies the bwrap-friendly security flags. Storage defaults to SQLite under `/data/warren.db`. To run against a managed Postgres instead (R-13), set `WARREN_DB_URL=postgres://user:pw@host/db` in `.env`; pg migrations apply on first start, and the SQLite path is bypassed entirely.
 
-`BURROW_API_TOKEN` (read by `burrow serve`) and `WARREN_BURROW_TOKEN` (read by warren's burrow-client) are the two ends of one channel and **must hold the same value** — the supervisor validates equality at boot (warren-d317) and refuses to spawn burrow + warren if either is missing or they disagree, instead of letting `burrow serve` crash-loop with `[validation_error]` and warren 401 on every dispatch. `WARREN_API_TOKEN` is the browser-facing bearer; rotate the three independently. For loopback-dev only, set `WARREN_BURROW_NO_AUTH=1` to skip burrow auth (and the validation).
-
-### 10.2 Kubernetes (GKE Autopilot, hosted target)
-
-The `k8s` runtime (`WARREN_RUNTIME=k8s`) runs the control plane as a Deployment and each agent run as its own pod — no burrow, no supervisor sidecar; the pod boundary is the sandbox. GKE Autopilot is the reference cluster.
+### 10.2 Fly.io
 
 ```bash
-deploy/docker/build-images.sh              # control-plane + agent + workspace-init
-kubectl apply -k deploy/k8s/overlays/gke   # GKE Autopilot (the hosted target)
-kubectl apply -k deploy/k8s/overlays/kind  # local kind / k3d dev
+fly launch                          # uses ./fly.toml
+fly volumes create warren_data --size 50 --region sjc
+BURROW_TOKEN=$(openssl rand -hex 32)
+fly secrets set \
+    WARREN_API_TOKEN=$(openssl rand -hex 32) \
+    BURROW_API_TOKEN=$BURROW_TOKEN \
+    WARREN_BURROW_TOKEN=$BURROW_TOKEN \
+    ANTHROPIC_API_KEY=... \
+    GITHUB_TOKEN=...
+# Optional: layer a custom canopy library on top of the built-ins:
+#   CANOPY_REPO_URL=https://github.com/<you>/agents.git
+# Optional: attach to a managed Postgres instead of the on-volume SQLite
+# (R-13). Without this, warren falls back to sqlite:///data/warren.db.
+#   fly secrets set WARREN_DB_URL=postgres://user:pw@host/db
+fly deploy
 ```
 
-The canonical operator procedure — secrets + rotation, RBAC, garbage collection, admission caps, observability, incident playbooks — lives in [`docs/RUNBOOK-K8S.md`](docs/RUNBOOK-K8S.md); the manifest quick-start is `deploy/k8s/README.md`. Continuous deployment is `.github/workflows/deploy-gke.yml`: a published GitHub release builds the SHA-pinned images and rolls the cluster forward via Workload Identity Federation. The storage backend (SQLite-on-volume vs. external Postgres) is a `WARREN_DB_URL` flip — under `k8s`, back it with a managed Postgres so state survives pod reschedules.
+`BURROW_API_TOKEN` (read by `burrow serve`) and `WARREN_BURROW_TOKEN` (read by warren's burrow-client) are the two ends of one channel and **must hold the same value** — the supervisor validates equality at boot (warren-d317) and refuses to spawn burrow + warren if either is missing or they disagree, instead of letting `burrow serve` crash-loop with `[validation_error]` and warren 401 on every dispatch. `WARREN_API_TOKEN` is the browser-facing bearer; rotate the three independently. For loopback-dev only, set `WARREN_BURROW_NO_AUTH=1` to skip burrow auth (and the validation).
+
+Same image, same volume layout, same security flags. Mac Pro and Fly.io are interchangeable hosts. The storage backend (SQLite-on-volume vs. external Postgres) is a `WARREN_DB_URL` flip — the rest of the deploy is unchanged.
 
 ### 10.3 Container layout
 
 ```dockerfile
 FROM ghcr.io/jayminwest/burrow-base:0.2.0   # bun + bwrap + uidmap + burrow CLI
 RUN bun install -g \
+    @os-eco/canopy-cli@<v> \
     @os-eco/seeds-cli@<v> \
     @os-eco/mulch-cli@<v> \
     @os-eco/sapling-cli@<v>
@@ -690,7 +658,7 @@ The entrypoint is the Bun supervisor (`src/supervisor/main.ts`), not warren dire
 - Waits for the socket file to appear (`fs.access` poll, 100 ms × 50 = 5s timeout) before spawning warren.
 - Spawns warren (`bun run src/server/main/index.ts`) as a child.
 - Forwards `SIGTERM` and `SIGINT` to both children, then waits for clean exit (5s grace) before forcing.
-- Restarts `burrow serve` if it exits non-zero, with an exponential backoff and a budget of 5 restarts in 60s; after exhaustion, the supervisor exits, the container restarts under Docker's (or the orchestrator's) restart policy.
+- Restarts `burrow serve` if it exits non-zero, with an exponential backoff and a budget of 5 restarts in 60s; after exhaustion, the supervisor exits, the container restarts under Docker/Fly's restart policy.
 - Crashes if warren exits non-zero (warren is the user-facing process; restart-by-orchestrator is preferred to mask warren bugs in-process).
 
 Rationale: zero non-Bun deps; signal handling and lifecycle are explicit in our code; warren restarts (the more frequent kind, e.g., on deploy) leave burrow's run loop and SQLite untouched.
@@ -724,21 +692,21 @@ The decided shape, expanded from prior open question #4:
 | Run cancellation | `POST /runs/:id/cancel` proxies to burrow's `POST /runs/:burrow_run_id/cancel`. Hard-stop = `DELETE /burrows/:burrow_id` is V2; not needed for V1. | §4.3 |
 | Burrow API contract | Burrow's `/openapi.json` is the source of truth. Warren generates a typed client against it. | §4.3 |
 | Burrow shippability | All 21 routes implemented as of `burrow@7926a0e` (2026-05-08). `POST /burrows` no longer returns 501. | — |
-| ~~`CANOPY_REPO_URL` is optional~~ **RETIRED (pl-3a79, phase C, 2026-07)** | The deletion pass removed the external canopy library. Warren ships built-in `claude-code`, `sapling`, and `pi` agents inline (`src/registry/builtins/`) and seeds them on boot. Warren no longer reads `CANOPY_REPO_URL`, serves `POST /agents/refresh`, or ships `warren register-agent`. `GET /agents` still returns `source: "builtin" \| "library"` provenance from `frontmatter.source` (the `library` arm survives for legacy rows). | §4.2, §8.1 |
+| `CANOPY_REPO_URL` is optional (warren-d3e9, 2026-05-10) | Warren ships built-in `claude-code`, `sapling`, and `pi` agents inline (`src/registry/builtins/`); the canopy library is a power-user override, not a hard dependency. Boot seeds built-ins; refresh upserts library agents on top (same-named library agents win). `warren doctor` and `/readyz` treat unset `CANOPY_REPO_URL` as info, not failure. `POST /agents/refresh` and `warren register-agent` 400 with a friendly hint when no library is configured. `GET /agents` returns `source: "builtin" \| "library"` provenance derived from `frontmatter.source`. | §10.2, §11.B |
 
 ### 11.C Open questions for V1
 
 1. **OpenAPI spec for warren's own HTTP surface.** Same question burrow resolved by hand-authoring `src/server/openapi/spec.ts` and golden-locking it. Recommend the same pattern; defer decision until after `/runs` and `/agents` routes stabilize.
 2. **Concurrent runs per project.** Warren can dispatch many runs against the same project; each run gets its own burrow (provisioned per-run, destroyed on completion). Or do we share a long-lived burrow per project and queue runs serially inside it? Decision affects burrow lifecycle (provision-per-run vs. provision-per-project) and `runs.burrow_id` semantics. Lean toward provision-per-run for V1: simpler isolation, matches "task burrow" model from burrow's §4.1.
-3. **Reverse proxy assumption.** Spec assumes warren is fronted by Caddy / cluster ingress for TLS. Should warren refuse to start if `WARREN_TRUST_PROXY != true` and the bind address is non-loopback? V1 default: warn loudly in `doctor`, do not refuse — home-server users may not have a proxy yet.
-4. **`readyz` timing.** When does warren consider itself "ready"? Burrow socket reachable + at least one agent registered? Both? Affects deploy-time orchestration.
+3. **Reverse proxy assumption.** Spec assumes warren is fronted by Caddy/Fly edge for TLS. Should warren refuse to start if `WARREN_TRUST_PROXY != true` and the bind address is non-loopback? V1 default: warn loudly in `doctor`, do not refuse — home-server users may not have a proxy yet.
+4. **`readyz` timing.** When does warren consider itself "ready"? Burrow socket reachable + canopy clone present + at least one agent successfully rendered? All three? Affects deploy-time orchestration.
 
 ### 11.D V1 security posture (known limitations)
 
 Documented, accepted for V1:
 
-- **Single bearer token.** No rotation, no expiry, no revocation. Loss of `WARREN_API_TOKEN` = full access. Mitigation: rotate by editing `.env` / the cluster secret and bouncing the container.
-- **Plaintext secrets in `.env`.** Standard for self-host; user is responsible for filesystem perms (`chmod 600 .env`). On a cluster, a managed secret store (Kubernetes Secrets / cloud secret manager) is encrypted at rest.
+- **Single bearer token.** No rotation, no expiry, no revocation. Loss of `WARREN_API_TOKEN` = full access. Mitigation: rotate by editing `.env` / `fly secrets set` and bouncing the container.
+- **Plaintext secrets in `.env`.** Standard for self-host; user is responsible for filesystem perms (`chmod 600 .env`). Fly.io's secret store is encrypted at rest.
 - **No HTTPS termination in warren.** TLS is the reverse proxy's job. Direct HTTP on a non-loopback address is a misconfiguration; `warren doctor` warns.
 - **Trust-the-socket between warren and burrow.** Burrow's unix socket has no auth; the in-container threat model is "warren is the only client." If a third party gains code execution inside the warren process, they have full burrow access. Acceptable: warren and burrow are co-tenanted by design.
 - **No CSRF protection on the UI.** UI calls warren's API with the bearer token. Not exposed to third-party origins (CORS strict). Single-user posture.
@@ -790,7 +758,7 @@ allowed (JSON's biggest weakness) and arrays-of-objects stay readable as
 new blocks accumulate. The pre-reorg JSON choice (`mx-2cefdd`) is
 superseded by the warren-5840 decision; both formats keep working until
 projects migrate via `warren config migrate`. YAML parser is `js-yaml
-^5.x` (was `^4.1.1`; warren-381c) to match mulch + overstory (`mx-8b6896`).
+^4.1.1` to match mulch + overstory (`mx-8b6896`).
 
 **Schema.** `triggers.yaml` is `Array<Trigger>` with a `kind:` discriminator
 (only `'cron'` is implemented today; `kind:` exists so future webhook
@@ -1364,10 +1332,8 @@ to re-spin a preview on a different host) is cheap.
 **Auth — signed cookie, not bearer.** A run against private code
 produces a preview that may contain secrets. Bearer-in-header is
 impossible for a browser hitting `run-<id>.<host>` directly, so warren
-issues a signed cookie from `POST /runs/:id/preview/login` — bearer in the
-`Authorization` header, optional `{redirect}` body (ROADMAP option a;
-warren-e1b0 moved the bearer out of the query string, where it would have
-landed in history, `Referer` headers and proxy logs). Cookie scope is `Domain=.<warren-host>;
+issues a signed cookie from `GET /runs/:id/preview/login?token=…&redirect=…`
+(ROADMAP option a). Cookie scope is `Domain=.<warren-host>;
 Path=/; HttpOnly; Secure; SameSite=Lax` **in subdomain mode**; path
 mode narrows the scope to `Path=/p/<run-id>/` with no `Domain` (see
 the "Routing modes — path vs subdomain" addendum below). The proxy
@@ -1390,7 +1356,7 @@ loopback port would manifest as "preview works for some runs, not
 others."
 
 **TLS termination stays operator-side.** Per SPEC §8.1 / §11.D, TLS is
-the operator's Caddy / cluster ingress. Warren ships docs for the wildcard
+the operator's Caddy / Fly edge. Warren ships docs for the wildcard
 `*.<warren-host>` CNAME + DNS-01 wildcard cert with a Caddy snippet,
 not built-in cert provisioning. The DEPLOY guide is honest about the
 operator burden (DNS provider must be on Caddy's DNS-01 list; some are
@@ -1463,8 +1429,8 @@ shape.
 The original §11.L lock above describes subdomain-mode routing
 (`Host: run-<id>.<warren-host>`). That mode requires the operator to own
 a domain, configure a wildcard CNAME, and provision a wildcard TLS cert
-via DNS-01 — a closed door for the common self-hoster running a single-box
-deploy. A second mode, **path mode**, reuses the single
+via DNS-01 — a closed door for the common self-hoster who just
+`fly deploy`s warren. A second mode, **path mode**, reuses the single
 hostname + cert that already serves the warren UI and adds zero
 DNS/cert work. Path mode is the **default** from this addendum onward;
 subdomain mode stays as the explicit opt-in for multi-tenant operators.
@@ -1544,9 +1510,9 @@ mx-c38965) parameterizes scope by mode:
   multiple previews simultaneously in the same browser.
 
 The HMAC and token shape are identical across modes. The login route
-`POST /runs/:id/preview/login` stays the canonical entry point; in path
-mode it sets the path-scoped cookie and answers with the
-`/p/<run-id>/<redirect-or-slash>` URL to navigate to. Unauthenticated requests on the
+`GET /runs/:id/preview/login?token=…&redirect=…` stays the canonical
+entry point; in path mode it sets the path-scoped cookie and redirects
+to `/p/<run-id>/<redirect-or-slash>`. Unauthenticated requests on the
 proxied path 401 (not 502) just as in subdomain mode.
 
 **PR annotation URL shape.** `src/runs/pr-annotate.ts` (mx-ba79c4)
@@ -1781,15 +1747,8 @@ implementation work isn't blocked on re-deriving the design.
 
 ### 11.O Plot integration (pl-2047, 2026-05-17)
 
-> **RETIRED — the deletion pass removed plot from warren (pl-3a79, phase
-> B, 2026-07).**
-> Plot gave warren an opt-in coordination substrate, keyed on a `.plot/`
-> directory and a per-run `plot_id`.
-> The pass dropped every plot module, route, table, column, config knob,
-> UI, and CLI, and warren now keeps only mulch, seeds, and sapling.
-
 Phase 1 of `warren-000b` — adopting [Plot](https://github.com/jayminwest/plot)
-as warren's coordination primitive. Plot was an opt-in bundled
+as warren's coordination primitive. Plot is the fifth opt-in bundled
 feature alongside canopy, mulch, seeds, and sapling: a project lights it
 up by shipping a `.plot/` directory, and projects without one are
 byte-identical to the pre-change behavior. Phase 1 is the dispatch wiring
@@ -1865,8 +1824,8 @@ two variables injected via `burrows.up`:
 
 | Variable | Value | Producer |
 |---|---|---|
-| `PLOT_ID` | `<run.plot_id>` | `composeRunEnv` (`src/runs/spawn/dispatch.ts`) |
-| `PLOT_ACTOR` | `agent:<agent-name>:<run-id>` | `composeRunEnv` |
+| `PLOT_ID` | `<run.plot_id>` | `composePlotEnv` (`src/runs/spawn.ts`) |
+| `PLOT_ACTOR` | `agent:<agent-name>:<run-id>` | `composePlotEnv` |
 
 The `plot` CLI inside the sandbox (installed globally in the Dockerfile,
 mirroring the `burrow-cli` double-pin rule) reads these on every
@@ -1954,7 +1913,7 @@ covers the round-trip end-to-end against a real warren+burrow stack:
   cron and scheduled-seed paths attribute to the trigger owner's handle.
 
 **`.plot/` preservation across refresh (pl-d4d6, 2026-05-18).** Warren's
-host-side Plot appenders (`defaultPlotAppender` in `src/runs/spawn/plot-append.ts`,
+host-side Plot appenders (`defaultPlotAppender` in `src/runs/spawn.ts`,
 `defaultPlanRunPlotAppender` in `src/plan-runs/plot-appender.ts`,
 `autoTransitionPlotToDone` in `src/plan-runs/plot-transition.ts`) write
 to `<project_clone>/.plot/<id>.events.jsonl` and
@@ -2005,9 +1964,8 @@ clone, a new `plot_commit` sub-step in `src/runs/reap.ts`
 (`stagePlotForCommit`) replicates `plot-*.events.jsonl` and
 `plot-*.json` files back into the burrow workspace, runs
 `git add -- .plot/`, and — when `git diff --cached --quiet -- .plot/`
-exits non-zero — authors a `chore(warren): plot state` commit under the
-canonical warren bot identity (`src/bot-identity.ts`, historically
-`warren@os-eco.dev`, since warren-02cd resolved per deployment).
+exits non-zero — authors a `chore(warren): plot state` commit under a
+fixed warren bot identity (`-c user.name=warren -c user.email=warren@os-eco.dev`).
 The follow-on `branch_push` carries that commit upstream. Filtering on
 copy: `.index.db*` files are skipped (derived state per the
 snapshot/restore contract above), and only `plot-*.{json,events.jsonl}`
@@ -2043,10 +2001,6 @@ re-dispatching B (or re-pushing after a manual refresh).
 
 #### 11.O.Plot.UI Plot-centric UI surface (pl-9d6a, 2026-05-18)
 
-> **RETIRED — the deletion pass removed plot (pl-3a79, phase B, 2026-07).**
-> The Plot-centric UI below no longer exists.
-> See the banner at the top of §11.O. Keep this section as a V1 record.
-
 > **Superseded by the Workspace collapse (pl-0008, 2026-06-14).** The
 > separate Leveret-conversations and Plots surfaces described below were
 > merged into a single **Workspace** section: one cross-project list
@@ -2063,15 +2017,6 @@ re-dispatching B (or re-pushing after a manual refresh).
 > The `/plots*` HTTP contract, ACL surface, and gating below are
 > otherwise unchanged — only the React surface moved. The original
 > phase-3 record is retained for the data-flow + ACL design history.
->
-> **Amendment (pl-3a79, 2026-07-21):** the conversations subsystem
-> — the Leveret overseer, the `mode=conversation` runs, the
-> `conversations` + `messages` tables, the `/conversations*` HTTP
-> surface, and the **Shape** tab — has since been **deleted outright**
-> (PHILOSOPHY rule 8: no users). The Workspace detail page now opens on
-> **Plan**; the Plot spine, its `/plots*` contract, and the remaining
-> Plan/Run/Activity tabs are unchanged by this amendment. Every Leveret
-> / conversation reference below is historical.
 
 Phase 3 of `warren-d362` shifts warren's web UI from run-centric to
 Plot-centric on deployments that opt into Plot, without disturbing the
@@ -2278,6 +2223,22 @@ shape, no new agent contract.
 
 ### 11.P PlanRun: serial plan execution (pl-a258, 2026-05-18)
 
+#### Cross-repo coordination contract (pl-fb43)
+
+The project named by `POST /plan-runs` is the coordination project. A child
+seed may set `extensions.repo` to a registered project slug or git remote.
+Warren resolves that value before dispatch and clones the child into the
+target project's Burrow workspace. Parent plan ownership, serial ordering,
+PR merge gating, and plan-run history remain in the coordination project.
+An unresolved target is rejected; it must never silently fall back to the
+coordination checkout. This is a Warren-side convention and requires no
+seeds-core schema change.
+
+The reference planner role is Sapling-backed (`runtime: sapling`,
+`auto_plan_run_agent: sapling`) and runs inside Burrow. Pi is not selected for
+this workflow. See `docs/cross-repo-planner.md` and the examples under
+`docs/examples/`.
+
 PlanRun is a dispatch mode, not a fifth bundled feature. The substrate
 is the existing single-run primitive — `spawnRun`, the events bus, the
 runs/projects/agents repos — composed by a second tick loop that takes
@@ -2412,8 +2373,18 @@ POST   /plan-runs                 dispatch (rejects without project.hasSeeds)
 GET    /plan-runs                 list (filter by project / state)
 GET    /plan-runs/:id             detail + fanned-out child runs[]
 POST   /plan-runs/:id/cancel      sets state='cancelled', cancels in-flight run
+POST   /plan-runs/:id/resume      resumes a child/parent PR merge-timeout failure
 GET    /plan-runs/:id/events      tails the union of every child run's events
 ```
+
+`POST /plan-runs/:id/resume` is accepted only for a failed plan-run whose
+`failure_reason` is `child_pr_merge_timeout` or `parent_pr_merge_timeout`.
+For a child timeout it restores that failed child to `pr_open`, preserving its
+linked run and PR URL; for a parent timeout it re-arms the parent PR gate.
+Both paths persist a fresh merge-wait baseline, clear the plan failure, and
+transition `failed → running`. Other terminal failures are rejected without
+changing state. If the PR has already merged, the next coordinator tick
+advances immediately; otherwise it waits under the fresh timeout.
 
 The dispatch handler rejects in this order: (1) project not found →
 404; (2) `!project.hasSeeds` → `ProjectLacksSeedsError` (typed 400,
@@ -2456,11 +2427,6 @@ preservation contract documented at the bottom of §11.O — without it,
 only the last child's `run_dispatched` would survive on disk.
 
 ### 11.P.Plot PlanRun + Plot composition (pl-7937, 2026-05-18)
-
-> **RETIRED — the deletion pass removed plot (pl-3a79, phase B, 2026-07).**
-> The deletion pass also cut the plan-run ↔ plot bridges below.
-> A plan-run today never threads a `plot_id`.
-> See the banner at the top of §11.O. Keep this section as a V1 record.
 
 Phase 2 of `warren-000b` — composing PlanRun (§11.P) onto Plot (§11.O).
 Phase 1 wired Plot into single-run dispatch; this phase mirrors that
@@ -2516,7 +2482,7 @@ POST /plan-runs { plot_id }
 [ coordinator ticks ]
    │
    ▼  for each child: dispatch.ts forwards planRun.plotId into spawnRun
-   ▼  composeRunEnv injects PLOT_ID + PLOT_ACTOR=agent:<name>:<run-id>
+   ▼  composePlotEnv injects PLOT_ID + PLOT_ACTOR=agent:<name>:<run-id>
    ▼  defaultPlotAppender emits per-child `run_dispatched` on the Plot (§11.O)
    │
    ▼  child runs → PR opens → reap → checkPullRequestMerged
@@ -2540,7 +2506,7 @@ per PlanRun**, immediately after `repos.planRuns.create` returns
 (handler edge, not coordinator tick), via the
 `defaultPlanRunPlotAppender` helper in `src/plan-runs/plot-appender.ts`
 — same rebuild-index + retry-once shape as `defaultPlotAppender`
-(`src/runs/spawn/plot-append.ts`). Payload:
+(`src/runs/spawn.ts`). Payload:
 
 ```json
 {
@@ -2685,11 +2651,6 @@ composes scenarios 25 + 26 against a real warren+burrow stack:
   JSONL-tail-at-reap for live updates).
 
 ### 11.Q Plot → synthesized plan-run pipeline (pl-5310 step 4, 2026-05-18)
-
-> **RETIRED — the deletion pass removed plot (pl-3a79, phase B, 2026-07).**
-> This synthesis pipeline reached design-lock but never shipped.
-> The plot surface it needs no longer exists.
-> See the banner at the top of §11.O. Keep this section as a V1 record.
 
 Design lock for `warren-a4b7` (pl-5310 step 4, parent epic
 `warren-e40a`). Closes the deepest realization of the Plot UX vision:
