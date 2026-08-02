@@ -127,35 +127,37 @@ describe("auto_plan_run (warren-a32a)", () => {
 		}
 	});
 
-	test("normalizes the legacy pi auto-plan override to sapling", async () => {
-		const ctx = await setupAutoPlanRun({
-			frontmatter: { auto_plan_run: true, auto_plan_run_agent: "pi" },
+	for (const legacyAgent of ["pi", "pi-chat"]) {
+		test(`normalizes the legacy ${legacyAgent} auto-plan override to sapling`, async () => {
+			const ctx = await setupAutoPlanRun({
+				frontmatter: { auto_plan_run: true, auto_plan_run_agent: legacyAgent },
+			});
+			try {
+				const f = fakeFs({
+					"/data/projects/x/y/.seeds/issues.jsonl": "",
+					"/data/projects/x/y/.seeds/plans.jsonl": "",
+					"/data/burrow/ws/.seeds/plans.jsonl":
+						'{"id":"pl-new1","status":"approved","children":["warren-c1","warren-c2"]}\n',
+				});
+				const e = fakeExec({ stagedDelta: true });
+
+				const result = await reapRun({
+					runId: ctx.runId,
+					outcome: "succeeded",
+					repos: ctx.repos,
+					burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+					fs: f.fs,
+					exec: e.exec,
+				});
+
+				expect(result.autoPlanRunCreated).toBe(true);
+				const planRun = await ctx.repos.planRuns.require(result.autoPlanRunId as string);
+				expect(planRun.agentName).toBe("sapling");
+			} finally {
+				await ctx.db.close();
+			}
 		});
-		try {
-			const f = fakeFs({
-				"/data/projects/x/y/.seeds/issues.jsonl": "",
-				"/data/projects/x/y/.seeds/plans.jsonl": "",
-				"/data/burrow/ws/.seeds/plans.jsonl":
-					'{"id":"pl-new1","status":"approved","children":["warren-c1","warren-c2"]}\n',
-			});
-			const e = fakeExec({ stagedDelta: true });
-
-			const result = await reapRun({
-				runId: ctx.runId,
-				outcome: "succeeded",
-				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
-				fs: f.fs,
-				exec: e.exec,
-			});
-
-			expect(result.autoPlanRunCreated).toBe(true);
-			const planRun = await ctx.repos.planRuns.require(result.autoPlanRunId as string);
-			expect(planRun.agentName).toBe("sapling");
-		} finally {
-			await ctx.db.close();
-		}
-	});
+	}
 
 	test("does not dispatch when agent lacks auto_plan_run frontmatter", async () => {
 		const ctx = await setupAutoPlanRun({ frontmatter: {} });

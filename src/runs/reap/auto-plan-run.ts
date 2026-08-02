@@ -38,7 +38,9 @@ function resolveAutoPlanRunAgent(run: { renderedAgentJson: unknown; agentName: s
 			// Warren's plan children execute through the Sapling runtime on
 			// Burrow. Older patrol definitions pinned the former `pi` agent;
 			// normalize that stale value so reap cannot create new pi children.
-			if (override !== undefined) return override === "pi" ? "sapling" : override;
+			if (override !== undefined) {
+				return override === "pi" || override === "pi-chat" ? "sapling" : override;
+			}
 		}
 	}
 	return run.agentName === "pi" ? "sapling" : run.agentName;
