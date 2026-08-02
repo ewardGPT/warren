@@ -29,10 +29,10 @@
 #     Run the housekeeping checklist and file seeds for anything off.
 
 - id: nightwatch-patrol
-  maxCostUsd: 2
   kind: cron
   cron: '0 2 * * *'
   role: nightwatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Scan this repo for quality issues. Follow your procedure exactly.
@@ -40,10 +40,10 @@
     codebase is clean, report clean and exit.
 
 - id: bugwatch-triage
-  maxCostUsd: 2
   kind: cron
   cron: '0 5 * * 0,3'
   role: bugwatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Triage open bug seeds and plan fixes. Follow your procedure exactly.
@@ -56,10 +56,10 @@
 # entries require explicit human review.
 
 - id: gatewatch-patrol
-  maxCostUsd: 2
   kind: cron
   cron: '10 3 * * *'
   role: gatewatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Audit the last 36 hours of merged history for gate-integrity
@@ -72,10 +72,10 @@
     and exit.
 
 - id: ratchetwatch-patrol
-  maxCostUsd: 2
   kind: cron
   cron: '40 3 * * *'
   role: ratchetwatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Measure ratchet slack (coverage floors, grandfather lists, bundle
@@ -88,10 +88,10 @@
     If everything is tight, report tight and exit.
 
 - id: warden-digest
-  maxCostUsd: 1
   kind: cron
   cron: '0 5 * * 0'
   role: warden-digest
+  maxCostUsd: 1
   timezone: America/Los_Angeles
   prompt: |
     Re-wake the Audit Warden conversation if its anchoring run has idled,
@@ -100,10 +100,10 @@
     exactly. Today's date is {{date}}.
 
 - id: tastewatch-digest
-  maxCostUsd: 2
   kind: cron
   cron: '0 4 * * 0'
   role: tastewatch
+  maxCostUsd: 1
   timezone: America/Los_Angeles
   prompt: |
     Produce the weekly taste digest: stratified sample of the week's
@@ -113,19 +113,3 @@
     conversation (well-known title "Audit Warden") over
     POST /conversations/:id/messages — the existing 202 steering channel,
     report-only, no dispatch or new path. Today's date is {{date}}.
-
-- id: weekly-seed-drain
-  maxCostUsd: 5
-  kind: cron
-  cron: '0 2 * * *'
-  role: sapling
-  timezone: America/Los_Angeles
-  prompt: |
-    Run ml prime. Then sd ready --format json.
-    Work ONLY seeds labelled ready-for-agent (prefer those with an
-    approved plan - the plan steps are the brief, execute them exactly).
-    If no ready-for-agent seed exists, report "drain <date>: nothing
-    ready" and exit - do NOT pick unlabelled or needs-triage seeds.
-    Run the quality gate (bun run check:all) before committing.
-    ml record learnings in the appropriate domain.
-
