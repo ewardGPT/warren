@@ -37,6 +37,7 @@ export interface TriageMergeResult {
 export interface TriageCollectorInput {
 	readonly projectId: string;
 	readonly projectPath: string;
+	readonly gitUrl?: string;
 	readonly now: Date;
 }
 

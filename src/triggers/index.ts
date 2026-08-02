@@ -64,6 +64,11 @@ export {
 	type UpdateSeedExtensionsFn,
 } from "./tick.ts";
 export {
+	createGithubTriageCollector,
+	type GithubTriageCollectorOptions,
+	type TriageCommandRunner,
+} from "./triage-collectors.ts";
+export {
 	DEFAULT_TRIAGE_INBOX_PATH,
 	emptyTriageInbox,
 	loadTriageInbox,

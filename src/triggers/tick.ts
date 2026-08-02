@@ -191,6 +191,7 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 		const triage = await runTriageInboxPass({
 			projectId: project.id,
 			projectPath: project.localPath,
+			gitUrl: project.gitUrl,
 			now,
 			collect: deps.triage.collect,
 		});
