@@ -129,7 +129,7 @@ export interface PrContext {
  * git error or missing `sd` CLI degrades to empty data rather than
  * failing the PR open.
  */
-export async function gatherPrContext(input: GatherPrContextInput): Promise<PrContext> {
+async function gatherPrContext(input: GatherPrContextInput): Promise<PrContext> {
 	const [commits, diffStat, seed] = await Promise.all([
 		collectCommits(input.workspacePath, input.baseBranch, input.exec),
 		collectDiffStat(input.workspacePath, input.baseBranch, input.exec),
