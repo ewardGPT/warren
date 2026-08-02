@@ -8,6 +8,7 @@ export interface TerminalNotificationEnvelope {
 	readonly runId: string;
 	readonly projectId: string | null;
 	readonly seedId: string | null;
+	readonly plotId: string | null;
 	readonly state: "succeeded" | "failed" | "cancelled" | "timed_out";
 	readonly prUrl: string | null;
 	readonly costUsd: number | null;
@@ -32,6 +33,7 @@ export function canonicalNotificationBody(event: TerminalNotificationEnvelope): 
 		run_id: event.runId,
 		project_id: event.projectId,
 		seed_id: event.seedId,
+		plot_id: event.plotId,
 		state: event.state,
 		pr_url: event.prUrl,
 		cost_usd: event.costUsd,

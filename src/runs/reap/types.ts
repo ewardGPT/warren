@@ -1,6 +1,7 @@
 import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { RunFailureReason, RunTerminalState } from "../../db/schema.ts";
+import type { TerminalNotificationEnvelope } from "../../notifications/signature.ts";
 import type {
 	LaunchPreviewInput,
 	LaunchPreviewResult,
@@ -57,6 +58,10 @@ export interface ReapRunInput {
 	readonly exec?: ReapExec;
 	readonly now?: () => Date;
 	readonly logger?: BridgeLogger;
+	/** Best-effort terminal notification; invoked after durable state transition. */
+	readonly terminalNotification?: {
+		readonly emit: (event: TerminalNotificationEnvelope) => Promise<void>;
+	};
 	/**
 	 * Override the inferred failure reason (warren-3c40, warren-5165). Reap
 	 * normally infers from state-on-entry plus the event log: `queued` ⇒

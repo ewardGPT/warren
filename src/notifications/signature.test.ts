@@ -12,6 +12,7 @@ const event = {
 	runId: "run_1",
 	projectId: null,
 	seedId: "warren-ee6f",
+	plotId: null,
 	state: "succeeded" as const,
 	prUrl: null,
 	costUsd: 0.42,

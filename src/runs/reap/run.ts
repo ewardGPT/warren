@@ -1,6 +1,7 @@
 import type { BurrowClient } from "../../burrow-client/client.ts";
 import { withTransportMapping } from "../../burrow-client/client.ts";
 import type { EventRow, RunFailureReason, RunTerminalState } from "../../db/schema.ts";
+import { buildTerminalNotification } from "../../notifications/delivery.ts";
 import { bindBridgeLogger } from "../stream/index.ts";
 import { runWorkspaceDestroy } from "./destroy.ts";
 import { createPipelineState, runReapPipeline } from "./pipeline.ts";
@@ -162,6 +163,19 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		now(),
 		failureReason,
 	);
+	if (input.terminalNotification !== undefined) {
+		void input.terminalNotification
+			.emit(buildTerminalNotification(run, finalState, failureReason))
+			.catch((error: unknown) => {
+				log.warn(
+					{
+						event: "notification.emit_failed",
+						error: error instanceof Error ? error.message : String(error),
+					},
+					"terminal notification failed after run finalization",
+				);
+			});
+	}
 
 	await emit("reap.completed", {
 		state: finalState,
