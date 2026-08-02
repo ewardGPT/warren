@@ -29,6 +29,7 @@
 #     Run the housekeeping checklist and file seeds for anything off.
 
 - id: nightwatch-patrol
+  maxCostUsd: 2
   kind: cron
   cron: '0 2 * * *'
   role: nightwatch
@@ -39,6 +40,7 @@
     codebase is clean, report clean and exit.
 
 - id: bugwatch-triage
+  maxCostUsd: 2
   kind: cron
   cron: '0 5 * * 0,3'
   role: bugwatch
@@ -54,6 +56,7 @@
 # entries require explicit human review.
 
 - id: gatewatch-patrol
+  maxCostUsd: 2
   kind: cron
   cron: '10 3 * * *'
   role: gatewatch
@@ -69,6 +72,7 @@
     and exit.
 
 - id: ratchetwatch-patrol
+  maxCostUsd: 2
   kind: cron
   cron: '40 3 * * *'
   role: ratchetwatch
@@ -84,6 +88,7 @@
     If everything is tight, report tight and exit.
 
 - id: warden-digest
+  maxCostUsd: 1
   kind: cron
   cron: '0 5 * * 0'
   role: warden-digest
@@ -95,6 +100,7 @@
     exactly. Today's date is {{date}}.
 
 - id: tastewatch-digest
+  maxCostUsd: 2
   kind: cron
   cron: '0 4 * * 0'
   role: tastewatch
@@ -109,6 +115,7 @@
     report-only, no dispatch or new path. Today's date is {{date}}.
 
 - id: weekly-seed-drain
+  maxCostUsd: 5
   kind: cron
   cron: '0 2 * * *'
   role: sapling
