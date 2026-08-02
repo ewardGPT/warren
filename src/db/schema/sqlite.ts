@@ -43,6 +43,7 @@ import {
 	TABLE_NAMES,
 	WORKER_STATES,
 } from "./columns.ts";
+import { createSqliteGraphTables } from "./sqlite-graph.ts";
 
 /**
  * Canopy registry cache. Three tiers of rows live here, addressed by
@@ -264,11 +265,10 @@ export const events = sqliteTable(
  * One row per (project, trigger-id-from-.warren/triggers.yaml). The PK is a
  * composite string `<projectId>:<triggerId>` so the scheduler tick can write
  * back last/next fire timestamps without juggling a separate generated id —
- * the trigger's authoring identity in YAML is what survives across restarts.
  * Trigger definitions stay in .warren/triggers.yaml (R-02); only mutable
  * Scheduler bookkeeping lives here. last_run_id points at the most recent dispatched run
- * (ON DELETE SET NULL so deleting a run row doesn't
- * orphan the trigger). project_id is the cascade root — deleting the project
+ * (ON DELETE SET NULL so deleting a run row doesn't orphan the trigger). project_id is the cascade root —
+ * deleting the project
  * drops its triggers, mirroring the .warren/ clone going away with it.
  */
 export const triggers = sqliteTable(
@@ -283,6 +283,7 @@ export const triggers = sqliteTable(
 		nextFireAt: text("next_fire_at"),
 		lastRunId: text("last_run_id").references(() => runs.id, { onDelete: "set null" }),
 		fireCount: integer("fire_count").notNull().default(0),
+		completedAt: text("completed_at"),
 	},
 	(t) => [index(INDEX_NAMES.triggersProject).on(t.projectId)],
 );
@@ -450,31 +451,26 @@ export const planRunChildren = sqliteTable(
 	],
 );
 
-export type AgentRow = typeof agents.$inferSelect;
-export type AgentInsert = typeof agents.$inferInsert;
-export type ProjectRow = typeof projects.$inferSelect;
-export type ProjectInsert = typeof projects.$inferInsert;
-export type RunRow = typeof runs.$inferSelect;
-export type RunInsert = typeof runs.$inferInsert;
-export type EventRow = typeof events.$inferSelect;
-export type EventInsert = typeof events.$inferInsert;
-export type TriggerRow = typeof triggers.$inferSelect;
-export type TriggerInsert = typeof triggers.$inferInsert;
-export type WorkerRow = typeof workers.$inferSelect;
-export type WorkerInsert = typeof workers.$inferInsert;
-export type BurrowRow = typeof burrows.$inferSelect;
-export type BurrowInsert = typeof burrows.$inferInsert;
-/**
- * Plots projection (warren-9022). A read-cache that
- * mirrors full git-backed Plot state — NOT an authoritative store; source of
- * truth stays git. The `state_json` blob holds the entire plot state (schema
- * stable across plot-shape drift), and the promoted scalars (project_id /
- * status / title / updated_at) are denormalized out of it for list / index
- * queries. `project_id` FKs `projects.id` ON DELETE CASCADE (the projection
- * is rebuildable from git); `id` is the caller-supplied `plot-...` id
- * (PLOT_ID_REGEX, mx-28a262). See `columns.ts`'s `PlotProjectionState` for
- * the full framing.
- */
+const graphTables = createSqliteGraphTables({ projects, runs });
+export const { graphRuns, graphRunChildren } = graphTables;
+
+export type {
+	AgentInsert,
+	AgentRow,
+	BurrowInsert,
+	BurrowRow,
+	EventInsert,
+	EventRow,
+	ProjectInsert,
+	ProjectRow,
+	RunInsert,
+	RunRow,
+	TriggerInsert,
+	TriggerRow,
+	WorkerInsert,
+	WorkerRow,
+} from "./sqlite-types.ts";
+/** Git-backed Plot projection cache; `state_json` remains the source of truth. */
 export const plots = sqliteTable(
 	TABLE_NAMES.plots,
 	{
@@ -493,15 +489,7 @@ export const plots = sqliteTable(
 	],
 );
 
-/**
- * Conversations (warren-0b91). One row per
- * leveret conversation. N conversations bind to one Plot (N:1). The
- * anchoring `mode:'conversation'` run rotates on re-wake, so
- * `anchoring_run_id` is nullable and mutable. `project_id` FKs `projects.id`
- * ON DELETE SET NULL so deleting a project orphans (not blocks) its
- * conversations. `plot_id` is plain text (Plots live in the project
- * workspace). The transcript lives in `messages`; `events` is single-writer.
- */
+/** Leveret conversations bind to a Plot; transcript rows live in `messages`. */
 export const conversations = sqliteTable(
 	TABLE_NAMES.conversations,
 	{
@@ -552,13 +540,19 @@ export const messages = sqliteTable(
 	(t) => [index(INDEX_NAMES.messagesConversationSeq).on(t.conversationId, t.seq)],
 );
 
-export type PlanRunRow = typeof planRuns.$inferSelect;
-export type PlanRunInsert = typeof planRuns.$inferInsert;
-export type PlanRunChildRow = typeof planRunChildren.$inferSelect;
-export type PlanRunChildInsert = typeof planRunChildren.$inferInsert;
-export type PlotRow = typeof plots.$inferSelect;
-export type PlotInsert = typeof plots.$inferInsert;
-export type ConversationRow = typeof conversations.$inferSelect;
-export type ConversationInsert = typeof conversations.$inferInsert;
-export type MessageRow = typeof messages.$inferSelect;
-export type MessageInsert = typeof messages.$inferInsert;
+export type {
+	ConversationInsert,
+	ConversationRow,
+	GraphRunChildInsert,
+	GraphRunChildRow,
+	GraphRunInsert,
+	GraphRunRow,
+	MessageInsert,
+	MessageRow,
+	PlanRunChildInsert,
+	PlanRunChildRow,
+	PlanRunInsert,
+	PlanRunRow,
+	PlotInsert,
+	PlotRow,
+} from "./sqlite-types.ts";
