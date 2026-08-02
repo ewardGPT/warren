@@ -107,3 +107,16 @@
     conversation (well-known title "Audit Warden") over
     POST /conversations/:id/messages — the existing 202 steering channel,
     report-only, no dispatch or new path. Today's date is {{date}}.
+
+- id: weekly-seed-drain
+  kind: cron
+  cron: '0 9 * * 1'
+  role: sapling
+  timezone: America/Los_Angeles
+  prompt: |
+    Run ml prime. Then sd ready.
+    Complete the highest-priority unblocked open task in this repo,
+    preferring ready-for-agent seeds that carry an approved plan (the
+    plan steps are the brief - execute them exactly).
+    Run the quality gate (bun run check:all) before committing.
+    ml record learnings in the appropriate domain.
