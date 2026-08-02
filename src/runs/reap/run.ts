@@ -2,6 +2,7 @@ import type { BurrowClient } from "../../burrow-client/client.ts";
 import { withTransportMapping } from "../../burrow-client/client.ts";
 import type { EventRow, RunFailureReason, RunTerminalState } from "../../db/schema.ts";
 import { buildTerminalNotification } from "../../notifications/delivery.ts";
+import { buildResumeFeedback, completionSignalFromEvents } from "../completion-signal.ts";
 import { bindBridgeLogger } from "../stream/index.ts";
 import { runWorkspaceDestroy } from "./destroy.ts";
 import { createPipelineState, runReapPipeline } from "./pipeline.ts";
@@ -53,6 +54,14 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// project clone on disk, which is gone. Skip them and emit a system so
 	// operators can see why reap was a no-op.
 	const project = run.projectId !== null ? await input.repos.projects.get(run.projectId) : null;
+	const persistedEvents = await input.repos.events.listByRun(run.id);
+	const completionSignal = completionSignalFromEvents(
+		persistedEvents.map((event) => ({
+			kind: event.kind,
+			stream: event.stream,
+			payload: event.payloadJson,
+		})),
+	);
 	const seq = createSeqAllocator((await input.repos.events.maxSeqForRun(run.id)) ?? 0);
 	const errors: ReapStepError[] = [];
 	const emit = async (kind: string, payload: unknown): Promise<EventRow> => {
@@ -163,6 +172,18 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		now(),
 		failureReason,
 	);
+	const resumeFeedback =
+		effectiveOutcome === "failed"
+			? buildResumeFeedback(completionSignal, failureReason ?? "failed", providerErrorMessage)
+			: null;
+	if (resumeFeedback !== null) {
+		await emit("completion.feedback", {
+			completionSignal,
+			failureReason,
+			providerError: providerErrorMessage,
+			feedback: resumeFeedback,
+		});
+	}
 	if (input.terminalNotification !== undefined) {
 		void input.terminalNotification
 			.emit(buildTerminalNotification(run, finalState, failureReason))
@@ -181,6 +202,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state: finalState,
 		failureReason,
 		providerError: failedFromProviderError ? providerErrorMessage : null,
+		completionSignal,
+		resumeFeedback,
 		mulch: {
 			updated: state.mulchUpdated,
 			skipped: state.mulchSkipped,
@@ -263,6 +286,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state: finalState,
 		failureReason,
 		providerError: failedFromProviderError ? providerErrorMessage : null,
+		completionSignal,
+		resumeFeedback,
 		mulchUpdated: state.mulchUpdated,
 		mulchSkipped: state.mulchSkipped,
 		mulchAppended: state.mulchAppended,

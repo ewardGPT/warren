@@ -10,6 +10,7 @@ import type {
 import type { PreviewPortAllocator } from "../../preview/port-allocator.ts";
 import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
 import type { ServerPreviewConfig } from "../../warren-config/index.ts";
+import type { CompletionSignal } from "../completion-signal.ts";
 import type { RunEventBroker } from "../events.ts";
 import type { AutoOpenPrConfig, OpenPullRequestInput, OpenPullRequestResult } from "../pr.ts";
 import type { AnnotatePrPreviewInput, AnnotatePrPreviewResult } from "../pr-annotate.ts";
@@ -186,6 +187,10 @@ export interface ReapRunResult {
 	 * message (also emitted on the `reap.provider_error` event).
 	 */
 	readonly providerError: string | null;
+	/** Last valid structured completion signal recovered from persisted output. */
+	readonly completionSignal: CompletionSignal | null;
+	/** Resume prompt emitted for failed runs; null for successful runs. */
+	readonly resumeFeedback: string | null;
 	readonly mulchUpdated: number;
 	readonly mulchSkipped: number;
 	readonly mulchAppended: number;
