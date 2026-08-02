@@ -40,6 +40,14 @@ infrastructure:
   Plot transition when the final child merges. See SPEC §11.P and
   §11.P.Plot.
 
+  Cross-repo plans keep the plan and seed ownership in the coordination
+  project. Each child may set `extensions.repo` to a registered project slug
+  or git remote; Warren resolves that target before dispatch and runs the
+  child in that repository's Burrow workspace. An unresolved target fails the
+  plan rather than falling back to the coordination checkout. Plan-run child
+  execution is pinned to Sapling in Burrow; do not configure Pi as the runtime.
+  See `docs/cross-repo-planner.md` and `docs/examples/cross-repo-planner.json`.
+
 Same code, same depth — only the user-facing framing surfaces them as
 opt-in. When you change cross-cutting docs (README, SPEC §1/§2, package
 description), keep the standalone path primary and the integrations as
