@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.11] — 2026-08-02
+
+Patch release covering the Sapling runtime migration, bounded loop and graph
+orchestration, and cross-repository plan-run execution.
+
+### Added
+
+- Cross-repository plan-run routing with coordination-project seed stamping,
+  execution-repository visibility, serial merge gating, and end-to-end
+  acceptance coverage.
+- Bounded goal and graph runs, plus runtime guardrails for Sapling/Burrow
+  execution.
+
+### Changed
+
+- Seeded dispatches now route through each seed's declared repository while
+  preserving the coordination repository as the source of task state.
+
 ## [0.9.10] — 2026-07-01
 
 Patch release landing the plan-run merge-gate transient-4xx fix

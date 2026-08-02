@@ -3,7 +3,7 @@
 openapi: 3.1.0
 info:
   title: warren HTTP API
-  version: 0.9.10
+  version: 0.9.11
   description: >-
     Auto-generated from `src/server/handlers/index.ts`'s `ROUTE_TABLE`. Run `bun run gen:openapi` to
     refresh; CI fails if this schema drifts from the handler module. Request/response bodies are
@@ -19,6 +19,8 @@ tags:
     description: '`/burrows` routes.'
   - name: conversations
     description: '`/conversations` routes.'
+  - name: graph-runs
+    description: '`/graph-runs` routes.'
   - name: meta
     description: Liveness, readiness, and version.
   - name: metrics
@@ -230,6 +232,34 @@ paths:
       tags:
         - conversations
       summary: POST /conversations/:id/send-off
+      responses:
+        '200':
+          description: Successful response.
+        default:
+          description: Error response (see `src/core/errors.ts`).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+  /graph-runs:
+    post:
+      operationId: createGraphRunHandler
+      tags:
+        - graph-runs
+      summary: POST /graph-runs
+      responses:
+        '200':
+          description: Successful response.
+        default:
+          description: Error response (see `src/core/errors.ts`).
+  /graph-runs/{id}:
+    get:
+      operationId: getGraphRunHandler
+      tags:
+        - graph-runs
+      summary: GET /graph-runs/:id
       responses:
         '200':
           description: Successful response.
