@@ -1,5 +1,5 @@
 /**
- * Signed-cookie auth for the preview reverse proxy (R-19 / SPEC §11.L,
+ * Signed-cookie auth for the preview reverse proxy (R-19 / docs/design/preview-environments.md,
  * warren-8a10; path-mode scope addendum warren-edff / pl-f4ea; per-run
  * name + `Path=/` revision warren-63e1).
  *
@@ -7,15 +7,7 @@
  * directly — the cookie scope is the only way to keep a private-code
  * preview private. `createPreviewAuth(token, …)` derives an HMAC-SHA256
  * key from `WARREN_API_TOKEN` (label-scoped so a future preview-secret
- * rotation can be decoupled from the API token) and exposes three methods:
- *
- *   - `verifyLoginToken(candidate)` — constant-time compare against
- *     `WARREN_API_TOKEN`, used by the `/runs/:id/preview/login` handler to
- *     validate the `?token=` query param. The bearer arrives via query
- *     because the browser hop either crosses a subdomain (subdomain mode)
- *     or jumps to a different path scope (path mode); either way the
- *     handler bypasses the standard `Authorization` gate (see
- *     `isAuthExempt`) and calls this method explicitly.
+ * rotation can be decoupled from the API token) and exposes two methods:
  *
  *   - `signCookie(runId, now)` — produces a `<runId>.<expiresMs>.<sig>`
  *     payload and a `Set-Cookie` header value scoped per the
@@ -29,7 +21,7 @@
  *         every same-origin request (including `/_next/static/...` asset
  *         loads with a `/p/<id>/...` Referer), and the per-run name keeps
  *         sibling preview sessions isolated on the same browser
- *         (SPEC §11.L risk 4 mitigation). Earlier revisions scoped
+ *         (docs/design/preview-environments.md risk 4 mitigation). Earlier revisions scoped
  *         `Path=/p/<runId>/` but that blocked the cookie on the asset
  *         requests referer routing needs to authenticate.
  *     Both modes set `HttpOnly`, `Secure` (unless overridden), `SameSite=Lax`,
@@ -54,7 +46,7 @@
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
-/** Default cookie lifetime (24 hours). Matches the SPEC §11.L expectation
+/** Default cookie lifetime (24 hours). Matches the docs/design/preview-environments.md expectation
  *  that a reviewer's session covers an entire workday without re-login. */
 export const DEFAULT_COOKIE_TTL_MS = 24 * 3_600_000;
 
@@ -77,8 +69,6 @@ export function previewCookieName(runId: string, mode: "subdomain" | "path"): st
 const KEY_DERIVATION_LABEL = "::preview-cookie-v1";
 
 export interface PreviewAuth {
-	/** Constant-time compare a candidate token against `WARREN_API_TOKEN`. */
-	verifyLoginToken(candidate: string | null | undefined): boolean;
 	/**
 	 * Issue a signed cookie attesting access to `runId`. Returns a
 	 * `Set-Cookie` header value plus the parsed envelope so handlers can
@@ -116,7 +106,7 @@ export interface SignedCookie {
  *
  *  - `path` — cookie name `warren_preview_<runId>`, `Path=/` with no
  *    `Domain`. Per-run name keeps sibling preview sessions isolated on
- *    the same browser (SPEC §11.L risk 4 mitigation); `Path=/` ships the
+ *    the same browser (docs/design/preview-environments.md risk 4 mitigation); `Path=/` ships the
  *    cookie on every same-origin request so referer-based asset routing
  *    in the proxy preamble can authenticate `/_next/static/...`-style
  *    sub-resource loads.
@@ -157,15 +147,9 @@ export function createPreviewAuth(token: string, opts: CreatePreviewAuthOptions 
 	}
 	const scope = opts.scope ?? DEFAULT_SCOPE;
 	const secure = opts.secure ?? true;
-	const tokenBytes = new TextEncoder().encode(token);
-	const cookieKey = deriveCookieKey(tokenBytes);
+	const cookieKey = deriveCookieKey(new TextEncoder().encode(token));
 
 	return {
-		verifyLoginToken(candidate: string | null | undefined): boolean {
-			if (candidate === null || candidate === undefined || candidate.length === 0) return false;
-			return constantTimeEqualBytes(new TextEncoder().encode(candidate), tokenBytes);
-		},
-
 		signCookie(runId: string, now: Date, ttlMs: number = DEFAULT_COOKIE_TTL_MS): SignedCookie {
 			if (runId.length === 0) {
 				throw new Error("signCookie: runId must be non-empty");

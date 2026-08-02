@@ -12,7 +12,7 @@
  * `DefaultsConfigSchema`. `parsePreviewFile` parses a standalone
  * `preview.yaml` whose top-level document is the preview block itself. The
  * preview block accepts an optional `mode: path | subdomain` field
- * (warren-fcb7 / SPEC §11.L path-mode addendum) so a project can pin a
+ * (warren-fcb7 / docs/design/preview-environments.md path-mode addendum) so a project can pin a
  * routing mode for its previews; `WARREN_PREVIEW_MODE` (operator-facing,
  * env) wins on conflict — precedence is enforced at consumption time.
  *
@@ -41,11 +41,9 @@
 
 import { z } from "zod";
 import { parseDurationMs } from "../preview/duration.ts";
-import { CortexConfigSchema } from "./cortex-config.ts";
 import { CiFixerConfigSchema, HealerConfigSchema } from "./feature-loop-config.ts";
-import { GoalTriggerSchema, LoopTriggerSchema } from "./trigger-loop-config.ts";
+import { AdmissionConfigSchema, ResourcesConfigSchema } from "./resources-config.ts";
 
-export type { CortexConfig } from "./cortex-config.ts";
 // warren-3db0: re-exported so the historical import sites (and
 // `warren-config/index.ts`) keep resolving these from `./schema.ts`
 // after the extraction into `feature-loop-config.ts`.
@@ -62,7 +60,30 @@ export {
 	type HealerConfig,
 	HealerConfigSchema,
 } from "./feature-loop-config.ts";
-export type { GoalTrigger, LoopTrigger } from "./trigger-loop-config.ts";
+// warren-ac7a / pl-829f step 14: K8s resource + network defaults re-exported
+// from `resources-config.ts` (extracted for the file-size budget).
+export {
+	type AdmissionConfig,
+	AdmissionConfigSchema,
+	DEFAULT_K8S_CPU_LIMIT_MILLICORES,
+	DEFAULT_K8S_CPU_REQUEST_MILLICORES,
+	DEFAULT_K8S_MEMORY_LIMIT_MIB,
+	DEFAULT_K8S_MEMORY_REQUEST_MIB,
+	DEFAULT_K8S_NETWORK,
+	type NetworkPolicy,
+	NetworkPolicySchema,
+	type ResourcesConfig,
+	ResourcesConfigSchema,
+} from "./resources-config.ts";
+// Goal/Loop trigger variants (local graph-engineering work, map #29): the
+// trigger schema discriminates on `kind`; cron-only origin/main dropped the
+// goal/loop exports this module's consumers import.
+export {
+	type GoalTrigger,
+	GoalTriggerSchema,
+	type LoopTrigger,
+	LoopTriggerSchema,
+} from "./trigger-loop-config.ts";
 
 const TriggerIdSchema = z
 	.string()
@@ -113,7 +134,7 @@ const TimezoneSchema = z.string().min(1, "timezone must be non-empty if provided
 
 const PromptSchema = z.string().min(1, "prompt must be non-empty if provided");
 
-// warren-7be9 / SPEC §11.L: idle_ttl and max_lifetime are both string-duration
+// warren-7be9 / docs/design/preview-environments.md: idle_ttl and max_lifetime are both string-duration
 // fields (e.g. "30m", "8h", "1h30m"). The launcher / eviction worker parses
 // these into milliseconds; the schema only validates shape so malformed input
 // surfaces in the per-file errors envelope before reap-time. Compound forms
@@ -198,65 +219,13 @@ const PreviewConnectTimeoutSchema = DurationStringSchema.refine(
 
 const PreviewSetupSchema = z.string().min(1, "preview.setup must be non-empty");
 
-// warren-cd37 / SPEC §11.O (pl-0344 step 2): wall-clock budget for paused interactive turns.
-// `question_posed` transitions the run to `paused`; if `question_answered` doesn't arrive within
-// this window the supervisor respawns with a timeout warning (warren-2976). Bounds: 1s..24h.
-// Field is `.default()`-backed; the `DEFAULT_*` constant is the fallback when the block is absent.
-export const DEFAULT_AGENT_PAUSE_TIMEOUT_MS = 1_800_000; // 30 minutes
-
-const AgentPauseTimeoutMsSchema = z
-	.number()
-	.int("agent.pauseTimeoutMs must be an integer (milliseconds)")
-	.min(1_000, "agent.pauseTimeoutMs must be between 1s (1000) and 24h (86400000)")
-	.max(86_400_000, "agent.pauseTimeoutMs must be between 1s (1000) and 24h (86400000)");
-
 const AgentConfigSchema = z
 	.object({
-		pauseTimeoutMs: AgentPauseTimeoutMsSchema.default(DEFAULT_AGENT_PAUSE_TIMEOUT_MS),
 		skipGitHooks: z.boolean().optional(), // warren-8f4c: skip git-hooks arming on the host clone
 	})
 	.strict();
 
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
-
-// warren-005d: idle-timeout budget for a
-// mode:"conversation" anchoring run. The run stays non-terminal across turns,
-// so warren owns the deadline; when `now - conversations.last_activity_at`
-// exceeds this, the coordinator finalizes ONLY the run (→ succeeded) — the
-// conversation stays status='active' and the `messages` transcript survives.
-// Mirrors `agent.pauseTimeoutMs` (bounds 1s..24h, `.default()`-backed); the
-// `DEFAULT_*` constant is the fallback when the block is absent.
-export const DEFAULT_CONVERSATION_IDLE_TIMEOUT_MS = 1_200_000; // 20 minutes
-
-const ConversationIdleTimeoutMsSchema = z
-	.number()
-	.int("conversation.idleTimeoutMs must be an integer (milliseconds)")
-	.min(1_000, "conversation.idleTimeoutMs must be between 1s (1000) and 24h (86400000)")
-	.max(86_400_000, "conversation.idleTimeoutMs must be between 1s (1000) and 24h (86400000)");
-
-const ConversationConfigSchema = z
-	.object({
-		idleTimeoutMs: ConversationIdleTimeoutMsSchema.default(DEFAULT_CONVERSATION_IDLE_TIMEOUT_MS),
-	})
-	.strict();
-
-export type ConversationConfig = z.infer<typeof ConversationConfigSchema>;
-
-// warren-cd22: per-project configuration for plot sync to GitHub (pl-5a6c).
-// mergeStrategy controls when changes are merged (immediate / auto / manual).
-// targetBranch overrides the default branch when pushing changes.
-const PlotSyncMergeStrategySchema = z.enum(["immediate", "auto", "manual"]);
-
-export type PlotSyncMergeStrategy = z.infer<typeof PlotSyncMergeStrategySchema>;
-
-const PlotSyncConfigSchema = z
-	.object({
-		mergeStrategy: PlotSyncMergeStrategySchema.optional(),
-		targetBranch: z.string().min(1, "targetBranch must be non-empty if provided").optional(),
-	})
-	.strict();
-
-export type PlotSyncConfig = z.infer<typeof PlotSyncConfigSchema>;
 
 // warren-b802: per-project override of the burrow runtime backing the
 // planner interactive built-in agent. Without this, an
@@ -276,7 +245,7 @@ const InteractiveAgentsConfigSchema = z
 
 export type InteractiveAgentsConfig = z.infer<typeof InteractiveAgentsConfigSchema>;
 
-// warren-fcb7 / SPEC §11.L (path-mode addendum, pl-f4ea): per-project pin of
+// warren-fcb7 / docs/design/preview-environments.md (path-mode addendum, pl-f4ea): per-project pin of
 // the preview routing mode. Operator-facing surface is `WARREN_PREVIEW_MODE`
 // in env; this top-level field on `.warren/preview.yaml` lets a project
 // declare its own preference when the operator runs warren in a mixed
@@ -289,7 +258,7 @@ export type PreviewMode = z.infer<typeof PreviewModeSchema>;
 /** Default routing mode when neither env nor per-project pin is set. */
 export const DEFAULT_PREVIEW_MODE: PreviewMode = "path";
 
-// warren-7be9 / SPEC §11.L: the schema carries a `type` discriminator from
+// warren-7be9 / docs/design/preview-environments.md: the schema carries a `type` discriminator from
 // day one so V2 can add `type: 'static'` (build step + dir to serve) without
 // breaking the config. V1 implements only `type: 'server'`. `type: 'static'`
 // is accepted by the parser but rejected at launch time by the reap-step
@@ -352,11 +321,8 @@ const CronTriggerSchema = z
 	})
 	.strict();
 
-export const TriggerSchema = z.discriminatedUnion("kind", [
-	CronTriggerSchema,
-	GoalTriggerSchema,
-	LoopTriggerSchema,
-]);
+export const TriggerSchema = z.discriminatedUnion("kind", [CronTriggerSchema]);
+
 export const TriggersConfigSchema = z.array(TriggerSchema).superRefine((list, ctx) => {
 	const seen = new Set<string>();
 	list.forEach((entry, index) => {
@@ -387,26 +353,25 @@ export const DefaultsConfigSchema = z
 		// warren-9993: run branch prefix; spawnRun composes `${prefix}/${run.id}`.
 		// Precedence: project default > WARREN_RUN_BRANCH_PREFIX env > "burrow".
 		runBranchPrefix: RunBranchPrefixSchema.optional(),
-		// warren-7be9 / SPEC §11.L: per-run preview environments (R-19). Canonical
+		// warren-7be9 / docs/design/preview-environments.md: per-run preview environments (R-19). Canonical
 		// home is `.warren/preview.yaml` (post-warren-5840); this nested field is
 		// still accepted for migration — when both exist, `preview.yaml` wins.
 		preview: PreviewConfigSchema.optional(),
-		// warren-cd37 / SPEC §11.O: per-project agent-runtime knobs (only
-		// `pauseTimeoutMs` today). Missing block → use the DEFAULT_* fallback.
+		// warren-8f4c: per-project agent-runtime knobs (only `skipGitHooks`
+		// today). Missing block → defaults apply.
 		agent: AgentConfigSchema.optional(),
-		// warren-005d: conversation-runtime knobs (`idleTimeoutMs`).
-		conversation: ConversationConfigSchema.optional(),
 		// warren-b802: override of the burrow runtime backing interactive built-in
 		// agents. Precedence: config override > agent frontmatter.runtime > name.
 		interactiveAgents: InteractiveAgentsConfigSchema.optional(),
-		// warren-cd22: per-project plot-sync-to-GitHub configuration.
-		plotSync: PlotSyncConfigSchema.optional(),
+		// warren-ac7a / pl-829f step 14: K8s pod resource + network defaults
+		// (design §3.1). Absent → the pod-spec builder uses DEFAULT_K8S_* constants.
+		resources: ResourcesConfigSchema.optional(),
+		// warren-b6f2: per-project admission control (K8s, design §3.3).
+		admission: AdmissionConfigSchema.optional(),
 		// warren-05ea: opt-in polling CI-fixer; missing block → poller skips it.
 		ciFixer: CiFixerConfigSchema.optional(),
 		// warren-3db0: opt-in closed-loop healer; missing block → intake skips it.
 		healer: HealerConfigSchema.optional(),
-		// Agent Cortex: optional URL/role overrides when `cortex.yaml` is present.
-		cortex: CortexConfigSchema.optional(),
 		qualityGate: z.string().min(1, "qualityGate must be non-empty if provided").optional(),
 	})
 	.strict();
@@ -418,7 +383,7 @@ export type ParseResult<T> =
 	| { readonly ok: false; readonly message: string };
 
 export function parseTriggersConfig(raw: unknown): ParseResult<TriggersConfig> {
-	// Empty file (yaml.load returns undefined) is the same as "no triggers"
+	// Empty / comment-only file (parses to undefined) is the same as "no triggers"
 	// — operators should be able to scaffold the file without forcing an
 	// explicit empty list literal.
 	if (raw === undefined || raw === null) {

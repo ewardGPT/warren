@@ -219,4 +219,64 @@ describe("cloneProjectRepo", () => {
 			}),
 		).rejects.toBeInstanceOf(ProjectUnavailableError);
 	});
+
+	test("token → clone + set-head spawns carry the credential env; token stays out of argv", async () => {
+		const envs: (Record<string, string | undefined> | undefined)[] = [];
+		const cmds: (readonly string[])[] = [];
+		const spawn: SpawnFn = async (cmd, opts) => {
+			cmds.push(cmd);
+			envs.push(opts.env);
+			// First symbolic-ref misses so the set-head recovery path runs.
+			if (cmd[1] === "symbolic-ref") {
+				return cmds.filter((c) => c[1] === "symbolic-ref").length === 1
+					? { stdout: "", stderr: "no HEAD", exitCode: 1 }
+					: ok("refs/remotes/origin/main\n");
+			}
+			return ok();
+		};
+		const fs = fsStubs();
+		await cloneProjectRepo({
+			config: CFG,
+			gitUrl: "https://github.com/x/private.git",
+			owner: "x",
+			name: "private",
+			token: "ghp_secret",
+			spawn,
+			exists: fs.exists,
+			mkdirp: fs.mkdirp,
+			rmrf: fs.rmrf,
+		});
+
+		expect(cmds.map((c) => c[1])).toEqual(["clone", "symbolic-ref", "remote", "symbolic-ref"]);
+		const expectedCred = {
+			GIT_CONFIG_COUNT: "1",
+			GIT_CONFIG_KEY_0: "url.https://x-access-token:ghp_secret@github.com/.insteadOf",
+			GIT_CONFIG_VALUE_0: "https://github.com/",
+		};
+		expect(envs[0]).toEqual(expectedCred); // clone
+		expect(envs[2]).toEqual(expectedCred); // remote set-head (network recovery)
+		// The token never rides in argv — env-based config only.
+		expect(cmds.flat().join(" ")).not.toContain("ghp_secret");
+	});
+
+	test("no token → spawns receive no env override (anonymous clone unchanged)", async () => {
+		const envs: (Record<string, string | undefined> | undefined)[] = [];
+		const spawn: SpawnFn = async (cmd, opts) => {
+			envs.push(opts.env);
+			if (cmd[1] === "symbolic-ref") return ok("refs/remotes/origin/main\n");
+			return ok();
+		};
+		const fs = fsStubs();
+		await cloneProjectRepo({
+			config: CFG,
+			gitUrl: "https://github.com/x/public.git",
+			owner: "x",
+			name: "public",
+			spawn,
+			exists: fs.exists,
+			mkdirp: fs.mkdirp,
+			rmrf: fs.rmrf,
+		});
+		expect(envs.every((e) => e === undefined)).toBe(true);
+	});
 });

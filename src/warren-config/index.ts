@@ -20,6 +20,7 @@ export {
 	WARREN_CONFIG_FILE_ERROR_CODES,
 	type WarrenConfigFileError,
 	type WarrenConfigFileErrorCode,
+	WarrenConfigInvalidError,
 	WarrenConfigUnavailableError,
 } from "./errors.ts";
 export {
@@ -29,27 +30,33 @@ export {
 	loadWarrenConfig,
 	type ReadFileFn,
 } from "./load.ts";
+// warren-653f: ephemeral-storage defaults sourced straight from resources-config
+// (not routed through schema.ts) to keep that frozen-budget file unchanged.
+export {
+	DEFAULT_K8S_EPHEMERAL_STORAGE_LIMIT_MIB,
+	DEFAULT_K8S_EPHEMERAL_STORAGE_REQUEST_MIB,
+} from "./resources-config.ts";
 export {
 	type AgentConfig,
-	type ConversationConfig,
 	type CronTrigger,
-	DEFAULT_AGENT_PAUSE_TIMEOUT_MS,
-	DEFAULT_CONVERSATION_IDLE_TIMEOUT_MS,
 	DEFAULT_HEALER_COOLDOWN_MINUTES,
 	DEFAULT_HEALER_MAX_RETRIES,
 	DEFAULT_HEALER_ROLE,
+	DEFAULT_K8S_CPU_LIMIT_MILLICORES,
+	DEFAULT_K8S_CPU_REQUEST_MILLICORES,
+	DEFAULT_K8S_MEMORY_LIMIT_MIB,
+	DEFAULT_K8S_MEMORY_REQUEST_MIB,
+	DEFAULT_K8S_NETWORK,
 	DEFAULT_PREVIEW_MODE,
 	type DefaultsConfig,
 	DefaultsConfigSchema,
-	type GoalTrigger,
 	type HealerConfig,
 	type InteractiveAgentsConfig,
 	interactiveRuntimeOverride,
 	KNOWN_RUNTIME_IDS,
-	type LoopTrigger,
+	type NetworkPolicy,
+	NetworkPolicySchema,
 	type ParseResult,
-	type PlotSyncConfig,
-	type PlotSyncMergeStrategy,
 	type PreviewConfig,
 	PreviewConfigSchema,
 	type PreviewMode,
@@ -58,6 +65,7 @@ export {
 	parseDefaultsConfig,
 	parsePreviewFile,
 	parseTriggersConfig,
+	type ResourcesConfig,
 	type RuntimeId,
 	type ServerPreviewConfig,
 	type StaticPreviewConfig,

@@ -61,17 +61,11 @@ export function CommandCategoryChart({ byCategory }: { byCategory: CommandCatego
 			</CardHeader>
 			<CardContent>
 				{byCategory.length === 0 ? (
-					<p className="py-6 text-sm text-(--color-muted-foreground)">
-						No data in this window.
-					</p>
+					<p className="py-6 text-sm text-(--color-muted-foreground)">No data in this window.</p>
 				) : (
 					<ChartContainer>
 						<BarChart data={byCategory} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
-							<CartesianGrid
-								strokeDasharray="3 3"
-								stroke="var(--color-border)"
-								vertical={false}
-							/>
+							<CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
 							<XAxis dataKey="category" {...AXIS_PROPS} interval={0} />
 							<YAxis allowDecimals={false} {...AXIS_PROPS} />
 							<Tooltip contentStyle={TOOLTIP_STYLE} />
@@ -120,7 +114,9 @@ export function StuckCommandTable({ byStuckScore }: { byStuckScore: CommandStat[
 			</CardHeader>
 			<CardContent>
 				{byStuckScore.length === 0 ? (
-					<p className="text-sm text-(--color-muted-foreground)">No stuck commands in this window.</p>
+					<p className="text-sm text-(--color-muted-foreground)">
+						No stuck commands in this window.
+					</p>
 				) : (
 					<Table>
 						<TableHeader>
@@ -139,9 +135,7 @@ export function StuckCommandTable({ byStuckScore }: { byStuckScore: CommandStat[
 									key={stat.command}
 									className={stat.osEco ? "bg-(--color-info)/5" : undefined}
 								>
-									<TableCell className="max-w-[320px] truncate">
-										{renderCommand(stat)}
-									</TableCell>
+									<TableCell className="max-w-[320px] truncate">{renderCommand(stat)}</TableCell>
 									<TableCell className="whitespace-nowrap text-right font-mono text-xs text-(--color-destructive)">
 										{stat.stuckScore}
 									</TableCell>

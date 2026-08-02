@@ -1,5 +1,5 @@
 /**
- * Reverse proxy preamble for per-run previews (R-19 / SPEC §11.L,
+ * Reverse proxy preamble for per-run previews (R-19 / docs/design/preview-environments.md,
  * warren-8a10; path-mode addendum warren-8085 + HTML rewrite warren-ab3a
  * / pl-f4ea; SPA out-of-the-box revision warren-63e1). Split into
  * `proxy/` modules in warren-b902.
@@ -39,7 +39,7 @@
  *      **401** pointing the browser at `/runs/:id/preview/login`.
  *
  *   4. **last_hit_at debounce.** Update `runs.preview_last_hit_at`
- *      **before** forwarding (SPEC §11.L) — debounced via an in-memory
+ *      **before** forwarding (docs/design/preview-environments.md) — debounced via an in-memory
  *      `Map<runId, lastFlushAtMs>` to ~once per `DEFAULT_DEBOUNCE_MS`.
  *
  *   5. **Forward.** Rewrite the URL to `http://127.0.0.1:<preview_port>`,
@@ -57,7 +57,7 @@
  * so unit tests don't touch real sockets or wait on real timers.
  */
 
-import { LOCAL_WORKER_NAME } from "../../burrow-client/pool.ts";
+import { LOCAL_WORKER_NAME } from "../../runs/worker-identity.ts";
 import type { PreviewMode } from "../../warren-config/index.ts";
 import { DEFAULT_DEBOUNCE_MS, forwardToUpstream, maybeFlushLastHit } from "./forward.ts";
 import { previewError, previewUnauthorized } from "./responses.ts";
@@ -151,10 +151,15 @@ export function createPreviewProxyHandler(deps: PreviewProxyDeps): PreviewProxyH
 		}
 
 		if (run.workerId !== null && run.workerId !== localWorkerName) {
+			// The preamble runs BEFORE the auth gate, so this body reaches
+			// anonymous callers — never interpolate `run.workerId` into it.
+			// `workerId` is a REDACTED_RUN_FIELDS member (warren-946f): internal
+			// worker topology is operator-only shape, and scenario 39 now drives
+			// this exact path with a sentinel in the column (warren-b0bd).
 			return previewError(
 				501,
 				"preview_remote_worker",
-				`preview proxying is local-worker-only in V1; run.worker_id=${run.workerId} (R-12 deferral, see SPEC §11.L)`,
+				"preview proxying is local-worker-only in V1; the run lives on a remote worker (R-12 deferral, see docs/design/preview-environments.md)",
 			);
 		}
 
@@ -195,7 +200,7 @@ export function createPreviewProxyHandler(deps: PreviewProxyDeps): PreviewProxyH
 			return previewUnauthorized(runId, deps.config, url);
 		}
 
-		// SPEC §11.L: update last_hit_at BEFORE forwarding (debounced).
+		// docs/design/preview-environments.md: update last_hit_at BEFORE forwarding (debounced).
 		await maybeFlushLastHit(deps.repos, run, lastFlush, debounceMs, now());
 
 		const pathPrefix = mode === "path" ? `${PREVIEW_PATH_PREFIX}/${runId}` : null;

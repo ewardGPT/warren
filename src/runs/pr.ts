@@ -18,14 +18,9 @@ export {
 	type CheckPrMergedResult,
 	type CheckPullRequestMergedInput,
 	checkPullRequestMerged,
-	isRateLimited,
-	type MergePullRequestInput,
-	type MergePullRequestResult,
-	mergePullRequest,
-	PR_SHORT_RE,
 	PR_URL_RE,
-	parsePullRequestRef,
 	parsePullRequestUrl,
+	parseRetryAfterMs,
 } from "./pr-checks.ts";
 
 /**
@@ -220,7 +215,7 @@ export interface BuildPrContentInput {
 	readonly tokensOutput?: number;
 	readonly tokensCacheRead?: number;
 	/**
-	 * Project opted into per-run preview environments (R-19 / SPEC §11.L).
+	 * Project opted into per-run preview environments (R-19 / docs/design/preview-environments.md).
 	 * When true, the body includes a `preview_url_or_placeholder` fragment
 	 * (a `## Preview` section bracketed by `<!-- warren:preview-start -->`
 	 * and `<!-- warren:preview-end -->`) so reap's `pr_annotate_preview`
@@ -325,6 +320,18 @@ function buildContext(input: BuildPrContentInput): PrFragmentContext {
 export interface AutoOpenPrConfig {
 	readonly enabled: boolean;
 	readonly token: string;
+	/**
+	 * Raw `GITHUB_TOKEN` for host-side git network ops against private
+	 * repos (project clone, refresh fetch, plan-run seed-close push),
+	 * applied per-spawn via `githubCredentialGitEnv`. Deliberately
+	 * separate from `token`: the acceptance seam below synthesizes a
+	 * `stub-token` there, which must never become a real git credential.
+	 * Undefined/empty → anonymous git (public repos only). The
+	 * supervisor's global insteadOf rule makes this redundant on the
+	 * local topology; under `WARREN_RUNTIME=k8s` (bare `warren serve`,
+	 * no supervisor) it is the ONLY thing authenticating these ops.
+	 */
+	readonly gitToken?: string;
 	readonly warrenBaseUrl: string | null;
 }
 
@@ -351,6 +358,8 @@ export function loadAutoOpenPrConfigFromEnv(env: AutoOpenEnvLike = process.env):
 	return {
 		enabled,
 		token,
+		// Raw only — never the synthetic stub-token (see AutoOpenPrConfig.gitToken).
+		gitToken: env.GITHUB_TOKEN,
 		warrenBaseUrl: env.WARREN_BASE_URL ?? null,
 	};
 }

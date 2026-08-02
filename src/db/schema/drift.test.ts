@@ -16,31 +16,23 @@ import { getTableConfig as getPgTableConfig, type PgTable } from "drizzle-orm/pg
 import { getTableConfig as getSqliteTableConfig, type SQLiteTable } from "drizzle-orm/sqlite-core";
 import {
 	agents as pgAgents,
-	burrows as pgBurrows,
-	conversations as pgConversations,
 	events as pgEvents,
-	messages as pgMessages,
 	planRunChildren as pgPlanRunChildren,
 	planRuns as pgPlanRuns,
-	plots as pgPlots,
 	projects as pgProjects,
+	runInbox as pgRunInbox,
 	runs as pgRuns,
 	triggers as pgTriggers,
-	workers as pgWorkers,
 } from "./postgres.ts";
 import {
 	agents as sqliteAgents,
-	burrows as sqliteBurrows,
-	conversations as sqliteConversations,
 	events as sqliteEvents,
-	messages as sqliteMessages,
 	planRunChildren as sqlitePlanRunChildren,
 	planRuns as sqlitePlanRuns,
-	plots as sqlitePlots,
 	projects as sqliteProjects,
+	runInbox as sqliteRunInbox,
 	runs as sqliteRuns,
 	triggers as sqliteTriggers,
-	workers as sqliteWorkers,
 } from "./sqlite.ts";
 
 const SQLITE_TABLES: Record<string, SQLiteTable> = {
@@ -49,13 +41,9 @@ const SQLITE_TABLES: Record<string, SQLiteTable> = {
 	runs: sqliteRuns,
 	events: sqliteEvents,
 	triggers: sqliteTriggers,
-	workers: sqliteWorkers,
-	burrows: sqliteBurrows,
 	planRuns: sqlitePlanRuns,
 	planRunChildren: sqlitePlanRunChildren,
-	plots: sqlitePlots,
-	conversations: sqliteConversations,
-	messages: sqliteMessages,
+	runInbox: sqliteRunInbox,
 };
 
 const PG_TABLES: Record<string, PgTable> = {
@@ -64,13 +52,9 @@ const PG_TABLES: Record<string, PgTable> = {
 	runs: pgRuns,
 	events: pgEvents,
 	triggers: pgTriggers,
-	workers: pgWorkers,
-	burrows: pgBurrows,
 	planRuns: pgPlanRuns,
 	planRunChildren: pgPlanRunChildren,
-	plots: pgPlots,
-	conversations: pgConversations,
-	messages: pgMessages,
+	runInbox: pgRunInbox,
 };
 
 type AnyTable = keyof typeof SQLITE_TABLES;
@@ -207,13 +191,9 @@ const TABLE_KEYS: AnyTable[] = [
 	"runs",
 	"events",
 	"triggers",
-	"workers",
-	"burrows",
 	"planRuns",
 	"planRunChildren",
-	"plots",
-	"conversations",
-	"messages",
+	"runInbox",
 ];
 
 describe("schema dialect parity (sqlite ↔ postgres)", () => {

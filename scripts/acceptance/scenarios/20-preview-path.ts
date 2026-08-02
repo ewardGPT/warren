@@ -1,6 +1,6 @@
 /**
  * Scenario 20-path — path-mode previews end-to-end
- * (R-19 / SPEC §11.L addendum, warren-7b3c / pl-f4ea step 8).
+ * (R-19 / docs/design/preview-environments.md path-mode addendum, warren-7b3c / pl-f4ea step 8).
  *
  * Sibling of scenario 20 (subdomain mode). Locks down the path-mode
  * acceptance criterion (#2 on pl-f4ea): a fresh-install warren with no
@@ -25,12 +25,13 @@
  *      assigned.
  *   2. Anonymous `GET <warrenUrl>/p/<runId>/` is rejected with 401 by
  *      the path-mode proxy preamble (cookie required).
- *   3. `GET /runs/<runId>/preview/login?token=…&redirect=…` returns 302
+ *   3. `POST /runs/<runId>/preview/login` (bearer in the `Authorization`
+ *      header, warren-e1b0) returns 200
  *      with a `Set-Cookie: warren_preview_<runId>=…; Path=/` —
  *      per-run cookie name + root `Path` (warren-63e1) is what makes
  *      referer-based asset routing authenticate `/_next/static/...`
  *      sub-resource loads and isolates sibling-run sessions in the same
- *      browser (SPEC §11.L risk 4 mitigation).
+ *      browser (docs/design/preview-environments.md risk 4 mitigation).
  *   4. Authenticated `GET <warrenUrl>/p/<runId>/` returns 200, the body
  *      carries the upstream `preview-ok` marker (proves the proxy hit
  *      the sidecar, not a sibling port) AND the path-mode HTML
@@ -47,7 +48,7 @@
  *
  *   - **macOS** — burrow's bwrap-based inbound-port-forwarding (R-08)
  *     is Linux-only (mx-1d31f0).
- *   - **Postgres dialect** — the SPEC §11.L port allocator + eviction
+ *   - **Postgres dialect** — the docs/design/preview-environments.md port allocator + eviction
  *     worker are sqlite-only today (mx-b82a55).
  */
 
@@ -124,7 +125,7 @@ async function runPathHappyPath(ctx: ScenarioCtx): Promise<void> {
 				WARREN_STUB_SLEEP_MS: "0",
 				// Path mode: WARREN_PREVIEW_HOST deliberately unset. The
 				// fresh-install promise is that the operator needs nothing
-				// beyond `fly deploy` + a warren API token.
+				// beyond a single-box deploy + a warren API token.
 				WARREN_PREVIEW_MODE: "path",
 				WARREN_PREVIEW_IDLE_TTL: "30m",
 				WARREN_PREVIEW_MAX_LIFETIME: "8h",
@@ -134,7 +135,7 @@ async function runPathHappyPath(ctx: ScenarioCtx): Promise<void> {
 		ctx.logger.info(`scenario-20-path: warren ready at ${handle.warrenUrl}`);
 
 		const http = new WarrenHttp({ baseUrl: handle.warrenUrl, token: handle.token });
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// stub-shell is seeded at boot via WARREN_SEED_AGENTS_FILE (warren-e376).
 		const project = await ensureProject(http, sample.gitUrl);
 
 		const created = await http.expectJson<CreateRunResponse>("POST", "/runs", 201, {

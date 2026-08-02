@@ -11,7 +11,7 @@
 #
 # Key envelope is the terminal `result` carrying `total_cost_usd` +
 # `usage.{input_tokens,output_tokens,cache_read_input_tokens,
-# cache_creation_input_tokens}` — warren's bridge (src/runs/stream.ts)
+# cache_creation_input_tokens}` — warren's bridge (src/runs/stream/bridge.ts)
 # `extractClaudeUsage` reads it on terminal detection and persists into
 # `runs.cost_usd` / `runs.tokens_*`. Scenario 17 asserts the columns
 # are non-null after this script exits.
@@ -33,16 +33,6 @@ emit '{"type":"system","subtype":"init","session_id":"sess_stub","model":"claude
 # jsonl-claude parser's mapAssistantBlock. Useful as the "at least one
 # event" signal scenario 17 polls on.
 emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ack"}]}}'
-
-# Plot integration (warren-06dc / pl-7937 step 8): when burrow forwards
-# PLOT_ID + PLOT_ACTOR into the sandbox (warren-e26f via plan-run
-# composePlotEnv), surface them as a text envelope so scenario 27 can
-# assert env propagation per acceptance criterion #6. Gated on PLOT_ID
-# so scenarios that don't bind a Plot (26, 17) are unaffected.
-if [ -n "${PLOT_ID:-}" ]; then
-  _plot_actor_safe="${PLOT_ACTOR:-<unset>}"
-  emit "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"claude-stub: PLOT_ID=${PLOT_ID} PLOT_ACTOR=${_plot_actor_safe}\"}]}}"
-fi
 
 # Plan-run mode (warren-ae00 / scenario 26): when the prompt embeds
 # `closeseed <id>`, close the named seed in the burrow workspace so

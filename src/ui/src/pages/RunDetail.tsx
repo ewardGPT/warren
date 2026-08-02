@@ -2,12 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CircleStop, ExternalLink, RefreshCw, Send, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import {
-	buildPreviewLoginUrl,
-	formatPreviewUrl,
-	previewApi,
-	runsApi,
-} from "@/api/client.ts";
+import { formatPreviewUrl, previewApi, runsApi } from "@/api/client.ts";
 import type {
 	CancelRunResponse,
 	PreviewState,
@@ -16,22 +11,20 @@ import type {
 	RunEvent,
 	RunRow,
 } from "@/api/types.ts";
-import { PREVIEW_ACTIVE_STATES, RUN_TERMINAL_STATES } from "@/api/types.ts";
-import { PlotMetaCardContent } from "@/components/PlotMetaCardContent.tsx";
+import { isActivePreviewState, isTerminalRunState } from "@/api/types.ts";
+import { OperatorOnly } from "@/components/OperatorOnly.tsx";
 import { StateBadge } from "@/components/StateBadge.tsx";
-import { StatusIndicator } from "@/components/StatusIndicator.tsx";
+import { RunFailureBadge, StatusIndicator } from "@/components/StatusIndicator.tsx";
 import { Alert } from "@/components/ui/alert.tsx";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
-import {
-	responsiveFooterActions,
-	responsiveFooterButton,
-} from "@/components/ui/responsive.ts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import { Label } from "@/components/ui/label.tsx";
 import { AnimatePresence, StreamItem } from "@/components/ui/motion.tsx";
+import { responsiveFooterActions, responsiveFooterButton } from "@/components/ui/responsive.ts";
 import { Spinner } from "@/components/ui/spinner.tsx";
 import { Textarea } from "@/components/ui/textarea.tsx";
+import { useCapabilities } from "@/hooks/use-capabilities.ts";
 import { useEventStream } from "@/hooks/useEventStream.ts";
 import { formatError } from "@/lib/format-error.ts";
 import { formatTimestamp, relativeTime } from "@/lib/utils.ts";
@@ -48,7 +41,7 @@ const REFETCH_TRIGGER_KINDS: ReadonlySet<string> = new Set([
 	"cancel.requested",
 	"reap.completed",
 	"reap_failed",
-	// Preview lifecycle events (R-19 / SPEC §11.L, warren-c0b9) — each
+	// Preview lifecycle events (R-19 / docs/design/preview-environments.md, warren-c0b9) — each
 	// flips one of the `previewState` / `previewPort` / `previewStartedAt`
 	// columns on the run row, so refresh the query to surface the new
 	// badge + URL + teardown affordance.
@@ -68,12 +61,11 @@ export function RunDetailPage() {
 		refetchInterval: (q) => {
 			const data = q.state.data;
 			if (!data) return 5000;
-			return RUN_TERMINAL_STATES.includes(data.state) ? false : 3000;
+			return isTerminalRunState(data.state) ? false : 3000;
 		},
 	});
 
-	const isTerminal =
-		run.data !== undefined && RUN_TERMINAL_STATES.includes(run.data.state);
+	const isTerminal = run.data !== undefined && isTerminalRunState(run.data.state);
 	const stream = useEventStream(id, !isTerminal);
 
 	// Invalidate the run query when an event with a state-changing kind
@@ -102,7 +94,7 @@ export function RunDetailPage() {
 			// badges either.
 			void qc.invalidateQueries({ queryKey: ["runs"] });
 		}
-	}, [stream.events, id, qc]);
+	}, [stream.events, qc]);
 
 	const cancel = useMutation({
 		mutationFn: () => runsApi.cancel(id, {}),
@@ -132,9 +124,7 @@ export function RunDetailPage() {
 						<h1 className="font-mono text-xl font-semibold">{r.id}</h1>
 						<StateBadge state={r.state} />
 						{r.state === "failed" && r.failureReason !== null ? (
-							<Badge variant="cancelled" className="font-mono text-xs">
-								{r.failureReason}
-							</Badge>
+							<RunFailureBadge reason={r.failureReason} />
 						) : null}
 						{reap !== null && reap.branchPushed === true && reap.commitsAhead === 0 ? (
 							<Badge
@@ -174,56 +164,56 @@ export function RunDetailPage() {
 						)}
 					</p>
 				</div>
-				<div className="flex flex-col items-end gap-1">
-					{isTerminal ? (
-						<div className="flex gap-2">
+				<OperatorOnly>
+					<div className="flex flex-col items-end gap-1">
+						{isTerminal ? (
+							<div className="flex gap-2">
+								<Button
+									variant="outline"
+									onClick={() =>
+										navigate("/runs/new", {
+											state: {
+												cloneFromRunId: r.id,
+												agent: r.agentName,
+												project: r.projectId ?? undefined,
+												prompt: r.prompt,
+											} satisfies NewRunRouteState,
+										})
+									}
+								>
+									<RefreshCw className="h-4 w-4" />
+									Re-run from scratch
+								</Button>
+								<Button
+									variant="outline"
+									onClick={() =>
+										navigate("/runs/new", {
+											state: {
+												continueFromRunId: r.id,
+												agent: r.agentName,
+												project: r.projectId ?? undefined,
+												prompt: r.prompt,
+											} satisfies NewRunRouteState,
+										})
+									}
+								>
+									<Send className="h-4 w-4" />
+									Continue with follow-up
+								</Button>
+							</div>
+						) : (
 							<Button
-								variant="outline"
-								onClick={() =>
-									navigate("/runs/new", {
-										state: {
-											cloneFromRunId: r.id,
-											agent: r.agentName,
-											project: r.projectId ?? undefined,
-											plotId: r.plotId ?? undefined,
-											prompt: r.prompt,
-										} satisfies NewRunRouteState,
-									})
-								}
+								variant="destructive"
+								onClick={() => cancel.mutate()}
+								disabled={cancel.isPending || isTerminal}
 							>
-								<RefreshCw className="h-4 w-4" />
-								Re-run from scratch
+								<CircleStop className="h-4 w-4" />
+								{cancel.isPending ? "Cancelling…" : "Cancel"}
 							</Button>
-							<Button
-								variant="outline"
-								onClick={() =>
-									navigate("/runs/new", {
-										state: {
-											continueFromRunId: r.id,
-											agent: r.agentName,
-											project: r.projectId ?? undefined,
-											plotId: r.plotId ?? undefined,
-											prompt: r.prompt,
-										} satisfies NewRunRouteState,
-									})
-								}
-							>
-								<Send className="h-4 w-4" />
-								Continue with follow-up
-							</Button>
-						</div>
-					) : (
-						<Button
-							variant="destructive"
-							onClick={() => cancel.mutate()}
-							disabled={cancel.isPending || isTerminal}
-						>
-							<CircleStop className="h-4 w-4" />
-							{cancel.isPending ? "Cancelling…" : "Cancel"}
-						</Button>
-					)}
-					<CancelStatus mutation={cancel} />
-				</div>
+						)}
+						<CancelStatus mutation={cancel} />
+					</div>
+				</OperatorOnly>
 			</header>
 
 			{bridgeStalled ? (
@@ -237,25 +227,26 @@ export function RunDetailPage() {
 				<MetaCard label="Started">{formatTimestamp(r.startedAt)}</MetaCard>
 				<MetaCard label="Ended">{formatTimestamp(r.endedAt)}</MetaCard>
 				<MetaCard label="Trigger">{r.trigger}</MetaCard>
-				<MetaCard label="Burrow ID">
-					<span className="font-mono text-xs">{r.burrowId ?? "—"}</span>
-				</MetaCard>
-				<MetaCard label="Burrow Run">
-					<span className="font-mono text-xs">{r.burrowRunId ?? "—"}</span>
-				</MetaCard>
+				{/* Gated on presence (warren-f53e): runtime handles — burrow ids under
+				    burrow, pod name/UID under k8s (NOT null there; warren-0965) — and
+				    absent from a spectator's projection, where they rendered as two
+				    empty "—" jargon cards on the hero page. */}
+				{r.burrowId ? (
+					<MetaCard label="Sandbox ID">
+						<span className="font-mono text-xs">{r.burrowId}</span>
+					</MetaCard>
+				) : null}
+				{r.burrowRunId ? (
+					<MetaCard label="Sandbox Run">
+						<span className="font-mono text-xs">{r.burrowRunId}</span>
+					</MetaCard>
+				) : null}
 				<MetaCard label="Updated">{relativeTime(r.endedAt ?? r.startedAt)}</MetaCard>
 				{r.seedId !== null ? (
 					<MetaCard label="Seed">
-						<span
-							className="font-mono text-xs"
-							title="Seeds issue this run was dispatched against"
-						>
+						<span className="font-mono text-xs" title="Seeds issue this run was dispatched against">
 							{r.seedId}
 						</span>
-						<p className="mt-1 text-xs text-(--color-muted-foreground)">
-							The seed lives in the coordination project; for a cross-repo plan-run
-							child this may differ from the execution repo above.
-						</p>
 					</MetaCard>
 				) : null}
 				{r.prUrl !== null ? (
@@ -268,11 +259,6 @@ export function RunDetailPage() {
 						>
 							{r.prUrl}
 						</a>
-					</MetaCard>
-				) : null}
-				{r.plotId !== null ? (
-					<MetaCard label="Plot">
-						<PlotMetaCardContent plotId={r.plotId} />
 					</MetaCard>
 				) : null}
 				{r.parentRunId !== null ? (
@@ -300,14 +286,20 @@ export function RunDetailPage() {
 				</CardContent>
 			</Card>
 
+			{/* Steer sits ABOVE the event tail (warren-f53e): the tail is a
+			    fixed 480px log, so steering used to mean scrolling past the
+			    whole thing to reach the box you want to type in while the
+			    agent is running. */}
+			<OperatorOnly>
+				<SteerForm runId={r.id} disabled={isTerminal} />
+			</OperatorOnly>
+
 			<EventTail
 				events={stream.events}
 				status={stream.status}
 				error={stream.error}
 				terminal={isTerminal}
 			/>
-
-			<SteerForm runId={r.id} disabled={isTerminal} />
 		</div>
 	);
 }
@@ -320,9 +312,7 @@ function CancelStatus({
 	if (mutation.isError) {
 		return (
 			<p className="text-xs text-(--color-destructive)">
-				{mutation.error instanceof Error
-					? mutation.error.message
-					: String(mutation.error)}
+				{mutation.error instanceof Error ? mutation.error.message : String(mutation.error)}
 			</p>
 		);
 	}
@@ -335,11 +325,11 @@ function CancelStatus({
 				</p>
 			);
 		}
-		const burrowState = d.burrowRun?.state;
+		const runtimeState = d.burrowRun?.state; // pod phase under k8s (warren-0965)
 		return (
 			<p className="text-xs text-emerald-700 dark:text-emerald-300">
 				Cancel forwarded
-				{burrowState !== undefined ? ` (burrow: ${burrowState})` : ""}.
+				{runtimeState !== undefined ? ` (sandbox: ${runtimeState})` : ""}.
 			</p>
 		);
 	}
@@ -358,9 +348,7 @@ function CostCard({ run }: { run: RunRow }) {
 	return (
 		<Card>
 			<CardContent className="space-y-1 p-4">
-				<div className="text-xs uppercase tracking-wide text-(--color-muted-foreground)">
-					Cost
-				</div>
+				<div className="text-xs uppercase tracking-wide text-(--color-muted-foreground)">Cost</div>
 				<div className="font-mono text-lg">
 					{run.costUsd !== null ? (
 						formatCostUsd(run.costUsd)
@@ -369,9 +357,7 @@ function CostCard({ run }: { run: RunRow }) {
 					)}
 				</div>
 				{tokens !== null ? (
-					<div className="font-mono text-xs text-(--color-muted-foreground)">
-						{tokens}
-					</div>
+					<div className="font-mono text-xs text-(--color-muted-foreground)">{tokens}</div>
 				) : null}
 			</CardContent>
 		</Card>
@@ -379,18 +365,18 @@ function CostCard({ run }: { run: RunRow }) {
 }
 
 /**
- * Per-run preview environment surface (R-19 / SPEC §11.L, warren-c0b9).
+ * Per-run preview environment surface (R-19 / docs/design/preview-environments.md, warren-c0b9).
  * Renders one of four states populated by reap's `preview_launch` sub-
  * step + the eviction / teardown paths:
  *
  *   - `starting`  — readiness probe pending; teardown is allowed (lets
  *                    the operator abort a hung sidecar).
- *   - `live`      — proxy can route; surface an "Open Preview ↗" link
- *                    that goes through the auth-exempt login handshake
- *                    (signs a `warren_preview` cookie, 302s to the
+ *   - `live`      — proxy can route; surface an "Open ↗" button that
+ *                    runs the bearer-gated login handshake (signs a
+ *                    `warren_preview` cookie, answers with the
  *                    mode-correct target) and a teardown button. The
  *                    canonical URL is rendered as a copyable string so
- *                    operators can share it without the `?token=` query.
+ *                    operators can share it.
  *   - `failed`    — `previewFailureMessage` holds the stderr tail; no
  *                    URL, no teardown (already released).
  *   - `torn-down` — informational only; the port was released and the
@@ -405,16 +391,21 @@ function CostCard({ run }: { run: RunRow }) {
  */
 function PreviewCard({ run }: { run: RunRow }) {
 	const state = run.previewState;
+	const caps = useCapabilities();
 	const previewConfig = useQuery({
 		queryKey: ["preview", "config"],
 		queryFn: ({ signal }) => previewApi.config(signal),
 		// Deployment-wide config; only a warren restart changes it.
 		staleTime: Number.POSITIVE_INFINITY,
 		gcTime: Number.POSITIVE_INFINITY,
+		// `GET /preview/config` discloses WARREN_PREVIEW_HOST and is
+		// readOperator — don't fire a guaranteed 403 for a spectator
+		// (warren-f53e). Without it the card drops the canonical URL and
+		// mode badge, which are the operator's affordances anyway.
+		enabled: caps.can("readOperator"),
 	});
 	if (state === null) return null;
-	const isActive = PREVIEW_ACTIVE_STATES.includes(state);
-	const loginUrl = state === "live" ? buildPreviewLoginUrl(run.id) : null;
+	const isActive = isActivePreviewState(state);
 	const canonicalUrl =
 		state === "live" && previewConfig.data !== undefined
 			? formatPreviewUrl(run.id, previewConfig.data, window.location.origin)
@@ -441,22 +432,14 @@ function PreviewCard({ run }: { run: RunRow }) {
 						</Badge>
 					) : null}
 				</CardTitle>
-				{loginUrl !== null ? (
-					<a
-						href={loginUrl}
-						target="_blank"
-						rel="noreferrer noopener"
-						className="inline-flex items-center gap-1 font-mono text-xs underline underline-offset-2 hover:text-(--color-primary)"
-						title="Open the live preview"
-					>
-						Open <ExternalLink className="h-3.5 w-3.5" />
-					</a>
+				{state === "live" ? (
+					<OperatorOnly>
+						<PreviewOpenButton runId={run.id} />
+					</OperatorOnly>
 				) : null}
 			</CardHeader>
 			<CardContent className="space-y-3">
-				{canonicalUrl !== null ? (
-					<PreviewMetaLine label="URL" value={canonicalUrl} mono />
-				) : null}
+				{canonicalUrl !== null ? <PreviewMetaLine label="URL" value={canonicalUrl} mono /> : null}
 				<div className="grid gap-x-6 gap-y-1 text-xs sm:grid-cols-2">
 					{run.previewPort !== null ? (
 						<PreviewMetaLine label="Port" value={String(run.previewPort)} />
@@ -468,7 +451,7 @@ function PreviewCard({ run }: { run: RunRow }) {
 						<PreviewMetaLine label="Last hit" value={relativeTime(run.previewLastHitAt)} />
 					) : null}
 				</div>
-				{state === "failed" && run.previewFailureMessage !== null ? (
+				{state === "failed" && run.previewFailureMessage ? (
 					<pre
 						className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md bg-(--color-muted) p-2 font-mono text-xs text-(--color-destructive)"
 						title="Sidecar stderr / readiness-probe failure tail"
@@ -476,21 +459,17 @@ function PreviewCard({ run }: { run: RunRow }) {
 						{run.previewFailureMessage}
 					</pre>
 				) : null}
-				{isActive ? <PreviewTeardownButton runId={run.id} mode={mode} /> : null}
+				{isActive ? (
+					<OperatorOnly>
+						<PreviewTeardownButton runId={run.id} mode={mode} />
+					</OperatorOnly>
+				) : null}
 			</CardContent>
 		</Card>
 	);
 }
 
-function PreviewMetaLine({
-	label,
-	value,
-	mono,
-}: {
-	label: string;
-	value: string;
-	mono?: boolean;
-}) {
+function PreviewMetaLine({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
 	return (
 		<div className="flex items-baseline gap-2">
 			<span className="uppercase tracking-wide text-(--color-muted-foreground)">{label}</span>
@@ -499,9 +478,61 @@ function PreviewMetaLine({
 	);
 }
 
+/**
+ * "Open ↗" affordance for a live preview (warren-e1b0).
+ *
+ * This used to be an `<a href="/runs/:id/preview/login?token=…">`, which
+ * put the warren bearer in a URL — and therefore in browser history, in
+ * the `Referer` header of every preview sub-resource, and in any proxy
+ * or analytics log on the path. It is a button now: the click POSTs the
+ * bearer-gated handshake (credential in the `Authorization` header), the
+ * browser stores the `Set-Cookie` that response carries, and only then
+ * do we navigate to the mode-correct URL the server returned.
+ *
+ * The tab is opened *synchronously* inside the click handler and pointed
+ * at the target once the handshake resolves — a `window.open` issued
+ * from an async continuation is rejected by popup blockers. `opener` is
+ * nulled so the preview (untrusted, agent-authored code) can't reach
+ * back into the warren UI window; when the popup is blocked outright we
+ * fall back to navigating the current tab.
+ */
+function PreviewOpenButton({ runId }: { runId: string }) {
+	const login = useMutation({
+		mutationFn: () => runsApi.previewLogin(runId),
+	});
+	const openPreview = () => {
+		const tab = window.open("", "_blank");
+		if (tab !== null) tab.opener = null;
+		login.mutate(undefined, {
+			onSuccess: ({ url }) => {
+				if (tab !== null) tab.location.href = url;
+				else window.location.href = url;
+			},
+			onError: () => tab?.close(),
+		});
+	};
+	return (
+		<div className="flex flex-col items-end gap-1">
+			<Button
+				variant="outline"
+				size="sm"
+				onClick={openPreview}
+				disabled={login.isPending}
+				title="Sign a preview session cookie and open the live preview"
+			>
+				{login.isPending ? "Opening…" : "Open"}
+				<ExternalLink className="h-3.5 w-3.5" />
+			</Button>
+			{login.isError ? (
+				<p className="text-xs text-(--color-destructive)">{formatError(login.error)}</p>
+			) : null}
+		</div>
+	);
+}
+
 function PreviewStateBadge({ state }: { state: PreviewState }) {
 	// warren-3849: delegate to the unified StatusIndicator registry so
-	// preview state colour/icon/pulse stays in lockstep with Plot/Run.
+	// preview state colour/icon/pulse stays in lockstep with run state.
 	return <StatusIndicator kind="preview" status={state} />;
 }
 
@@ -607,6 +638,7 @@ function EventTail({
 		}
 	}, [autoScroll]);
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: sorted.length is the trigger, not a read
 	useEffect(() => {
 		if (!autoScroll || !ref.current) return;
 		ref.current.scrollTop = ref.current.scrollHeight;
@@ -650,9 +682,7 @@ function EventTail({
 				</div>
 			</CardHeader>
 			<CardContent>
-				{error !== null ? (
-					<p className="mb-2 text-xs text-(--color-destructive)">{error}</p>
-				) : null}
+				{error !== null ? <p className="mb-2 text-xs text-(--color-destructive)">{error}</p> : null}
 				<div
 					ref={ref}
 					onScroll={onScroll}
@@ -664,7 +694,9 @@ function EventTail({
 						<p className="p-4 text-(--color-muted-foreground)">No events yet.</p>
 					) : (
 						<AnimatePresence initial={false}>
-							{sorted.map((e) => <EventLine key={e.id} event={e} />)}
+							{sorted.map((e) => (
+								<EventLine key={e.id} event={e} />
+							))}
 						</AnimatePresence>
 					)}
 				</div>
@@ -788,9 +820,7 @@ function EventLineInner({ event }: { event: RunEvent }) {
 	const displayKind = sub !== null ? (PI_SUBKIND_LABELS[sub] ?? event.kind) : event.kind;
 	const summary = summarizeEvent(event);
 	const expanded =
-		typeof event.payload === "string"
-			? event.payload
-			: JSON.stringify(event.payload, null, 2);
+		typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload, null, 2);
 	return (
 		<details className={`group ${colour}`}>
 			<summary className="flex cursor-pointer items-baseline gap-2 select-none [&::-webkit-details-marker]:hidden">
@@ -912,9 +942,7 @@ function summarizeStateChange(payload: Record<string, unknown>): string {
 
 function summarizeTool(payload: Record<string, unknown>): string {
 	const name =
-		readString(payload.name) ??
-		readString(payload.tool) ??
-		readString(payload.tool_name);
+		readString(payload.name) ?? readString(payload.tool) ?? readString(payload.tool_name);
 	const exit = readNumber(payload.exit_code) ?? readNumber(payload.exitCode);
 	const parts: string[] = [];
 	if (name !== null) parts.push(name);
@@ -1044,9 +1072,7 @@ function SteerForm({ runId, disabled }: { runId: string; disabled: boolean }) {
 					</div>
 					{steer.isError ? (
 						<p className="text-sm text-(--color-destructive)">
-							{steer.error instanceof Error
-								? steer.error.message
-								: String(steer.error)}
+							{steer.error instanceof Error ? steer.error.message : String(steer.error)}
 						</p>
 					) : null}
 					{success ? (

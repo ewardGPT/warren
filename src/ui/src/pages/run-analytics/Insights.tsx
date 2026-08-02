@@ -13,10 +13,7 @@
 import type { Insight, InsightSeverity } from "@/api/client.ts";
 import { Card, CardContent } from "@/components/ui/card.tsx";
 
-const SEVERITY_STYLE: Record<
-	InsightSeverity,
-	{ border: string; badge: string; label: string }
-> = {
+const SEVERITY_STYLE: Record<InsightSeverity, { border: string; badge: string; label: string }> = {
 	critical: {
 		border: "border-l-(--color-destructive)",
 		badge: "bg-(--color-destructive) text-(--color-destructive-foreground)",
@@ -49,9 +46,7 @@ function InsightCard({ insight }: { insight: Insight }) {
 				</div>
 				<p className="text-xs text-(--color-muted-foreground)">{insight.detail}</p>
 				{insight.subject !== null ? (
-					<p className="font-mono text-[11px] text-(--color-muted-foreground)">
-						{insight.subject}
-					</p>
+					<p className="font-mono text-[11px] text-(--color-muted-foreground)">{insight.subject}</p>
 				) : null}
 			</CardContent>
 		</Card>

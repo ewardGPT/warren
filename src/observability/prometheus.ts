@@ -4,7 +4,7 @@
  *
  * Deliberately dependency-free — warren's low-dep + knip-strict ethos makes a
  * tiny pure encoder cleaner than pulling `prom-client` server-side. Emits the
- * exposition format Fly's managed Prometheus scrapes: one `# HELP` + `# TYPE`
+ * standard Prometheus exposition format a scraper reads: one `# HELP` + `# TYPE`
  * pair per metric family, then one sample line per label-set. Label values are
  * escaped per the spec (backslash, double-quote, newline).
  *

@@ -1,0 +1,17 @@
+# gitleaks allowlist — test fixtures carry INTENTIONAL fake secrets
+# (jwt/aws/slack/anthropic-shaped tokens in .test-corpus and .test files).
+# These are inert corpus values, not credentials; gitleaks otherwise flags
+# them on every pre-commit scan (the files predate this config in origin/main).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "test corpora with deliberate fake secrets"
+paths = [
+	"scripts/acceptance/scenarios/39-public-exposure.helpers.ts",
+	"src/server/handlers/runs.events-projection.test.ts",
+	"src/server/handlers/runs.events-projection.test-corpus.ts",
+	"src/ui/src/api/client.test.ts",
+	"src/ui/src/api/client.stream.test.ts",
+	"src/ui/src/hooks/use-event-stream.helpers.test.ts",
+]

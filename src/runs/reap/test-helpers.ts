@@ -1,11 +1,38 @@
 import { type Burrow, NotFoundError } from "@os-eco/burrow-cli";
-import { BurrowClient, BurrowClientPool } from "../../burrow-client/index.ts";
+import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import type { RunTerminalState } from "../../db/schema.ts";
+import type { PreviewSidecarResolver } from "../../preview/launch/index.ts";
+import type { RuntimeProvider } from "../../runtime/contract.ts";
+import { createLocalSidecarsResolver } from "../../runtime/local/preview/sidecars.ts";
+import { LocalProvider } from "../../runtime/local/provider.ts";
 import { RunEventBroker } from "../events.ts";
 import type { OpenPullRequestInput, OpenPullRequestResult } from "../pr.ts";
 import type { ReapExec, ReapFs, ReapRunResult } from "./types.ts";
+
+/**
+ * Build the reap runtime seams for tests over a fake burrow client (warren-e24d).
+ * Reap no longer takes a burrow client: it drives finalize/terminate/workspace
+ * resolution through a `RuntimeProvider` and preview through a neutral sidecar
+ * resolver. This helper wraps a `fakeBurrowClient` into the burrow-backed
+ * `LocalProvider` (with the test's fake `fs`/`exec` so finalize runs against
+ * them) plus the sidecar resolver, so a test spreads `...reapDeps(client, {
+ * fs, exec })` where it used to pass `burrowClient`.
+ */
+export function reapDeps(
+	client: BurrowClient,
+	opts: { fs?: ReapFs; exec?: ReapExec } = {},
+): { runtimeProvider: RuntimeProvider; previewSidecars: PreviewSidecarResolver } {
+	return {
+		runtimeProvider: new LocalProvider({
+			burrowClient: () => client,
+			...(opts.fs !== undefined ? { fs: opts.fs } : {}),
+			...(opts.exec !== undefined ? { exec: opts.exec } : {}),
+		}),
+		previewSidecars: createLocalSidecarsResolver(client),
+	};
+}
 
 /**
  * Build a `ReapRunResult` for tests that stub the reap step (bridges,
@@ -26,11 +53,6 @@ export function makeReapRunResult(overrides: Partial<ReapRunResult> = {}): ReapR
 		mulchAppended: 0,
 		seedsClosed: 0,
 		seedsCreated: 0,
-		seedIdClosed: false,
-		plotEventsAppended: 0,
-		plotsUpdated: 0,
-		plotEventsMirrored: 0,
-		plotCommitted: false,
 		seedsCommitted: false,
 		branchPushed: false,
 		commitsAhead: null,
@@ -42,6 +64,8 @@ export function makeReapRunResult(overrides: Partial<ReapRunResult> = {}): ReapR
 		autoPlanRunId: null,
 		autoPlanRunPlanId: null,
 		workspaceDestroyed: false,
+		salvageRescueRef: null,
+		salvagePath: null,
 		errors: [],
 		alreadyTerminal: false,
 		...overrides,
@@ -49,18 +73,17 @@ export function makeReapRunResult(overrides: Partial<ReapRunResult> = {}): ReapR
 }
 
 /**
- * One-worker pool wired to a stub burrow client (warren-c0c9). Upserts a
- * `local` worker row so `pool.clientFor` resolves cleanly.
+ * Historical one-worker pool wrapper (warren-c0c9). Placement + the
+ * workers/burrows tables were retired (warren-76c5 / warren-3743), so this is
+ * now a pass-through kept for call-site stability; the `_repos` param is
+ * vestigial.
  */
 export async function makePool(
 	client: BurrowClient,
-	repos: Repos,
-	workerName = "local",
-): Promise<BurrowClientPool> {
-	await repos.workers.upsert({ name: workerName, url: "unix:///tmp/x.sock" });
-	const pool = new BurrowClientPool({ repos });
-	pool.register(workerName, client);
-	return pool;
+	_repos: Repos,
+	_workerName = "local",
+): Promise<BurrowClient> {
+	return client;
 }
 
 export interface FakeFs {
@@ -97,13 +120,25 @@ export function fakeFs(seed: Record<string, string> = {}): FakeFs {
 
 export interface FakeExec {
 	readonly exec: ReapExec;
-	readonly calls: { cmd: string; args: readonly string[]; cwd: string }[];
+	readonly calls: {
+		cmd: string;
+		args: readonly string[];
+		cwd: string;
+		env?: Record<string, string | undefined>;
+	}[];
 	readonly fail: { reason: string } | null;
 }
 
 export interface FakeExecOpts {
 	/** Throw on every git push call (default: succeed). */
 	fail?: string;
+	/**
+	 * Throw ONLY on `git push` calls, leaving add/diff/commit/rev-list intact
+	 * (default: succeed). Distinct from `fail` (which throws on every non-routed
+	 * command): used by warren-486c to exercise the durability-push failure path
+	 * where the clone commit lands but the origin push is rejected.
+	 */
+	failPush?: string;
 	/** Throw on git rev-list calls (default: succeed). */
 	failRevList?: string;
 	/**
@@ -128,8 +163,6 @@ export interface FakeExecOpts {
 	gitStatus?: string;
 	/** Throw on `git status --porcelain` calls (default: succeed). */
 	failGitStatus?: string;
-	/** Treat Plot carriers as ignored for `git check-ignore --quiet`. */
-	ignoredPaths?: boolean;
 }
 
 /** Match a `git <sub> …` invocation for the fakeExec command router. */
@@ -154,14 +187,15 @@ function handleDiffCached(stagedDelta: boolean): ExecResult {
 	return { stdout: "", stderr: "" };
 }
 
-function handleCheckIgnore(ignoredPaths: boolean): ExecResult {
-	if (ignoredPaths) return { stdout: "", stderr: "" };
-	throw new Error("not ignored");
-}
-
 export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
-	const calls: { cmd: string; args: readonly string[]; cwd: string }[] = [];
+	const calls: {
+		cmd: string;
+		args: readonly string[];
+		cwd: string;
+		env?: Record<string, string | undefined>;
+	}[] = [];
 	const fail = opts.fail !== undefined ? { reason: opts.fail } : null;
+	const failPush = opts.failPush ?? null;
 	const failRevList = opts.failRevList ?? null;
 	const revListCount = opts.revListCount ?? "1";
 	const stagedDelta = opts.stagedDelta === true;
@@ -169,17 +203,15 @@ export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 	const failGitStatus = opts.failGitStatus ?? null;
 	const exec: ReapExec = {
 		run: async (cmd, args, opt) => {
-			calls.push({ cmd, args, cwd: opt.cwd });
+			calls.push({ cmd, args, cwd: opt.cwd, env: opt.env });
 			if (isGitSub(cmd, args, "rev-list")) return handleRevList(failRevList, revListCount);
-			if (isGitSub(cmd, args, "check-ignore") && args.includes("--quiet")) {
-				return handleCheckIgnore(opts.ignoredPaths === true);
-			}
 			if (isGitSub(cmd, args, "status") && args.includes("--porcelain")) {
 				return handleStatus(failGitStatus, gitStatus);
 			}
 			if (isGitSub(cmd, args, "diff") && args.includes("--cached") && args.includes("--quiet")) {
 				return handleDiffCached(stagedDelta);
 			}
+			if (failPush !== null && isGitSub(cmd, args, "push")) throw new Error(failPush);
 			if (fail !== null) throw new Error(fail.reason);
 			return { stdout: "", stderr: "" };
 		},
@@ -279,7 +311,6 @@ export async function setup(): Promise<Ctx> {
 		burrowId: "bur_aaaaaaaaaaaa",
 		burrowRunId: "run_zzzzzzzzzzzz",
 	});
-	await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
 	await repos.runs.markRunning(run.id);
 	return {
 		db,
@@ -308,12 +339,4 @@ export function fakeOpenPr(
 	return { openPr, calls };
 }
 
-export {
-	type Burrow,
-	BurrowClient,
-	BurrowClientPool,
-	createRepos,
-	NotFoundError,
-	openDatabase,
-	RunEventBroker,
-};
+export { type Burrow, BurrowClient, createRepos, NotFoundError, openDatabase, RunEventBroker };

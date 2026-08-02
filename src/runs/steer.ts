@@ -1,5 +1,5 @@
 /**
- * `steerRun` — SPEC §8.1 `POST /runs/:id/steer`.
+ * `steerRun` — docs/http-api.md `POST /runs/:id/steer`.
  *
  * Forwards a steering message to the burrow inbox. Burrow's inbox is
  * scoped per-burrow (not per-run); the message is delivered to the next
@@ -13,7 +13,7 @@
  *     keeps the wire calls clean).
  *   - run must not be in a terminal state — steering a finished run is
  *     meaningless. Returns `ValidationError`, not `StateTransitionError`,
- *     to match the §7 error envelope used by the rest of warren's HTTP
+ *     to match the error envelope (src/core/wire.ts) used by the rest of warren's HTTP
  *     surface for "operator asked for an impossible action".
  *   - run must have a `burrow_id` attached. A queued warren row without a
  *     burrowId is the spawn-rollback window; sending an inbox message in
@@ -28,15 +28,13 @@
  * route can map them onto the appropriate response envelope.
  */
 
-import {
-	NotFoundError as BurrowNotFoundError,
-	type Message,
-	type MessagePriority,
-} from "@os-eco/burrow-cli";
-import { withTransportMapping } from "../burrow-client/client.ts";
-import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import { ValidationError } from "../core/errors.ts";
 import type { Repos } from "../db/repos/index.ts";
+import type { Message, MessagePriority, RuntimeProvider } from "../runtime/contract.ts";
+// The seam neutralizes burrow's `NotFoundError` into the provider-neutral
+// `RuntimeRunNotFoundError` (warren-1f56), so steer catches THAT to map a ghost
+// run onto a clean ValidationError — no `@os-eco/burrow-cli` import remains.
+import { RuntimeRunNotFoundError } from "../runtime/errors.ts";
 import type { RunEventBroker } from "./events.ts";
 
 export interface SteerRunInput {
@@ -46,13 +44,15 @@ export interface SteerRunInput {
 	readonly fromActor?: string;
 	readonly repos: Repos;
 	/**
-	 * Multi-worker burrow pool (warren-c0c9 / pl-9ba1 step 5). steer resolves
-	 * the owning worker via `pool.clientFor({burrowId: run.burrowId})` so an
-	 * inbox send routes to the same worker that hosts the burrow. Propagates
-	 * `StickyWorkerUnreachableError` (503 via src/server/errors.ts) when the
-	 * pinned worker is `unreachable`.
+	 * Runtime-provider seam (K8s migration pl-829f step 13 / warren-1f56).
+	 * The inbox send is `provider.sendMessage(handle, msg)`; the provider owns
+	 * resolving its backend (the single-container LocalProvider resolves the sole
+	 * burrow worker itself — placement/sticky-by-burrow is retired at the seam,
+	 * design §3). Burrow-side errors (e.g. `NotFoundError` for a ghost burrow)
+	 * propagate through the provider unchanged; steer maps them below exactly as
+	 * it did against the raw client.
 	 */
-	readonly burrowClientPool: BurrowClientPool;
+	readonly runtimeProvider: RuntimeProvider;
 	/** If supplied, the audit event is published here too. */
 	readonly broker?: RunEventBroker;
 	readonly now?: () => Date;
@@ -80,20 +80,21 @@ export async function steerRun(input: SteerRunInput): Promise<SteerRunResult> {
 	}
 
 	const burrowId = run.burrowId;
-	const { client } = await input.burrowClientPool.clientFor({ burrowId });
+	// The seam `RunHandle`: `sandboxId` is the burrowId the inbox is scoped to
+	// (the only field `sendMessage` reads). `providerRunId` is carried for
+	// completeness — burrow attributes delivery itself when a turn claims the
+	// message, so a fresh send doesn't need it.
+	const handle = { runId: run.id, sandboxId: burrowId, providerRunId: run.burrowRunId ?? "" };
 	let message: Message;
 	try {
-		message = await withTransportMapping(client.config, () =>
-			client.http.inbox.send({
-				burrowId,
-				body: input.body,
-				...(input.priority !== undefined ? { priority: input.priority } : {}),
-				...(input.fromActor !== undefined ? { fromActor: input.fromActor } : {}),
-			}),
-		);
+		message = await input.runtimeProvider.sendMessage(handle, {
+			body: input.body,
+			...(input.priority !== undefined ? { priority: input.priority } : {}),
+			...(input.fromActor !== undefined ? { fromActor: input.fromActor } : {}),
+		});
 	} catch (err) {
-		if (err instanceof BurrowNotFoundError) {
-			// warren-b1a9: burrow has no record of this burrow (ghost). Steering
+		if (err instanceof RuntimeRunNotFoundError) {
+			// warren-b1a9: the backend has no record of this run (ghost). Steering
 			// is meaningless against a lost run; reject with a clean
 			// ValidationError so the UI knows to refresh — the bridge or the
 			// next bootBridges pass will reconcile the warren row to `failed`.

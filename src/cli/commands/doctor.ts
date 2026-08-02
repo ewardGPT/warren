@@ -1,36 +1,26 @@
 /**
- * `warren doctor` — startup health check (SPEC §8.2).
+ * `warren doctor` — startup health check.
  *
  * Runs the union of:
- *   - required env vars (WARREN_API_TOKEN, CANOPY_REPO_URL),
- *   - canopy clone exists on disk,
- *   - canopy clone is "clean" (no working-tree mutations — Phase 13),
+ *   - required env vars (WARREN_API_TOKEN),
  *   - bwrap binary reachable (Phase 13),
  *   - projects root resolvable (non-fatal),
  *   - per-project `.warren/` config validity (R-02, pl-5d74 step 6),
  *   - burrow socket reachable.
  *
- * The Phase-13 probes (bwrap + canopy_clean) live in
- * `src/diagnostics/checks.ts` so `GET /readyz` mirrors them without
+ * The Phase-13 bwrap probe lives in
+ * `src/diagnostics/checks.ts` so `GET /readyz` mirrors it without
  * duplicating logic. Each check returns `{name, ok, message?, hint?}`;
  * the command exits 0 when every check passes and 1 otherwise.
  */
 
 import { existsSync } from "node:fs";
-import { BurrowClient } from "../../burrow-client/client.ts";
-import { loadBurrowClientConfigFromEnv } from "../../burrow-client/config.ts";
 import { ValidationError } from "../../core/errors.ts";
 import type { AnyWarrenDb } from "../../db/client.ts";
 import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
-import type { Repos } from "../../db/repos/index.ts";
 import { createRepos } from "../../db/repos/index.ts";
 import {
-	type CrossRepoCheckProject,
-	checkBurrowReachable,
 	checkBwrap,
-	checkCanopyClean,
-	checkCanopyClone,
-	checkCrossRepoPlanTargets,
 	checkDatabaseReachable,
 	checkPreviewAuthStrength,
 	checkPreviewPortAllocator,
@@ -38,13 +28,15 @@ import {
 	checkWarrenConfigDeprecations,
 	checkWarrenDb,
 	type DiagnosticCheck,
+	type DiagnosticLogger,
 	type WarrenConfigCheckProject,
 } from "../../diagnostics/checks.ts";
 import { checkStaleBurrowWorkspaces } from "../../diagnostics/stale-workspaces.ts";
 import { loadPreviewPortRangeFromEnv, PreviewPortAllocator } from "../../preview/port-allocator.ts";
 import { loadProjectsConfigFromEnv } from "../../projects/config.ts";
 import { loadWorkspaceGcConfigFromEnv } from "../../runs/reap/gc.ts";
-import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
+import { doctorBurrowCheck } from "../../runtime/local/diagnostics/burrow.ts";
+import { resolveRuntimeKind } from "../../runtime/registry.ts";
 import type { CliContext, EnvLike } from "../output.ts";
 import { writeJsonLine } from "../output.ts";
 
@@ -52,6 +44,14 @@ export type DoctorCheck = DiagnosticCheck;
 
 export interface DoctorArgs {
 	readonly noAuth?: boolean;
+	/**
+	 * When true, wire a stderr logger into the probes that deliberately
+	 * withhold raw driver/loader text from the check messages
+	 * (warren-51de). The CLI has no server logger seam, so without this
+	 * flag the raw text is dropped entirely (warren-2d14). Default output
+	 * is unchanged.
+	 */
+	readonly verbose?: boolean;
 }
 
 export interface DoctorDeps {
@@ -66,17 +66,19 @@ export interface DoctorDeps {
 	 * empty the warren_config check still runs and reports an
 	 * informational `ok: true`.
 	 */
-	readonly projects?: ReadonlyArray<WarrenConfigCheckProject & Partial<CrossRepoCheckProject>>;
-	/** Seeds CLI used to inspect open plans for unresolved repo targets. */
-	readonly seedsCli?: SeedsCliDeps;
+	readonly projects?: ReadonlyArray<WarrenConfigCheckProject>;
 	/**
 	 * Live db handle for the `db_reachable` probe (R-13 pl-f17e step 5,
 	 * warren-e2ea). `main.ts` wires this from `withCliDb`; tests omit
 	 * and the check degrades to an informational `ok: true`.
 	 */
 	readonly db?: AnyWarrenDb;
-	/** Live project registry used to resolve cross-repo plan targets. */
-	readonly repos?: Pick<Repos, "projects">;
+	/**
+	 * Platform seam for the bwrap probe. Production omits it
+	 * (`checkBwrap` reads `process.platform`); tests force `"linux"` so
+	 * the probe path runs identically on macOS dev machines.
+	 */
+	readonly platform?: NodeJS.Platform;
 }
 
 export interface DoctorResult {
@@ -91,37 +93,65 @@ export async function runDoctor(
 ): Promise<DoctorResult> {
 	const exists = deps.existsSync ?? existsSync;
 	const checks: DoctorCheck[] = [];
+	// Burrow/bwrap/stale-workspace probes only make sense for the LOCAL backend,
+	// where warren co-tenants a burrow daemon. Under `WARREN_RUNTIME=k8s` agents
+	// run in pods with no co-tenanted burrow, so we skip them cleanly and emit a
+	// single informational line saying so — mirroring the `/readyz` behavior
+	// (warren-c128, src/server/handlers/diagnostics.ts).
+	const isLocalTopology = resolveRuntimeKind(context.env) === "local";
 
 	checks.push(envCheck("WARREN_API_TOKEN", context.env, args.noAuth ?? false));
-	checks.push(canopyRepoUrlCheck(context.env));
+
+	// Threaded per-call, never a global: only the probes that already
+	// accept a `log` seam (warren-51de) receive it, and only under
+	// --verbose. `GET /readyz` wires its own pino logger server-side.
+	const verboseLog = args.verbose === true ? verboseLogger(context) : undefined;
 
 	checks.push(checkWarrenDb({ env: context.env }));
-	checks.push(await checkDatabaseReachable({ ...(deps.db !== undefined ? { db: deps.db } : {}) }));
-
-	checks.push(checkCanopyClone({ env: context.env, exists }));
-	checks.push(await checkCanopyClean({ env: context.env, spawn: context.spawn, exists }));
-
-	checks.push(projectsRootCheck(context.env, exists));
-
-	checks.push(await checkBwrap({ spawn: context.spawn }));
-
-	checks.push(await checkWarrenConfig({ projects: deps.projects ?? [] }));
-	checks.push(await checkWarrenConfigDeprecations({ projects: deps.projects ?? [] }));
 	checks.push(
-		await checkCrossRepoPlanTargets({
-			projects: deps.projects ?? [],
-			...(deps.seedsCli !== undefined ? { seedsCli: deps.seedsCli } : {}),
-			...(deps.repos !== undefined ? { repos: deps.repos } : {}),
+		await checkDatabaseReachable({
+			...(deps.db !== undefined ? { db: deps.db } : {}),
+			...(verboseLog !== undefined ? { log: verboseLog } : {}),
 		}),
 	);
 
+	checks.push(projectsRootCheck(context.env, exists));
+
+	if (isLocalTopology) {
+		checks.push(
+			await checkBwrap({
+				spawn: context.spawn,
+				...(deps.platform !== undefined ? { platform: deps.platform } : {}),
+			}),
+		);
+	}
+
+	checks.push(
+		await checkWarrenConfig({
+			projects: deps.projects ?? [],
+			...(verboseLog !== undefined ? { log: verboseLog } : {}),
+		}),
+	);
+	checks.push(await checkWarrenConfigDeprecations({ projects: deps.projects ?? [] }));
+
 	checks.push(await previewPortAllocatorCheck(context.env, deps.db));
 
-	checks.push(await staleBurrowWorkspacesCheck(context.env, deps.db));
+	if (isLocalTopology) {
+		checks.push(await staleBurrowWorkspacesCheck(context.env, deps.db));
+	}
 
 	checks.push(checkPreviewAuthStrength({ env: context.env }));
 
-	checks.push(await burrowCheck(context.env, deps.probeBurrow));
+	if (isLocalTopology) {
+		checks.push(await doctorBurrowCheck(context.env, deps.probeBurrow));
+	} else {
+		checks.push({
+			name: "runtime_backend",
+			ok: true,
+			message:
+				"k8s: burrow / bwrap / stale-workspace probes skipped (agents run in pods, no co-tenanted burrow)",
+		});
+	}
 
 	for (const check of checks) {
 		writeJsonLine(context.stdio.stdout, check);
@@ -132,6 +162,22 @@ export async function runDoctor(
 		context.stdio.stderr.write("warren: one or more checks failed\n");
 	}
 	return { exitCode: allOk ? 0 : 1, checks };
+}
+
+/**
+ * The `--verbose` logger (warren-2d14): a `DiagnosticLogger` that writes
+ * the raw probe detail the wire messages withhold to stderr, one line
+ * per failure. Stderr (not stdout) so the newline-delimited-JSON check
+ * stream on stdout stays machine-parseable unchanged.
+ */
+function verboseLogger(context: CliContext): DiagnosticLogger {
+	return {
+		warn(obj: object, msg?: string): void {
+			context.stdio.stderr.write(
+				`warren doctor verbose: ${msg ?? "probe failed"} ${JSON.stringify(obj)}\n`,
+			);
+		},
+	};
 }
 
 function envCheck(name: string, env: EnvLike, exempted: boolean): DoctorCheck {
@@ -145,23 +191,6 @@ function envCheck(name: string, env: EnvLike, exempted: boolean): DoctorCheck {
 		ok: false,
 		message: `${name} is not set`,
 		hint: `export ${name}=...`,
-	};
-}
-
-/**
- * `CANOPY_REPO_URL` is optional (warren-d3e9): warren ships built-in
- * agents that cover the common case. Report unset as `ok: true` with an
- * informational message rather than failing the check.
- */
-function canopyRepoUrlCheck(env: EnvLike): DoctorCheck {
-	const value = env.CANOPY_REPO_URL;
-	if (value !== undefined && value !== "") {
-		return { name: "CANOPY_REPO_URL", ok: true };
-	}
-	return {
-		name: "CANOPY_REPO_URL",
-		ok: true,
-		message: "no canopy library configured (using built-in agents only)",
 	};
 }
 
@@ -204,7 +233,6 @@ async function staleBurrowWorkspacesCheck(
 	const repos = createRepos(db);
 	return checkStaleBurrowWorkspaces({
 		probe: {
-			listAll: () => repos.burrows.listAll(),
 			listByState: (state) => repos.runs.listByState(state),
 		},
 		ttlMs,
@@ -246,56 +274,4 @@ async function previewPortAllocatorCheck(
 	// against the runs table. Dialect-polymorphic since warren-adfb.
 	const allocator = new PreviewPortAllocator(DrizzleAdapter.for(db), range);
 	return checkPreviewPortAllocator({ probe: allocator });
-}
-
-async function burrowCheck(
-	env: EnvLike,
-	override?: (env: EnvLike) => Promise<void>,
-): Promise<DoctorCheck> {
-	if (override !== undefined) {
-		try {
-			await override(env);
-			return { name: "burrow_reachable", ok: true };
-		} catch (err) {
-			if (err instanceof ValidationError) {
-				return {
-					name: "burrow_reachable",
-					ok: false,
-					message: err.message,
-					...(err.recoveryHint !== undefined ? { hint: err.recoveryHint } : {}),
-				};
-			}
-			return {
-				name: "burrow_reachable",
-				ok: false,
-				message: err instanceof Error ? err.message : String(err),
-				hint: "check that burrow serve is running and WARREN_BURROW_SOCKET / WARREN_BURROW_HOST point to it",
-			};
-		}
-	}
-	let client: BurrowClient;
-	try {
-		const config = loadBurrowClientConfigFromEnv(env);
-		client = new BurrowClient({ config });
-	} catch (err) {
-		if (err instanceof ValidationError) {
-			return {
-				name: "burrow_reachable",
-				ok: false,
-				message: err.message,
-				...(err.recoveryHint !== undefined ? { hint: err.recoveryHint } : {}),
-			};
-		}
-		return {
-			name: "burrow_reachable",
-			ok: false,
-			message: err instanceof Error ? err.message : String(err),
-			hint: "check that burrow serve is running and WARREN_BURROW_SOCKET / WARREN_BURROW_HOST point to it",
-		};
-	}
-	try {
-		return await checkBurrowReachable({ burrowClient: client });
-	} finally {
-		await client.close().catch(() => undefined);
-	}
 }

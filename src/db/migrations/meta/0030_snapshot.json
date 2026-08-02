@@ -1,8 +1,8 @@
 {
 	"version": "6",
 	"dialect": "sqlite",
-	"id": "f069da84-b5e0-49ab-a5fa-8b17a3bfe953",
-	"prevId": "b29005b3-6c75-4108-9704-cf98e872d689",
+	"id": "6c0e340f-5ba0-4ce4-9ff8-37d885e9a997",
+	"prevId": "1dc3cd5d-230a-4ec0-bc6c-a2474f0c6ca7",
 	"tables": {
 		"agents": {
 			"name": "agents",
@@ -71,166 +71,6 @@
 					"columnsFrom": ["project_id"],
 					"columnsTo": ["id"],
 					"onDelete": "cascade",
-					"onUpdate": "no action"
-				}
-			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"checkConstraints": {}
-		},
-		"burrows": {
-			"name": "burrows",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"worker_id": {
-					"name": "worker_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				}
-			},
-			"indexes": {
-				"burrows_worker_idx": {
-					"name": "burrows_worker_idx",
-					"columns": ["worker_id"],
-					"isUnique": false
-				}
-			},
-			"foreignKeys": {},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"checkConstraints": {}
-		},
-		"conversations": {
-			"name": "conversations",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"project_id": {
-					"name": "project_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"plot_id": {
-					"name": "plot_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"anchoring_run_id": {
-					"name": "anchoring_run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"status": {
-					"name": "status",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false,
-					"default": "'active'"
-				},
-				"title": {
-					"name": "title",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"submitted_pr_url": {
-					"name": "submitted_pr_url",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"submitted_pr_number": {
-					"name": "submitted_pr_number",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"planner_agent": {
-					"name": "planner_agent",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"planner_run_id": {
-					"name": "planner_run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"created_at": {
-					"name": "created_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"last_activity_at": {
-					"name": "last_activity_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"closed_at": {
-					"name": "closed_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				}
-			},
-			"indexes": {
-				"conversations_project_idx": {
-					"name": "conversations_project_idx",
-					"columns": ["project_id"],
-					"isUnique": false
-				},
-				"conversations_plot_idx": {
-					"name": "conversations_plot_idx",
-					"columns": ["plot_id"],
-					"isUnique": false
-				}
-			},
-			"foreignKeys": {
-				"conversations_project_id_projects_id_fk": {
-					"name": "conversations_project_id_projects_id_fk",
-					"tableFrom": "conversations",
-					"tableTo": "projects",
-					"columnsFrom": ["project_id"],
-					"columnsTo": ["id"],
-					"onDelete": "set null",
 					"onUpdate": "no action"
 				}
 			},
@@ -311,81 +151,6 @@
 					"columnsFrom": ["run_id"],
 					"columnsTo": ["id"],
 					"onDelete": "no action",
-					"onUpdate": "no action"
-				}
-			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"checkConstraints": {}
-		},
-		"messages": {
-			"name": "messages",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"conversation_id": {
-					"name": "conversation_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"seq": {
-					"name": "seq",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"role": {
-					"name": "role",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"content": {
-					"name": "content",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"run_id": {
-					"name": "run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"created_at": {
-					"name": "created_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				}
-			},
-			"indexes": {
-				"messages_conversation_seq_idx": {
-					"name": "messages_conversation_seq_idx",
-					"columns": ["conversation_id", "seq"],
-					"isUnique": false
-				}
-			},
-			"foreignKeys": {
-				"messages_conversation_id_conversations_id_fk": {
-					"name": "messages_conversation_id_conversations_id_fk",
-					"tableFrom": "messages",
-					"tableTo": "conversations",
-					"columnsFrom": ["conversation_id"],
-					"columnsTo": ["id"],
-					"onDelete": "cascade",
 					"onUpdate": "no action"
 				}
 			},
@@ -834,6 +599,98 @@
 			"uniqueConstraints": {},
 			"checkConstraints": {}
 		},
+		"run_inbox": {
+			"name": "run_inbox",
+			"columns": {
+				"id": {
+					"name": "id",
+					"type": "text",
+					"primaryKey": true,
+					"notNull": true,
+					"autoincrement": false
+				},
+				"run_id": {
+					"name": "run_id",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"autoincrement": false
+				},
+				"seq": {
+					"name": "seq",
+					"type": "integer",
+					"primaryKey": false,
+					"notNull": true,
+					"autoincrement": false
+				},
+				"body": {
+					"name": "body",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"autoincrement": false
+				},
+				"priority": {
+					"name": "priority",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"autoincrement": false,
+					"default": "'normal'"
+				},
+				"from_actor": {
+					"name": "from_actor",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"autoincrement": false,
+					"default": "'operator'"
+				},
+				"state": {
+					"name": "state",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"autoincrement": false,
+					"default": "'unread'"
+				},
+				"created_at": {
+					"name": "created_at",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"autoincrement": false
+				},
+				"delivered_at": {
+					"name": "delivered_at",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": false,
+					"autoincrement": false
+				}
+			},
+			"indexes": {
+				"run_inbox_run_state_idx": {
+					"name": "run_inbox_run_state_idx",
+					"columns": ["run_id", "state"],
+					"isUnique": false
+				}
+			},
+			"foreignKeys": {
+				"run_inbox_run_id_runs_id_fk": {
+					"name": "run_inbox_run_id_runs_id_fk",
+					"tableFrom": "run_inbox",
+					"tableTo": "runs",
+					"columnsFrom": ["run_id"],
+					"columnsTo": ["id"],
+					"onDelete": "cascade",
+					"onUpdate": "no action"
+				}
+			},
+			"compositePrimaryKeys": {},
+			"uniqueConstraints": {},
+			"checkConstraints": {}
+		},
 		"runs": {
 			"name": "runs",
 			"columns": {
@@ -923,13 +780,6 @@
 				},
 				"ended_at": {
 					"name": "ended_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
-				"merge_wait_started_at": {
-					"name": "merge_wait_started_at",
 					"type": "text",
 					"primaryKey": false,
 					"notNull": false,
@@ -1166,21 +1016,6 @@
 					"primaryKey": false,
 					"notNull": false,
 					"autoincrement": false
-				},
-				"fire_count": {
-					"name": "fire_count",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false,
-					"default": 0
-				},
-				"completed_at": {
-					"name": "completed_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
 				}
 			},
 			"indexes": {
@@ -1210,45 +1045,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"checkConstraints": {}
-		},
-		"workers": {
-			"name": "workers",
-			"columns": {
-				"name": {
-					"name": "name",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"url": {
-					"name": "url",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"state": {
-					"name": "state",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false,
-					"default": "'healthy'"
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				}
-			},
-			"indexes": {},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"checkConstraints": {}

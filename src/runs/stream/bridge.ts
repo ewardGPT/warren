@@ -1,6 +1,6 @@
 /**
- * `bridgeRunStream` — the main event-bridge pump (SPEC §4.3 step 5,
- * §9 "event durability rationale"). Splits out of the legacy
+ * `bridgeRunStream` — the main event-bridge pump (docs/design/agent-composition.md step 5;
+ * event durability per docs/design/runtime-and-supervisor.md). Splits out of the legacy
  * monolithic `src/runs/stream.ts` (warren-041e / pl-9088 step 5):
  * terminal-detection lives in `./terminal-detect.ts`, the run-state
  * fallback in `./run-state-poller.ts`, cost-stats persistence in
@@ -17,13 +17,12 @@
  * place rather than fanning out across the split.
  */
 
-import { NotFoundError as BurrowNotFoundError, type RunEvent } from "@os-eco/burrow-cli";
-import type { BurrowClient } from "../../burrow-client/client.ts";
-import { withTransportMapping } from "../../burrow-client/client.ts";
 import type { EventStream, RunTerminalState } from "../../db/schema.ts";
 import { EVENT_STREAMS } from "../../db/schema.ts";
+import type { RunHandle } from "../../runtime/contract.ts";
+import { RuntimeRunNotFoundError } from "../../runtime/errors.ts";
 import { resolveCostCapUsd } from "../cost-cap.ts";
-import { TokenBudgetLedger } from "../token-budget.ts";
+import { lifecycleBus } from "../lifecycle-bus.ts";
 import {
 	accumulatePiUsage,
 	extractClaudeUsage,
@@ -31,11 +30,10 @@ import {
 	type SessionStatsAccumulator,
 } from "../usage-aggregate.ts";
 import { type CancelBurrowRunFn, enforceBudgetCap } from "./budget.ts";
-import { extractAssistantText, extractIntentPatch } from "./conversation-turn.ts";
+import { providerStreamSource } from "./provider-source.ts";
 import { defaultRunStateProbe, runStatePoller } from "./run-state-poller.ts";
 import { persistInStreamUsage, persistPiStatsDelta, snapshotStats } from "./stats.ts";
 import { detectRuntimeTerminal, isPiAgentEnd } from "./terminal-detect.ts";
-import { emitTokenBudgetEvent, resolveBridgeTokenBudget, tokenUsageDelta } from "./token-budget.ts";
 import {
 	type BridgeLogger,
 	type BridgeRunStreamInput,
@@ -45,6 +43,7 @@ import {
 	DEFAULT_RUN_STATE_POLL_MS,
 	type RunStateProbe,
 	type SessionStats,
+	type StreamEventView,
 } from "./types.ts";
 
 /**
@@ -66,33 +65,54 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 	}
 
 	const resumeSeq = (await repos.events.maxSeqForRun(runId)) ?? 0;
-	// warren-c0c9: route the stream poll through the worker that owns this
-	// burrow. The source override (tests) bypasses the pool entirely.
-	const sourceClient =
-		input.source !== undefined
-			? null
-			: (await input.burrowClientPool.clientFor({ burrowId: input.burrowId })).client;
-	const source = input.source ?? defaultSource(sourceClient as BurrowClient, burrowRunId);
+
+	// Runtime-provider seam (warren-1f56, warren-1fce). The bridge's backend
+	// touchpoints — the event stream, the run-state poller, and the budget-cap
+	// cancel — route through the provider the domain resolved at boot; there is no
+	// burrow fallback here (the caller always threads the active provider).
+	const provider = input.runtimeProvider;
+	// Seam handle: `sandboxId` is the burrowId, `providerRunId` the burrowRunId.
+	const handle: RunHandle = {
+		runId,
+		sandboxId: input.burrowId,
+		providerRunId: burrowRunId,
+	};
+
+	// Stream source. Default: `provider.streamEvents(handle, { sinceSeq })` adapted
+	// to the abort controller so the run-state poller's `ctrl.abort()` tears the
+	// stream down (the seam hides the signal, so we bridge it to the async-iterator
+	// teardown). Passing the resume cursor lets a reconnect after a disconnect
+	// re-attach from where the events table left off (warren-1fce) — the in-loop
+	// `seq <= resumeSeq` dedup below stays as a belt-and-braces guard for sources
+	// that ignore the cursor (e.g. a test `source` override, which bypasses the
+	// provider entirely).
+	const source: (signal: AbortSignal) => AsyncIterable<StreamEventView> =
+		input.source ??
+		providerStreamSource(provider, handle, { sinceSeq: resumeSeq }, input.streamTeardownMs);
 
 	// warren-a63d: resolve the run's effective spend cap once. Explicit
 	// input wins (tests); otherwise read the cap frozen onto
 	// `runs.rendered_agent_json` (per-trigger override already folded over
 	// the per-agent value at dispatch). A null cap disables enforcement.
 	const costCapUsd = input.costCapUsd ?? (await resolveBridgeCostCap(repos, runId, input.logger));
-	const tokenBudget =
-		input.tokenBudget ?? (await resolveBridgeTokenBudget(repos, runId, input.logger));
-	const tokenLedger = tokenBudget === null ? null : new TokenBudgetLedger(tokenBudget);
+	// Budget-cap graceful stop is `provider.cancel(handle, reason)` (warren-1f56).
+	// A test `source` override leaves the provider path inert — default to a no-op
+	// (mirroring the old `sourceClient === null` behavior) so a source-only test
+	// never reaches a live backend; tests asserting the cancel fired inject their own.
 	const cancelBurrowRun: CancelBurrowRunFn =
 		input.cancelBurrowRun ??
-		defaultCancelBurrowRun(sourceClient as BurrowClient | null, burrowRunId);
+		(input.source === undefined
+			? (reason: string) => provider.cancel(handle, reason)
+			: async () => {});
 
 	// warren-6596: run-state poller. Covers runtimes that don't emit a
-	// recognised in-stream terminal envelope (raw-text declarative agents).
-	// Skipped when neither a probe override nor a real burrow client exists
-	// (tests that pass `source` but no `runStateProbe`).
+	// recognised in-stream terminal envelope (raw-text declarative agents). The
+	// default probe reads `provider.status(handle)`. Kept dormant when a test
+	// overrides `source` without an explicit probe (mirrors the old
+	// `sourceClient === null` gate) so those tests make no backend calls.
 	const runStateProbe: RunStateProbe | null =
 		input.runStateProbe ??
-		(sourceClient !== null ? defaultRunStateProbe(sourceClient as BurrowClient) : null);
+		(input.source === undefined ? defaultRunStateProbe(provider, handle) : null);
 	const probedTerminal: { value: BurrowTerminalSnapshot | null } = { value: null };
 	const pollerTask =
 		runStateProbe !== null
@@ -110,6 +130,7 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 
 	let written = 0;
 	let skipped = 0;
+	let dropped = 0;
 	let errored = false;
 	let claimed = false;
 	let terminalDetected: { outcome: RunTerminalState } | undefined;
@@ -123,9 +144,6 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 	// Both paths are best-effort; failures leave the columns null.
 	let statsBaseline: Promise<SessionStats | null> | undefined;
 	let statsPersisted = false;
-	// warren-df71: assistant text accumulated within the current conversation
-	// turn, flushed to the transcript on `agent_end` (the turn boundary).
-	let conversationTurnText = "";
 	const piUsage: SessionStatsAccumulator = newSessionStatsAccumulator();
 	// claude-code cost tracking (warren-87f9). Single-shot: claude-code
 	// emits one `result` envelope at run end carrying `total_cost_usd` +
@@ -141,6 +159,11 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 				const claimedRun = await repos.runs.claimById(runId);
 				if (claimedRun !== null) {
 					input.logger?.info?.({ runId, burrowRunId }, "bridge transitioned run queued → running");
+					// warren-28ca: the queued → running edge is the production
+					// emit for the `run_started` lifecycle hook. `claimById`
+					// returns non-null exactly once (the atomic claim), so this
+					// fires once per run start and never on a re-observed edge.
+					lifecycleBus()?.emitRunStarted({ runId });
 				}
 				claimed = true;
 				if (input.piStats !== undefined) {
@@ -156,6 +179,28 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 			}
 			if (event.seq <= resumeSeq) {
 				skipped += 1;
+				// warren-2206: terminal detection must run even for an already-persisted
+				// (deduped) event. A prior bridge pass can append a terminal event and
+				// then be torn down (reconnect / abort / process restart) BEFORE its
+				// inline reap fires; on the resumed pass that event replays with
+				// `seq <= resumeSeq`. If we `continue` before detecting, the terminal is
+				// never observed and the run hangs `running` forever. Detect on the
+				// persisted event and break so reap still finalizes — without
+				// re-appending the row or re-accumulating stats (dedup semantics intact;
+				// the prior pass already persisted both).
+				const resumedOutcome = detectRuntimeTerminal(event);
+				if (resumedOutcome !== null) {
+					terminalDetected = { outcome: resumedOutcome };
+					input.logger?.info?.(
+						{ runId, burrowRunId, outcome: resumedOutcome, seq: event.seq },
+						"bridge observed runtime-terminal on an already-persisted event; reap will finalize",
+					);
+					break;
+				}
+				continue;
+			}
+			if (isPerDeltaNoiseEvent(event)) {
+				dropped += 1;
 				continue;
 			}
 			const row = await repos.events.append({
@@ -168,21 +213,20 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 			});
 			written += 1;
 			broker.publish(runId, row);
+			// warren-28ca: `event_emitted` is the lifecycle mirror of the
+			// broker publish — one persisted run-event row, fanned to
+			// boot-wired consumers as a provider-neutral projection. The
+			// bridge is the sole writer to `events`, so this is the single
+			// production call-site (design doc §5).
+			lifecycleBus()?.emitEventEmitted({
+				runId,
+				seq: row.burrowEventSeq,
+				kind: row.kind,
+				stream: row.stream ?? "",
+			});
 
 			accumulatePiUsage(piUsage, event);
 			extractClaudeUsage(claudeUsage, event);
-			if (tokenLedger !== null) {
-				const usage = tokenUsageDelta(event);
-				if (usage !== null) {
-					const decision = tokenLedger.record(usage);
-					if (decision === "exhausted" || decision === "bad_attempt_cap") {
-						await emitTokenBudgetEvent(repos, broker, runId, decision, tokenLedger.snapshot());
-						await cancelBurrowRun(`token budget ${decision}`);
-						terminalDetected = { outcome: "cancelled" };
-						break;
-					}
-				}
-			}
 
 			// warren-a63d: enforce the spend cap as cumulative cost crosses it.
 			// On exceed, the helper persists usage + emits `budget.exceeded` +
@@ -204,41 +248,6 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 					statsPersisted = true;
 					terminalDetected = { outcome: "cancelled" };
 					break;
-				}
-			}
-
-			// warren-df71: conversation keep-alive. A mode:'conversation' run is
-			// a long-lived pi-chat session — `agent_end` is a TURN boundary, not
-			// a run terminal. Persist the turn's usage + assistant text, apply
-			// any propose_intent patch, and KEEP the run `running` (no break, no
-			// inline reap). Non-conversation runs skip this whole branch and
-			// retain their exact prior lifecycle.
-			if (input.mode === "conversation") {
-				const assistantText = extractAssistantText(event);
-				if (assistantText !== null) conversationTurnText += assistantText;
-				const intentPatch = extractIntentPatch(event);
-				if (intentPatch !== null) {
-					await input.conversationTurn?.applyIntentPatch({ runId, patch: intentPatch });
-				}
-				if (isPiAgentEnd(event)) {
-					await persistInStreamUsage({
-						usage: piUsage,
-						runtime: "pi",
-						runId,
-						burrowRunId,
-						repos,
-						logger: input.logger,
-					});
-					const turnText = conversationTurnText.trim();
-					if (turnText.length > 0) {
-						await input.conversationTurn?.persistAssistantTurn({ runId, text: turnText });
-					}
-					conversationTurnText = "";
-					input.logger?.info?.(
-						{ runId, burrowRunId, seq: event.seq },
-						"conversation run: agent_end treated as turn-end; keeping run alive",
-					);
-					continue;
 				}
 			}
 
@@ -311,18 +320,19 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 			}
 		}
 	} catch (err) {
-		if (err instanceof BurrowNotFoundError) {
-			// warren-b1a9: burrow no longer has this run (machine restart wiped
-			// its in-memory store, deliberate cleanup, etc.). Surface as a
-			// distinct terminal signal so the registry stops reconnecting and
-			// reconciles the warren row to `failed` instead of spinning on
-			// backoff. Don't set `errored` — errored=true triggers the reconnect
-			// loop; the missing-run signal is exactly the case where reconnect
-			// is hopeless.
+		if (err instanceof RuntimeRunNotFoundError) {
+			// warren-b1a9: the backend no longer has this run (machine restart wiped
+			// burrow's in-memory store, deliberate cleanup, etc.) — surfaced across
+			// the seam as the neutralized `RuntimeRunNotFoundError` (warren-1f56), no
+			// longer burrow's raw 404. Surface as a distinct terminal signal so the
+			// registry stops reconnecting and reconciles the warren row to `failed`
+			// instead of spinning on backoff. Don't set `errored` — errored=true
+			// triggers the reconnect loop; the missing-run signal is exactly the case
+			// where reconnect is hopeless.
 			burrowRunMissing = true;
 			input.logger?.warn?.(
 				{ runId, burrowRunId, written, skipped, err: err.message },
-				"run stream bridge: burrow returned 404 for burrow_run_id (ghost run)",
+				"run stream bridge: backend reports run not found (ghost run)",
 			);
 		} else if (probedTerminal.value !== null) {
 			// warren-6596: the run-state poller observed burrow terminal and
@@ -365,15 +375,27 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 	// detected in-stream — the in-stream path is authoritative because it
 	// carries exit_code semantics from the runtime parser.
 	if (terminalDetected === undefined && !burrowRunMissing && probedTerminal.value !== null) {
-		terminalDetected = { outcome: probedTerminal.value.state };
+		// warren-9cce: carry the poller's distilled `failure_reason` (only
+		// `oom_killed` today) onto the synthesized terminal so the registry's
+		// inline reap finalizes with it instead of inferring an anonymous cause.
+		const { state, failureReason } = probedTerminal.value;
+		terminalDetected = {
+			outcome: state,
+			...(failureReason !== undefined ? { failureReason } : {}),
+		};
 		input.logger?.info?.(
-			{ runId, burrowRunId, outcome: probedTerminal.value.state },
-			"bridge synthesized terminalDetected from burrow run-state probe",
+			{
+				runId,
+				burrowRunId,
+				outcome: state,
+				...(failureReason !== undefined ? { failureReason } : {}),
+			},
+			"bridge synthesized terminalDetected from run-state probe",
 		);
 	}
 
 	input.logger?.info?.(
-		{ runId, burrowRunId, written, skipped, errored, burrowRunMissing },
+		{ runId, burrowRunId, written, skipped, dropped, errored, burrowRunMissing },
 		"run stream bridge ended",
 	);
 	if (burrowRunMissing) {
@@ -385,30 +407,48 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 }
 
 /**
- * Default source factory: shells through the HttpClient. Wrapping in
- * `withTransportMapping` is moot here because the iterator yields
- * after the initial fetch returns — but the initial fetch can still
- * fail with a transport error, and we want that to surface as
- * `BurrowUnreachableError` for consistency with the spawn flow.
+ * Per-delta noise envelopes the bridge deliberately does NOT persist
+ * (warren event-volume incident, 2026-07-30; widened warren-ef12
+ * 2026-07-31 after a post-fix audit showed ~75% of persisted rows per
+ * run were still non-durable chatter).
+ *
+ * Dropped set — all are per-delta / skeleton envelopes whose durable
+ * content is already stored elsewhere:
+ *   - `message_update` (telemetry): pi emits one per model stream
+ *     delta, each carrying the FULL cumulative message so far — on
+ *     per-token streams (kimi-k3 via openrouter) thousands of rows per
+ *     run growing quadratically in payload (a single run reached 12k+
+ *     rows / ~50MB). The durable record is the `message_end` explosion
+ *     into `text`/`thinking`/`tool_use` rows.
+ *   - `tool_execution_update` (state_change): pi v0.74.0+ streams
+ *     partial tool output (payload carries cumulative partialResult);
+ *     unknown to burrow's parser it falls into the default
+ *     `unknown -> state_change` branch. Same snapshot class as
+ *     `message_update`; the final output is durably stored as
+ *     `tool_result`.
+ *   - `message_start`: an empty skeleton (content: [], stopReason
+ *     pending, zeroed usage) that nothing reads.
+ *
+ * Deliberately KEPT: `turn_start`, `tool_execution_start` and
+ * `tool_execution_end` are once-per-invocation lifecycle markers (not
+ * per-delta), and `turn_end` MUST keep flowing — usage aggregation
+ * (`src/runs/usage-aggregate.ts`) reads `state_change` `turn_end` (pi)
+ * / `result` (claude-code) envelopes via `EventsRepo.listUsageEvents`
+ * for cost/token totals; dropping it breaks usage. Other telemetry
+ * subtypes (`queue_update`, `auto_retry_*`) are rare and meaningful.
+ *
+ * Nuance: dropping here means the UI never sees streaming partials; if
+ * mid-run typing UX is ever wanted, the shape is
+ * publish-but-dont-persist.
  */
-function defaultSource(
-	client: BurrowClient,
-	burrowRunId: string,
-): (signal: AbortSignal) => AsyncIterable<RunEvent> {
-	return (signal) => {
-		return {
-			[Symbol.asyncIterator](): AsyncIterator<RunEvent> {
-				const inner = client.http.runs.stream(burrowRunId, { signal });
-				return {
-					next: () =>
-						withTransportMapping(client.config, () => inner.next()) as Promise<
-							IteratorResult<RunEvent>
-						>,
-					return: () => inner.return(undefined) as Promise<IteratorResult<RunEvent>>,
-				};
-			},
-		};
-	};
+const PER_DELTA_NOISE_TYPES = new Set(["message_update", "tool_execution_update", "message_start"]);
+
+function isPerDeltaNoiseEvent(event: StreamEventView): boolean {
+	if (event.kind !== "telemetry" && event.kind !== "state_change") return false;
+	const p = event.payload;
+	if (p === null || typeof p !== "object" || Array.isArray(p)) return false;
+	const t = (p as { type?: unknown }).type;
+	return typeof t === "string" && PER_DELTA_NOISE_TYPES.has(t);
 }
 
 /**
@@ -447,22 +487,4 @@ async function resolveBridgeCostCap(
 		);
 		return null;
 	}
-}
-
-/**
- * Default graceful-cancel seam for spend-cap enforcement (warren-a63d):
- * forward to the resolved burrow client's `runs.cancel`. When no client
- * is available (tests with a `source` override but no `cancelBurrowRun`),
- * it's a no-op — the bridge still breaks with `cancelled`.
- */
-function defaultCancelBurrowRun(
-	client: BurrowClient | null,
-	burrowRunId: string,
-): CancelBurrowRunFn {
-	return async (reason: string): Promise<void> => {
-		if (client === null) return;
-		await withTransportMapping(client.config, () =>
-			client.http.runs.cancel(burrowRunId, { reason }),
-		);
-	};
 }

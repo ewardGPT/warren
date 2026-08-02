@@ -15,6 +15,13 @@
  * No-op when `GITHUB_TOKEN` is unset — only agents that hit github.com over
  * HTTPS need it, so a token-less env (e.g. a doctor smoke test, an agent
  * that never touches GitHub) shouldn't refuse to boot.
+ *
+ * LOCAL TOPOLOGY ONLY: the K8s control plane runs `warren serve` with no
+ * supervisor, so this global rule never installs there. The serve path's
+ * host-side git network ops instead carry the same rewrite per-spawn via
+ * `githubCredentialGitEnv` (`src/workspace/git/credential-env.ts`),
+ * threaded from `AutoOpenPrConfig.gitToken`. The two compose harmlessly when
+ * both are present (same key, same value).
  */
 
 import { execFile } from "node:child_process";

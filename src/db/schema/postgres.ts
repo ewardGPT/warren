@@ -35,13 +35,12 @@ import {
 	text,
 	uniqueIndex,
 } from "drizzle-orm/pg-core";
-import type { PlotProjectionState } from "./columns.ts";
 import {
 	CLONE_KINDS,
-	CONVERSATION_STATES,
 	EVENT_STREAMS,
+	INBOX_PRIORITIES,
+	INBOX_STATES,
 	INDEX_NAMES,
-	MESSAGE_ROLES,
 	PLAN_RUN_CHILD_STATES,
 	PLAN_RUN_STATES,
 	PREVIEW_STATES,
@@ -49,23 +48,18 @@ import {
 	RUN_MODES,
 	RUN_STATES,
 	TABLE_NAMES,
-	WORKER_STATES,
 } from "./columns.ts";
 
 export const agents = pgTable(
 	TABLE_NAMES.agents,
 	{
 		id: serial("id").primaryKey(),
-		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
 		name: text("name").notNull(),
 		renderedJson: jsonb("rendered_json").notNull(),
 		registeredAt: text("registered_at").notNull(),
 		lastRefreshed: text("last_refreshed").notNull(),
 	},
-	(t) => [
-		uniqueIndex(INDEX_NAMES.agentsProjectName).on(t.projectId, t.name),
-		uniqueIndex(INDEX_NAMES.agentsGlobalName).on(t.name).where(sql`${t.projectId} IS NULL`),
-	],
+	(t) => [uniqueIndex(INDEX_NAMES.agentsName).on(t.name)],
 );
 
 export const projects = pgTable(
@@ -78,11 +72,6 @@ export const projects = pgTable(
 		addedAt: text("added_at").notNull(),
 		lastFetchedAt: text("last_fetched_at"),
 		lastHeadSha: text("last_head_sha"),
-		// Plot opt-in gating flag (warren-4e20) — mirror of sqlite. Boolean
-		// rather than integer here; the drift check only compares structure
-		// (column name + nullability + default presence), not the storage
-		// type, so the sqlite integer-as-boolean stays in lockstep.
-		hasPlot: boolean("has_plot").notNull().default(false),
 		// Seeds opt-in gating flag (warren-9990 / pl-a258 step 1) — mirror of
 		// sqlite. See sqlite.ts for shape.
 		hasSeeds: boolean("has_seeds").notNull().default(false),
@@ -98,13 +87,14 @@ export const runs = pgTable(
 		// pl-fef5, warren-094a). With agents identified by (name, project_id)
 		// rather than a single-column PK, this FK is no longer representable.
 		agentName: text("agent_name").notNull(),
-		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		// ON DELETE CASCADE (warren-41b3) — mirror of sqlite. Deleting a
+		// project removes its runs and (via events.run_id CASCADE) their
+		// event transcripts rather than orphaning them. See sqlite.ts.
+		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
 		burrowId: text("burrow_id"),
 		burrowRunId: text("burrow_run_id"),
 		workerId: text("worker_id"),
 		seedId: text("seed_id"),
-		// Mirror of sqlite plot_id (warren-a8c3). See sqlite.ts for shape.
-		plotId: text("plot_id"),
 		renderedAgentJson: jsonb("rendered_agent_json").notNull(),
 		state: text("state", { enum: RUN_STATES }).notNull(),
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
@@ -117,6 +107,9 @@ export const runs = pgTable(
 		trigger: text("trigger").notNull(),
 		prUrl: text("pr_url"),
 		targetBranch: text("target_branch"),
+		// Salvage-before-destroy (warren-cd3b); see the sqlite schema comment.
+		salvageRef: text("salvage_ref"),
+		salvagePath: text("salvage_path"),
 		costUsd: doublePrecision("cost_usd"),
 		tokensInput: integer("tokens_input"),
 		tokensOutput: integer("tokens_output"),
@@ -130,8 +123,6 @@ export const runs = pgTable(
 		// Mirror of sqlite mode (pl-0344 step 1 / warren-67b6). See sqlite.ts
 		// for shape + state-machine intent.
 		mode: text("mode", { enum: RUN_MODES }).notNull().default("batch"),
-		pausedAt: text("paused_at"),
-		pausedQuestionEventId: text("paused_question_event_id"),
 		// Mirror of sqlite parent_run_id (warren-4b11). Continuation back-link
 		// for re-run-with-follow-up; see sqlite.ts for the full shape + intent.
 		parentRunId: text("parent_run_id"),
@@ -144,7 +135,6 @@ export const runs = pgTable(
 		index(INDEX_NAMES.runsProjectStarted).on(t.projectId, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsAgentStarted).on(t.agentName, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsWorkerState).on(t.workerId, t.state),
-		index(INDEX_NAMES.runsPlotId).on(t.plotId),
 		index(INDEX_NAMES.runsMode).on(t.mode),
 		index(INDEX_NAMES.runsPrUrl).on(t.prUrl),
 	],
@@ -154,9 +144,12 @@ export const events = pgTable(
 	TABLE_NAMES.events,
 	{
 		id: serial("id").primaryKey(),
+		// ON DELETE CASCADE (warren-41b3) — mirror of sqlite. Removes a
+		// run's event transcript with the run, including the project-delete
+		// cascade.
 		runId: text("run_id")
 			.notNull()
-			.references(() => runs.id),
+			.references(() => runs.id, { onDelete: "cascade" }),
 		burrowEventSeq: integer("burrow_event_seq").notNull(),
 		ts: text("ts").notNull(),
 		kind: text("kind").notNull(),
@@ -181,25 +174,9 @@ export const triggers = pgTable(
 		nextFireAt: text("next_fire_at"),
 		lastRunId: text("last_run_id").references(() => runs.id, { onDelete: "set null" }),
 		fireCount: integer("fire_count").notNull().default(0),
+		completedAt: text("completed_at"),
 	},
 	(t) => [index(INDEX_NAMES.triggersProject).on(t.projectId)],
-);
-
-export const workers = pgTable(TABLE_NAMES.workers, {
-	name: text("name").primaryKey(),
-	url: text("url").notNull(),
-	state: text("state", { enum: WORKER_STATES }).notNull().default("healthy"),
-	addedAt: text("added_at").notNull(),
-});
-
-export const burrows = pgTable(
-	TABLE_NAMES.burrows,
-	{
-		id: text("id").primaryKey(),
-		workerId: text("worker_id").notNull(),
-		addedAt: text("added_at").notNull(),
-	},
-	(t) => [index(INDEX_NAMES.burrowsWorker).on(t.workerId)],
 );
 
 /**
@@ -221,9 +198,6 @@ export const planRuns = pgTable(
 		modelOverride: text("model_override"),
 		dispatcherHandle: text("dispatcher_handle").notNull().default("operator"),
 		trigger: text("trigger").notNull().default("manual"),
-		// Mirror of sqlite plan_runs.plot_id (warren-06dc / pl-7937 Phase 2).
-		// See sqlite.ts for shape + gating intent.
-		plotId: text("plot_id"),
 		// Mirror of sqlite plan_runs.parent_run_id (warren-d9a2). See
 		// sqlite.ts for shape + gating intent.
 		parentRunId: text("parent_run_id"),
@@ -236,7 +210,6 @@ export const planRuns = pgTable(
 	(t) => [
 		index(INDEX_NAMES.planRunsProjectState).on(t.projectId, t.state),
 		index(INDEX_NAMES.planRunsState).on(t.state),
-		index(INDEX_NAMES.planRunsPlotId).on(t.plotId),
 	],
 );
 
@@ -253,9 +226,6 @@ export const planRunChildren = pgTable(
 		seq: integer("seq").notNull(),
 		seedId: text("seed_id").notNull(),
 		runId: text("run_id").references(() => runs.id, { onDelete: "set null" }),
-		// Execution project this child was routed to (pl-fb43 step 6 /
-		// warren-57f6) — mirror of sqlite. See sqlite.ts for intent.
-		executionProjectId: text("execution_project_id"),
 		state: text("state", { enum: PLAN_RUN_CHILD_STATES }).notNull(),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -271,7 +241,7 @@ export const planRunChildren = pgTable(
 	],
 );
 
-export type AgentRow = typeof agents.$inferSelect;
+export type AgentDbRow = typeof agents.$inferSelect;
 export type AgentInsert = typeof agents.$inferInsert;
 export type ProjectRow = typeof projects.$inferSelect;
 export type ProjectInsert = typeof projects.$inferInsert;
@@ -281,91 +251,31 @@ export type EventRow = typeof events.$inferSelect;
 export type EventInsert = typeof events.$inferInsert;
 export type TriggerRow = typeof triggers.$inferSelect;
 export type TriggerInsert = typeof triggers.$inferInsert;
-export type WorkerRow = typeof workers.$inferSelect;
-export type WorkerInsert = typeof workers.$inferInsert;
-export type BurrowRow = typeof burrows.$inferSelect;
-export type BurrowInsert = typeof burrows.$inferInsert;
 /**
- * Plots projection (warren-9022) — mirror of sqlite.
- * `state_json` is `jsonb` here (vs sqlite's `text mode:"json"`); the drift
- * check compares structure (column name + nullability + FK + index), not the
- * storage type. See sqlite.ts for the projection's full intent.
+ * Run inbox (warren-3d0b) — mirror of sqlite. See sqlite.ts for the pod-per-run
+ * steering-channel intent + delivery semantics.
  */
-export const plots = pgTable(
-	TABLE_NAMES.plots,
+export const runInbox = pgTable(
+	TABLE_NAMES.runInbox,
 	{
 		id: text("id").primaryKey(),
-		projectId: text("project_id")
+		runId: text("run_id")
 			.notNull()
-			.references(() => projects.id, { onDelete: "cascade" }),
-		status: text("status").notNull(),
-		title: text("title"),
-		updatedAt: text("updated_at").notNull(),
-		stateJson: jsonb("state_json").$type<PlotProjectionState>().notNull(),
-	},
-	(t) => [
-		index(INDEX_NAMES.plotsProjectUpdated).on(t.projectId, t.updatedAt),
-		index(INDEX_NAMES.plotsStatus).on(t.status),
-	],
-);
-
-/**
- * Conversations (warren-0b91) — mirror of sqlite. See
- * sqlite.ts for shape + lifecycle intent.
- */
-export const conversations = pgTable(
-	TABLE_NAMES.conversations,
-	{
-		id: text("id").primaryKey(),
-		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
-		plotId: text("plot_id"),
-		anchoringRunId: text("anchoring_run_id"),
-		status: text("status", { enum: CONVERSATION_STATES }).notNull().default("active"),
-		title: text("title"),
-		// Send-off submission (warren-756d) — mirror of
-		// sqlite. See sqlite.ts for intent.
-		submittedPrUrl: text("submitted_pr_url"),
-		submittedPrNumber: integer("submitted_pr_number"),
-		plannerAgent: text("planner_agent"),
-		// Merge-poller planner dispatch back-link (warren-b872) — mirror of sqlite.
-		plannerRunId: text("planner_run_id"),
-		createdAt: text("created_at").notNull(),
-		lastActivityAt: text("last_activity_at").notNull(),
-		closedAt: text("closed_at"),
-	},
-	(t) => [
-		index(INDEX_NAMES.conversationsProject).on(t.projectId),
-		index(INDEX_NAMES.conversationsPlot).on(t.plotId),
-	],
-);
-
-/**
- * Messages (warren-0b91) — mirror of sqlite. See
- * sqlite.ts for shape + transcript intent.
- */
-export const messages = pgTable(
-	TABLE_NAMES.messages,
-	{
-		id: text("id").primaryKey(),
-		conversationId: text("conversation_id")
-			.notNull()
-			.references(() => conversations.id, { onDelete: "cascade" }),
+			.references(() => runs.id, { onDelete: "cascade" }),
 		seq: integer("seq").notNull(),
-		role: text("role", { enum: MESSAGE_ROLES }).notNull(),
-		content: text("content").notNull(),
-		runId: text("run_id"),
+		body: text("body").notNull(),
+		priority: text("priority", { enum: INBOX_PRIORITIES }).notNull().default("normal"),
+		fromActor: text("from_actor").notNull().default("operator"),
+		state: text("state", { enum: INBOX_STATES }).notNull().default("unread"),
 		createdAt: text("created_at").notNull(),
+		deliveredAt: text("delivered_at"),
 	},
-	(t) => [index(INDEX_NAMES.messagesConversationSeq).on(t.conversationId, t.seq)],
+	(t) => [index(INDEX_NAMES.runInboxRunState).on(t.runId, t.state)],
 );
 
 export type PlanRunRow = typeof planRuns.$inferSelect;
 export type PlanRunInsert = typeof planRuns.$inferInsert;
 export type PlanRunChildRow = typeof planRunChildren.$inferSelect;
 export type PlanRunChildInsert = typeof planRunChildren.$inferInsert;
-export type PlotRow = typeof plots.$inferSelect;
-export type PlotInsert = typeof plots.$inferInsert;
-export type ConversationRow = typeof conversations.$inferSelect;
-export type ConversationInsert = typeof conversations.$inferInsert;
-export type MessageRow = typeof messages.$inferSelect;
-export type MessageInsert = typeof messages.$inferInsert;
+export type RunInboxRow = typeof runInbox.$inferSelect;
+export type RunInboxInsert = typeof runInbox.$inferInsert;

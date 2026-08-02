@@ -21,18 +21,21 @@ import {
 	buildSteeringSignals,
 	type DimensionTokenSeries,
 	hydrateRunsUsage,
+	type RunGroupBucket,
 	type RunMetrics,
 	type RunMetricsRow,
+	type RunTotals,
 	type TokenBreakdown,
 	type TokenDayBucket,
 	type ToolEventRow,
 } from "../../../runs/index.ts";
+import { isPublicOnly, pickFields } from "../../projection.ts";
 import { jsonResponse } from "../../response.ts";
-import type { RouteHandler, ServerDeps } from "../../types.ts";
+import type { Actor, RouteHandler, ServerDeps } from "../../types.ts";
 import {
 	extractProviderModel,
 	parseAnalyticsDateBound,
-	resolveAnalyticsFrom,
+	resolveAnalyticsWindow as resolveAnalyticsWindowBounds,
 } from "./lifecycle.ts";
 
 /**
@@ -65,25 +68,24 @@ interface AnalyticsWindow {
 
 /**
  * Parse + resolve the shared `?from`/`?to`/`?projectId` window. Defaults the
- * `from` bound to the last 30 days when neither bound is supplied, matching
- * `GET /analytics/cost`. Both bounds and `projectId` are validated lightly — a
- * malformed date is a 400 because the lexicographic ISO8601 compare in
- * `listForAnalytics` would silently produce surprising results otherwise.
+ * `from` bound to the last 30 days whenever it is absent and clamps the span
+ * to 90 days, matching `GET /analytics/cost` (warren-30cc). Both bounds and
+ * `projectId` are validated lightly — a malformed date is a 400 because the
+ * lexicographic ISO8601 compare in `listForAnalytics` would silently produce
+ * surprising results otherwise.
  */
-function resolveAnalyticsWindow(ctx: { url: URL }): {
+function parseAnalyticsWindow(ctx: { url: URL }): {
 	echo: { projectId: string | null; from: string | null; to: string | null };
 	filter: AnalyticsWindow;
 } {
 	const projectId = ctx.url.searchParams.get("projectId") ?? undefined;
 	const from = parseAnalyticsDateBound(ctx, "from");
 	const to = parseAnalyticsDateBound(ctx, "to");
-	const defaultFrom = resolveAnalyticsFrom(from, to);
-	const filter: AnalyticsWindow = {};
+	const window = resolveAnalyticsWindowBounds(from, to);
+	const filter: AnalyticsWindow = { from: window.from, to: window.to };
 	if (projectId !== undefined) filter.projectId = projectId;
-	if (defaultFrom !== undefined) filter.from = defaultFrom;
-	if (to !== undefined) filter.to = to;
 	return {
-		echo: { projectId: projectId ?? null, from: defaultFrom ?? null, to: to ?? null },
+		echo: { projectId: projectId ?? null, from: window.from, to: window.to },
 		filter,
 	};
 }
@@ -159,6 +161,123 @@ function buildTokensSection(metrics: RunMetrics): RunAnalyticsTokensSection {
 	};
 }
 
+/** The full `GET /analytics/runs` body an operator receives. */
+export interface RunAnalyticsBody extends RunMetrics {
+	readonly filter: { projectId: string | null; from: string | null; to: string | null };
+	readonly tokens: RunAnalyticsTokensSection;
+}
+
+/**
+ * The `GET /analytics/runs` sections a `readPublic`-only spectator sees
+ * (warren-4f6c / pl-b82d step 15). Public analytics is a run-count and
+ * state-distribution view: how much work this instance does, how much of
+ * it lands, and how many tokens it burns doing so.
+ *
+ * Three allowlists, one per nesting level, so a field added to `RunMetrics`,
+ * `RunTotals` or `RunGroupBucket` tomorrow is absent from the public body
+ * until someone classifies it — see `src/server/projection.ts`.
+ */
+export const PUBLIC_RUN_ANALYTICS_FIELDS = [
+	"filter",
+	"totals",
+	"timeSeries",
+	"byAgent",
+	"byModel",
+	"byProvider",
+	"byFailureReason",
+	"tokenTimeSeries",
+	"tokenByModelSeries",
+	"tokenByProviderSeries",
+	"tokens",
+] as const satisfies readonly (keyof RunAnalyticsBody)[];
+
+/**
+ * The complement of `PUBLIC_RUN_ANALYTICS_FIELDS`.
+ *
+ * - `topSeedsByContext` — a leaderboard of the instance's own issue ids
+ *   ranked by context burn. Reads as internal backlog triage, and the
+ *   seed ids only mean anything to the operator.
+ */
+export const REDACTED_RUN_ANALYTICS_FIELDS = [
+	"topSeedsByContext",
+] as const satisfies readonly (keyof RunAnalyticsBody)[];
+
+/** `RunTotals` minus the windowed USD rollup. */
+export const PUBLIC_RUN_TOTALS_FIELDS = [
+	"runs",
+	"succeeded",
+	"failed",
+	"cancelled",
+	"active",
+	"successRate",
+	"durationMs",
+	"contextTokens",
+	"tokens",
+] as const satisfies readonly (keyof RunTotals)[];
+
+/**
+ * - `cost` — the windowed `{total, avg, priced}` USD rollup. Same call as
+ *   `costTotalUsd` on `GET /runs` (warren-946f): per-run cost on a run
+ *   detail is a deliberate exception, an aggregate headline is not.
+ */
+export const REDACTED_RUN_TOTALS_FIELDS = ["cost"] as const satisfies readonly (keyof RunTotals)[];
+
+/** `RunGroupBucket` minus the per-group USD rollup. */
+export const PUBLIC_RUN_GROUP_FIELDS = [
+	"key",
+	"runs",
+	"succeeded",
+	"failed",
+	"cancelled",
+	"successRate",
+	"contextTokensTotal",
+	"avgContextTokens",
+	"tokens",
+	"avgDurationMs",
+] as const satisfies readonly (keyof RunGroupBucket)[];
+
+/**
+ * - `costUsd` / `priced` — per-agent / per-model / per-provider spend.
+ *   Summing them reconstructs the aggregate `totals.cost` the projection
+ *   just dropped, so they go together or not at all.
+ */
+export const REDACTED_RUN_GROUP_FIELDS = [
+	"costUsd",
+	"priced",
+] as const satisfies readonly (keyof RunGroupBucket)[];
+
+/** The `GET /analytics/runs` body as a `readPublic`-only caller sees it. */
+export type PublicRunAnalytics = Omit<
+	Pick<RunAnalyticsBody, (typeof PUBLIC_RUN_ANALYTICS_FIELDS)[number]>,
+	"totals" | "byAgent" | "byModel" | "byProvider"
+> & {
+	readonly totals: Pick<RunTotals, (typeof PUBLIC_RUN_TOTALS_FIELDS)[number]>;
+	readonly byAgent: readonly Pick<RunGroupBucket, (typeof PUBLIC_RUN_GROUP_FIELDS)[number]>[];
+	readonly byModel: readonly Pick<RunGroupBucket, (typeof PUBLIC_RUN_GROUP_FIELDS)[number]>[];
+	readonly byProvider: readonly Pick<RunGroupBucket, (typeof PUBLIC_RUN_GROUP_FIELDS)[number]>[];
+};
+
+/**
+ * Narrow the analytics body for `actor`. The operator gets the body
+ * untouched, so the public body is provably the operator body minus
+ * fields — one construction site, no drift.
+ */
+function projectRunAnalytics(
+	body: RunAnalyticsBody,
+	actor: Actor | undefined,
+): RunAnalyticsBody | PublicRunAnalytics {
+	if (!isPublicOnly(actor)) return body;
+	const groups = (buckets: readonly RunGroupBucket[]) =>
+		buckets.map((b) => pickFields(b, PUBLIC_RUN_GROUP_FIELDS));
+	return {
+		...pickFields(body, PUBLIC_RUN_ANALYTICS_FIELDS),
+		totals: pickFields(body.totals, PUBLIC_RUN_TOTALS_FIELDS),
+		byAgent: groups(body.byAgent),
+		byModel: groups(body.byModel),
+		byProvider: groups(body.byProvider),
+	};
+}
+
 /**
  * `GET /analytics/runs?from=&to=&projectId=` (warren-0692 / pl-ad0f step 2;
  * tokens section added by warren-1244 / pl-d1a2 step 3).
@@ -175,10 +294,11 @@ function buildTokensSection(metrics: RunMetrics): RunAnalyticsTokensSection {
  */
 export function listRunAnalyticsHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
-		const { echo, filter } = resolveAnalyticsWindow(ctx);
+		const { echo, filter } = parseAnalyticsWindow(ctx);
 		const { metrics } = await loadRunMetrics(deps, filter);
 		const tokens = buildTokensSection(metrics);
-		return jsonResponse(200, { filter: echo, ...metrics, tokens });
+		const body: RunAnalyticsBody = { filter: echo, ...metrics, tokens };
+		return jsonResponse(200, projectRunAnalytics(body, ctx.actor));
 	};
 }
 
@@ -194,19 +314,19 @@ export function listRunAnalyticsHandler(deps: ServerDeps): RouteHandler {
  * itself stays on `/analytics/runs` — this endpoint returns just the behavior
  * layers (`mining` + `insights`) so the fast view can render independently.
  *
- * Steering / pause event kinds scanned when building {@link SteeringSignals}
- * for `buildInsights`. These three event kinds are lightweight (at most a
- * handful per run) so they are fetched in a separate, uncapped query rather
+ * Steering event kinds scanned when building {@link SteeringSignals}
+ * for `buildInsights`. The `steer.sent` kind is lightweight (at most a
+ * handful per run) so it is fetched in a separate, uncapped query rather
  * than being mixed into the tool-event cap that bounds command mining.
  */
 export function listBehaviorAnalyticsHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
-		const { echo, filter } = resolveAnalyticsWindow(ctx);
+		const { echo, filter } = parseAnalyticsWindow(ctx);
 		const { rows, metrics } = await loadRunMetrics(deps, filter);
 		const runIds = rows.map((r) => r.id);
 		const [eventRows, steeringRows] = await Promise.all([
 			loadToolEventRows(deps.repos.events, runIds),
-			deps.repos.events.listSteeringAndPauseEventsForRuns(runIds),
+			deps.repos.events.listSteeringEventsForRuns(runIds),
 		]);
 		const mining = buildCommandMining(eventRows);
 		const steering = buildSteeringSignals(steeringRows, rows.length);

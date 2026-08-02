@@ -7,7 +7,7 @@
  * to into its frontmatter `provider` / `model` pair.
  *
  * Models churn fast, so defaults are overridable at deploy time via env
- * (set in docker-compose.yml / fly.toml) with no code change or image
+ * (set in docker-compose.yml / the k8s Deployment env) with no code change or image
  * rebuild:
  *
  *   WARREN_MODEL_OPUS            / WARREN_MODEL_OPUS_PROVIDER

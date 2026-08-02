@@ -6,9 +6,8 @@ import { Label } from "./label.tsx";
  * Phase 6 layout primitive (warren-e6b3 / pl-55a3 step 7):
  *
  * Field — wraps `<Label>` + control + optional description/error/hint
- * into the `space-y-1.5` stack that NewRun, NewPlanRun, ProjectDetail,
- * and the per-Plot form blocks all repeat by hand. Consolidating the
- * pattern means every form field gets:
+ * into the `space-y-1.5` stack that NewRun, NewPlanRun, and ProjectDetail
+ * all repeat by hand. Consolidating the pattern means every form field gets:
  *   - the same vertical rhythm,
  *   - the same `text-xs text-(--color-muted-foreground)` hint copy,
  *   - the same `text-(--color-destructive)` error voice,
@@ -50,25 +49,11 @@ export interface FieldProps extends Omit<React.HTMLAttributes<HTMLDivElement>, "
 }
 
 export const Field = React.forwardRef<HTMLDivElement, FieldProps>(
-	(
-		{
-			className,
-			label,
-			id,
-			htmlFor,
-			description,
-			error,
-			required,
-			children,
-			...props
-		},
-		ref,
-	) => {
+	({ className, label, id, htmlFor, description, error, required, children, ...props }, ref) => {
 		const controlId = id ?? htmlFor;
 		const descId = description !== undefined && controlId ? `${controlId}-desc` : undefined;
-		const errId = error !== undefined && error !== null && controlId
-			? `${controlId}-err`
-			: undefined;
+		const errId =
+			error !== undefined && error !== null && controlId ? `${controlId}-err` : undefined;
 		const describedBy = [descId, errId].filter(Boolean).join(" ") || undefined;
 		const ctl: FieldControlProps = {
 			id: controlId ?? "",

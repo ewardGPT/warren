@@ -1,11 +1,7 @@
 import { ChevronDown, ChevronUp } from "lucide-react";
 import type * as React from "react";
 import { cn } from "@/lib/utils.ts";
-import {
-	ariaSortFor,
-	type SortDirection,
-	type SortState,
-} from "./sortable-table-head.helpers.ts";
+import { ariaSortFor, type SortDirection, type SortState } from "./sortable-table-head.helpers.ts";
 import { TableHead } from "./table.tsx";
 
 export {
@@ -44,9 +40,8 @@ export function SortableTableHead<K extends string>({
 	...rest
 }: SortableTableHeadProps<K>) {
 	const isActive = sort.key === columnKey;
-	const Icon: typeof ChevronUp = (sort.direction satisfies SortDirection) === "asc"
-		? ChevronUp
-		: ChevronDown;
+	const Icon: typeof ChevronUp =
+		(sort.direction satisfies SortDirection) === "asc" ? ChevronUp : ChevronDown;
 	return (
 		<TableHead
 			aria-sort={ariaSortFor(columnKey, sort)}

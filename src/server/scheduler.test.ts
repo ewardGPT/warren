@@ -1,37 +1,19 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Burrow, Run as BurrowRun } from "@os-eco/burrow-cli";
-import { BurrowClient, BurrowClientPool } from "../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { agents } from "../db/schema.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import type { SpawnRunInput, SpawnRunResult } from "../runs/index.ts";
+import type { RuntimeProvider } from "../runtime/contract.ts";
 import type { TriggerSchedulerConfig } from "../triggers/index.ts";
 import { createWarrenConfigCache } from "../warren-config/index.ts";
 import { bootScheduler } from "./scheduler.ts";
 import type { BridgeRegistry } from "./types.ts";
-
-function stubFetch(): typeof fetch {
-	return (async () =>
-		new Response(JSON.stringify({ error: { code: "x", message: "stub" } }), {
-			status: 404,
-		})) as unknown as typeof fetch;
-}
-
-function makeBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stubFetch(),
-	});
-}
-
-async function makePool(repos: Repos): Promise<BurrowClientPool> {
-	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
-	const pool = new BurrowClientPool({ repos });
-	pool.register("local", makeBurrowClient());
-	return pool;
-}
 
 interface BridgeCall {
 	readonly runId: string;
@@ -60,6 +42,11 @@ const SCHEDULER_CONFIG: TriggerSchedulerConfig = {
 };
 
 const NOW = new Date("2026-05-11T00:05:00.000Z");
+
+// Identity-only stub — the tests assert the SAME instance reaches spawnRun
+// (warren-c531 follow-up: a dropped provider silently falls back to the
+// burrow-backed LocalProvider, which cannot spawn under WARREN_RUNTIME=k8s).
+const RUNTIME_PROVIDER = { kind: "stub" } as unknown as RuntimeProvider;
 
 describe("bootScheduler", () => {
 	let db: WarrenDb;
@@ -138,7 +125,7 @@ describe("bootScheduler", () => {
 
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
 			projectsConfig: PROJECTS_CONFIG,
@@ -146,6 +133,9 @@ describe("bootScheduler", () => {
 			config: { ...SCHEDULER_CONFIG, disabled: true },
 			now: () => NOW,
 			spawnRunFn,
+			// Self-heal probe (warren-1ec7): treat the clone as present so the
+			// tick reaches dispatch without touching disk.
+			cloneExists: () => true,
 		});
 
 		const result = await handle.runOnce();
@@ -160,6 +150,7 @@ describe("bootScheduler", () => {
 		// spawnRun threaded the prod plumbing through (refresh hook + cache).
 		expect(spawnRunCalls[0]?.projectsConfig).toBe(PROJECTS_CONFIG);
 		expect(spawnRunCalls[0]?.warrenConfigs).toBe(warrenConfigs);
+		expect(spawnRunCalls[0]?.runtimeProvider).toBe(RUNTIME_PROVIDER);
 		expect(bridgeCalls).toHaveLength(1);
 		expect(bridgeCalls[0]?.burrowRunId).toBe("rb_a");
 	});
@@ -218,7 +209,7 @@ describe("bootScheduler", () => {
 
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
 			projectsConfig: PROJECTS_CONFIG,
@@ -226,6 +217,7 @@ describe("bootScheduler", () => {
 			config: { ...SCHEDULER_CONFIG, sdBinary: "sd-test", disabled: true },
 			now: () => NOW,
 			spawnRunFn,
+			cloneExists: () => true,
 		});
 
 		const result = await handle.runOnce();
@@ -262,11 +254,61 @@ describe("bootScheduler", () => {
 		expect(bridgeCalls).toHaveLength(1);
 	});
 
+	test("warren-1ec7: a missing clone is re-cloned via projectSpawn and the tick proceeds", async () => {
+		const warrenConfigs = createWarrenConfigCache({
+			load: async () => ({
+				triggers: null,
+				defaults: null,
+				prTemplate: null,
+				sourceFile: null,
+				errors: [],
+				warnings: [],
+			}),
+		});
+
+		// Point the projects root at a tmp dir so `cloneProjectRepo`'s real
+		// parent-dir mkdir succeeds; the git spawn itself is stubbed.
+		const tmpRoot = await mkdtemp(join(tmpdir(), "warren-heal-"));
+		let missing = true;
+		const gitCommands: string[][] = [];
+		const projectSpawn: SpawnFn = async (cmd) => {
+			gitCommands.push([...cmd]);
+			if (cmd[1] === "clone") missing = false; // clone materialized the dir
+			return { stdout: "", stderr: "", exitCode: 0 };
+		};
+
+		try {
+			const handle = bootScheduler({
+				repos,
+				runtimeProvider: RUNTIME_PROVIDER,
+				bridges: makeBridges([]),
+				warrenConfigs,
+				projectsConfig: { root: tmpRoot, gitBinary: "git" },
+				projectSpawn,
+				config: { ...SCHEDULER_CONFIG, disabled: true },
+				now: () => NOW,
+				// The clone is absent until the re-clone spawn runs.
+				cloneExists: () => !missing,
+			});
+
+			const result = await handle.runOnce();
+			await handle.stop();
+
+			// The tick self-healed rather than surfacing a project error.
+			expect(result?.projectErrors).toEqual([]);
+			const cloneCall = gitCommands.find((c) => c[1] === "clone");
+			expect(cloneCall).toBeDefined();
+			expect(cloneCall).toContain("https://github.com/x/y.git");
+		} finally {
+			await rm(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
 	test("disabled config does not schedule an interval", async () => {
 		const setIntervalCalls: { ms: number }[] = [];
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
 				load: async () => ({
@@ -297,7 +339,7 @@ describe("bootScheduler", () => {
 		const clearCalls: number[] = [];
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
 				load: async () => ({

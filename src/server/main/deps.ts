@@ -5,37 +5,27 @@
  * inputs the orchestrator has already wired.
  */
 
-import type { BurrowClientPool } from "../../burrow-client/index.ts";
 import type { AnyWarrenDb } from "../../db/client.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { MetricsRegistry } from "../../observability/metrics-registry.ts";
-import { createDefaultPlanSynthesizer } from "../../plot-plan-runs/index.ts";
-import {
-	createPlotAggregator,
-	createPlotResolver,
-	defaultPlanChildAdopter,
-	defaultPlotAttacher,
-	defaultPlotCreator,
-	defaultPlotIntentEditor,
-	defaultPlotPrMerger,
-	defaultPlotQuestionAnswerer,
-	defaultPlotReader,
-	defaultPlotRenamer,
-	defaultPlotStatusChanger,
-} from "../../plots/index.ts";
 import type { PreviewAuth } from "../../preview/cookie.ts";
 import type { loadPreviewEvictionConfigFromEnv } from "../../preview/eviction/index.ts";
 import type { loadPreviewLaunchConfigFromEnv } from "../../preview/launch/index.ts";
 import type { loadPreviewPortRangeFromEnv } from "../../preview/port-allocator.ts";
 import type { ProjectsConfig } from "../../projects/config.ts";
-import type { loadCanopyRegistryConfigFromEnv } from "../../registry/config.ts";
+import type { PublicAllowlist } from "../../projects/public-allowlist.ts";
 import type { loadAutoOpenPrConfigFromEnv, RunEventBroker } from "../../runs/index.ts";
+import type { RuntimeProvider } from "../../runtime/contract.ts";
+import type { PodAdmissionSource } from "../../runtime/k8s/admission.ts";
+import type { PodMetricsSource } from "../../runtime/k8s/pod-metrics.ts";
+import type { PodCacheReader } from "../../runtime/k8s/pod-watcher.ts";
 import type { createWarrenConfigCache } from "../../warren-config/index.ts";
+import { createDbSeams } from "../db-seams.ts";
 import { IdempotencyStore } from "../idempotency.ts";
+import { EventStreamLimiter, type EventStreamLimits } from "../stream-limits.ts";
 import type { BridgeRegistry, Logger, ServerDeps } from "../types.ts";
 import { defaultSpawn } from "./utils.ts";
 
-type CanopyConfig = ReturnType<typeof loadCanopyRegistryConfigFromEnv>;
 type AutoOpenPrConfig = ReturnType<typeof loadAutoOpenPrConfigFromEnv>;
 type WarrenConfigs = ReturnType<typeof createWarrenConfigCache>;
 type PreviewLaunchConfig = ReturnType<typeof loadPreviewLaunchConfigFromEnv>;
@@ -45,10 +35,28 @@ type PreviewPortRange = ReturnType<typeof loadPreviewPortRangeFromEnv>;
 export interface BuildServerDepsInput {
 	readonly repos: Repos;
 	readonly db: AnyWarrenDb;
-	readonly burrowClientPool: BurrowClientPool;
+	/**
+	 * The runtime provider resolved ONCE at boot (`resolveRuntimeProvider`,
+	 * warren-c531) — the sole composition point. `bootServer` resolves it before
+	 * `bootBridges` (so the bridge registry, run-state poller, and watchdog all
+	 * share the same instance) and hands it here rather than deps re-resolving a
+	 * second instance. Under `local` it is the burrow-backed `LocalProvider`.
+	 */
+	readonly runtimeProvider: RuntimeProvider;
+	/**
+	 * Provider-neutral preview sidecar resolver (warren-e24d), gated on the
+	 * runtime's preview-port capability at boot. Threaded onto `ServerDeps` for
+	 * the preview-teardown handler's best-effort sidecar stop. Absent under a
+	 * backend without preview ports.
+	 */
+	readonly previewSidecars?: import("../../runtime/local/preview/sidecars.ts").LocalSidecarsResolver;
+	/**
+	 * Local-topology `/readyz` burrow probe (warren-f796). Present only under
+	 * `WARREN_RUNTIME=local` (from the `LocalBootBackend`); absent under k8s.
+	 */
+	readonly burrowProbe?: () => Promise<import("../../diagnostics/checks.ts").DiagnosticCheck>;
 	readonly broker: RunEventBroker;
 	readonly bridges: BridgeRegistry;
-	readonly canopyConfig: CanopyConfig;
 	readonly projectsConfig: ProjectsConfig;
 	readonly logger: Logger;
 	readonly uiDistDir: string | null;
@@ -59,9 +67,35 @@ export interface BuildServerDepsInput {
 	readonly previewLaunchConfig: PreviewLaunchConfig;
 	readonly previewEvictionConfig: PreviewEvictionConfig;
 	readonly workspaceGcTtlMs: number;
+	/**
+	 * Event-stream concurrency caps (warren-25f6), resolved from env by the
+	 * orchestrator so a malformed knob fails at boot rather than at the first
+	 * stream. One `EventStreamLimiter` is built from them here and shared by
+	 * both NDJSON routes plus the `/metrics` saturation gauge.
+	 */
+	readonly eventStreamLimits: EventStreamLimits;
+	/**
+	 * Orgs `POST /projects` may register (warren-ce9b). Resolved by the
+	 * orchestrator, which passes `undefined` unless `WARREN_AUTH=public`.
+	 */
+	readonly publicAllowlist: PublicAllowlist | undefined;
 	readonly previewAuth: PreviewAuth | undefined;
 	readonly sdBinary: string;
 	readonly metricsRegistry?: MetricsRegistry;
+	/**
+	 * The started K8s pod-watcher (src/server/main/runtime-wiring.ts), present
+	 * only under `WARREN_RUNTIME=k8s`. One instance satisfies three seams: the
+	 * `K8sProvider`'s status cache + admission source (threaded onto the provider
+	 * below) and the `/metrics` pod-gauge source (`ServerDeps.podMetrics`).
+	 * Absent under `local` — no pod plumbing is wired.
+	 */
+	readonly k8sPodWatcher?: PodCacheReader & PodAdmissionSource & PodMetricsSource;
+	/**
+	 * Durable salvage-bundle directory (warren-cd3b), resolved by the
+	 * orchestrator to `<dataDir>/salvage`. Threaded onto `ServerDeps` for the
+	 * `POST /runs/:id/salvage` intake.
+	 */
+	readonly salvageDir: string;
 	readonly now?: () => Date;
 }
 
@@ -69,10 +103,10 @@ export function buildServerDeps(input: BuildServerDepsInput): ServerDeps {
 	const {
 		repos,
 		db,
-		burrowClientPool,
+		runtimeProvider,
+		burrowProbe,
 		broker,
 		bridges,
-		canopyConfig,
 		projectsConfig,
 		logger,
 		uiDistDir,
@@ -83,36 +117,36 @@ export function buildServerDeps(input: BuildServerDepsInput): ServerDeps {
 		previewLaunchConfig,
 		previewEvictionConfig,
 		workspaceGcTtlMs,
+		eventStreamLimits,
+		publicAllowlist,
 		previewAuth,
+		previewSidecars,
 		sdBinary,
 		metricsRegistry,
+		k8sPodWatcher,
+		salvageDir,
 		now,
 	} = input;
-
-	// Plot aggregator (warren-c167 / pl-9d6a step 2). 5s in-memory cache,
-	// fan-out across every `hasPlot=true` project, byte-identical empty
-	// contract for deployments where no project ships `.plot/`. Threaded
-	// through ServerDeps so `GET /plots` (and later mutating handlers in
-	// pl-9d6a) read the same cache. `paused_run` needs-attention signal
-	// source (warren-d693 / pl-0344 step 9): `repos.runs` already
-	// satisfies `AggregatorRunsRepo`'s narrow surface.
-	const plotAggregator = createPlotAggregator({
-		projectsRepo: repos.projects,
-		logger,
-		runsRepo: repos.runs,
-		...(now !== undefined ? { now: () => now().getTime() } : {}),
-	});
 
 	const previewHostForDeps =
 		previewLaunchConfig.host !== null ? previewLaunchConfig.host : undefined;
 
+	// Runtime-provider seam (warren-c531): the provider is resolved ONCE at boot
+	// (before `bootBridges`, so the bridge registry + poller + watchdog share it)
+	// and threaded in here, rather than deps re-resolving a second instance.
+
 	return {
 		repos,
 		db,
-		burrowClientPool,
+		// Persistence seams derived from `db` ONCE here (warren-89a6). The HTTP
+		// handlers are a thin surface: `check:layers` forbids them building a
+		// drizzle adapter or a repo out of `deps.db` per request.
+		...createDbSeams(db),
+		runtimeProvider,
+		...(burrowProbe !== undefined ? { burrowProbe } : {}),
+		salvageDir,
 		broker,
 		bridges,
-		...(canopyConfig !== null ? { canopyConfig } : {}),
 		projectsConfig,
 		logger,
 		uiDistDir,
@@ -124,28 +158,17 @@ export function buildServerDeps(input: BuildServerDepsInput): ServerDeps {
 		previewPortRange,
 		previewMaxLive: previewEvictionConfig.maxLive,
 		workspaceGcTtlMs,
+		streamLimiter: new EventStreamLimiter(eventStreamLimits),
+		...(publicAllowlist !== undefined ? { publicAllowlist } : {}),
 		previewMode: previewLaunchConfig.mode,
 		...(previewHostForDeps !== undefined ? { previewHost: previewHostForDeps } : {}),
 		...(previewAuth !== undefined ? { previewAuth } : {}),
-		plotAggregator,
-		plotCreator: defaultPlotCreator,
-		plotAttacher: defaultPlotAttacher,
-		plotPrMerger: defaultPlotPrMerger,
-		plotIntentEditor: defaultPlotIntentEditor,
-		plotRenamer: defaultPlotRenamer,
-		plotReader: defaultPlotReader,
-		planChildAdopter: defaultPlanChildAdopter,
-		plotStatusChanger: defaultPlotStatusChanger,
-		plotQuestionAnswerer: defaultPlotQuestionAnswerer,
-		plotResolver: createPlotResolver({
-			projectsRepo: repos.projects,
-			aggregator: plotAggregator,
-		}),
-		planSynthesizer: createDefaultPlanSynthesizer({
-			seedsCli: { sdBinary, spawn: defaultSpawn },
-		}),
+		...(previewSidecars !== undefined ? { previewSidecars } : {}),
 		idempotencyStore: new IdempotencyStore(now !== undefined ? { now: () => now().getTime() } : {}),
 		...(metricsRegistry !== undefined ? { metricsRegistry } : {}),
+		// `/metrics` pod-phase gauges read live from the same pod-watcher at scrape
+		// (pl-829f step 25 / warren-7c30); absent under LocalProvider.
+		...(k8sPodWatcher !== undefined ? { podMetrics: k8sPodWatcher } : {}),
 		...(now !== undefined ? { now } : {}),
 	};
 }

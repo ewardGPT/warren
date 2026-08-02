@@ -18,13 +18,7 @@ export function WarrenLogo({ className }: { className?: string }) {
 		>
 			<title>warren</title>
 			{/* tunnel ring (dim) */}
-			<g
-				stroke="currentColor"
-				strokeWidth={2.2}
-				strokeLinecap="round"
-				fill="none"
-				opacity={0.35}
-			>
+			<g stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" fill="none" opacity={0.35}>
 				<line x1="50" y1="18" x2="77.713" y2="34" />
 				<line x1="77.713" y1="34" x2="77.713" y2="66" />
 				<line x1="77.713" y1="66" x2="50" y2="82" />
@@ -33,13 +27,7 @@ export function WarrenLogo({ className }: { className?: string }) {
 				<line x1="22.287" y1="34" x2="50" y2="18" />
 			</g>
 			{/* inactive spokes */}
-			<g
-				stroke="currentColor"
-				strokeWidth={2.2}
-				strokeLinecap="round"
-				fill="none"
-				opacity={0.55}
-			>
+			<g stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" fill="none" opacity={0.55}>
 				<line x1="50" y1="50" x2="50" y2="18" />
 				<line x1="50" y1="50" x2="77.713" y2="66" />
 				<line x1="50" y1="50" x2="50" y2="82" />

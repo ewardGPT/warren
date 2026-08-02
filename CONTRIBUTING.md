@@ -1,6 +1,6 @@
 # Contributing to Warren
 
-Thanks for your interest in contributing to Warren! This guide covers everything you need to get started.
+Thanks for your interest in contributing to Warren! This guide covers everything you need to get started. [`docs/README.md`](docs/README.md) indexes every other operator and contributor document.
 
 ## Getting Started
 
@@ -14,9 +14,9 @@ Thanks for your interest in contributing to Warren! This guide covers everything
    ```bash
    bun install
    ```
-4. **Link** the CLI for local development:
+4. **Run** the CLI straight from the checkout — warren is not published to npm, so there is no global install:
    ```bash
-   bun link
+   bun run src/cli/main.ts --help
    ```
 5. **Create a branch** for your work:
    ```bash
@@ -38,13 +38,10 @@ Use descriptive branch names with a category prefix:
 ```bash
 bun test                                   # Run all tests
 bun test src/foo.test.ts                   # Run a single test file
-biome check .                              # Lint + format check
-biome check --write .                      # Auto-fix lint + format issues
-tsc --noEmit                               # Type check
-bun run check:all                          # All quality gates
+bun run check:all                          # All quality gates CI enforces
 ```
 
-Always run `bun run check:all` before submitting a PR.
+Run lint, typecheck, and the other gates through `bun run check:all`. `biome check .` alone is not the gate. Always run `bun run check:all` before submitting a PR.
 
 ## TypeScript Conventions
 
@@ -68,8 +65,9 @@ Warren is a strict TypeScript project that runs directly on Bun (no build step).
 
 ### File Organization
 
-- All shared types go in `src/types.ts`
-- Each CLI command gets its own file in `src/commands/`
+- Types live with the domain that owns them: `src/core/` for ids and the error hierarchy, `src/server/types.ts` for the HTTP wire shapes, and `src/runs/`, `src/projects/`, `src/registry/` for their own
+- Enum-shaped wire values live once in `src/core/wire.ts`. Every other surface re-exports them (see `AGENTS.md` for the full rule)
+- Each CLI command gets its own file in `src/cli/commands/`
 - Import with `.ts` extensions
 
 ## Testing Conventions
@@ -108,10 +106,10 @@ describe("my-feature", () => {
 
 ## Adding a New Command
 
-1. Create `src/commands/<name>.ts`
-2. Register the command in `src/index.ts`
-3. Add tests in `src/commands/<name>.test.ts`
-4. Update the CLI Reference in `README.md`
+1. Create `src/cli/commands/<name>.ts`, exporting a pure `run<Name>` function
+2. Import it in `src/cli/main.ts` and add its `case` to the subcommand dispatch
+3. Add tests in `src/cli/commands/<name>.test.ts`
+4. Add a row to the `## CLI` table in `README.md`
 
 ## Commit Message Style
 
@@ -129,7 +127,7 @@ Prefix with `fix:`, `feat:`, or `docs:` when the category is clear. Plain descri
 
 - **One concern per PR.** Keep changes focused -- a bug fix, a feature, a refactor. Not all three.
 - **Tests required.** New features and bug fixes should include tests. See the testing conventions above.
-- **Passing CI.** All PRs must pass CI checks (lint + typecheck + test) before merge.
+- **Passing CI.** All PRs must pass the full `bun run check:all` gate manifest before merge.
 - **Description.** Briefly explain what the PR does and why. Link to any relevant issues.
 
 ## Reporting Issues

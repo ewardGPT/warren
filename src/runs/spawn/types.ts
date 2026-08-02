@@ -1,18 +1,17 @@
 /**
  * Shared types for the spawn flow. Kept in their own module so the
- * source files (`dispatch.ts`, `plot-append.ts`, `seed-extensions.ts`,
+ * source files (`dispatch.ts`, `seed-extensions.ts`,
  * `agent-cache.ts`) and their tests can import the input/result shapes
  * without dragging in the full `spawnRun` implementation graph.
  */
 
-import type { Burrow, Run as BurrowRun } from "@os-eco/burrow-cli";
-import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { CloneKind, RunMode, RunRow } from "../../db/schema.ts";
 import type { SpawnFn as ProjectSpawnFn } from "../../projects/clone.ts";
 import type { ProjectsConfig } from "../../projects/config.ts";
 import type { refreshProject } from "../../projects/manage.ts";
 import type { AgentDefinition } from "../../registry/schema.ts";
+import type { RuntimeProvider } from "../../runtime/contract.ts";
 import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
 import type { WarrenConfigCache } from "../../warren-config/index.ts";
 
@@ -34,43 +33,17 @@ export interface SpawnLogger {
 export interface SpawnRunInput {
 	readonly repos: Repos;
 	/**
-	 * Multi-worker successor to the legacy `burrowClient` parameter
-	 * (warren-39c3 / pl-9ba1 step 4, parent warren-6747). `spawnRun`
-	 * resolves placement via `pool.placeFor({projectId})` so the chosen
-	 * worker name lands on `runs.worker_id` AND `burrows.worker_id`
-	 * before any burrow HTTP call. The same client services provision +
-	 * dispatch + rollback so a single run never crosses workers.
+	 * Runtime-provider seam (warren-c42c: burrow-client eviction, bucket 2).
+	 * `spawnRun` dispatches EXCLUSIVELY through `provider.create(spec)` — the
+	 * single call that collapses burrow's `burrowsUp` + `runs.create` (and, on
+	 * a partial failure, owns the sandbox-half teardown). Required: the spawn
+	 * path no longer knows about burrow, so callers resolve the boot-selected
+	 * provider (`resolveRuntimeProvider`, honoring `WARREN_RUNTIME`) and thread
+	 * it here. LocalProvider (default) wraps burrow; K8sProvider runs a pod.
 	 */
-	readonly burrowClientPool: BurrowClientPool;
+	readonly runtimeProvider: RuntimeProvider;
 	readonly agentName: string;
 	readonly projectId: string;
-	/**
-	 * Coordination project id (warren-c1a4 / pl-fb43 step 3). Splits the
-	 * single project identity into two roles:
-	 *
-	 *   - `projectId` (execution) selects the repo cloned into the burrow
-	 *     workspace — where the agent actually does its work.
-	 *   - `seedProjectId` (coordination) selects the *host* project clone
-	 *     used for the post-dispatch bookkeeping: the seeds
-	 *     `updateExtensions` stamp (`role`/`lastRunId`/`lastRunAt`) and the
-	 *     `run_dispatched` Plot append/mirror.
-	 *
-	 * Defaults to `projectId` when unset/empty, so a same-repo run is
-	 * byte-identical to the pre-split behavior. When it differs, the seed
-	 * stamp and Plot operations target the coordination project's clone
-	 * while the workspace still clones the execution `projectId`. The
-	 * burrow provisioning path is unaffected — it always uses `projectId`.
-	 */
-	readonly seedProjectId?: string;
-	/**
-	 * Legibility-only repo ref for the cross-repo plan-run path (pl-fb43
-	 * step 5 / warren-d9f3). When the child was routed to a different
-	 * execution repo than the coordination project, this carries the raw
-	 * `extensions.repo` string so the `run_dispatched` Plot mirror on the
-	 * coordination project is self-describing about which repo the run
-	 * actually targeted. Omitted on same-repo dispatches.
-	 */
-	readonly executionRepo?: string;
 	readonly prompt: string;
 	readonly trigger?: string;
 	/**
@@ -91,16 +64,6 @@ export interface SpawnRunInput {
 	 * mode — the discriminator is warren-side only).
 	 */
 	readonly mode?: RunMode;
-	/**
-	 * Optional Plot id this run is dispatched against (warren-a8c3,
-	 * parent warren-000b). Validated against `project.hasPlot` here:
-	 * passing a plot_id for a project whose clone has no `.plot/`
-	 * directory raises a typed ValidationError so the operator gets a
-	 * 400 with a clear hint instead of a silently-dropped field.
-	 * Persisted to `runs.plot_id`; downstream steps (warren-e26f,
-	 * warren-e848, warren-7e0f) read it from the runs row.
-	 */
-	readonly plotId?: string;
 	readonly metadata?: unknown;
 	/**
 	 * Optional per-run override of the agent's `frontmatter.provider`. When
@@ -133,6 +96,13 @@ export interface SpawnRunInput {
 	 */
 	readonly projectsConfig?: ProjectsConfig;
 	readonly projectSpawn?: ProjectSpawnFn;
+	/**
+	 * GitHub token for the pre-dispatch refresh's `git fetch` against a
+	 * private repo (`AutoOpenPrConfig.gitToken`, forwarded to
+	 * `refreshProject`). Needed wherever no supervisor-installed global
+	 * `insteadOf` rule exists (K8s control plane). Absent → anonymous.
+	 */
+	readonly githubToken?: string;
 	/** Branch, tag, or SHA to refresh to. Defaults to the project's tracked default branch. */
 	readonly ref?: string;
 	/**
@@ -207,23 +177,10 @@ export interface SpawnRunInput {
 	 */
 	readonly seedsCli?: SeedsCliDeps;
 	/**
-	 * Handle of the user dispatching the run (warren-e848 / pl-2047 step 5).
-	 * Used as the actor for the `run_dispatched` event appended to the
-	 * originating Plot — Plot's SPEC §6 ACL allows both `user:*` and
-	 * `agent:*` actors for `run_dispatched`, but warren attributes the
-	 * dispatch to the human who triggered it. Falls back to
-	 * `DEFAULT_DISPATCHER_HANDLE` when undefined, empty, or doesn't match
-	 * the actor segment regex — non-user dispatch paths (cron/webhook)
-	 * are accounted for under pl-2047 risk #4.
+	 * Handle of the user dispatching the run (warren-e848). Persisted onto
+	 * plan-run bookkeeping; carried through unchanged by the spawn flow.
 	 */
 	readonly dispatcherHandle?: string;
-	/**
-	 * Test seam for the `run_dispatched` Plot append (warren-e848). The
-	 * default opens a `UserPlotClient` against `<project>/.plot/` and
-	 * fire-and-logs on failure; tests substitute a stub to assert the
-	 * payload without touching disk.
-	 */
-	readonly plotAppender?: SpawnPlotAppender;
 	/**
 	 * Structured logger for the spawn flow (warren-c686 / pl-f700 step 1).
 	 * The HTTP handlers pass `ctx.logger` (pre-bound with `request_id`);
@@ -232,27 +189,29 @@ export interface SpawnRunInput {
 	 * CLI paths that don't care — the flow degrades to a no-op logger.
 	 */
 	readonly logger?: SpawnLogger;
-}
-
-export interface AppendPlotRunDispatchedInput {
-	readonly plotDir: string;
-	readonly plotId: string;
-	readonly handle: string;
-	readonly runId: string;
-	readonly agentName: string;
-	readonly model: string | null;
-	readonly projectId: string;
-	/** pl-fb43 step 5: execution repo ref when it differs from coordination. */
-	readonly executionRepo?: string;
-}
-
-export interface SpawnPlotAppender {
-	appendRunDispatched(input: AppendPlotRunDispatchedInput): Promise<void>;
+	/**
+	 * Fired once with the freshly-minted warren run id, right after the run
+	 * row is created and before any runtime contact (warren-a0a2). Lets a
+	 * caller learn the row id even when `spawnRun` later throws (the row is
+	 * finalized `failed`/`never_started` on a pre-dispatch failure). The
+	 * scheduler's bounded-retry GC uses this to drop the transient
+	 * never_started rows a persistently-unreachable runtime would flood the
+	 * runs list with. Best-effort: the callback must not throw.
+	 */
+	readonly onRunRowCreated?: (runId: string) => void;
 }
 
 export interface SpawnRunResult {
 	readonly run: RunRow;
-	readonly burrow: Burrow;
-	readonly burrowRun: BurrowRun;
+	/**
+	 * Narrowed from burrow's full `Run`/`Burrow` rows (warren-1f56) to just the
+	 * ids the callers use (`bridges.start`, the HTTP response). The runtime seam
+	 * returns only an opaque `RunHandle`, so `burrow.workspacePath` — a host path
+	 * with no provider-neutral home — is a display-only carry-over (empty on the
+	 * real dispatch path) kept for wire/UI compatibility until the `/burrows`
+	 * surface is retired (plan §5.C).
+	 */
+	readonly burrow: { readonly id: string; readonly workspacePath: string };
+	readonly burrowRun: { readonly id: string };
 	readonly agent: AgentDefinition;
 }

@@ -1,0 +1,89 @@
+{
+	"$comment": "Declared seams for scripts/check-layers.ts (warren-89a6). One entry per architectural boundary. `from` and `allow` hold repo-relative POSIX paths: a trailing slash is a directory prefix, anything else is an exact file. `forbidImports` holds module targets — a relative specifier is resolved against the importing file first, so `src/server/` catches `../server/types.ts` but not `../seeds-cli/index.ts`; a bare entry matches a package and its subpaths; `*` matches every target. `exceptImports` carves targets back out of `forbidImports`. `forbidPattern` is a JS regex applied to each non-comment source line, for a rule that is not about imports. Every `allow` entry states why the exception is legitimate. Adding a seam here is a data edit — new seams are born enforced.",
+	"rules": [
+		{
+			"name": "burrow-facade-is-local-only",
+			"why": "The src/burrow-client/ facade is local-topology only. Route runtime calls through the RuntimeProvider seam (src/runtime/contract.ts) instead, or move the coupling under src/runtime/local/.",
+			"from": ["src/"],
+			"forbidImports": ["src/burrow-client/"],
+			"allow": [
+				{ "path": "src/burrow-client/", "why": "the facade itself" },
+				{
+					"path": "src/runtime/local/",
+					"why": "the LocalProvider and its seams, including diagnostics/burrow.ts and boot-backend.ts"
+				},
+				{
+					"path": "src/supervisor/",
+					"why": "local-topology by definition — it spawns burrow serve"
+				},
+				{ "path": "src/runtime/registry.ts", "why": "the () => BurrowClient factory seam" }
+			]
+		},
+		{
+			"name": "burrow-package-is-local-only",
+			"why": "@os-eco/burrow-cli is burrow's own library (transport and error types plus the in-pod agent framework). It is local-topology only; under WARREN_RUNTIME=k8s there is no burrow at all.",
+			"from": ["src/"],
+			"forbidImports": ["@os-eco/burrow-cli"],
+			"allow": [
+				{ "path": "src/burrow-client/", "why": "the facade itself" },
+				{
+					"path": "src/runs/stream/token-budget.ts",
+					"why": "type-only RunEvent import for the bridge token ledger; no runtime burrow dependency"
+				},
+				{ "path": "src/runtime/local/", "why": "the LocalProvider and its seams" },
+				{ "path": "src/supervisor/", "why": "local-topology by definition" },
+				{
+					"path": "src/runtime/k8s/",
+					"why": "the pod agent harness uses burrow-cli's AgentRegistry / AgentRuntime — residual burrow surface, deliberately left"
+				}
+			]
+		},
+		{
+			"name": "domain-owns-the-logic",
+			"why": "The domain modules own the logic. The HTTP handlers and the CLI are surfaces over them, so the dependency points inward only. A type the domain needs belongs in the domain; src/server/types.ts may re-export it outward.",
+			"from": [
+				"src/runs/",
+				"src/projects/",
+				"src/plan-runs/",
+				"src/registry/",
+				"src/db/",
+				"src/runtime/",
+				"src/preview/",
+				"src/triggers/",
+				"src/observability/"
+			],
+			"forbidImports": ["src/server/", "src/cli/"]
+		},
+		{
+			"name": "cli-is-a-consumer",
+			"why": "The CLI is a consumer. It calls the domain function or the HTTP route that wraps it; it never reaches into the server's internals.",
+			"from": ["src/cli/"],
+			"forbidImports": ["src/server/"],
+			"allow": [
+				{
+					"path": "src/cli/commands/serve.ts",
+					"why": "`warren serve` boots the server in-process — this command IS the server's entry point, so importing bootServer is the command's whole job"
+				}
+			]
+		},
+		{
+			"name": "handlers-are-a-thin-surface",
+			"why": "HTTP handlers talk to repos, never to drizzle tables. Reaching into src/db/schema/ puts a query in the request path instead of in the repo that owns it.",
+			"from": ["src/server/handlers/"],
+			"forbidImports": ["src/db/schema/"]
+		},
+		{
+			"name": "handlers-do-not-build-repos",
+			"why": "Assembling the persistence layer is boot wiring, not request handling. Consume the seams ServerDeps already carries (deps.repos, deps.dbAdapter, deps.runPreviews); add a new one in src/server/db-seams.ts rather than building one per request.",
+			"from": ["src/server/handlers/"],
+			"forbidPattern": "[A-Za-z_$][\\w$.]*\\(\\s*deps\\.db\\b"
+		},
+		{
+			"name": "core-kernel-imports-nothing",
+			"why": "src/core/ is the dependency-free kernel. A kernel with no imports is what lets the Vite-bundled UI reach the same module, so neither drizzle nor bun:sqlite reaches the browser bundle.",
+			"from": ["src/core/"],
+			"forbidImports": ["*"],
+			"exceptImports": ["src/core/"]
+		}
+	]
+}

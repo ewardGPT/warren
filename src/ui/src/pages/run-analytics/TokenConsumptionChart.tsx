@@ -225,7 +225,10 @@ function tokenFormatter(
 function KindChart({ timeSeries }: { timeSeries: readonly TokenDayBucket[] }) {
 	return (
 		<ChartContainer>
-			<AreaChart data={timeSeries as TokenDayBucket[]} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
+			<AreaChart
+				data={timeSeries as TokenDayBucket[]}
+				margin={{ top: 8, right: 8, bottom: 0, left: -16 }}
+			>
 				<CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
 				<XAxis dataKey="date" {...AXIS_PROPS} />
 				<YAxis tickFormatter={formatTokens} {...AXIS_PROPS} />
@@ -278,10 +281,7 @@ function DimChart({ dimSeries }: { dimSeries: readonly DimensionTokenSeries[] })
 
 	return (
 		<ChartContainer>
-			<AreaChart
-				data={data}
-				margin={{ top: 8, right: 8, bottom: 0, left: -16 }}
-			>
+			<AreaChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
 				<CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
 				<XAxis dataKey="date" {...AXIS_PROPS} />
 				<YAxis tickFormatter={formatTokens} {...AXIS_PROPS} />
@@ -300,7 +300,13 @@ function DimChart({ dimSeries }: { dimSeries: readonly DimensionTokenSeries[] })
 							fill={color}
 							fillOpacity={deEmphasised ? 0.2 : 0.5}
 							strokeOpacity={deEmphasised ? 0.4 : 1}
-							name={key === RUN_ANALYTICS_NONE_KEY ? "unknown" : key === RUN_ANALYTICS_OTHER_KEY ? "other" : key}
+							name={
+								key === RUN_ANALYTICS_NONE_KEY
+									? "unknown"
+									: key === RUN_ANALYTICS_OTHER_KEY
+										? "other"
+										: key
+							}
 						/>
 					);
 				})}
@@ -308,4 +314,3 @@ function DimChart({ dimSeries }: { dimSeries: readonly DimensionTokenSeries[] })
 		</ChartContainer>
 	);
 }
-

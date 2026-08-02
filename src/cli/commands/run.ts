@@ -1,7 +1,7 @@
 /**
  * `warren run <agent> <project> -p "..."` — one-shot, no UI.
  *
- * Spawns a run via the §4.3 composition flow, opens a stream bridge so
+ * Spawns a run via the docs/design/agent-composition.md composition flow, opens a stream bridge so
  * events land in the warren events table, and tails them as NDJSON to
  * stdout until the burrow run terminates. When the bridge ends, fetches
  * the burrow run's terminal state, runs `reapRun` to finalize the warren
@@ -20,8 +20,6 @@
  * UI does. The CLI prints a hint on first SIGINT, exits on the second.
  */
 
-import { withTransportMapping } from "../../burrow-client/client.ts";
-import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { RunTerminalState } from "../../db/schema.ts";
 import {
@@ -36,6 +34,8 @@ import {
 	spawnRun,
 	tailRunEvents,
 } from "../../runs/index.ts";
+import type { RunHandle, RuntimeProvider } from "../../runtime/contract.ts";
+import type { LocalSidecarsResolver } from "../../runtime/local/preview/sidecars.ts";
 import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
 import { loadTriggerSchedulerConfigFromEnv } from "../../triggers/index.ts";
 import { createWarrenConfigCache, type WarrenConfigCache } from "../../warren-config/index.ts";
@@ -61,12 +61,20 @@ export interface RunArgs {
 export interface RunDeps {
 	readonly repos: Repos;
 	/**
-	 * Multi-worker burrow pool (warren-39c3 / warren-c0c9 / pl-9ba1).
-	 * `spawnRun` consumes it for placement; `bridgeRunStream`, `reapRun`,
-	 * and `fetchBurrowRunState` resolve the owning worker via
-	 * `pool.clientFor({burrowId})`.
+	 * Boot-resolved runtime provider for the whole run lifecycle (warren-11cc).
+	 * REQUIRED: `main.ts` resolves it once (honoring `WARREN_RUNTIME`) via
+	 * `resolveLocalRunBackend` and threads it here; `spawnRun`, `bridgeRunStream`,
+	 * `reapRun`, and the terminal-state read all dispatch through it — the run
+	 * command no longer touches a burrow client. Tests inject a stub.
 	 */
-	readonly burrowClientPool: BurrowClientPool;
+	readonly runtimeProvider: RuntimeProvider;
+	/**
+	 * Preview sidecar seam (warren-11cc), capability-gated by `main.ts` on
+	 * `runtimeProvider.capabilities.previewPorts`. Present only for the local
+	 * backend; absent under `WARREN_RUNTIME=k8s`, so reap's preview sub-step goes
+	 * dark exactly as it does for a project without preview config.
+	 */
+	readonly previewSidecars?: LocalSidecarsResolver;
 	/** Optional broker injection — defaults to a fresh broker per run. */
 	readonly broker?: RunEventBroker;
 	/** Override the bridge factory (tests). Defaults to the live `bridgeRunStream`. */
@@ -75,8 +83,13 @@ export interface RunDeps {
 	readonly spawn?: typeof spawnRun;
 	/** Override reap (tests). Defaults to the live `reapRun`. */
 	readonly reap?: typeof reapRun;
-	/** Override the burrow run state lookup (tests). */
-	readonly fetchBurrowRunState?: (burrowRunId: string) => Promise<RunTerminalState>;
+	/**
+	 * Override the terminal-state fallback lookup (tests). Consulted only when
+	 * the bridge detected no in-stream terminal envelope (warren-2909).
+	 * Defaults to a bounded-retry `provider.status(handle)` read — the
+	 * provider seam, not a burrow client.
+	 */
+	readonly fetchBurrowRunState?: (handle: RunHandle) => Promise<RunTerminalState>;
 	/**
 	 * Auto-open-PR config (warren-f6af). Defaults to
 	 * `loadAutoOpenPrConfigFromEnv(process.env)`. Tests pass an explicit
@@ -136,18 +149,23 @@ export async function runRun(
 		deps.runBranchPrefixDefault === null
 			? undefined
 			: (deps.runBranchPrefixDefault ?? loadRunBranchPrefixFromEnv());
-	const fetchBurrowRunState =
-		deps.fetchBurrowRunState ?? defaultFetchBurrowRunState(deps.burrowClientPool);
+	// The active runtime provider is boot-resolved in `main.ts` (honoring
+	// WARREN_RUNTIME) and shared across spawn + the stream bridge + reap + the
+	// terminal-state read: every burrow interaction crosses the provider seam,
+	// not a burrow client (warren-11cc).
+	const runtimeProvider = deps.runtimeProvider;
+	const fetchBurrowRunState = deps.fetchBurrowRunState ?? defaultFetchRunState(runtimeProvider);
 	const seedsCli: SeedsCliDeps = deps.seedsCli ?? {
 		sdBinary: loadTriggerSchedulerConfigFromEnv().sdBinary,
 		spawn: defaultSpawn,
 	};
 
+	let handle: RunHandle | undefined;
 	let spawnResult: SpawnRunResult;
 	try {
 		spawnResult = await spawn({
 			repos: deps.repos,
-			burrowClientPool: deps.burrowClientPool,
+			runtimeProvider,
 			agentName: args.agent,
 			projectId: args.project,
 			prompt: args.prompt,
@@ -164,6 +182,11 @@ export async function runRun(
 	}
 
 	const runId = spawnResult.run.id;
+	handle = {
+		runId,
+		sandboxId: spawnResult.burrow.id,
+		providerRunId: spawnResult.burrowRun.id,
+	};
 	writeJsonLine(context.stdio.stdout, {
 		event: "run.spawned",
 		runId,
@@ -182,7 +205,7 @@ export async function runRun(
 		burrowId: spawnResult.burrow.id,
 		repos: deps.repos,
 		broker,
-		burrowClientPool: deps.burrowClientPool,
+		runtimeProvider,
 		signal: bridgeAbort.signal,
 	});
 
@@ -218,14 +241,29 @@ export async function runRun(
 	}
 
 	await bridgeDone.catch(() => undefined);
+	const bridgeResult = await bridgePromise.catch(() => undefined);
+
+	// warren-2909 / GH #663: prefer the bridge's in-stream terminal
+	// detection (`detectRuntimeTerminal` on the result envelope's
+	// `is_error`) over the status() probe. The probe races burrow's
+	// finalize — the terminal envelope can arrive while burrow still
+	// reports `running`, and a one-shot read then mislabels a clean run
+	// as failed/crashed, skipping PR auto-open. The probe is the fallback
+	// for runs whose runtime emits no in-stream terminal envelope (or
+	// whose bridge errored).
+	const terminal = bridgeResult?.terminalDetected;
 
 	let outcome: RunTerminalState;
-	try {
-		outcome = await fetchBurrowRunState(spawnResult.burrowRun.id);
-	} catch (err) {
-		context.stdio.stderr.write(`warren: failed to read burrow run state: ${formatError(err)}\n`);
-		// Best-effort: assume failed so the warren row finalizes rather than stays running.
-		outcome = "failed";
+	if (terminal !== undefined) {
+		outcome = terminal.outcome;
+	} else {
+		try {
+			outcome = await fetchBurrowRunState(handle);
+		} catch (err) {
+			context.stdio.stderr.write(`warren: failed to read burrow run state: ${formatError(err)}\n`);
+			// Best-effort: assume failed so the warren row finalizes rather than stays running.
+			outcome = "failed";
+		}
 	}
 
 	let finalState: RunTerminalState = outcome;
@@ -233,8 +271,14 @@ export async function runRun(
 		const reaped = await reap({
 			runId,
 			outcome,
+			// warren-2909: an explicit failure reason the bridge distilled
+			// in-stream (e.g. `oom_killed`) overrides reap's inference.
+			...(terminal?.failureReason !== undefined ? { failureReason: terminal.failureReason } : {}),
 			repos: deps.repos,
-			burrowClientPool: deps.burrowClientPool,
+			runtimeProvider,
+			// warren-11cc: preview sidecar seam, capability-gated by main.ts on the
+			// runtime's preview-port capability (absent under K8s).
+			...(deps.previewSidecars !== undefined ? { previewSidecars: deps.previewSidecars } : {}),
 			broker,
 			autoOpenPr,
 			seedsCli,
@@ -270,31 +314,42 @@ export async function runRun(
 	};
 }
 
-function defaultFetchBurrowRunState(
-	pool: BurrowClientPool,
-): (burrowRunId: string) => Promise<RunTerminalState> {
-	return async (burrowRunId) => {
-		// warren-c0c9: the CLI deploy registers exactly one worker via
-		// `BurrowClientPool.fromEnv`, but rather than special-case the
-		// single-entry shape, walk every registered client and use whichever
-		// owns the run. The zero-config CLI path has one entry today; the
-		// fan-out keeps the lookup correct under any future multi-worker CLI.
-		const errors: unknown[] = [];
-		for (const { client } of pool.entries()) {
-			try {
-				const row = await withTransportMapping(client.config, () =>
-					client.http.runs.get(burrowRunId),
-				);
-				const state = row.state;
-				if (state === "succeeded" || state === "failed" || state === "cancelled") return state;
-				return "failed";
-			} catch (err) {
-				errors.push(err);
-			}
+/** Fallback status()-probe poll cadence (ms) — see warren-2909. */
+const FINALIZE_POLL_MS = 250;
+/**
+ * Fallback status()-probe budget (ms). burrow finalizes the run row a few
+ * hundred ms after the terminal envelope; 5s is comfortably past a healthy
+ * finalize while staying bounded for a genuinely wedged one.
+ */
+const FINALIZE_TIMEOUT_MS = 5_000;
+
+export function defaultFetchRunState(
+	provider: RuntimeProvider,
+	opts?: {
+		readonly pollMs?: number;
+		readonly timeoutMs?: number;
+		readonly sleep?: (ms: number) => Promise<void>;
+	},
+): (handle: RunHandle) => Promise<RunTerminalState> {
+	const pollMs = opts?.pollMs ?? FINALIZE_POLL_MS;
+	const timeoutMs = opts?.timeoutMs ?? FINALIZE_TIMEOUT_MS;
+	const sleep =
+		opts?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	return async (handle) => {
+		// warren-11cc: read the run's terminal state through the provider seam
+		// (`status()` never throws on a missing run — it reports `exists:false`).
+		// warren-2909: tolerate burrow's finalize lag — while the phase is still
+		// `queued`/`running`, retry on a bounded budget instead of mapping the
+		// first non-terminal read straight to `failed`. A run that never reaches
+		// terminal within the budget maps to `failed` so the warren row finalizes
+		// rather than stranding as running.
+		const maxAttempts = Math.max(1, Math.ceil(timeoutMs / pollMs));
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+			const status = await provider.status(handle);
+			const phase = status.phase;
+			if (phase === "succeeded" || phase === "failed" || phase === "cancelled") return phase;
+			if (attempt < maxAttempts - 1) await sleep(pollMs);
 		}
-		// Surface the most-recent transport failure rather than masking it as
-		// "failed" — `runRun` translates the throw into a non-zero exit code
-		// and a stderr line.
-		throw errors[errors.length - 1] ?? new Error("no workers registered");
+		return "failed";
 	};
 }

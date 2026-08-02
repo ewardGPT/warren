@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { SortState } from "@/components/ui/sortable-table-head.helpers.ts";
-import { applySort, compareStrings, type Comparator } from "./use-client-sort.helpers.ts";
+import { applySort, type Comparator, compareStrings } from "./use-client-sort.helpers.ts";
 
 interface Row {
 	name: string;

@@ -1,6 +1,6 @@
 {
-	"id": "e4993842-cefa-4835-a737-81b633137fd6",
-	"prevId": "d58b9be0-c13a-4c88-bacc-14c7b5caef3b",
+	"id": "d61d6c7a-0a3f-4dc1-bbcc-1d6960074c76",
+	"prevId": "678d3afd-8c36-4765-8bfa-16d8f40643cc",
 	"version": "7",
 	"dialect": "postgresql",
 	"tables": {
@@ -95,53 +95,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.burrows": {
-			"name": "burrows",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"worker_id": {
-					"name": "worker_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {
-				"burrows_worker_idx": {
-					"name": "burrows_worker_idx",
-					"columns": [
-						{
-							"expression": "worker_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"policies": {},
@@ -983,6 +936,108 @@
 			"checkConstraints": {},
 			"isRLSEnabled": false
 		},
+		"public.run_inbox": {
+			"name": "run_inbox",
+			"schema": "",
+			"columns": {
+				"id": {
+					"name": "id",
+					"type": "text",
+					"primaryKey": true,
+					"notNull": true
+				},
+				"run_id": {
+					"name": "run_id",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"seq": {
+					"name": "seq",
+					"type": "integer",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"body": {
+					"name": "body",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"priority": {
+					"name": "priority",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"default": "'normal'"
+				},
+				"from_actor": {
+					"name": "from_actor",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"default": "'operator'"
+				},
+				"state": {
+					"name": "state",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"default": "'unread'"
+				},
+				"created_at": {
+					"name": "created_at",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"delivered_at": {
+					"name": "delivered_at",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": false
+				}
+			},
+			"indexes": {
+				"run_inbox_run_state_idx": {
+					"name": "run_inbox_run_state_idx",
+					"columns": [
+						{
+							"expression": "run_id",
+							"isExpression": false,
+							"asc": true,
+							"nulls": "last"
+						},
+						{
+							"expression": "state",
+							"isExpression": false,
+							"asc": true,
+							"nulls": "last"
+						}
+					],
+					"isUnique": false,
+					"concurrently": false,
+					"method": "btree",
+					"with": {}
+				}
+			},
+			"foreignKeys": {
+				"run_inbox_run_id_runs_id_fk": {
+					"name": "run_inbox_run_id_runs_id_fk",
+					"tableFrom": "run_inbox",
+					"tableTo": "runs",
+					"columnsFrom": ["run_id"],
+					"columnsTo": ["id"],
+					"onDelete": "cascade",
+					"onUpdate": "no action"
+				}
+			},
+			"compositePrimaryKeys": {},
+			"uniqueConstraints": {},
+			"policies": {},
+			"checkConstraints": {},
+			"isRLSEnabled": false
+		},
 		"public.runs": {
 			"name": "runs",
 			"schema": "",
@@ -1061,12 +1116,6 @@
 				},
 				"ended_at": {
 					"name": "ended_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"merge_wait_started_at": {
-					"name": "merge_wait_started_at",
 					"type": "text",
 					"primaryKey": false,
 					"notNull": false
@@ -1368,13 +1417,6 @@
 					"type": "text",
 					"primaryKey": false,
 					"notNull": false
-				},
-				"fire_count": {
-					"name": "fire_count",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": true,
-					"default": 0
 				}
 			},
 			"indexes": {
@@ -1414,44 +1456,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.workers": {
-			"name": "workers",
-			"schema": "",
-			"columns": {
-				"name": {
-					"name": "name",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"url": {
-					"name": "url",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"state": {
-					"name": "state",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"default": "'healthy'"
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"policies": {},

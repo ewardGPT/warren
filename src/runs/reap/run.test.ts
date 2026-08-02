@@ -9,8 +9,8 @@ import {
 	fakeExec,
 	fakeFs,
 	makeBurrow,
-	makePool,
 	openDatabase,
+	reapDeps,
 	setup,
 } from "./test-helpers.ts";
 
@@ -42,7 +42,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: f.fs,
 			exec: e.exec,
@@ -74,7 +74,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: f.fs,
 			exec: e.exec,
@@ -106,7 +106,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -130,7 +130,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 		});
@@ -147,7 +147,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 		});
@@ -164,7 +164,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 		});
@@ -207,7 +207,7 @@ describe("reapRun", () => {
 			runId: run.id,
 			outcome: "succeeded",
 			repos: customRepos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 		});
@@ -223,7 +223,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "failed",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: fakeExec().exec }),
 			fs: fakeFs().fs,
 			exec: fakeExec().exec,
 		});
@@ -251,7 +251,7 @@ describe("reapRun", () => {
 			runId: fresh.id,
 			outcome: "succeeded",
 			repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: fakeExec().exec }),
 			fs: fakeFs().fs,
 			exec: fakeExec().exec,
 		});
@@ -260,7 +260,7 @@ describe("reapRun", () => {
 		expect(row.startedAt).not.toBeNull();
 	});
 
-	test("logs reap_failed but does not throw when the branch push fails", async () => {
+	test("branch push failure fails the run and preserves the workspace (warren-495d)", async () => {
 		const f = fakeFs();
 		const e = fakeExec({ fail: "remote rejected: not allowed" });
 
@@ -268,16 +268,22 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 			fs: f.fs,
 			exec: e.exec,
 		});
 
 		expect(result.branchPushed).toBe(false);
 		expect(result.errors.map((x) => x.step)).toContain("branch_push");
-		expect(result.state).toBe("succeeded");
+		// warren-495d: a run whose push never landed must NOT masquerade as success.
+		expect(result.state).toBe("failed");
+		expect(result.failureReason).toBe("finalize_failed");
+		// warren-495d: the workspace holding the unpushed commits is preserved.
+		expect(result.workspaceDestroyed).toBe(false);
 		const events = await ctx.repos.events.listByRun(ctx.runId);
 		expect(events.some((ev) => ev.kind === "reap_failed")).toBe(true);
+		const skipped = events.find((ev) => ev.kind === "reap.workspace_destroy_skipped");
+		expect(skipped?.payloadJson).toMatchObject({ reason: "branch_push_failed" });
 	});
 
 	test("logs reap_failed when burrow lookup fails and skips file work", async () => {
@@ -297,7 +303,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(client, ctx.repos),
+			...reapDeps(client, { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 		});
@@ -314,7 +320,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 		});
@@ -327,13 +333,12 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: fakeExec().exec }),
 			fs: fakeFs().fs,
 			exec: fakeExec().exec,
 		});
 
 		expect(result.workspaceDestroyed).toBe(true);
-		expect(await ctx.repos.burrows.get("bur_aaaaaaaaaaaa")).toBeNull();
 		const events = await ctx.repos.events.listByRun(ctx.runId);
 		const destroyed = events.find((ev) => ev.kind === "reap.workspace_destroyed");
 		expect(destroyed?.payloadJson).toMatchObject({ burrowId: "bur_aaaaaaaaaaaa" });
@@ -361,7 +366,7 @@ describe("reapRun", () => {
 			runId: queued.id,
 			outcome: "failed",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 		});
@@ -370,7 +375,6 @@ describe("reapRun", () => {
 		expect(e.calls).toHaveLength(0);
 		// No workspace pipeline work done.
 		expect(result.branchPushed).toBe(false);
-		expect(result.plotCommitted).toBe(false);
 		expect(result.mulchUpdated).toBe(0);
 		expect(result.mulchSkipped).toBe(0);
 		// State correctly reflects never_started.
@@ -402,7 +406,7 @@ describe("reapRun", () => {
 			runId: queued.id,
 			outcome: "failed",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: fakeExec().exec }),
 			fs: fakeFs().fs,
 			exec: fakeExec().exec,
 		});
@@ -410,44 +414,6 @@ describe("reapRun", () => {
 		expect(result.state).toBe("failed");
 		expect(result.workspaceDestroyed).toBe(true);
 		expect(result.errors).toEqual([]);
-	});
-
-	test("conversation run: skips branch push + PR (warren-df71)", async () => {
-		const project = (await ctx.repos.projects.listAll())[0];
-		expect(project).toBeDefined();
-		const conv = await ctx.repos.runs.create({
-			agentName: "refactor-bot",
-			projectId: (project as { id: string }).id,
-			prompt: "p",
-			renderedAgentJson: {},
-			trigger: "conversation",
-			mode: "conversation",
-			burrowId: "bur_aaaaaaaaaaaa",
-			burrowRunId: "run_conversation1",
-		});
-		await ctx.repos.runs.markRunning(conv.id);
-		const e = fakeExec();
-
-		const result = await reapRun({
-			runId: conv.id,
-			outcome: "succeeded",
-			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
-			broker: ctx.broker,
-			fs: fakeFs().fs,
-			exec: e.exec,
-			autoOpenPr: { enabled: true, token: "ghp_xyz", warrenBaseUrl: null },
-		});
-
-		// No git push (and therefore no rev-list / PR) for a conversation run.
-		expect(e.calls).toHaveLength(0);
-		expect(result.branchPushed).toBe(false);
-		expect(result.plotCommitted).toBe(false);
-		expect(result.prUrl).toBeNull();
-		const events = await ctx.repos.events.listByRun(conv.id);
-		expect(events.find((ev) => ev.kind === "reap.branch_push_skipped")).toBeDefined();
-		// Workspace survives a conversation reap (warren-c770).
-		expect(result.workspaceDestroyed).toBe(false);
 	});
 
 	test("publishes reap-emitted events to the broker for live tailers", async () => {
@@ -468,7 +434,7 @@ describe("reapRun", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: fakeExec().exec }),
 			broker: ctx.broker,
 			fs: f.fs,
 			exec: fakeExec().exec,

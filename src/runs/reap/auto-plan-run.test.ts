@@ -7,9 +7,9 @@ import {
 	fakeExec,
 	fakeFs,
 	makeBurrow,
-	makePool,
 	openDatabase,
 	RunEventBroker,
+	reapDeps,
 } from "./test-helpers.ts";
 
 /* Auto plan-run from reap (warren-a32a)                                    */
@@ -44,7 +44,6 @@ describe("auto_plan_run (warren-a32a)", () => {
 			burrowId: "bur_aaaaaaaaaaaa",
 			burrowRunId: "run_zzzzzzzzzzzz",
 		});
-		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
 		await repos.runs.markRunning(run.id);
 		return {
 			db,
@@ -72,7 +71,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -112,10 +111,10 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(
-					fakeBurrowClient(makeBurrow(), { seedsPlansBody: plansBody }),
-					ctx.repos,
-				),
+				...reapDeps(fakeBurrowClient(makeBurrow(), { seedsPlansBody: plansBody }), {
+					fs: f.fs,
+					exec: e.exec,
+				}),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -127,37 +126,35 @@ describe("auto_plan_run (warren-a32a)", () => {
 		}
 	});
 
-	for (const legacyAgent of ["pi", "pi-chat"]) {
-		test(`normalizes the legacy ${legacyAgent} auto-plan override to sapling`, async () => {
-			const ctx = await setupAutoPlanRun({
-				frontmatter: { auto_plan_run: true, auto_plan_run_agent: legacyAgent },
-			});
-			try {
-				const f = fakeFs({
-					"/data/projects/x/y/.seeds/issues.jsonl": "",
-					"/data/projects/x/y/.seeds/plans.jsonl": "",
-					"/data/burrow/ws/.seeds/plans.jsonl":
-						'{"id":"pl-new1","status":"approved","children":["warren-c1","warren-c2"]}\n',
-				});
-				const e = fakeExec({ stagedDelta: true });
-
-				const result = await reapRun({
-					runId: ctx.runId,
-					outcome: "succeeded",
-					repos: ctx.repos,
-					burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
-					fs: f.fs,
-					exec: e.exec,
-				});
-
-				expect(result.autoPlanRunCreated).toBe(true);
-				const planRun = await ctx.repos.planRuns.require(result.autoPlanRunId as string);
-				expect(planRun.agentName).toBe("sapling");
-			} finally {
-				await ctx.db.close();
-			}
+	test("uses auto_plan_run_agent override instead of parent agent name (warren-65b2)", async () => {
+		const ctx = await setupAutoPlanRun({
+			frontmatter: { auto_plan_run: true, auto_plan_run_agent: "pi" },
 		});
-	}
+		try {
+			const f = fakeFs({
+				"/data/projects/x/y/.seeds/issues.jsonl": "",
+				"/data/projects/x/y/.seeds/plans.jsonl": "",
+				"/data/burrow/ws/.seeds/plans.jsonl":
+					'{"id":"pl-new1","status":"approved","children":["warren-c1","warren-c2"]}\n',
+			});
+			const e = fakeExec({ stagedDelta: true });
+
+			const result = await reapRun({
+				runId: ctx.runId,
+				outcome: "succeeded",
+				repos: ctx.repos,
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
+				fs: f.fs,
+				exec: e.exec,
+			});
+
+			expect(result.autoPlanRunCreated).toBe(true);
+			const planRun = await ctx.repos.planRuns.require(result.autoPlanRunId as string);
+			expect(planRun.agentName).toBe("pi");
+		} finally {
+			await ctx.db.close();
+		}
+	});
 
 	test("does not dispatch when agent lacks auto_plan_run frontmatter", async () => {
 		const ctx = await setupAutoPlanRun({ frontmatter: {} });
@@ -174,7 +171,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -201,7 +198,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "failed",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -227,7 +224,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -254,7 +251,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -296,7 +293,6 @@ describe("auto_plan_run (warren-a32a)", () => {
 			burrowId: "bur_aaaaaaaaaaaa",
 			burrowRunId: "run_zzzzzzzzzzzz",
 		});
-		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
 		await repos.runs.markRunning(run.id);
 		try {
 			const f = fakeFs({
@@ -309,70 +305,12 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: run.id,
 				outcome: "succeeded",
 				repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 			});
 
 			expect(result.autoPlanRunCreated).toBe(false);
-		} finally {
-			await db.close();
-		}
-	});
-
-	test("inherits plotId from the parent run when present", async () => {
-		const db = await openDatabase({ path: ":memory:" });
-		const repos = createRepos(db);
-		await repos.agents.upsert({
-			name: "patrol-bot",
-			renderedJson: { sections: { system: "x" } },
-		});
-		const project = await repos.projects.create({
-			gitUrl: "https://github.com/x/y.git",
-			localPath: "/data/projects/x/y",
-			defaultBranch: "main",
-			hasSeeds: true,
-			hasPlot: true,
-		});
-		const run = await repos.runs.create({
-			agentName: "patrol-bot",
-			projectId: project.id,
-			prompt: "patrol scan",
-			renderedAgentJson: {
-				name: "patrol-bot",
-				version: 1,
-				sections: { system: "x" },
-				resolvedFrom: [],
-				frontmatter: { auto_plan_run: true },
-			},
-			trigger: "cron",
-			burrowId: "bur_aaaaaaaaaaaa",
-			burrowRunId: "run_zzzzzzzzzzzz",
-			plotId: "plot-abc123",
-		});
-		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
-		await repos.runs.markRunning(run.id);
-		try {
-			const f = fakeFs({
-				"/data/projects/x/y/.seeds/issues.jsonl": "",
-				"/data/projects/x/y/.seeds/plans.jsonl": "",
-				"/data/burrow/ws/.seeds/plans.jsonl":
-					'{"id":"pl-new1","status":"approved","children":["warren-c1"]}\n',
-			});
-			const e = fakeExec({ stagedDelta: true });
-
-			const result = await reapRun({
-				runId: run.id,
-				outcome: "succeeded",
-				repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), repos),
-				fs: f.fs,
-				exec: e.exec,
-			});
-
-			expect(result.autoPlanRunCreated).toBe(true);
-			const planRun = await repos.planRuns.require(result.autoPlanRunId as string);
-			expect(planRun.plotId).toBe("plot-abc123");
 		} finally {
 			await db.close();
 		}
@@ -415,7 +353,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 				seedsCli: fakeSeedsCli({ "warren-c1": "open", "warren-c2": "closed" }),
@@ -443,7 +381,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 				seedsCli: fakeSeedsCli({ "warren-c1": "open", "warren-gone": "missing" }),
@@ -476,7 +414,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+				...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: e.exec }),
 				fs: f.fs,
 				exec: e.exec,
 				seedsCli: fakeSeedsCli({ "warren-c1": "closed", "warren-c2": "closed" }),

@@ -1,7 +1,7 @@
 /**
- * Warren container entrypoint (SPEC §10.3).
+ * Warren container entrypoint (docs/design/runtime-and-supervisor.md).
  *
- * The supervisor runs as the docker / fly entrypoint and owns three
+ * The supervisor runs as the container entrypoint and owns three
  * responsibilities the warren and burrow processes can't own themselves:
  *
  *   1. Boot ordering. `burrow serve` must open its unix socket before
@@ -10,7 +10,7 @@
  *   2. Signal forwarding. SIGTERM/SIGINT to the container should reach
  *      both children with a 5s grace period, then SIGKILL if needed.
  *   3. Restart policy. Warren is the user-facing process; if it crashes,
- *      hand the failure to docker/fly so its restart policy decides what
+ *      hand the failure to the orchestrator (docker) so its restart policy decides what
  *      to do — never mask a warren bug with an in-process restart loop.
  *      Burrow is the runtime substrate; restart it inside the container
  *      with an exponential backoff and a 5-in-60s budget so a misbehaving
@@ -148,7 +148,7 @@ export async function runSupervisor(
 			return { exitCode: outcome.code, reason: "warren_exited" };
 		}
 
-		// Burrow gave up. Tear down warren so docker/fly's restart policy
+		// Burrow gave up. Tear down warren so the orchestrator's restart policy
 		// brings the whole container back fresh.
 		deps.logger.error({ reason: outcome.reason }, "supervisor: burrow oversight ended");
 		state.shuttingDown = true;
@@ -344,7 +344,7 @@ export const DEFAULT_BURROW_SOCKET = "/var/run/burrow.sock";
 
 /**
  * Resolve the supervisor's launch commands from env. The defaults match the
- * canonical container layout (SPEC §10.3); env overrides exist so a developer
+ * canonical container layout (docs/design/runtime-and-supervisor.md); env overrides exist so a developer
  * can run the supervisor on a host without /var/run/.
  *
  * Env contract:
@@ -395,7 +395,7 @@ function parseArgsEnv(raw: string | undefined): string[] {
 
 if (import.meta.main) {
 	const { default: pino } = await import("pino");
-	const { LOG_REDACT_OPTIONS } = await import("../server/main/redact.ts");
+	const { LOG_REDACT_OPTIONS } = await import("../observability/log-redact.ts");
 	const logger = pino({
 		name: "warren-supervisor",
 		level: process.env.WARREN_LOG_LEVEL ?? "info",

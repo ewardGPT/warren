@@ -3,18 +3,15 @@
  * (warren-8d3d / pl-9088 step 10). The adapters are trivial
  * pass-throughs; this test locks the call-forwarding shape so the
  * structural subtype each subsystem (bridges, probe, scheduler,
- * plan-run coordinator, pause detector, preview eviction) declares
- * stays satisfied.
+ * plan-run coordinator, preview eviction) declares stays satisfied.
  */
 
 import { describe, expect, test } from "bun:test";
 import type { Logger } from "../types.ts";
 import {
 	bridgeLoggerFromPino,
-	pauseLoggerFromPino,
 	planRunLoggerFromPino,
 	previewEvictionLoggerFromPino,
-	probeLoggerFromPino,
 	schedulerLoggerFromPino,
 } from "./logging.ts";
 
@@ -52,35 +49,10 @@ describe("bridgeLoggerFromPino", () => {
 	});
 });
 
-describe("probeLoggerFromPino", () => {
-	test("forwards all four levels (info/warn/error/debug)", () => {
-		const { logger, calls } = makeRecorder();
-		const adapter = probeLoggerFromPino(logger);
-		adapter.info({ a: 1 });
-		adapter.warn({ b: 2 });
-		adapter.error({ c: 3 });
-		adapter.debug?.({ d: 4 }, "dbg");
-		expect(calls.map((c) => c.level)).toEqual(["info", "warn", "error", "debug"]);
-		expect(calls[3]?.msg).toBe("dbg");
-	});
-
-	test("debug is a no-op when the underlying logger has no debug method", () => {
-		const adapter = probeLoggerFromPino({
-			info: () => {},
-			warn: () => {},
-			error: () => {},
-		} as unknown as Logger);
-		// `debug?` is an optional method — when source logger lacks it,
-		// calling through is still safe via optional chaining.
-		expect(() => adapter.debug?.({ d: 1 })).not.toThrow();
-	});
-});
-
-describe("schedulerLoggerFromPino / planRunLoggerFromPino / pauseLoggerFromPino / previewEvictionLoggerFromPino", () => {
+describe("schedulerLoggerFromPino / planRunLoggerFromPino / previewEvictionLoggerFromPino", () => {
 	const factories = {
 		scheduler: schedulerLoggerFromPino,
 		planRun: planRunLoggerFromPino,
-		pause: pauseLoggerFromPino,
 		previewEviction: previewEvictionLoggerFromPino,
 	} as const;
 

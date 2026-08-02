@@ -1,9 +1,9 @@
 /**
- * `teardownPreview` — `POST /runs/:id/preview/teardown` (R-19 / SPEC §11.L
+ * `teardownPreview` — `POST /runs/:id/preview/teardown` (R-19 / docs/design/preview-environments.md
  * acceptance #8, warren-d725).
  *
  * Operator-driven counterpart to the TTL+LRU eviction worker
- * (`src/preview/eviction.ts`, warren-ea6b). Same end-state on the runs
+ * (`src/preview/eviction/`, warren-ea6b). Same end-state on the runs
  * row (`preview_state='torn-down'`, `preview_port=null`), same
  * best-effort sidecar stop on burrow, but the trigger is a human via
  * the UI / curl rather than a periodic sweep.
@@ -37,16 +37,14 @@
  * own JSON shaping (`src/server/handlers/`).
  */
 
-import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { PreviewState } from "../db/schema.ts";
 import type { RunEventBroker } from "../runs/events.ts";
-import {
-	createPoolSidecarResolver,
-	type ManualTeardownStatus,
-	type PreviewEvictionLogger,
-	type RunPreviewsRepo,
-	type SidecarResolver,
+import type {
+	ManualTeardownStatus,
+	PreviewEvictionLogger,
+	RunPreviewsRepo,
+	SidecarResolver,
 } from "./eviction/index.ts";
 
 export type { ManualTeardownStatus };
@@ -64,7 +62,6 @@ export interface TeardownPreviewInput {
 	 * eviction worker / port allocator posture, mx-b82a55).
 	 */
 	readonly previews: RunPreviewsRepo;
-	readonly burrowClientPool: BurrowClientPool;
 	readonly broker?: RunEventBroker;
 	readonly now?: () => Date;
 	readonly logger?: PreviewEvictionLogger;
@@ -75,8 +72,13 @@ export interface TeardownPreviewInput {
 	 * forwards verbatim.
 	 */
 	readonly actor?: string;
-	/** Override the sidecar resolver (tests). Defaults to the pool-backed
-	 *  resolver from `src/preview/eviction.ts` (shared with the worker). */
+	/**
+	 * Provider-neutral sidecar resolver (warren-e24d). Built at boot from the
+	 * runtime provider's preview seam and threaded in gated on
+	 * `RuntimeCapabilities.previewPorts`. Omitted (or a backend without preview
+	 * ports) ⇒ the db-side teardown CAS still runs and the best-effort sidecar
+	 * stop is skipped.
+	 */
 	readonly resolveSidecar?: SidecarResolver;
 }
 
@@ -105,7 +107,7 @@ export async function teardownPreview(input: TeardownPreviewInput): Promise<Tear
 	// `never-launched` rather than re-raising 404 from inside the txn.
 	await input.repos.runs.require(input.runId);
 
-	const resolveSidecar = input.resolveSidecar ?? createPoolSidecarResolver(input.burrowClientPool);
+	const resolveSidecar = input.resolveSidecar ?? null;
 
 	const claim = await input.previews.claimTeardown({ runId: input.runId });
 	if (claim.status !== "torn-down") {
@@ -120,7 +122,7 @@ export async function teardownPreview(input: TeardownPreviewInput): Promise<Tear
 		};
 	}
 
-	if (claim.burrowId !== null) {
+	if (claim.burrowId !== null && resolveSidecar !== null) {
 		await stopSidecarsBestEffort({
 			burrowId: claim.burrowId,
 			runId: input.runId,

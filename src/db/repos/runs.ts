@@ -5,12 +5,12 @@
  * (queued → running → succeeded|failed|cancelled). The state is updated as
  * we observe burrow's stream; warren itself does not pick runs off a queue.
  *
- * `attachBurrow` exists because the §4.3 composition flow creates the warren
+ * `attachBurrow` exists because the composition flow (docs/design/agent-composition.md) creates the warren
  * row before burrow's `POST /burrows` and `POST /burrows/:id/runs` return —
  * the burrow IDs are written back once we have them.
  */
 
-import { and, asc, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { NotFoundError, StateTransitionError, ValidationError } from "../../core/errors.ts";
 import { generateId } from "../../core/ids.ts";
 import type { SqliteDrizzleDb } from "../client.ts";
@@ -30,7 +30,6 @@ import {
 	listAll,
 	listByAgent,
 	listByIds,
-	listByPlotId,
 	listByProject,
 	listByState,
 	listForAnalytics,
@@ -38,13 +37,7 @@ import {
 
 const ALLOWED_TRANSITIONS: Record<RunState, readonly RunState[]> = {
 	queued: ["running", "cancelled"],
-	// `paused` is pl-0344 step 1 / warren-67b6: the supervisor (step 5 /
-	// warren-2976) flips a running batch run to `paused` on detection of a
-	// blocking Plot `question_posed` event; the answer (or pause-timeout)
-	// flips it back to `running` via a respawned turn. Operators can still
-	// cancel a paused run.
-	running: ["paused", "succeeded", "failed", "cancelled"],
-	paused: ["running", "cancelled"],
+	running: ["succeeded", "failed", "cancelled"],
 	succeeded: [],
 	failed: [],
 	cancelled: [],
@@ -75,12 +68,6 @@ export interface CreateRunInput {
 	 * primitive (warren-1117). Fixed at run-create time.
 	 */
 	mode?: RunMode;
-	/**
-	 * Back-link to the Plot this run was dispatched against (warren-a8c3).
-	 * Null when the project hasn't opted into Plots or plot_id was omitted;
-	 * `project.hasPlot` is validated at the handler.
-	 */
-	plotId?: string | null;
 	/**
 	 * Continuation/replicate back-link (warren-4b11 / warren-e96f). Null for
 	 * root runs; plain text id, no FK. `cloneKind` tells the two chain kinds
@@ -139,7 +126,6 @@ export class RunsRepo {
 			burrowRunId: input.burrowRunId ?? null,
 			workerId: input.workerId ?? null,
 			seedId: input.seedId ?? null,
-			plotId: input.plotId ?? null,
 			parentRunId: input.parentRunId ?? null,
 			cloneKind: input.cloneKind ?? null,
 			renderedAgentJson: input.renderedAgentJson,
@@ -152,6 +138,8 @@ export class RunsRepo {
 			trigger: input.trigger,
 			prUrl: null,
 			targetBranch: input.targetBranch ?? null,
+			salvageRef: null,
+			salvagePath: null,
 			costUsd: null,
 			tokensInput: null,
 			tokensOutput: null,
@@ -163,8 +151,6 @@ export class RunsRepo {
 			previewLastHitAt: null,
 			previewFailureMessage: null,
 			mode: input.mode ?? "batch",
-			pausedAt: null,
-			pausedQuestionEventId: null,
 		};
 		await this.adapter.runWrite(this.db.insert(this.runs).values(row));
 		return row;
@@ -181,6 +167,42 @@ export class RunsRepo {
 		const row = await this.get(id);
 		if (!row) throw new NotFoundError(`run not found: ${id}`);
 		return row;
+	}
+
+	/**
+	 * Hard-delete a run row that never reached the runtime (warren-a0a2).
+	 *
+	 * The scheduler's bounded-retry GC calls this to drop the transient
+	 * `never_started` rows a persistently-unreachable runtime would otherwise
+	 * mint one-per-tick, so the runs list isn't flooded during an outage. It
+	 * is deliberately narrow:
+	 *
+	 *   - Guarded to `state=failed` + `failureReason=never_started`. Any other
+	 *     row (a real queued/running/succeeded run, or a `failed` run that
+	 *     actually dispatched) is left untouched and the method returns false.
+	 *   - `events.run_id` carries no `ON DELETE` cascade, so the write-through
+	 *     event rows are cleared first, then the run row, inside one
+	 *     transaction. `triggers.last_run_id` / `plan_run_children.run_id`
+	 *     (both `ON DELETE SET NULL`) and `run_inbox` (`CASCADE`) fall away on
+	 *     their own; a never_started cron retry has none of them anyway.
+	 *
+	 * Returns true when a row was deleted, false when the id was missing or
+	 * the guard rejected it.
+	 */
+	async deleteNeverStarted(id: string): Promise<boolean> {
+		return this.adapter.runInTransaction(async (tx) => {
+			const txDb = tx.drizzle as SqliteDrizzleDb;
+			const runs = tx.schema.runs;
+			const events = tx.schema.events;
+			const existing = await tx.pickOne<RunRow>(txDb.select().from(runs).where(eq(runs.id, id)));
+			if (!existing) return false;
+			if (existing.state !== "failed" || existing.failureReason !== "never_started") {
+				return false;
+			}
+			await tx.runWrite(txDb.delete(events).where(eq(events.runId, id)));
+			await tx.runWrite(txDb.delete(runs).where(eq(runs.id, id)));
+			return true;
+		});
 	}
 
 	/** Read/query methods (warren-ac7f); bodies live in runs-queries.ts. */
@@ -205,10 +227,6 @@ export class RunsRepo {
 		} = {},
 	): Promise<RunRow[]> {
 		return listByProject(this.adapter, projectId, options);
-	}
-
-	listByPlotId(plotId: string): Promise<RunRow[]> {
-		return listByPlotId(this.adapter, plotId);
 	}
 
 	listByAgent(
@@ -246,7 +264,7 @@ export class RunsRepo {
 	}
 
 	/**
-	 * Write back the burrow IDs as they become available. The §4.3 spawn flow
+	 * Write back the burrow IDs as they become available. The spawn flow (docs/design/agent-composition.md)
 	 * provisions the burrow first (`POST /burrows`) and dispatches the run
 	 * second (`POST /burrows/:id/runs`), so each ID lands on a different turn.
 	 * Both fields are optional, but at least one must be set.
@@ -276,46 +294,6 @@ export class RunsRepo {
 		const patch = {
 			state: "running" as const,
 			startedAt: now.toISOString(),
-		};
-		await this.adapter.runWrite(this.db.update(this.runs).set(patch).where(eq(this.runs.id, id)));
-		return { ...current, ...patch };
-	}
-
-	/**
-	 * Transition `running → paused` for the pause detector (pl-0344 step 5
-	 * / warren-2976). Stamps `paused_at` + `paused_question_event_id`; the
-	 * resume path (`markResumedFromPause`) clears both on transition back
-	 * to `running`. `failureReason` / `startedAt` / `endedAt` are
-	 * intentionally left alone — a paused run isn't terminal, and the
-	 * underlying burrow run continues to count against `startedAt`.
-	 */
-	async markPaused(id: string, questionEventId: string, now: Date = new Date()): Promise<RunRow> {
-		const current = await this.require(id);
-		assertRunTransition(current.state, "paused");
-		const patch = {
-			state: "paused" as const,
-			pausedAt: now.toISOString(),
-			pausedQuestionEventId: questionEventId,
-		};
-		await this.adapter.runWrite(this.db.update(this.runs).set(patch).where(eq(this.runs.id, id)));
-		return { ...current, ...patch };
-	}
-
-	/**
-	 * Transition `paused → running` for the pause detector resume path
-	 * (pl-0344 step 5 / warren-2976). Clears `paused_at` +
-	 * `paused_question_event_id` so a subsequent pause-detect pass against
-	 * the same row reads as a fresh `running` row, not a stale paused
-	 * remnant. Leaves `startedAt` alone — the burrow run's wall-clock
-	 * lifetime is unchanged by a pause round-trip.
-	 */
-	async markResumedFromPause(id: string): Promise<RunRow> {
-		const current = await this.require(id);
-		assertRunTransition(current.state, "running");
-		const patch = {
-			state: "running" as const,
-			pausedAt: null,
-			pausedQuestionEventId: null,
 		};
 		await this.adapter.runWrite(this.db.update(this.runs).set(patch).where(eq(this.runs.id, id)));
 		return { ...current, ...patch };
@@ -370,8 +348,13 @@ export class RunsRepo {
 	}
 
 	/**
-	 * Persist per-run preview environment fields (R-19 / SPEC §11.L).
-	 * Omitted fields preserve existing values.
+	 * Persist per-run preview environment fields (R-19 / docs/design/preview-environments.md). Mirrors
+	 * `attachStats`'s partial-input semantics (mx-49272e): omitted fields
+	 * preserve existing values, explicit `null` clears. Throws ValidationError
+	 * when called with no fields, matching `attachBurrow` / `attachStats`.
+	 * Used by reap's `preview_launch` sub-step, the readiness probe, the host
+	 * reverse proxy (debounced `previewLastHitAt`), the eviction worker, and
+	 * the manual teardown route.
 	 */
 	async attachPreview(id: string, input: AttachPreviewInput): Promise<RunRow> {
 		const keys: (keyof AttachPreviewInput)[] = [
@@ -395,7 +378,12 @@ export class RunsRepo {
 		return { ...current, ...patch };
 	}
 
-	/** Persist the PR URL opened by reap; null clears it. */
+	/**
+	 * Persist the PR URL reap's `pr_open` sub-step opened (warren-f6af).
+	 * Last write wins; passing `null` clears the field. Separate from
+	 * `finalize` because reap fires this *before* the terminal transition
+	 * (so the URL lands on the `reap.completed` event payload too).
+	 */
 	async setPrUrl(id: string, prUrl: string | null): Promise<RunRow> {
 		const current = await this.require(id);
 		await this.adapter.runWrite(
@@ -404,66 +392,25 @@ export class RunsRepo {
 		return { ...current, prUrl };
 	}
 
-	/** Re-arm PR merge waiting without changing terminal history. */
-	async rearmMergeWait(id: string, now: Date = new Date()): Promise<RunRow> {
+	/**
+	 * Persist where a failed finalize's work was salvaged to (warren-cd3b):
+	 * the rescue branch on origin (`salvageRef`) and/or the durable git-bundle
+	 * file (`salvagePath`). Written by the salvage intake handler (k8s) or
+	 * reap's local salvage step before the workspace is destroyed. Last write
+	 * wins (a retried/re-dispatched salvage overwrites the stale location).
+	 */
+	async setSalvage(
+		id: string,
+		salvage: { rescueRef: string | null; bundlePath: string | null },
+	): Promise<RunRow> {
 		const current = await this.require(id);
-		const mergeWaitStartedAt = now.toISOString();
 		await this.adapter.runWrite(
-			this.db.update(this.runs).set({ mergeWaitStartedAt }).where(eq(this.runs.id, id)),
-		);
-		return { ...current, mergeWaitStartedAt };
-	}
-
-	/**
-	 * Project-affinity probe for `placeFor` (warren-135b / pl-9ba1 step 2):
-	 * the most-recent run that succeeded against this project AND has a
-	 * recorded `workerId`. Returns null if the project has no successful
-	 * runs yet, or if no successful run was tagged with a worker (rows
-	 * written before pl-9ba1 step 4 wired this in). Newest-first by
-	 * `endedAt` so a recent run wins over an older one even if the older
-	 * one started later in startedAt order.
-	 */
-	async mostRecentSucceededWithWorker(projectId: string): Promise<RunRow | null> {
-		const row = await this.adapter.pickOne(
 			this.db
-				.select()
-				.from(this.runs)
-				.where(
-					and(
-						eq(this.runs.projectId, projectId),
-						eq(this.runs.state, "succeeded"),
-						isNotNull(this.runs.workerId),
-					),
-				)
-				.orderBy(desc(this.runs.endedAt), asc(this.runs.id))
-				.limit(1),
+				.update(this.runs)
+				.set({ salvageRef: salvage.rescueRef, salvagePath: salvage.bundlePath })
+				.where(eq(this.runs.id, id)),
 		);
-		return row ?? null;
-	}
-
-	/**
-	 * In-flight load per worker for the least-loaded leg of `placeFor`
-	 * (warren-135b / pl-9ba1 step 2). Counts `queued` + `running` runs
-	 * grouped by `workerId`. Rows with a null `workerId` (legacy or
-	 * unplaced) are excluded. Result is keyed by worker name; workers
-	 * with zero in-flight runs are absent (the caller defaults to 0).
-	 */
-	async countInflightByWorker(): Promise<Map<string, number>> {
-		const rows = await this.adapter.pickAll<{ workerId: string | null; count: number | string }>(
-			this.db
-				.select({
-					workerId: this.runs.workerId,
-					count: sql<number>`count(*)`.as("count"),
-				})
-				.from(this.runs)
-				.where(and(isNotNull(this.runs.workerId), inArray(this.runs.state, ["queued", "running"])))
-				.groupBy(this.runs.workerId),
-		);
-		const out = new Map<string, number>();
-		for (const r of rows) {
-			if (r.workerId !== null) out.set(r.workerId, Number(r.count));
-		}
-		return out;
+		return { ...current, salvageRef: salvage.rescueRef, salvagePath: salvage.bundlePath };
 	}
 
 	/** CI-fixer queries (warren-0b75); bodies live in runs-ci-fixer.ts. */
@@ -486,7 +433,7 @@ export class RunsRepo {
 			const txDb = tx.drizzle as SqliteDrizzleDb;
 			const runs = tx.schema.runs;
 			const row = await tx.pickOne(txDb.select().from(runs).where(eq(runs.id, id)));
-			if (row?.state !== "queued") return null;
+			if (!row || row.state !== "queued") return null;
 			const startedAt = now.toISOString();
 			await tx.runWrite(
 				txDb
@@ -496,5 +443,14 @@ export class RunsRepo {
 			);
 			return { ...row, state: "running", startedAt };
 		});
+	}
+
+	async rearmMergeWait(id: string, now: Date = new Date()): Promise<RunRow> {
+		const current = await this.require(id);
+		const mergeWaitStartedAt = now.toISOString();
+		await this.adapter.runWrite(
+			this.db.update(this.runs).set({ mergeWaitStartedAt }).where(eq(this.runs.id, id)),
+		);
+		return { ...current, mergeWaitStartedAt };
 	}
 }

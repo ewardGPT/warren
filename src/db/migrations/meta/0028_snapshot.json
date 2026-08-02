@@ -1,7 +1,7 @@
 {
 	"version": "6",
 	"dialect": "sqlite",
-	"id": "d8021417-a1bd-4723-a58a-0d922f0e88a3",
+	"id": "6441f06d-89b9-4d5e-b445-8582cc34f02a",
 	"prevId": "6d603f6c-17b5-4942-9744-6d525ceb2915",
 	"tables": {
 		"agents": {
@@ -74,43 +74,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"checkConstraints": {}
-		},
-		"burrows": {
-			"name": "burrows",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"worker_id": {
-					"name": "worker_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				}
-			},
-			"indexes": {
-				"burrows_worker_idx": {
-					"name": "burrows_worker_idx",
-					"columns": ["worker_id"],
-					"isUnique": false
-				}
-			},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"checkConstraints": {}
@@ -928,13 +891,6 @@
 					"notNull": false,
 					"autoincrement": false
 				},
-				"merge_wait_started_at": {
-					"name": "merge_wait_started_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false,
-					"autoincrement": false
-				},
 				"prompt": {
 					"name": "prompt",
 					"type": "text",
@@ -1195,45 +1151,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"checkConstraints": {}
-		},
-		"workers": {
-			"name": "workers",
-			"columns": {
-				"name": {
-					"name": "name",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"url": {
-					"name": "url",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				},
-				"state": {
-					"name": "state",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false,
-					"default": "'healthy'"
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"autoincrement": false
-				}
-			},
-			"indexes": {},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"checkConstraints": {}

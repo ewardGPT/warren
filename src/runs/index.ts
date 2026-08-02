@@ -53,48 +53,7 @@ export {
 	resolveRunBranchPrefix,
 } from "./branch.ts";
 export { type ParsedBurrowConfig, parseBurrowConfig } from "./burrow-config.ts";
-export { type CancelRunInput, type CancelRunResult, cancelRun } from "./cancel.ts";
-export {
-	type BootConversationIdleDetectorInput,
-	bootConversationIdleDetector,
-	CONVERSATION_IDLE_FINALIZED_KIND,
-	type ConversationIdleDetectorHandle,
-	type ConversationIdleTickDeps,
-	type ConversationIdleTickResult,
-	createRepoIdleConversationReader,
-	type IdleConversationCandidate,
-	type IdleConversationReader,
-	tickConversationIdleDetector,
-} from "./conversation-idle.ts";
-export {
-	type CreateMergePollerDispatchInput,
-	createMergePollerDispatch,
-} from "./conversation-merge-dispatch.ts";
-export {
-	type BootMergePollerInput,
-	bootConversationMergePoller,
-	buildPlannerDispatchPrompt,
-	CONVERSATION_PLANNER_DISPATCHED_KIND,
-	DEFAULT_PLANNER_AGENT,
-	type MergePollerHandle,
-	type MergePollTickDeps,
-	type MergePollTickResult,
-	type PlannerDispatchFn,
-	type PlannerDispatchInput,
-	type PlannerDispatchResult,
-	tickConversationMergePoller,
-} from "./conversation-merge-poller.ts";
-export {
-	buildCortexEnv,
-	buildCortexHooksJsonSeed,
-	buildCortexMcpSeed,
-	buildCortexOntologyHookSeed,
-	buildCortexWorkspaceSeeds,
-	CORTEX_MARKER_FILE,
-	type CortexSpawnConfig,
-	projectHasCortex,
-	resolveCortexSpawnConfig,
-} from "./cortex.ts";
+export { type CancelReap, type CancelRunInput, type CancelRunResult, cancelRun } from "./cancel.ts";
 export {
 	buildCostAnalytics,
 	type CostAnalytics,
@@ -112,23 +71,35 @@ export {
 	tailRunEvents,
 } from "./events.ts";
 export {
-	bootPauseDetector,
-	defaultPlotEventReader,
-	extractAnswerText,
-	findAnswerFor,
-	PAUSE_DETECTED_KIND,
-	PAUSE_RESUMED_KIND,
-	PAUSE_TIMED_OUT_KIND,
-	type PauseDetectorHandle,
-	type PauseTickDeps,
-	type PauseTickResult,
-	type PlotEventReader,
-	pickUnansweredQuestion,
-	type RespawnFn,
-	type RespawnInput,
-	type RespawnReason,
-	tickPauseDetector,
-} from "./pause.ts";
+	type PollRunInboxInput,
+	type PollRunInboxResult,
+	pollRunInbox,
+} from "./inbox.ts";
+export {
+	type BranchPushedPayload,
+	clearLifecycleBus,
+	type EventEmittedPayload,
+	installLifecycleBus,
+	LIFECYCLE_HOOKS,
+	LifecycleBus,
+	type LifecycleBusOptions,
+	type LifecycleEnvelope,
+	type LifecycleErrorSink,
+	type LifecycleExtension,
+	type LifecycleHandler,
+	type LifecycleHook,
+	type LifecycleOutcome,
+	type LifecyclePayloads,
+	type LifecycleRegistration,
+	lifecycleBus,
+	type PostReapPayload,
+	type PreReapPayload,
+	type RunDispatchedPayload,
+	type RunStartedPayload,
+	registerExtensions,
+	WARREN_EXT_PROTOCOL,
+	type WarrenExtProtocol,
+} from "./lifecycle-bus.ts";
 export {
 	type AutoOpenPrConfig,
 	buildPrContent,
@@ -150,21 +121,9 @@ export {
 export {
 	type BuildSeedFilesResult,
 	buildSeedFiles,
-	type HttpWorkspaceFile,
+	type SeedFile,
 } from "./seed.ts";
-export {
-	type SessionEvent,
-	type SessionEventClass,
-	type SessionSnapshot,
-	wakeSession,
-} from "./session.ts";
-export {
-	DEFAULT_DISPATCHER_HANDLE,
-	resolveDispatcherHandle,
-	type SpawnRunInput,
-	type SpawnRunResult,
-	spawnRun,
-} from "./spawn/index.ts";
+export { type SpawnRunInput, type SpawnRunResult, spawnRun } from "./spawn/index.ts";
 export { type SteerRunInput, type SteerRunResult, steerRun } from "./steer.ts";
 export {
 	type ActiveBridge,
@@ -206,6 +165,7 @@ export {
 	WATCHDOG_TIMED_OUT_KIND,
 	type WatchdogConfig,
 	type WatchdogHandle,
+	type WatchdogReap,
 	type WatchdogTickDeps,
 	type WatchdogTickResult,
 } from "./watchdog.ts";

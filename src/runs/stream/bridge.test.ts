@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { RunEvent } from "@os-eco/burrow-cli";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import { RunEventBroker } from "../events.ts";
 import { bridgeRunStream } from "./bridge.ts";
-import { evt, makePool, seedBridgeRun, source } from "./test-helpers.ts";
+import { evt, makeProvider, seedBridgeRun, source } from "./test-helpers.ts";
+import type { StreamEventView } from "./types.ts";
 
 describe("bridgeRunStream — event flow", () => {
 	let db: WarrenDb;
@@ -33,7 +33,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: source([evt(burrowRunId, 1), evt(burrowRunId, 2), evt(burrowRunId, 3)]),
 		});
 		expect(result.written).toBe(3);
@@ -59,13 +59,94 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: source([evt(burrowRunId, 1), evt(burrowRunId, 2)]),
 		});
 		await consumer;
 
 		expect(consumed).toEqual([1, 2]);
 		expect(broker.subscriberCount(runId)).toBe(0);
+	});
+
+	test("drops per-delta message_update telemetry snapshots (never persisted or published)", async () => {
+		const published: string[] = [];
+		const sub = broker.subscribe(runId);
+		const consumer = (async () => {
+			for await (const row of sub) {
+				published.push(row.kind);
+				if (published.length >= 2) break;
+			}
+		})();
+
+		const messageUpdate = (seq: number): StreamEventView =>
+			evt(burrowRunId, seq, {
+				kind: "telemetry",
+				stream: "system",
+				payload: { type: "message_update", message: { role: "assistant", content: [] } },
+			});
+		const result = await bridgeRunStream({
+			runId,
+			burrowRunId,
+			repos,
+			broker,
+			burrowId: "bur_aaaaaaaaaaaa",
+			runtimeProvider: makeProvider(),
+			source: source([
+				evt(burrowRunId, 1),
+				messageUpdate(2),
+				messageUpdate(3),
+				// Non-snapshot telemetry subtypes still persist.
+				evt(burrowRunId, 4, {
+					kind: "telemetry",
+					stream: "system",
+					payload: { type: "auto_retry_start" },
+				}),
+			]),
+		});
+		await consumer;
+
+		expect(result.written).toBe(2);
+		expect(result.skipped).toBe(0);
+		const rows = await repos.events.listByRun(runId);
+		expect(rows.map((e) => e.burrowEventSeq)).toEqual([1, 4]);
+		expect(published).toEqual(["text", "telemetry"]);
+	});
+
+	test("drops per-delta noise envelopes (tool_execution_update, message_start); keeps lifecycle markers and turn_end", async () => {
+		const stateChange =
+			(type: string) =>
+			(seq: number): StreamEventView =>
+				evt(burrowRunId, seq, {
+					kind: "state_change",
+					stream: "system",
+					payload: { type },
+				});
+		const result = await bridgeRunStream({
+			runId,
+			burrowRunId,
+			repos,
+			broker,
+			burrowId: "bur_aaaaaaaaaaaa",
+			runtimeProvider: makeProvider(),
+			source: source([
+				evt(burrowRunId, 1),
+				// Dropped: burrow's parser maps pi's unknown
+				// tool_execution_update into state_change.
+				stateChange("tool_execution_update")(2),
+				stateChange("message_start")(3),
+				// Kept: once-per-invocation lifecycle markers.
+				stateChange("turn_start")(4),
+				stateChange("tool_execution_start")(5),
+				stateChange("tool_execution_end")(6),
+				// Kept: HARD CONSTRAINT — usage aggregation reads turn_end.
+				stateChange("turn_end")(7),
+			]),
+		});
+
+		expect(result.written).toBe(5);
+		expect(result.skipped).toBe(0);
+		const rows = await repos.events.listByRun(runId);
+		expect(rows.map((e) => e.burrowEventSeq)).toEqual([1, 4, 5, 6, 7]);
 	});
 
 	test("resume: skips events with seq <= MAX(burrow_event_seq)", async () => {
@@ -92,7 +173,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: source([
 				evt(burrowRunId, 1),
 				evt(burrowRunId, 2),
@@ -113,8 +194,10 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
-			source: source([evt(burrowRunId, 1, { stream: "weird" as unknown as RunEvent["stream"] })]),
+			runtimeProvider: makeProvider(),
+			source: source([
+				evt(burrowRunId, 1, { stream: "weird" as unknown as StreamEventView["stream"] }),
+			]),
 		});
 		const row = (await repos.events.listByRun(runId))[0];
 		expect(row?.stream).toBeNull();
@@ -122,7 +205,7 @@ describe("bridgeRunStream — event flow", () => {
 
 	test("source error: logs, sets errored=true, and does not throw", async () => {
 		const errs: object[] = [];
-		const errSource = (): AsyncIterable<RunEvent> => ({
+		const errSource = (): AsyncIterable<StreamEventView> => ({
 			async *[Symbol.asyncIterator]() {
 				yield evt(burrowRunId, 1);
 				throw new Error("burrow disconnected");
@@ -134,7 +217,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: () => errSource(),
 			logger: {
 				error(obj: object) {
@@ -149,7 +232,7 @@ describe("bridgeRunStream — event flow", () => {
 
 	test("AbortSignal stops consumption mid-stream", async () => {
 		const ctrl = new AbortController();
-		const infinite = (signal: AbortSignal): AsyncIterable<RunEvent> => ({
+		const infinite = (signal: AbortSignal): AsyncIterable<StreamEventView> => ({
 			async *[Symbol.asyncIterator]() {
 				let i = 1;
 				while (!signal.aborted) {
@@ -165,7 +248,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			signal: ctrl.signal,
 			source: (s: AbortSignal) => infinite(s),
 		});
@@ -187,7 +270,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: source([evt(burrowRunId, 1)]),
 		});
 
@@ -203,7 +286,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: source([]),
 		});
 		const after = await repos.runs.require(runId);
@@ -222,7 +305,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: source([evt(burrowRunId, 1)]),
 		});
 
@@ -243,7 +326,7 @@ describe("bridgeRunStream — event flow", () => {
 			repos,
 			broker,
 			burrowId: "bur_aaaaaaaaaaaa",
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider(),
 			source: source([evt(burrowRunId, 1)]),
 		});
 		await consumer;

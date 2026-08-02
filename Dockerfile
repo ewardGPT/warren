@@ -1,24 +1,37 @@
-# Warren container image (SPEC §10.3).
+# Warren container image (docs/design/runtime-and-supervisor.md).
 #
 # Two-stage build:
 #   1. ui-builder — build the React/Vite SPA into src/ui/dist.
 #   2. runtime    — bun + bwrap + uidmap, warren source, burrow itself
 #                   plus the bundled os-eco CLIs warren shells out to for
-#                   opt-in features (canopy/mulch/seeds/sapling), and the
+#                   opt-in features (mulch/seeds/sapling), and the
 #                   SPA bundle copied from stage 1.
 #
 # The supervisor (src/supervisor/main.ts) is the ENTRYPOINT — it owns
 # spawning + signal-forwarding + restart policy for `burrow serve` and
-# warren's HTTP server. See SPEC §10.3 for the contract.
+# warren's HTTP server. See docs/design/runtime-and-supervisor.md for the contract.
 #
 # The four `bwrap` security flags (apparmor=unconfined, seccomp=unconfined,
 # systempaths=unconfined, cap_add=SYS_ADMIN) are applied by the orchestrator
-# (docker-compose.yml or fly.toml), not the image. See SPEC §5.3 + §11.A
-# and burrow's DEPLOY.md for the rationale.
+# (docker-compose.yml in the `local` topology), not the image. Under the
+# `k8s` runtime there is no bwrap — the pod boundary is the sandbox. See
+# docs/design/runtime-and-supervisor.md and burrow's DEPLOY.md for the rationale.
 
 # ---------- stage 1: build the UI ----------
+#
+# The build tree mirrors the repo's own layout — `ui/` and `core/` as
+# siblings — because the SPA imports the shared wire vocabulary across
+# that seam: `src/ui/src/api/types.ts` does
+# `from "../../../core/wire.ts"`, and `src/ui/tsconfig.app.json` lists
+# `../core/wire.ts` in its `include` (warren-b229). A flat WORKDIR that
+# copied only `src/ui` resolved those to a path outside the build
+# context and failed the image build with TS2307, while `bun run
+# build:ui` stayed green everywhere else because a full checkout has the
+# file. Keep the two directories siblings, or the relative specifier
+# breaks again.
 FROM oven/bun:1.2 AS ui-builder
-WORKDIR /ui-build
+WORKDIR /build/ui
+COPY src/core /build/core
 COPY src/ui/package.json src/ui/bun.lock src/ui/tsconfig.json ./
 COPY src/ui/tsconfig.app.json src/ui/tsconfig.node.json ./
 COPY src/ui/vite.config.ts src/ui/index.html ./
@@ -43,7 +56,7 @@ FROM oven/bun:1.2
 # Next.js / Remix project on startup. NodeSource ships a recent LTS — bookworm's
 # stock `nodejs` package is too old (18.19) for current frontend stacks.
 #
-# netcat-openbsd is required by burrow's inbound port-forwarder (SPEC §8.7,
+# netcat-openbsd is required by burrow's inbound port-forwarder (../burrow/SPEC.md §8.7,
 # `../burrow/src/provider/local/inbound-forward.ts`): the forwarder accepts
 # host-loopback connections and `nsenter`s into the burrow netns to relay
 # via `nc 127.0.0.1 <sandboxPort>`. Without it, every accepted connection's
@@ -67,13 +80,13 @@ RUN apt-get update \
 
 # Bundled CLIs warren shells out to during run setup, reap, and project
 # management, plus burrow itself (the supervisor execs `burrow serve`).
-# The four os-eco CLIs (canopy/seeds/mulch/sapling) back warren's opt-in
+# The three os-eco CLIs (seeds/mulch/sapling) back warren's opt-in
 # features — they ship in every image so the features light up the moment
 # a project or operator opts in, with no separate install. Versions track
 # each tool's current release; bumping them is a deliberate image-rebuild
 # decision.
 #
-# pnpm is baked in so per-run preview sidecars (R-19 / SPEC §11.L) can
+# pnpm is baked in so per-run preview sidecars (R-19 / docs/design/preview-environments.md) can
 # boot the common JS dev-server commands (`pnpm dev`) in projects that
 # don't use bun. npm ships with the NodeSource `nodejs` package above,
 # so we don't reinstall it via bun. Both run under the real Node installed
@@ -84,22 +97,17 @@ RUN apt-get update \
 # /root/.bun/install/global into /usr/local/install/global. Burrow's bwrap
 # profile only ro-binds /usr, /etc, /lib, /lib64, /bin, /sbin, /opt (see
 # burrow src/provider/local/bwrap.ts SYSTEM_RO_MOUNTS) — /root is not visible
-# inside the sandbox, so symlinks at /usr/local/bin/{sd,ml,cn,sapling,burrow}
+# inside the sandbox, so symlinks at /usr/local/bin/{sd,ml,sapling,burrow}
 # pointing into /root/.bun would dangle for the UID-1000 agent (warren-1eaa).
 # /usr/local sits under /usr so the symlink targets resolve inside the sandbox.
 ENV BUN_INSTALL=/usr/local
-# Pin Burrow to the reviewed clone-fallback fix until it is released upstream.
-# The registered Warren repository is bare, so Burrow must clone its configured
-# base branch before creating each per-run branch (burrow-46bd).
 RUN bun install -g \
-    github:ewardGPT/burrow#dc267692af25f56c8d4a5632be684a9d059fbc50 \
-    @os-eco/canopy-cli@0.2.4 \
+    @os-eco/burrow-cli@0.3.15 \
     @os-eco/seeds-cli@0.5.13 \
     @os-eco/mulch-cli@0.10.7 \
     @os-eco/sapling-cli@0.3.2 \
-    @os-eco/plot-cli@0.4.0 \
     @anthropic-ai/claude-code@2.1.150 \
-    @earendil-works/pi-coding-agent@0.77.0 \
+    @earendil-works/pi-coding-agent@0.83.0 \
     pnpm@11.1.2
 
 # bun install -g skips lifecycle scripts by default, so claude-code's
@@ -132,7 +140,7 @@ RUN bun install --frozen-lockfile
 COPY . /app
 
 # Pull the prebuilt UI bundle from stage 1.
-COPY --from=ui-builder /ui-build/dist /app/src/ui/dist
+COPY --from=ui-builder /build/ui/dist /app/src/ui/dist
 
 # Put warren itself on PATH. package.json declares bin: { warren, wr } but
 # `bun install -g` is not run for /app, so the bin entries aren't wired up.
@@ -156,7 +164,7 @@ ENV WARREN_BURROW_SOCKET=/var/run/burrow.sock
 # The supervisor's burrow child inherits this env (src/supervisor/main.ts).
 ENV BURROW_DATA_DIR=/data/burrow
 
-# /data is a persistence boundary (sqlite + cloned canopy + cloned project
+# /data is a persistence boundary (sqlite + cloned project
 # repos + burrow's db.sqlite under /data/burrow). /var/run is where the
 # supervisor binds burrow's unix socket; the directory must exist for
 # `burrow serve --socket /var/run/burrow.sock`. /data/burrow itself is

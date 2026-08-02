@@ -1,13 +1,14 @@
 /**
  * Built-in `claude-code` agent definition.
  *
- * Mirrors the canonical canopy `claude-code` prompt (canopy-daf3) so a
- * fresh warren install can dispatch a run without an external library.
- * The shape matches what `cn render` would emit; `parseRenderedAgent`
- * round-trips through warren's schema validation in the test suite.
+ * A fresh warren install can dispatch a run against this agent with no
+ * external tooling. `parseRenderedAgent` round-trips the shape through
+ * warren's schema validation in the test suite.
  *
- * Operators with a custom canopy library override this by registering a
- * same-named library agent — refresh upserts on top.
+ * Warren re-seeds the built-ins into the agents registry on every server
+ * boot. The external canopy agent library was removed in the deletion
+ * pass (pl-3a79), so no library-refresh path remains — the built-in is
+ * the whole registry entry.
  */
 
 import type { AgentDefinition } from "../schema.ts";
@@ -17,7 +18,7 @@ const SYSTEM_BODY = `You are a helpful coding assistant. Be concise.
 
 Workspace map:
 - The project repo is mounted at the burrow workspace root.
-- /workspace/.canopy/agent.json is the rendered agent definition (warren seeded it).
+- /workspace/.warren/agent.json is the rendered agent definition (warren seeded it).
 - /workspace/.mulch/expertise/<domain>.jsonl holds the project's expertise records.
 - /workspace/.seeds/issues.jsonl holds the project's issue queue.
 

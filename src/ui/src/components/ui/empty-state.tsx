@@ -6,12 +6,9 @@ import { cn } from "@/lib/utils.ts";
  * Phase 4 shared-state primitive (warren-36f0 / pl-55a3 step 5):
  *
  * EmptyState — a centered "nothing here yet" placeholder for list and
- * detail surfaces. Audit found ~12 ad-hoc empty branches across pages/
- * (Plots.tsx had its own local EmptyState, ProjectDetail.tsx had
- * EmptyHint, Runs/Projects/PlanRuns/PlotDetail used bare `<p>`
- * placeholders) — this primitive consolidates them so all empty
- * surfaces share the same vertical rhythm, icon size, and muted color
- * token.
+ * detail surfaces. Consolidates the former ad-hoc empty branches across
+ * pages so all empty surfaces share the same vertical rhythm, icon size,
+ * and muted color token.
  *
  * Slots:
  *   - `icon` — optional lucide-react icon component (constructor),
@@ -32,10 +29,7 @@ export interface EmptyStateProps extends Omit<React.HTMLAttributes<HTMLDivElemen
 }
 
 export const EmptyState = React.forwardRef<HTMLDivElement, EmptyStateProps>(
-	(
-		{ className, icon: Icon, title, description, action, compact, children, ...props },
-		ref,
-	) => (
+	({ className, icon: Icon, title, description, action, compact, children, ...props }, ref) => (
 		<div
 			ref={ref}
 			className={cn(
@@ -46,16 +40,11 @@ export const EmptyState = React.forwardRef<HTMLDivElement, EmptyStateProps>(
 			{...props}
 		>
 			{Icon ? (
-				<Icon
-					aria-hidden="true"
-					className="h-8 w-8 text-(--color-muted-foreground) opacity-70"
-				/>
+				<Icon aria-hidden="true" className="h-8 w-8 text-(--color-muted-foreground) opacity-70" />
 			) : null}
 			<div className="text-sm font-medium text-(--color-fg)">{title}</div>
 			{description ? (
-				<div className="text-sm text-(--color-muted-foreground) max-w-prose">
-					{description}
-				</div>
+				<div className="text-sm text-(--color-muted-foreground) max-w-prose">{description}</div>
 			) : null}
 			{children}
 			{action ? <div className="mt-2">{action}</div> : null}

@@ -1,7 +1,10 @@
+import { isTerminalRunState } from "../../../core/wire.ts";
 import { tailRunEvents } from "../../../runs/index.ts";
 import { ndjsonResponse } from "../../response.ts";
-import type { RouteHandler, ServerDeps } from "../../types.ts";
+import { reserveEventStreamSlot } from "../../stream-limits.ts";
+import type { Actor, RouteHandler, ServerDeps } from "../../types.ts";
 import { parseBoolean, parseNonNegativeInt, requireParam } from "../index.ts";
+import { projectEvent } from "./event-projection.ts";
 
 export function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
@@ -10,10 +13,25 @@ export function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 		// stream an empty NDJSON forever for a typo'd id.
 		const run = await deps.repos.runs.require(id);
 
-		const follow = parseBoolean(ctx.url.searchParams.get("follow"), "follow") ?? false;
+		// warren-7bff: follow by DEFAULT while the run is non-terminal. A
+		// bare `curl -N /runs/:id/events` (RUNBOOK-K8S's stream check) or any
+		// client not passing `?follow=` must hold the connection on a live
+		// run, not replay-then-close. Terminal runs keep replay-then-close;
+		// an explicit `?follow=0|1` always wins.
+		const followParam = parseBoolean(ctx.url.searchParams.get("follow"), "follow");
+		const follow = followParam ?? !isTerminalRunState(run.state);
 		const sinceSeq = parseNonNegativeInt(ctx.url.searchParams.get("since"), "since");
 
 		const ctrl = bridgeAbort(ctx.request.signal);
+		// Concurrency admission (warren-25f6) — AFTER the 404 so a typo'd id
+		// never burns a slot, BEFORE any streaming work so a refusal is a fast
+		// 503 + Retry-After rather than a connection warren has to hold.
+		const slot = reserveEventStreamSlot({
+			limiter: deps.streamLimiter,
+			ctx,
+			ctrl,
+			route: "GET /runs/:id/events",
+		});
 		const source = tailRunEvents({
 			runId: id,
 			repos: { events: deps.repos.events },
@@ -21,14 +39,24 @@ export function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 			follow,
 			...(sinceSeq !== undefined ? { sinceSeq } : {}),
 			signal: ctrl.signal,
+			// warren-7bff: close the tail promptly when the run finishes even
+			// if no live bridge remains to `broker.close` it (warren restart,
+			// finalize racing the connect) — no dangling follow connections.
+			terminal: {
+				isTerminal: async () => {
+					const row = await deps.repos.runs.get(id);
+					return row === null || isTerminalRunState(row.state);
+				},
+			},
 		});
-		// warren-a8c3: tag every NDJSON envelope with the run's plot_id so
-		// Plot-aware consumers can route mirrored events (warren-7e0f) without
-		// a second GET /runs/:id call. Snapshot at stream-open time — plot_id
-		// is set at spawn and never mutates, so the closure-captured value is
-		// authoritative for the life of the stream.
-		const plotId = run.plotId;
-		return ndjsonResponse(asNdjsonStream(source, (row) => eventToNdjson(row, plotId), ctrl));
+		return ndjsonResponse(
+			asNdjsonStream(
+				source,
+				(row) => eventToNdjson(row, ctx.actor),
+				ctrl,
+				() => slot.release(),
+			),
+		);
 	};
 }
 
@@ -46,23 +74,43 @@ export function bridgeAbort(reqSignal: AbortSignal): AbortController {
 	return ctrl;
 }
 
+/**
+ * `onClose` (warren-25f6) fires exactly once the stream is no longer
+ * attached — normal end-of-source, error, or client cancel. It carries the
+ * event-stream slot release, so it runs BEFORE each exit's
+ * `controller.close()` / `.error()`: those can themselves throw on a stream
+ * the runtime already tore down, and a leaked slot would permanently shrink
+ * the instance's capacity. `EventStreamSlot.release` is idempotent, so the
+ * overlap between these paths is harmless.
+ */
 export function asNdjsonStream<T>(
 	source: AsyncIterable<T>,
-	encode: (value: T) => string,
+	encode: (value: T) => string | null,
 	ctrl: AbortController,
+	onClose?: () => void,
 ): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
 	const iterator = source[Symbol.asyncIterator]();
 	return new ReadableStream<Uint8Array>({
 		async pull(controller) {
 			try {
-				const { done, value } = await iterator.next();
-				if (done) {
-					controller.close();
+				// warren-1cb7: `encode` returns null for a value the projection
+				// dropped. Pull the next one instead of enqueuing a blank chunk —
+				// a dropped event must be absent from the wire, not an empty line.
+				while (true) {
+					const { done, value } = await iterator.next();
+					if (done) {
+						onClose?.();
+						controller.close();
+						return;
+					}
+					const line = encode(value);
+					if (line === null) continue;
+					controller.enqueue(encoder.encode(line));
 					return;
 				}
-				controller.enqueue(encoder.encode(encode(value)));
 			} catch (err) {
+				onClose?.();
 				if (ctrl.signal.aborted) {
 					controller.close();
 					return;
@@ -71,6 +119,7 @@ export function asNdjsonStream<T>(
 			}
 		},
 		async cancel() {
+			onClose?.();
 			ctrl.abort();
 			try {
 				await iterator.return?.(undefined);
@@ -81,6 +130,12 @@ export function asNdjsonStream<T>(
 	});
 }
 
+/**
+ * Encode one event row as an NDJSON line, narrowed for `actor`
+ * (warren-1cb7). The seven envelope keys are an allowlist by
+ * construction; `projectEvent` owns the payload half and returns `null`
+ * for an event a `readPublic`-only caller must not see at all.
+ */
 export function eventToNdjson(
 	row: {
 		id: number;
@@ -91,16 +146,17 @@ export function eventToNdjson(
 		stream: string | null;
 		payloadJson: unknown;
 	},
-	plotId: string | null = null,
-): string {
+	actor?: Actor,
+): string | null {
+	const projected = projectEvent(row, actor);
+	if (projected === null) return null;
 	return `${JSON.stringify({
-		id: row.id,
-		runId: row.runId,
-		seq: row.burrowEventSeq,
-		ts: row.ts,
-		kind: row.kind,
-		stream: row.stream,
-		payload: row.payloadJson,
-		plotId,
+		id: projected.id,
+		runId: projected.runId,
+		seq: projected.burrowEventSeq,
+		ts: projected.ts,
+		kind: projected.kind,
+		stream: projected.stream,
+		payload: projected.payloadJson,
 	})}\n`;
 }

@@ -106,6 +106,6 @@ body:
     attributes:
       label: Deployment mode
       description: How is warren running?
-      placeholder: "docker compose, fly.io, local bun, etc."
+      placeholder: "docker compose, GKE / k8s, local bun, etc."
     validations:
       required: false

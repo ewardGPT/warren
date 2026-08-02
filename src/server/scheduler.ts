@@ -21,16 +21,19 @@
  * bridge.
  */
 
-import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import { spawnRun } from "../runs/index.ts";
+import type { RuntimeProvider } from "../runtime/contract.ts";
 import { listScheduledSeeds, updateExtensions } from "../seeds-cli/index.ts";
 import {
+	CronRetryTracker,
+	createProjectCloneHealer,
 	type DispatchSpawnFn,
 	type DispatchSpawnInput,
 	type DispatchSpawnResult,
+	ProjectHealTracker,
 	type SchedulerHandle,
 	type SchedulerTimerHandle,
 	startScheduler,
@@ -45,7 +48,14 @@ import type { BridgeRegistry } from "./types.ts";
 
 export interface BootSchedulerInput {
 	readonly repos: Repos;
-	readonly burrowClientPool: BurrowClientPool;
+	/**
+	 * Resolved runtime provider (warren-c42c: required — the spawn seam is now
+	 * exclusively `provider.create()`, no burrow-client fallback). Boot threads
+	 * the boot-selected instance (`resolveRuntimeProvider`, honoring
+	 * `WARREN_RUNTIME`) — the same one `POST /runs` dispatches through — so
+	 * cron/scheduled-for/CI-fixer fires all honor `WARREN_RUNTIME=k8s`.
+	 */
+	readonly runtimeProvider: RuntimeProvider;
 	readonly bridges: BridgeRegistry;
 	readonly warrenConfigs: WarrenConfigCache;
 	readonly projectsConfig: ProjectsConfig;
@@ -63,10 +73,21 @@ export interface BootSchedulerInput {
 	 * `GITHUB_TOKEN` for the CI-fixer poller's check-runs fetch (warren-0b75).
 	 * Resolved from the same env the reap pr-open path reads. Defaults to the
 	 * empty string; the poller surfaces per-PR `error` results when unset.
+	 * Also forwarded onto every scheduled `spawnRun` as the pre-dispatch
+	 * refresh's git credential (`SpawnRunInput.githubToken`) so cron /
+	 * scheduled-for dispatches can fetch private repos on the K8s control
+	 * plane. The acceptance seam's synthetic `stub-token` is inert there:
+	 * the harness's own `insteadOf` rules are longer-prefix and win.
 	 */
 	readonly githubToken?: string;
 	/** Override the spawnRun seam (tests). Defaults to the live `spawnRun`. */
 	readonly spawnRunFn?: typeof spawnRun;
+	/**
+	 * Filesystem probe for the self-heal clone check (warren-1ec7). Defaults
+	 * to `existsSync`; tests inject a stub so a registered project's clone can
+	 * be treated as present (or absent) without touching disk.
+	 */
+	readonly cloneExists?: (path: string) => boolean;
 	/** Test override for setInterval (forwarded to `startScheduler`). */
 	readonly setInterval?: (cb: () => void, ms: number) => SchedulerTimerHandle;
 	readonly clearInterval?: (handle: SchedulerTimerHandle) => void;
@@ -81,12 +102,38 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 
 	const seedsDeps = { sdBinary: input.config.sdBinary, spawn: input.projectSpawn };
 
+	// warren-a0a2: one bounded-retry tracker for the scheduler's process
+	// lifetime (in-memory; a restart resets counters — see cron-retry.ts). The
+	// cron dispatcher caps consecutive transient spawn failures per slot against
+	// it, and GCs the transient never_started rows via `deleteNeverStarted`.
+	const cronRetryTracker = new CronRetryTracker();
+	const deleteNeverStartedRun = async (runId: string): Promise<void> => {
+		await input.repos.runs.deleteNeverStarted(runId);
+	};
+
+	// warren-1ec7: self-heal + notice rate-limiting. One tracker for the
+	// scheduler's process lifetime (in-memory; a restart resets backoff
+	// counters — same shape as cronRetryTracker). The healer re-clones a
+	// registered project whose on-disk clone vanished (ephemeral PVC), using
+	// the same token/`insteadOf` auth as the dispatch clone (warren-57ad),
+	// and the tracker gates the per-project error notices to once per hour.
+	const projectHealTracker = new ProjectHealTracker();
+	const ensureProjectClone = createProjectCloneHealer({
+		tracker: projectHealTracker,
+		config: input.projectsConfig,
+		spawn: input.projectSpawn,
+		...(input.githubToken !== undefined ? { token: input.githubToken } : {}),
+		...(input.logger !== undefined ? { logger: input.logger } : {}),
+		...(input.cloneExists !== undefined ? { exists: input.cloneExists } : {}),
+		...(input.now !== undefined ? { now: input.now } : {}),
+	});
+
 	const spawnDispatch: DispatchSpawnFn = async (
 		args: DispatchSpawnInput,
 	): Promise<DispatchSpawnResult> => {
 		const result = await spawnRunFn({
 			repos: input.repos,
-			burrowClientPool: input.burrowClientPool,
+			runtimeProvider: input.runtimeProvider,
 			agentName: args.agentName,
 			projectId: args.projectId,
 			prompt: args.prompt,
@@ -95,8 +142,12 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 			...(args.maxCostUsd !== undefined ? { maxCostUsdOverride: args.maxCostUsd } : {}),
 			projectsConfig: input.projectsConfig,
 			projectSpawn: input.projectSpawn,
+			githubToken: input.githubToken,
 			warrenConfigs: input.warrenConfigs,
 			seedsCli: seedsDeps,
+			// warren-a0a2: forward the cron dispatcher's row-id probe so its
+			// bounded-retry GC can reclaim a transient never_started row.
+			...(args.onRowCreated !== undefined ? { onRunRowCreated: args.onRowCreated } : {}),
 			...(input.runBranchPrefixDefault !== undefined
 				? { runBranchPrefixDefault: input.runBranchPrefixDefault }
 				: {}),
@@ -121,7 +172,7 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 	): Promise<{ runId: string }> => {
 		const result = await spawnRunFn({
 			repos: input.repos,
-			burrowClientPool: input.burrowClientPool,
+			runtimeProvider: input.runtimeProvider,
 			agentName: args.agentName,
 			projectId: args.projectId,
 			prompt: args.prompt,
@@ -130,6 +181,7 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 			targetBranch: args.targetBranch,
 			projectsConfig: input.projectsConfig,
 			projectSpawn: input.projectSpawn,
+			githubToken: input.githubToken,
 			warrenConfigs: input.warrenConfigs,
 			seedsCli: seedsDeps,
 			...(input.runBranchPrefixDefault !== undefined
@@ -150,6 +202,10 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 		updateExtensions: (projectPath, seedId, extensions) =>
 			updateExtensions(seedsDeps, projectPath, seedId, extensions),
 		spawn: spawnDispatch,
+		cronRetryTracker,
+		deleteNeverStartedRun,
+		ensureProjectClone,
+		noticeGate: projectHealTracker,
 		ciFixer: {
 			githubToken: input.githubToken ?? "",
 			spawn: ciFixerSpawn,

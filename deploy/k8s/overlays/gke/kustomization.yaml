@@ -1,0 +1,182 @@
+# GKE Autopilot overlay — the hosted target (docs/RUNBOOK-K8S.md §1.1).
+#
+# This overlay is a TEMPLATE — the LOCATION/PROJECT registry paths and the git
+# identity are placeholders. Do not put real deployment values here; create a
+# gitignored sibling overlay instead (convention: `overlays/gke-live/`) that
+# builds on this one and overrides the images + env:
+#
+#   # deploy/k8s/overlays/gke-live/kustomization.yaml  (gitignored)
+#   apiVersion: kustomize.config.k8s.io/v1beta1
+#   kind: Kustomization
+#   resources: [../gke]
+#   images:
+#     - name: LOCATION-docker.pkg.dev/PROJECT/warren/warren
+#       newName: us-west1-docker.pkg.dev/<your-project>/warren/warren
+#       newTag: <git-sha>
+#   patches:
+#     - patch: |
+#         apiVersion: apps/v1
+#         kind: Deployment
+#         metadata: {name: warren, namespace: warren}
+#         spec:
+#           template:
+#             spec:
+#               containers:
+#                 - name: warren
+#                   env:
+#                     - {name: WARREN_K8S_AGENT_IMAGE, value: us-west1-docker.pkg.dev/<your-project>/warren/warren-agent:<git-sha>}
+#                     - {name: WARREN_K8S_INIT_IMAGE, value: us-west1-docker.pkg.dev/<your-project>/warren/warren-workspace-init:<git-sha>}
+#                     - {name: WARREN_GIT_AUTHOR_NAME, value: warren}
+#                     - {name: WARREN_GIT_AUTHOR_EMAIL, value: <id>+warren@users.noreply.github.com}
+#
+# Then: kubectl apply -k deploy/k8s/overlays/gke-live
+#
+# Differences from base:
+#   - Images pulled from Artifact Registry, pinned to the deployed git SHA tag.
+#   - The placeholder Secret templates are DELETED from the render (real
+#     secrets are created imperatively — see ../../README.md).
+#   - Ingress is a GCE external Application LB (warren-682a): reserved global
+#     static IP (`warren-ingress`), ManagedCertificate TLS, FrontendConfig
+#     HTTP→HTTPS redirect, ClusterIP Service + NEG (container-native LB; no
+#     NodePort). The Ingress `host` and ManagedCertificate `domains` are
+#     placeholders — gke-live patches in the real hostname (never commit it).
+#     DNS must point the hostname at the static IP (DNS-only / unproxied if
+#     Cloudflare) BEFORE the cert can go Active.
+#   - BackendConfig attaches the `warren-armor` Cloud Armor policy (per-IP rate
+#     limiting + preconfigured WAF) and raises the backend timeout so event
+#     streams survive (warren-48d3). The policy itself is a GCP project
+#     resource — run `deploy/gcp/cloud-armor.sh` before applying, or the
+#     reference is inert. See docs/RUNBOOK-K8S.md §1.7.
+#   - CANOPY_REPO_URL is wired from warren-secrets (optional — activates the
+#     canopy prompt-library agents).
+#   - WARREN_GIT_AUTHOR_NAME/EMAIL feed run pods' GIT_AUTHOR_*/GIT_COMMITTER_*
+#     (composeRunEnv, warren-4e36) — without them every in-pod `git commit`
+#     fails with "Author identity unknown".
+#   - Autopilot ignores fixed storageClassName choices for some tiers; the
+#     default `standard-rwo` binds the PVC. The repo-cache is OPT-IN
+#     (warren-554f): if you enable it and later go multi-node you need an RWM
+#     class (Filestore) — see README "Repo cache (opt-in)" (design R2).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - managedcertificate.yaml
+  - frontendconfig.yaml
+  - backendconfig.yaml
+images:
+  - name: warren
+    newName: LOCATION-docker.pkg.dev/PROJECT/warren/warren
+    newTag: latest
+patches:
+  # base/secrets.yaml is a placeholder TEMPLATE (README: "do not apply as-is").
+  # The real secrets are created imperatively; applying the templates here
+  # would clobber them with placeholder values. Delete both from the render.
+  - target:
+      kind: Secret
+      name: warren-secrets
+    patch: |
+      $patch: delete
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: warren-secrets
+        namespace: warren
+  - target:
+      kind: Secret
+      name: warren-git-token
+    patch: |
+      $patch: delete
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: warren-git-token
+        namespace: warren-runs
+  - target:
+      kind: Secret
+      name: warren-openrouter-key
+    patch: |
+      $patch: delete
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: warren-openrouter-key
+        namespace: warren-runs
+  # GCE external Application LB exposure (warren-682a). The host below is a
+  # PLACEHOLDER — gke-live patches it (and the ManagedCertificate domain) to
+  # the real hostname. The static-IP name refers to a reserved *global*
+  # address: `gcloud compute addresses create warren-ingress --global`.
+  - target:
+      kind: Ingress
+      name: warren
+    patch: |
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: warren
+        namespace: warren
+        annotations:
+          kubernetes.io/ingress.class: gce
+          kubernetes.io/ingress.global-static-ip-name: warren-ingress
+          networking.gke.io/managed-certificates: warren
+          networking.gke.io/v1beta1.FrontendConfig: warren
+  # Container-native LB: GCE Ingress routes straight to pod NEGs, so the
+  # Service stays ClusterIP (no NodePort needed on Autopilot). Explicit
+  # annotation — Autopilot defaults to NEGs, but don't rely on it silently.
+  #
+  # `backend-config` is the only thing that binds backendconfig.yaml to the
+  # generated backend service; without it the Cloud Armor policy and the raised
+  # stream timeout are never applied (warren-48d3). `default` covers every port
+  # on this Service.
+  - target:
+      kind: Service
+      name: warren
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: warren
+        namespace: warren
+        annotations:
+          cloud.google.com/neg: '{"ingress": true}'
+          cloud.google.com/backend-config: '{"default": "warren"}'
+  # Strategic-merge (keyed by env `name`) so the agent/init image env vars are
+  # overridden regardless of list position.
+  - patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: warren
+        namespace: warren
+      spec:
+        template:
+          spec:
+            containers:
+              - name: warren
+                env:
+                  - name: WARREN_K8S_AGENT_IMAGE
+                    value: LOCATION-docker.pkg.dev/PROJECT/warren/warren-agent:latest
+                  - name: WARREN_K8S_INIT_IMAGE
+                    value: LOCATION-docker.pkg.dev/PROJECT/warren/warren-workspace-init:latest
+                  - name: CANOPY_REPO_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: warren-secrets
+                        key: canopy-repo-url
+                        optional: true
+                  # Agent-commit identity forwarded into run pods as
+                  # GIT_AUTHOR_*/GIT_COMMITTER_* (composeRunEnv). Without it
+                  # every in-pod `git commit` fails with "Author identity
+                  # unknown" (warren-4e36). The noreply address keeps agent
+                  # commits attributed to the operator's GitHub account.
+                  # GCLB appends `<client-ip>, <lb-ip>` after any client-
+                  # supplied X-Forwarded-For, so the per-client event-stream
+                  # cap must skip the one right-most infrastructure hop to
+                  # reach the client key (warren-46a7). Without this every
+                  # spectator collapses into the LB's address and shares one
+                  # per-client allowance.
+                  - name: WARREN_EVENT_STREAM_TRUSTED_PROXY_HOPS
+                    value: "1"
+                  - name: WARREN_GIT_AUTHOR_NAME
+                    value: warren
+                  - name: WARREN_GIT_AUTHOR_EMAIL
+                    value: CHANGE_ME+warren@users.noreply.github.com

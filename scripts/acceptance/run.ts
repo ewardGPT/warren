@@ -1,7 +1,7 @@
 /**
  * Acceptance harness entry — `bun run scripts/acceptance/run.ts`.
  *
- * Phase 14 (warren-3ee3): exercises the §3.1 V1 acceptance criteria
+ * Phase 14 (warren-3ee3): exercises the ACCEPTANCE.md V1 acceptance criteria
  * against a real warren+burrow process pair (in-proc by default,
  * `--mode container` brings up the docker-compose stack and runs the
  * container-supported scenarios on top of it).
@@ -34,7 +34,6 @@ import { type BuiltFixtures, buildFixtures } from "./lib/fixtures.ts";
 import { type BootHandle, bootInProc } from "./lib/inproc.ts";
 
 import { scenario as scenario01 } from "./scenarios/01-boot-healthz-readyz.ts";
-import { scenario as scenario02 } from "./scenarios/02-agents-refresh.ts";
 import { scenario as scenario03 } from "./scenarios/03-projects-management.ts";
 import { scenario as scenario04 } from "./scenarios/04-run-spawn.ts";
 import { scenario as scenario05 } from "./scenarios/05-events-stream.ts";
@@ -50,31 +49,22 @@ import { scenario as scenario14 } from "./scenarios/14-warren-config.ts";
 import { scenario as scenario15 } from "./scenarios/15-triggers-roundtrip.ts";
 import { scenario as scenario16 } from "./scenarios/16-pi-parity-smoke.ts";
 import { scenario as scenario17 } from "./scenarios/17-init-scaffold.ts";
-import { scenario as scenario18 } from "./scenarios/18-multi-worker.ts";
 import { scenario as scenario19 } from "./scenarios/19-warren-on-postgres.ts";
 import { scenario as scenario20 } from "./scenarios/20-preview.ts";
 import { scenario as scenario20Path } from "./scenarios/20-preview-path.ts";
 import { scenario as scenario21 } from "./scenarios/21-claude-code-cost-smoke.ts";
 import { scenario as scenario22 } from "./scenarios/22-seeds-extensions-roundtrip.ts";
-import { scenario as scenario23 } from "./scenarios/23-canopy-project-tier.ts";
 import { scenario as scenario24 } from "./scenarios/24-preview-node-runtime.ts";
-import { scenario as scenario25 } from "./scenarios/25-plot-roundtrip.ts";
 import { scenario as scenario26 } from "./scenarios/26-plan-run-roundtrip.ts";
-import { scenario as scenario27 } from "./scenarios/27-plan-run-plot-roundtrip.ts";
-import { scenario as scenario28 } from "./scenarios/28-plot-list-and-create.ts";
-import { scenario as scenario29 } from "./scenarios/29-plot-detail-roundtrip.ts";
 import { scenario as scenario30 } from "./scenarios/30-pi-multi-provider-env.ts";
-import { scenario as scenario31 } from "./scenarios/31-plot-plan-run-synthesis.ts";
-import { scenario as scenario32 } from "./scenarios/32-plot-workbench-loop.ts";
-import { scenario as scenario33 } from "./scenarios/33-leveret-conversation-loop.ts";
-import { scenario as scenario34 } from "./scenarios/34-warden-conversation-acceptance.ts";
 import { scenario as scenario35 } from "./scenarios/35-ci-fixer-roundtrip.ts";
 import { scenario as scenario36 } from "./scenarios/36-ready-to-dispatch-plans.ts";
-import { scenario as scenario37 } from "./scenarios/37-cross-repo-plan-run.ts";
+import { scenario as scenario37 } from "./scenarios/37-k8s-oom-fast-fail.ts";
+import { scenario as scenario38 } from "./scenarios/38-k8s-steer-delivery.ts";
+import { scenario as scenario39 } from "./scenarios/39-public-exposure.ts";
 
 const SCENARIOS: readonly Scenario[] = [
 	scenario01,
-	scenario02,
 	scenario03,
 	scenario04,
 	scenario05,
@@ -90,27 +80,19 @@ const SCENARIOS: readonly Scenario[] = [
 	scenario15,
 	scenario16,
 	scenario17,
-	scenario18,
 	scenario19,
 	scenario20,
 	scenario20Path,
 	scenario21,
 	scenario22,
-	scenario23,
 	scenario24,
-	scenario25,
 	scenario26,
-	scenario27,
-	scenario28,
-	scenario29,
 	scenario30,
-	scenario31,
-	scenario32,
-	scenario33,
-	scenario34,
 	scenario35,
 	scenario36,
 	scenario37,
+	scenario38,
+	scenario39,
 ];
 
 interface ParsedArgs {
@@ -225,6 +207,11 @@ async function runInProcMode(opts: RunModeArgs): Promise<number> {
 		logger.info(
 			`acceptance: fixtures built (canopy=${fixtures.canopyRepoUrl} project=${fixtures.sampleProjectGitUrl})`,
 		);
+		// Register the stub-shell agent on every warren boot (shared and
+		// scenario-owned) via the boot-time seed path (warren-e376) — the
+		// POST /agents/refresh endpoint the scenarios used to call was
+		// deleted in pl-3a79. bootInProc passes this var through.
+		process.env.WARREN_SEED_AGENTS_FILE = fixtures.seedAgentsFilePath;
 		handle = await bootInProc({
 			tmpRoot,
 			token,
@@ -262,6 +249,7 @@ async function runInProcMode(opts: RunModeArgs): Promise<number> {
 				stubAgentName: fixtures.stubAgentName,
 				knownSeedTitle: fixtures.knownSeedTitle,
 				knownMulchDomain: fixtures.knownMulchDomain,
+				gitConfigPath: fixtures.gitConfigPath,
 			},
 			logger,
 			tmp: tmpRoot,
@@ -413,6 +401,7 @@ async function runContainerMode(opts: RunModeArgs): Promise<number> {
 				stubAgentName: "",
 				knownSeedTitle: "",
 				knownMulchDomain: "",
+				gitConfigPath: "",
 			},
 			logger,
 			tmp: tmpRoot,

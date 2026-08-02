@@ -1,30 +1,43 @@
 /**
- * The reap "success pipeline" (warren-c65d): the long sequence of
- * best-effort sub-steps that runs once a non-`queued` run with a live
- * workspace and a surviving project clone reaches reap. Extracted from
- * `run.ts` so the top-level `reapRun` orchestrator stays under the
- * file-size / function-length budget; behavior is byte-for-byte the same.
+ * The reap "success pipeline" (warren-c65d): the long sequence of best-effort
+ * sub-steps that runs once a non-`queued` run with a live workspace and a
+ * surviving project clone reaches reap. Extracted from `run.ts` to keep the
+ * top-level `reapRun` orchestrator under budget.
  *
- * The pipeline mutates a {@link ReapPipelineState} accumulator in place
- * rather than returning a fresh object, so `reapRun` can read the same
- * field set in its terminal `reap.completed` emit / return regardless of
- * which branch of the dispatch chain ran.
+ * ## Routed through the RuntimeProvider seam (warren-1f56, pl-829f step 13)
+ *
+ * The workspace-touching half — the four tracker merges, the two
+ * `chore(warren): seeds state` commit, the branch push, and the
+ * commits-ahead + dirtiness probe — runs inside a SINGLE
+ * `provider.finalize(handle, intent)` call (§4). finalize returns the mirror
+ * deltas, collected events, the `dirty` flag + dirty paths, and the workspace
+ * `.seeds/plans.jsonl` snapshot; the domain re-emits those events, classifies
+ * `reap.empty_push`, and keeps the interleaved DOMAIN steps at the call-site
+ * (baseline snapshot, `sd close`, auto-plan-run detection, PR/preview). The
+ * pipeline mutates a {@link ReapPipelineState} accumulator in place so `reapRun`
+ * reads the same field set in its terminal `reap.completed` emit.
  */
 
 import { join } from "node:path";
-import type { BurrowClient } from "../../burrow-client/client.ts";
 import type { EventRow, ProjectRow, RunRow } from "../../db/schema.ts";
+import type { PreviewSidecarResolver } from "../../preview/launch/index.ts";
+import type {
+	FinalizeIntent,
+	FinalizeResult,
+	FinalizeStage,
+	RunHandle,
+	RuntimeProvider,
+} from "../../runtime/contract.ts";
+import { finalizeCommitStage, finalizeMergeStage } from "../../runtime/contract.ts";
 import { openPullRequest } from "../pr.ts";
 import type { BoundBridgeLogger } from "../stream/index.ts";
 import { dispatchAutoPlanRuns, hasAutoPlanRunFrontmatter, parsePlanIds } from "./auto-plan-run.ts";
-import { mergeMulch } from "./mulch.ts";
-import { mergePlot } from "./plot-merge.ts";
+import { applyK8sCloneDeltas } from "./clone-apply.ts";
 import { runPrOpen } from "./pr-open.ts";
 import { runPreviewAnnotate, runPreviewLaunch } from "./preview.ts";
-import { closeReferencedSeeds, closeRunSeedId, mirrorPlans, mirrorSeeds } from "./seeds.ts";
-import { stagePlotForCommit, stageSeedsForCommit } from "./stage.ts";
+import { seededArtifactResetPaths } from "./seed-reset.ts";
 import type { ReapExec, ReapFs, ReapRunInput, ReapStep } from "./types.ts";
-import { isWorkspaceDirty } from "./util.ts";
+import { classifyEmptyPush } from "./util.ts";
 
 /** Mutable accumulator carrying every result the pipeline can produce. */
 export interface ReapPipelineState {
@@ -33,15 +46,29 @@ export interface ReapPipelineState {
 	mulchAppended: number;
 	seedsClosed: number;
 	seedsCreated: number;
-	seedIdClosed: boolean;
 	seedsCommitted: boolean;
-	plotEventsAppended: number;
-	plotsUpdated: number;
-	plotEventsMirrored: number;
-	plotCommitted: boolean;
 	branchPushed: boolean;
 	commitsAhead: number | null;
 	droppedCommit: boolean;
+	/** warren-89b0: deliberate no-op (clean/bookkeeping-only tree); stays succeeded. */
+	noChanges: boolean;
+	/** warren-495d: requested push did NOT complete; fail run + preserve workspace. */
+	finalizeFailed: boolean;
+	/**
+	 * warren-5ea1: set when the finalize result was warren-SYNTHESIZED because
+	 * the pod never posted one (the `FinalizeResult.unposted` cause); null on a
+	 * pod-computed result. Splits the `finalize_unposted` failure reason from
+	 * `finalize_failed` in reap.
+	 */
+	finalizeUnposted: NonNullable<FinalizeResult["unposted"]> | null;
+	/** warren-e9e1 (leg 2): K8s finalize's mirror deltas applied to the clone; local=false. */
+	cloneDeltasApplied: boolean;
+	/**
+	 * warren-486c: the K8s mirror commit could NOT be made durable on origin
+	 * (push failed/rejected), so auto-dispatch is suppressed — a plan-run must
+	 * never be created against host-only tracker state child pods can't clone.
+	 */
+	mirrorDurabilityFailed: boolean;
 	prUrl: string | null;
 	previewLaunchState: "live" | "failed" | null;
 	previewLaunchPort: number | null;
@@ -59,15 +86,15 @@ export function createPipelineState(): ReapPipelineState {
 		mulchAppended: 0,
 		seedsClosed: 0,
 		seedsCreated: 0,
-		seedIdClosed: false,
 		seedsCommitted: false,
-		plotEventsAppended: 0,
-		plotsUpdated: 0,
-		plotEventsMirrored: 0,
-		plotCommitted: false,
 		branchPushed: false,
 		commitsAhead: null,
 		droppedCommit: false,
+		noChanges: false,
+		finalizeFailed: false,
+		finalizeUnposted: null,
+		cloneDeltasApplied: false,
+		mirrorDurabilityFailed: false,
 		prUrl: null,
 		previewLaunchState: null,
 		previewLaunchPort: null,
@@ -84,61 +111,63 @@ export interface ReapPipelineContext {
 	readonly run: RunRow;
 	/** Non-null in this branch: the project clone survived. */
 	readonly project: ProjectRow;
-	/** Non-null in this branch: the burrow exposed a workspace path. */
-	readonly workspacePath: string;
+	/** HOST workspace path (LocalProvider) or `null` under K8s — finalize runs
+	 * in-pod, the domain applies mirror deltas to the clone (warren-e9e1). */
+	readonly workspacePath: string | null;
 	readonly branch: string | null;
 	readonly baseBranch: string | null;
-	/** Non-null whenever `workspacePath !== null` (same try-block). */
-	readonly workerClient: BurrowClient | null;
+	/** Preview sidecar seam (warren-e24d); absent when the backend lacks preview
+	 * ports (K8s) or no caller wired it. Launch gates on `previewPorts` + this. */
+	readonly previewSidecars?: PreviewSidecarResolver;
+	/** The RuntimeProvider the workspace-dependent half of reap routes through. */
+	readonly provider: RuntimeProvider;
 	readonly fs: ReapFs;
 	readonly exec: ReapExec;
 	readonly now: () => Date;
 	readonly log: BoundBridgeLogger;
 	readonly emit: (kind: string, payload: unknown) => Promise<EventRow>;
 	readonly fail: (step: ReapStep, err: unknown, path?: string) => Promise<void>;
+	/**
+	 * Record a best-effort failure into reap's `errors[]` WITHOUT emitting a
+	 * `reap_failed` event — folds finalize's failed stages into the error trail
+	 * when the matching event already rode `FinalizeResult.events`.
+	 */
+	readonly recordError: (step: ReapStep, message: string) => void;
 }
 
-async function mergeMulchStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	try {
-		const result = await mergeMulch(
-			ctx.workspacePath,
-			ctx.project.localPath,
-			ctx.fs,
-			ctx.emit,
-			ctx.fail,
-		);
-		state.mulchUpdated = result.updated;
-		state.mulchSkipped = result.skipped;
-		state.mulchAppended = result.appended;
-	} catch (err) {
-		await ctx.fail("mulch_merge", err);
-	}
-}
-
-async function mirrorSeedsStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	try {
-		// workerClient is set whenever workspacePath !== null (both land in the
-		// same try-block in reapRun), so the cast is sound.
-		const mirrorResult = await mirrorSeeds({
-			burrowClient: ctx.workerClient as BurrowClient,
-			burrowId: ctx.run.burrowId as string,
-			projectPath: ctx.project.localPath,
-			fs: ctx.fs,
-			emit: ctx.emit,
-		});
-		state.seedsClosed = mirrorResult.closed;
-		state.seedsCreated = mirrorResult.created;
-	} catch (err) {
-		await ctx.fail("seeds_close", err);
+/**
+ * Map a finalize stage onto the reap step name reap's `errors[]` uses. Omitted
+ * stages (`commits_ahead`) are NOT errors — reap only logs a rev-list failure.
+ */
+/**
+ * warren-357c: finalize stage names are DERIVED from the opaque artifact keys
+ * (`${key}_merge` / `${key}_commit`), so the fold maps them back onto reap's
+ * step vocabulary with a function, not a fixed record. Unknown derived keys
+ * (an artifact with no reap step) and `commits_ahead` fold to nothing.
+ */
+function finalizeStageToReapStep(stage: FinalizeStage): ReapStep | undefined {
+	switch (stage) {
+		case "seed_reset":
+			return "seed_reset";
+		case "branch_push":
+			return "branch_push";
+		case finalizeMergeStage("mulch"):
+			return "mulch_merge";
+		case finalizeMergeStage("seeds"):
+			return "seeds_close";
+		case finalizeMergeStage("plans"):
+			return "plans_mirror";
+		case finalizeCommitStage("seeds"):
+			return "seeds_commit";
+		default:
+			return undefined;
 	}
 }
 
 /**
- * warren-a32a: snapshot the project-clone baseline plans.jsonl BEFORE
- * mirrorPlans so auto_plan_run can diff workspace vs baseline. Must happen
- * before mirrorPlans appends workspace plans into the project clone, which
- * would make the baseline identical to the workspace and defeat the diff
- * (warren-d9a2 ordering bug).
+ * warren-a32a: snapshot the project-clone baseline plans.jsonl BEFORE finalize's
+ * plans mirror so auto_plan_run can diff workspace vs baseline — the mirror
+ * appends workspace plans into the clone, which would otherwise defeat the diff.
  */
 async function snapshotBaselinePlanIds(ctx: ReapPipelineContext): Promise<Set<string> | null> {
 	if (
@@ -160,156 +189,111 @@ async function snapshotBaselinePlanIds(ctx: ReapPipelineContext): Promise<Set<st
 	}
 }
 
-/**
- * warren-d9a2: mirror plans.jsonl from workspace → project clone, same shape
- * as mirrorSeeds. Without this, stageSeedsForCommit copies the OLD project
- * baseline plans.jsonl into the workspace, overwriting the agent's newly
- * created plans.
- */
-async function mirrorPlansStep(ctx: ReapPipelineContext): Promise<void> {
-	try {
-		await mirrorPlans({
-			burrowClient: ctx.workerClient as BurrowClient,
-			burrowId: ctx.run.burrowId as string,
-			projectPath: ctx.project.localPath,
-			fs: ctx.fs,
-			emit: ctx.emit,
-		});
-	} catch (err) {
-		await ctx.fail("plans_mirror", err);
-	}
+/** Build the seam handle + neutral intent, then run the §4 finalize. */
+async function runFinalize(ctx: ReapPipelineContext): Promise<FinalizeResult> {
+	const handle: RunHandle = {
+		runId: ctx.run.id,
+		sandboxId: ctx.run.burrowId as string, // non-null in the pipeline branch (reapRun guards it)
+		providerRunId: ctx.run.burrowRunId ?? "",
+	};
+	// Merges run unconditionally; COMMITS gate on project flags (warren-1f56).
+	const commit: string[] = [];
+	if (ctx.project.hasSeeds) commit.push("seeds");
+	const intent: FinalizeIntent = {
+		branch: ctx.branch ?? "",
+		push: true,
+		// Opaque artifact keys the domain asks the provider to merge (warren-df3e);
+		// the returned `FinalizeResult.artifacts` is keyed the same way.
+		artifacts: ["mulch", "seeds", "plans"],
+		commit,
+		projectClonePathHint: ctx.project.localPath,
+		// warren-8d95: reset warren-seeded artifacts to base before push so a broad
+		// agent commit can't sweep them into the PR (Article IX protected-path guard).
+		resetSeededPaths: seededArtifactResetPaths(ctx.run.renderedAgentJson),
+		...(ctx.baseBranch !== null ? { baseBranch: ctx.baseBranch } : {}),
+	};
+	return ctx.provider.finalize(handle, intent);
 }
 
-async function mergePlotStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	try {
-		const result = await mergePlot(
-			ctx.workspacePath,
-			ctx.project.localPath,
-			ctx.fs,
-			ctx.emit,
-			ctx.fail,
-		);
-		state.plotEventsAppended = result.eventsAppended;
-		state.plotsUpdated = result.plotsUpdated;
-		state.plotEventsMirrored = result.mirrored;
-	} catch (err) {
-		await ctx.fail("plot_merge", err);
+/** Re-emit finalize's collected per-record events through reap's real emit. */
+async function replayFinalizeEvents(ctx: ReapPipelineContext, r: FinalizeResult): Promise<void> {
+	for (const ev of r.events) {
+		await ctx.emit(ev.kind, ev.payload);
 	}
 }
 
 /**
- * warren-343a / shape (a) commit-through-reap: replicate the merged `.plot/`
- * from the project clone into the workspace and author a `chore(warren): plot
- * state` commit when there's a staged delta the agent never committed. This is
- * the carrier for host-side appender writes (defaultPlotAppender,
- * defaultPlanRunPlotAppender, autoTransitionPlotToDone — see SPEC §11.O) and
- * for any agent-emitted `.plot/` lines that the agent left uncommitted. Skipped
- * when the project has no `.plot/`. Best-effort: failures emit `reap_failed`
- * step=`plot_commit` and do not fail the run.
+ * Fold finalize's failed stages into reap's `errors[]` (the matching
+ * `reap_failed` events already rode `r.events`, so record only — no re-emit).
+ * `commits_ahead` is excluded: a rev-list failure is log-only in reap.
  */
-async function plotCommitStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	if (!ctx.project.hasPlot) return;
-	try {
-		state.plotCommitted = await stagePlotForCommit({
-			workspacePath: ctx.workspacePath,
-			projectPath: ctx.project.localPath,
-			fs: ctx.fs,
-			exec: ctx.exec,
-			emit: ctx.emit,
-		});
-	} catch (err) {
-		await ctx.fail("plot_commit", err, join(ctx.workspacePath, ".plot"));
+function recordFinalizeErrors(ctx: ReapPipelineContext, r: FinalizeResult): void {
+	for (const st of r.stages) {
+		if (st.status !== "failed") continue;
+		const step = finalizeStageToReapStep(st.stage);
+		if (step === undefined) continue;
+		ctx.recordError(step, st.error ?? "");
 	}
 }
 
+/** Copy finalize's counts/flags onto the pipeline state accumulator. */
+function applyFinalizeToState(state: ReapPipelineState, r: FinalizeResult): void {
+	// The domain reads deltas back by the opaque keys it merged (warren-df3e);
+	// absent count keys read as 0.
+	const mulch = r.artifacts.mulch?.counts;
+	const seeds = r.artifacts.seeds?.counts;
+	state.mulchUpdated = mulch?.updated ?? 0;
+	state.mulchSkipped = mulch?.skipped ?? 0;
+	state.mulchAppended = mulch?.appended ?? 0;
+	state.seedsClosed = seeds?.closed ?? 0;
+	state.seedsCreated = seeds?.created ?? 0;
+	// A bookkeeping commit was authored iff finalize emitted its committed event.
+	state.seedsCommitted = r.events.some((e) => e.kind === "reap.seeds_committed");
+	state.branchPushed = r.pushed;
+	state.commitsAhead = r.commitsAhead;
+	// warren-495d: push failed/timed out (commits left unpushed).
+	state.finalizeFailed = r.stages.some((s) => s.stage === "branch_push" && s.status === "failed");
+	// warren-5ea1: a warren-synthesized result (pod never posted) carries its cause.
+	state.finalizeUnposted = r.unposted ?? null;
+}
+
 /**
- * warren-a32a: snapshot the workspace's plans.jsonl BEFORE stageSeedsForCommit
- * (which copies project→workspace). The baseline was already captured before
- * mirrorPlans.
+ * warren-72b9 / warren-89b0: classify a zero-commit push via `classifyEmptyPush`
+ * — clean/bookkeeping-only ⇒ `noChanges` (succeeded), else `droppedCommit`
+ * (failed). Domain-owned: needs the run outcome; workspace is gone post-terminate.
  */
-async function snapshotWorkspacePlans(
+async function emitEmptyPushIfNeeded(
 	ctx: ReapPipelineContext,
+	state: ReapPipelineState,
+	r: FinalizeResult,
+): Promise<void> {
+	if (!(r.pushed && r.commitsAhead === 0)) return;
+	const c = classifyEmptyPush(ctx.input.outcome === "succeeded", r.dirty, r.dirtyPaths ?? []);
+	state.noChanges = c.noChanges;
+	state.droppedCommit = c.droppedCommit;
+	await ctx.emit("reap.empty_push", {
+		branch: ctx.branch,
+		baseBranch: ctx.baseBranch,
+		dirty: r.dirty,
+		dirtyPaths: r.dirtyPaths ?? [],
+		droppedCommit: c.droppedCommit,
+		noChanges: c.noChanges,
+		message: c.message,
+	});
+}
+
+/**
+ * warren-a32a: reconstruct `snapshotWorkspacePlans`'s output from finalize's
+ * captured `workspacePlansBody`. Gated on the baseline (which encodes the
+ * hasSeeds + succeeded + frontmatter check) exactly as reap did.
+ */
+function resolveWorkspacePlans(
 	baselinePlanIds: Set<string> | null,
-): Promise<{ ids: Set<string> | null; body: string | null }> {
+	r: FinalizeResult,
+): { ids: Set<string> | null; body: string | null } {
 	if (baselinePlanIds === null) return { ids: null, body: null };
-	try {
-		const body = (await ctx.fs.readFile(join(ctx.workspacePath, ".seeds", "plans.jsonl"))) ?? "";
-		return { ids: parsePlanIds(body), body };
-	} catch {
-		// Non-fatal — detection failure degrades to no auto-dispatch.
-		return { ids: null, body: null };
-	}
-}
-
-/**
- * warren-0d2d: host-side safety net — close the run's associated seed after a
- * successful reap even if the agent didn't call `sd close`. Runs after
- * mirrorSeeds (workspace → project clone) so an agent-side close is already
- * reflected; `sd close` is idempotent. Runs before stageSeedsForCommit so the
- * updated issues.jsonl is picked up into the workspace commit and lands on
- * origin via branch_push.
- */
-async function seedIdCloseStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	const { seedId } = ctx.run;
-	const { seedsCli } = ctx.input;
-	if (
-		!(
-			ctx.input.outcome === "succeeded" &&
-			seedId !== null &&
-			ctx.project.hasSeeds &&
-			seedsCli !== undefined
-		)
-	) {
-		return;
-	}
-	try {
-		state.seedIdClosed = await closeRunSeedId({
-			seedId,
-			projectPath: ctx.project.localPath,
-			seedsCli,
-			emit: ctx.emit,
-		});
-	} catch (err) {
-		await ctx.fail("seed_id_close", err);
-	}
-}
-
-/**
- * Close extra seeds referenced in commit footers (flywheel integration).
- * Scans recent commits for `(closes <seed-id>)` and closes those seeds.
- * Runs after the main seed close so multi-seed branches are handled.
- */
-async function extraSeedCloseStep(ctx: ReapPipelineContext, _s: ReapPipelineState): Promise<void> {
-	const { seedsCli } = ctx.input;
-	if (!ctx.project.hasSeeds || seedsCli === undefined || ctx.exec === undefined) return;
-	try {
-		const closed = await closeReferencedSeeds({
-			projectPath: ctx.project.localPath,
-			seedsCli,
-			emit: ctx.emit,
-			run: ctx.exec.run,
-		});
-		if (closed > 0) {
-			await ctx.emit("extra_seeds_closed", { count: closed });
-		}
-	} catch {
-		// Non-fatal — extra seed close is a best-effort integration.
-	}
-}
-
-async function seedsCommitStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	if (!ctx.project.hasSeeds) return;
-	try {
-		state.seedsCommitted = await stageSeedsForCommit({
-			workspacePath: ctx.workspacePath,
-			projectPath: ctx.project.localPath,
-			fs: ctx.fs,
-			exec: ctx.exec,
-			emit: ctx.emit,
-		});
-	} catch (err) {
-		await ctx.fail("seeds_commit", err, join(ctx.workspacePath, ".seeds"));
-	}
+	const body = r.workspacePlansBody ?? "";
+	return { ids: parsePlanIds(body), body };
 }
 
 async function autoDispatchStep(
@@ -317,6 +301,12 @@ async function autoDispatchStep(
 	state: ReapPipelineState,
 	plans: { ids: Set<string> | null; body: string | null; baseline: Set<string> | null },
 ): Promise<void> {
+	// warren-486c: never dispatch against a mirror commit that never reached
+	// origin — the child pods would clone a ref missing their seed ids.
+	if (state.mirrorDurabilityFailed) {
+		await ctx.emit("auto_plan_run_skipped", { reason: "mirror_durability_failed" });
+		return;
+	}
 	const autoDispatch = await dispatchAutoPlanRuns({
 		run: ctx.run,
 		project: ctx.project,
@@ -331,56 +321,6 @@ async function autoDispatchStep(
 	state.autoPlanRunCreated = autoDispatch.created;
 	state.autoPlanRunId = autoDispatch.id;
 	state.autoPlanRunPlanId = autoDispatch.planId;
-}
-
-async function pushStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	try {
-		await ctx.exec.run(
-			"git",
-			["push", "origin", ctx.branch !== null ? `HEAD:${ctx.branch}` : "HEAD"],
-			{ cwd: ctx.workspacePath, timeoutMs: 60_000 },
-		);
-		state.branchPushed = true;
-	} catch (err) {
-		await ctx.fail("branch_push", err, ctx.workspacePath);
-	}
-}
-
-/**
- * Empty-push observability (warren-f3bb): count commits ahead of defaultBranch,
- * surface zero as `reap.empty_push`, pin on `commitsAhead`; rev-list failure
- * degrades to `commitsAhead: null`.
- */
-async function commitsAheadStep(ctx: ReapPipelineContext, state: ReapPipelineState): Promise<void> {
-	const { baseBranch } = ctx;
-	if (!(state.branchPushed && baseBranch !== null)) return;
-	try {
-		const out = await ctx.exec.run("git", ["rev-list", "--count", `${baseBranch}..HEAD`], {
-			cwd: ctx.workspacePath,
-			timeoutMs: 10_000,
-		});
-		const parsed = Number.parseInt(out.stdout.trim(), 10);
-		state.commitsAhead = Number.isFinite(parsed) ? parsed : null;
-	} catch (err) {
-		const reason = err instanceof Error ? err.message : String(err);
-		ctx.log.info(
-			{ event: "reap.commits_ahead_failed", err: reason },
-			"reap commits-ahead count failed",
-		);
-	}
-	if (state.commitsAhead !== 0) return;
-	// warren-72b9: dirty tree + zero commits = staged-but-uncommitted.
-	const dirty = await isWorkspaceDirty(ctx.exec, ctx.workspacePath);
-	state.droppedCommit = dirty && ctx.input.outcome === "succeeded";
-	await ctx.emit("reap.empty_push", {
-		branch: ctx.branch,
-		baseBranch,
-		dirty,
-		droppedCommit: state.droppedCommit,
-		message: dirty
-			? "git push exited zero and the workspace still has uncommitted changes — agent staged work but never committed"
-			: "git push exited zero but the branch landed no new commits — agent did not commit",
-	});
 }
 
 /** Auto-open PR (warren-f6af); a CI-fixer run self-skips inside runPrOpen (warren-a993). */
@@ -418,27 +358,52 @@ async function prOpenStep(ctx: ReapPipelineContext, state: ReapPipelineState): P
 }
 
 /**
- * Preview launch (warren-f156 / SPEC §11.L). See runPreviewLaunch +
- * runPreviewAnnotate for the gate semantics. Skipped on a dropped commit
- * (warren-72b9).
+ * Preview launch (warren-f156 / docs/design/preview-environments.md). Skipped on a dropped commit
+ * (warren-72b9). warren-4fbe: preview is LocalProvider-only — under a provider
+ * with `capabilities.previewPorts === false` (K8s) skip cleanly, surfacing
+ * `reap.preview_skipped_unsupported` when a project opted in.
  */
 async function previewLaunchStep(
 	ctx: ReapPipelineContext,
 	state: ReapPipelineState,
 ): Promise<void> {
 	const { burrowId } = ctx.run;
+	// Surface the skip only when a successful, committed run opted in (preview
+	// WOULD have launched locally); otherwise stay silent.
+	if (!ctx.provider.capabilities.previewPorts) {
+		if (
+			ctx.input.outcome === "succeeded" &&
+			!state.droppedCommit &&
+			ctx.input.previewConfig !== undefined &&
+			ctx.input.portAllocator !== undefined
+		) {
+			await ctx.emit("reap.preview_skipped_unsupported", {
+				reason: "provider_no_preview_ports",
+				message: "preview launch skipped: provider does not support inbound preview ports",
+			});
+			ctx.log.info(
+				{ event: "reap.preview_skipped_unsupported", reason: "provider_no_preview_ports" },
+				"preview launch skipped: provider lacks preview-port capability",
+			);
+		}
+		return;
+	}
 	if (
 		!(
 			ctx.input.outcome === "succeeded" &&
 			!state.droppedCommit &&
 			ctx.input.previewConfig !== undefined &&
 			ctx.input.portAllocator !== undefined &&
-			ctx.workerClient !== null &&
+			ctx.previewSidecars !== undefined &&
 			burrowId !== null
 		)
 	) {
 		return;
 	}
+	// Resolve the sandbox sidecars facade through the neutral seam; a null
+	// resolution (sandbox gone) skips the launch (warren-e24d).
+	const sidecars = await ctx.previewSidecars(burrowId);
+	if (sidecars === null) return;
 	const pv = await runPreviewLaunch({
 		runId: ctx.run.id,
 		burrowId,
@@ -446,7 +411,7 @@ async function previewLaunchStep(
 		outcome: ctx.input.outcome,
 		previewConfig: ctx.input.previewConfig,
 		portAllocator: ctx.input.portAllocator,
-		workerClient: ctx.workerClient,
+		sidecars,
 		repos: ctx.input.repos,
 		now: ctx.now,
 		emit: ctx.emit,
@@ -487,34 +452,70 @@ async function previewAnnotateStep(
 	});
 }
 
+/** Zeroed finalize result used when the seam call itself throws (best-effort). */
+function emptyFinalizeResult(): FinalizeResult {
+	return {
+		pushed: false,
+		commitsAhead: null,
+		emptyPush: false,
+		dirty: false,
+		workspacePlansBody: null,
+		artifacts: {},
+		prBranch: null,
+		stages: [],
+		events: [],
+	};
+}
+
 /**
  * Run the reap success pipeline, mutating `state` as each sub-step lands.
  * Every step is best-effort: failures surface as `reap_failed` events via
- * `ctx.fail` and never throw out of the pipeline. The sub-steps run in a fixed
- * order — several depend on earlier ones (e.g. the plans baseline snapshot must
- * precede mirrorPlans; commitsAhead must follow the branch push).
+ * `ctx.fail` (or ride finalize's collected events) and never throw out of the
+ * pipeline. The workspace-touching half runs as one `provider.finalize` call;
+ * the interleaved DOMAIN steps (baseline snapshot, seed close, auto-dispatch,
+ * PR/preview) bracket it in reap's original order.
  */
 export async function runReapPipeline(
 	ctx: ReapPipelineContext,
 	state: ReapPipelineState,
 ): Promise<void> {
-	await mergeMulchStep(ctx, state);
-	await mirrorSeedsStep(ctx, state);
+	// CLONE baseline read BEFORE finalize's plans mirror mutates it.
 	const baselinePlanIds = await snapshotBaselinePlanIds(ctx);
-	await mirrorPlansStep(ctx);
-	await mergePlotStep(ctx, state);
-	await plotCommitStep(ctx, state);
-	const workspacePlans = await snapshotWorkspacePlans(ctx, baselinePlanIds);
-	await seedIdCloseStep(ctx, state);
-	await extraSeedCloseStep(ctx, state);
-	await seedsCommitStep(ctx, state);
+
+	let finalizeResult: FinalizeResult;
+	try {
+		finalizeResult = await runFinalize(ctx);
+	} catch (err) {
+		// The seam call should not throw on the tested paths (reapRun only runs
+		// the pipeline once the workspace resolved), but degrade to a no-op rather
+		// than crash reap if the workspace access fails inside finalize.
+		await ctx.fail("workspace_lookup", err);
+		finalizeResult = emptyFinalizeResult();
+	}
+
+	await replayFinalizeEvents(ctx, finalizeResult);
+	recordFinalizeErrors(ctx, finalizeResult);
+	applyFinalizeToState(state, finalizeResult);
+	await emitEmptyPushIfNeeded(ctx, state, finalizeResult);
+
+	// warren-e9e1 (leg 2): K8s merged in-pod, so apply finalize's mirror deltas to
+	// the clone host-side. Gated on the K8s discriminator; the local path already
+	// merged into the clone during finalize (byte-identical). See clone-apply.ts.
+	if (ctx.workspacePath === null) await applyK8sCloneDeltas(ctx, state, finalizeResult);
+
+	// warren-df3e: the clone-side seed-close safety net is no longer a pipeline
+	// step — it observes `post_reap` on the observation bus
+	// (`./seed-close-lifecycle.ts`), keyed off the settled outcome + branchPushed.
+	// Auto-plan-run detection still reads finalize's captured snapshot here.
+	const workspacePlans = resolveWorkspacePlans(baselinePlanIds, finalizeResult);
 	await autoDispatchStep(ctx, state, {
 		ids: workspacePlans.ids,
 		body: workspacePlans.body,
 		baseline: baselinePlanIds,
 	});
-	await pushStep(ctx, state);
-	await commitsAheadStep(ctx, state);
+
+	// Pure domain orchestration — the workspace is still live (terminate runs
+	// after the pipeline, back in reapRun).
 	await prOpenStep(ctx, state);
 	await previewLaunchStep(ctx, state);
 	await previewAnnotateStep(ctx, state);

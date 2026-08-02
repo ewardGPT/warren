@@ -8,7 +8,7 @@ import {
 } from "./schema.ts";
 
 describe("PreviewConfigSchema", () => {
-	test("accepts the full server-type shape from SPEC §11.L", () => {
+	test("accepts the full server-type shape from docs/design/preview-environments.md", () => {
 		const parsed = PreviewConfigSchema.safeParse(VALID_SERVER_PREVIEW);
 		expect(parsed.success).toBe(true);
 	});
@@ -136,7 +136,7 @@ describe("PreviewConfigSchema", () => {
 
 	// warren-d9e7: setup splits dependency-install from dev-server bind so each
 	// phase has its own timeout and failure reason. Schema accepts the field at
-	// the parser layer; launcher (src/preview/launch.ts) skips the pre-step
+	// the parser layer; launcher (src/preview/launch/) skips the pre-step
 	// when the field is absent so existing projects keep working unchanged.
 	test("accepts a server preview with setup + setup_timeout (warren-d9e7)", () => {
 		const parsed = PreviewConfigSchema.safeParse({

@@ -2,27 +2,20 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { lazy, Suspense } from "react";
 import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthGate } from "@/components/AuthGate.tsx";
-import { DefaultLanding } from "@/components/DefaultLanding.tsx";
 import { Layout } from "@/components/Layout.tsx";
+import { OperatorRoute } from "@/components/OperatorOnly.tsx";
 import { MotionProvider } from "@/components/ui/motion.tsx";
 import { ToastProvider } from "@/components/ui/toast.tsx";
-import {
-	ConversationToWorkspaceRedirect,
-	PlotToWorkspaceRedirect,
-} from "@/components/WorkspaceRedirects.tsx";
 import { AgentsPage } from "@/pages/Agents.tsx";
 import { LoginPage } from "@/pages/Login.tsx";
 import { NewPlanRunPage } from "@/pages/NewPlanRun.tsx";
 import { NewRunPage } from "@/pages/NewRun.tsx";
 import { PlanRunDetailPage } from "@/pages/PlanRunDetail.tsx";
 import { PlanRunsPage } from "@/pages/PlanRuns.tsx";
-import { PlotSummaryPage } from "@/pages/PlotSummary.tsx";
 import { ProjectDetailPage } from "@/pages/ProjectDetail.tsx";
 import { ProjectsPage } from "@/pages/Projects.tsx";
 import { RunDetailPage } from "@/pages/RunDetail.tsx";
 import { RunsPage } from "@/pages/Runs.tsx";
-import { WorkspacePage } from "@/pages/Workspace.tsx";
-import { WorkspaceDetailPage } from "@/pages/WorkspaceDetail.tsx";
 
 // recharts is heavy and tree-shakes poorly (warren-876c). The two
 // analytics pages are its only consumers, so they're code-split into a
@@ -60,57 +53,73 @@ export function App() {
 	return (
 		<QueryClientProvider client={queryClient}>
 			<MotionProvider>
-			<ToastProvider>
-			<HashRouter>
-				<Routes>
-					<Route path="/login" element={<LoginPage />} />
-					<Route
-						element={
-							<AuthGate>
-								<Layout />
-							</AuthGate>
-						}
-					>
-						<Route index element={<DefaultLanding />} />
-						<Route path="/runs" element={<RunsPage />} />
-						<Route path="/runs/new" element={<NewRunPage />} />
-						<Route path="/runs/:id" element={<RunDetailPage />} />
-						<Route path="/plan-runs" element={<PlanRunsPage />} />
-						<Route path="/plan-runs/new" element={<NewPlanRunPage />} />
-						<Route path="/plan-runs/:id" element={<PlanRunDetailPage />} />
-						<Route path="/workspace" element={<WorkspacePage />} />
-						<Route path="/workspace/:id" element={<WorkspaceDetailPage />} />
-						{/* Legacy Leveret + Plots routes collapse into Workspace
-						    (warren-9cad / pl-0008 step 11). */}
-						<Route path="/leveret" element={<Navigate to="/workspace" replace />} />
-						<Route path="/leveret/:id" element={<ConversationToWorkspaceRedirect />} />
-						<Route path="/plots" element={<Navigate to="/workspace" replace />} />
-						<Route path="/plots/:id" element={<PlotToWorkspaceRedirect />} />
-						<Route path="/plots/:id/summary" element={<PlotSummaryPage />} />
-						<Route path="/agents" element={<AgentsPage />} />
-						<Route
-							path="/cost-analytics"
-							element={
-								<Suspense fallback={<AnalyticsFallback />}>
-									<CostAnalyticsPage />
-								</Suspense>
-							}
-						/>
-						<Route
-							path="/run-analytics"
-							element={
-								<Suspense fallback={<AnalyticsFallback />}>
-									<RunAnalyticsPage />
-								</Suspense>
-							}
-						/>
-						<Route path="/projects" element={<ProjectsPage />} />
-						<Route path="/projects/:id" element={<ProjectDetailPage />} />
-					</Route>
-					<Route path="*" element={<Navigate to="/runs" replace />} />
-				</Routes>
-			</HashRouter>
-			</ToastProvider>
+				<ToastProvider>
+					<HashRouter>
+						<Routes>
+							<Route path="/login" element={<LoginPage />} />
+							<Route
+								element={
+									<AuthGate>
+										<Layout />
+									</AuthGate>
+								}
+							>
+								{/* Runs is the home surface (warren-1f12 / pl-3a79 step 10). */}
+								<Route index element={<Navigate to="/runs" replace />} />
+								<Route path="/runs" element={<RunsPage />} />
+								{/* The two dispatch forms are the only pages whose whole
+						    reason to exist is a mutation, so they are guarded at
+						    the route rather than field by field — a spectator
+						    who deep-links here lands on /runs
+						    (warren-f53e / pl-b82d step 19). */}
+								<Route
+									path="/runs/new"
+									element={
+										<OperatorRoute>
+											<NewRunPage />
+										</OperatorRoute>
+									}
+								/>
+								<Route path="/runs/:id" element={<RunDetailPage />} />
+								<Route path="/plan-runs" element={<PlanRunsPage />} />
+								<Route
+									path="/plan-runs/new"
+									element={
+										<OperatorRoute>
+											<NewPlanRunPage />
+										</OperatorRoute>
+									}
+								/>
+								<Route path="/plan-runs/:id" element={<PlanRunDetailPage />} />
+								<Route path="/agents" element={<AgentsPage />} />
+								<Route
+									path="/cost-analytics"
+									element={
+										// `GET /analytics/cost` is readOperator (the
+										// instance-wide USD rollup), so the page is
+										// guarded to match the nav entry it drops.
+										<OperatorRoute capability="readOperator">
+											<Suspense fallback={<AnalyticsFallback />}>
+												<CostAnalyticsPage />
+											</Suspense>
+										</OperatorRoute>
+									}
+								/>
+								<Route
+									path="/run-analytics"
+									element={
+										<Suspense fallback={<AnalyticsFallback />}>
+											<RunAnalyticsPage />
+										</Suspense>
+									}
+								/>
+								<Route path="/projects" element={<ProjectsPage />} />
+								<Route path="/projects/:id" element={<ProjectDetailPage />} />
+							</Route>
+							<Route path="*" element={<Navigate to="/runs" replace />} />
+						</Routes>
+					</HashRouter>
+				</ToastProvider>
 			</MotionProvider>
 		</QueryClientProvider>
 	);

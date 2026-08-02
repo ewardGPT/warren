@@ -5,18 +5,14 @@
 
 import type { AnyWarrenDb } from "../client.ts";
 import { AgentsRepo } from "./agents.ts";
-import { BurrowsRepo } from "./burrows.ts";
-import { ConversationsRepo } from "./conversations.ts";
 import { DrizzleAdapter } from "./drizzle-adapter.ts";
 import { EventsRepo } from "./events.ts";
 import { GraphRunsRepo } from "./graph-runs.ts";
-import { MessagesRepo } from "./messages.ts";
 import { PlanRunsRepo } from "./plan-runs.ts";
-import { PlotsRepo } from "./plots.ts";
 import { ProjectsRepo } from "./projects.ts";
+import { RunInboxRepo } from "./run-inbox.ts";
 import { RunsRepo } from "./runs.ts";
 import { TriggersRepo } from "./triggers.ts";
-import { WorkersRepo } from "./workers.ts";
 
 export interface Repos {
 	agents: AgentsRepo;
@@ -24,13 +20,9 @@ export interface Repos {
 	runs: RunsRepo;
 	events: EventsRepo;
 	triggers: TriggersRepo;
-	workers: WorkersRepo;
-	burrows: BurrowsRepo;
-	planRuns: PlanRunsRepo;
 	graphRuns: GraphRunsRepo;
-	plots: PlotsRepo;
-	conversations: ConversationsRepo;
-	messages: MessagesRepo;
+	planRuns: PlanRunsRepo;
+	runInbox: RunInboxRepo;
 }
 
 export function createRepos(db: AnyWarrenDb): Repos {
@@ -41,27 +33,10 @@ export function createRepos(db: AnyWarrenDb): Repos {
 		runs: new RunsRepo(adapter),
 		events: new EventsRepo(adapter),
 		triggers: new TriggersRepo(adapter),
-		workers: new WorkersRepo(adapter),
-		burrows: new BurrowsRepo(adapter),
-		planRuns: new PlanRunsRepo(adapter),
 		graphRuns: new GraphRunsRepo(adapter),
-		plots: new PlotsRepo(adapter),
-		conversations: new ConversationsRepo(adapter),
-		messages: new MessagesRepo(adapter),
+		planRuns: new PlanRunsRepo(adapter),
+		runInbox: new RunInboxRepo(adapter),
 	};
 }
 
-export {
-	AgentsRepo,
-	BurrowsRepo,
-	ConversationsRepo,
-	EventsRepo,
-	GraphRunsRepo,
-	MessagesRepo,
-	PlanRunsRepo,
-	PlotsRepo,
-	ProjectsRepo,
-	RunsRepo,
-	TriggersRepo,
-	WorkersRepo,
-};
+export { AgentsRepo, EventsRepo, PlanRunsRepo, ProjectsRepo, RunInboxRepo, RunsRepo, TriggersRepo };

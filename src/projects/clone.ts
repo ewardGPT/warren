@@ -1,6 +1,6 @@
 /**
  * Clone a project repo into `<projectsRoot>/<owner>/<name>` and detect
- * its default branch (SPEC §5, §9 `projects.default_branch`).
+ * its default branch (docs/design/runtime-and-supervisor.md, `projects.default_branch`).
  *
  * Project clones are working trees that agents will run against — *not*
  * a cache like the canopy library clone. So the contract is the
@@ -24,6 +24,7 @@ import { existsSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { formatError } from "../core/errors.ts";
+import { githubCredentialGitEnv } from "../workspace/git/credential-env.ts";
 import type { ProjectsConfig } from "./config.ts";
 import { ProjectUnavailableError } from "./errors.ts";
 
@@ -38,9 +39,79 @@ export interface SpawnResult {
 export interface SpawnOptions {
 	readonly cwd: string;
 	readonly timeoutMs?: number;
+	/**
+	 * Extra environment merged OVER the inherited process environment at the
+	 * spawn (warren-035c). Commit sites pass `warrenCommitIdentityEnv()` so an
+	 * inherited `GIT_AUTHOR_*` / `GIT_COMMITTER_*` can't out-rank the pinned
+	 * warren bot identity. A key mapped to `undefined` is REMOVED from the
+	 * child environment (warren-fa84) — the only way to unset an inherited var,
+	 * e.g. clone-apply scrubbing repo-context `GIT_*` leaked by a parent
+	 * `git commit`'s hook. Omitted ⇒ plain inheritance, behavior unchanged.
+	 */
+	readonly env?: Record<string, string | undefined>;
 }
 
 export type SpawnFn = (cmd: readonly string[], opts: SpawnOptions) => Promise<SpawnResult>;
+
+/**
+ * Resolve the child-process environment for a spawn given the caller's `env`
+ * overrides. Merges `overrides` OVER the inherited `process.env` (warren-035c:
+ * a pinned identity beats an inherited one), then drops every key whose
+ * override value is `undefined` — the single way a caller can UNSET an
+ * inherited variable (warren-fa84: clone-apply scrubs repo-context `GIT_*`
+ * vars a parent `git commit`'s hook exports so its subprocesses can't escape
+ * their `cwd`). A plain object spread can't remove keys, hence the filter.
+ *
+ * Shared by the execFile adaptor (`src/runs/reap/util.ts`) and the
+ * `Bun.spawn` adaptor below so the merge semantics can never drift.
+ */
+export function resolveSpawnEnv(
+	overrides: Record<string, string | undefined>,
+): Record<string, string> {
+	const merged: Record<string, string | undefined> = { ...process.env, ...overrides };
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(merged)) {
+		if (value !== undefined) out[key] = value;
+	}
+	return out;
+}
+
+/**
+ * The production `Bun.spawn` adaptor for `SpawnFn` (warren-032a). Every
+ * surface that needs one — the CLI (`src/cli/output.ts`), the boot wiring
+ * (`src/server/main/utils.ts`), and the HTTP handlers
+ * (`src/server/handlers/index.ts`) — imports this single definition, which
+ * lives beside the `SpawnFn` contract and `resolveSpawnEnv` those surfaces
+ * already import.
+ *
+ * `timeoutMs` kills the child; the caller still observes whatever the process
+ * wrote before the kill, plus its exit code.
+ */
+export const defaultSpawn: SpawnFn = async (
+	cmd: readonly string[],
+	opts: SpawnOptions,
+): Promise<SpawnResult> => {
+	const proc = Bun.spawn({
+		cmd: [...cmd],
+		cwd: opts.cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+		// warren-035c/fa84: merge caller env OVER process.env (pinned identity
+		// wins); an `undefined` override unsets an inherited var. See resolveSpawnEnv.
+		...(opts.env !== undefined ? { env: resolveSpawnEnv(opts.env) } : {}),
+	});
+	const timer =
+		opts.timeoutMs !== undefined && opts.timeoutMs > 0
+			? setTimeout(() => proc.kill(), opts.timeoutMs)
+			: null;
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (timer !== null) clearTimeout(timer);
+	return { stdout, stderr, exitCode: exitCode ?? 0 };
+};
 
 export interface CloneProjectInput {
 	readonly config: ProjectsConfig;
@@ -49,6 +120,16 @@ export interface CloneProjectInput {
 	readonly name: string;
 	/** Override default-branch detection. */
 	readonly defaultBranch?: string;
+	/**
+	 * GitHub token for private-repo access (`GITHUB_TOKEN` at the HTTP
+	 * boundary). Applied as a process-scoped `insteadOf` rewrite via
+	 * `githubCredentialGitEnv` on the network-touching git spawns (clone,
+	 * `remote set-head`) — never in argv, never persisted to the clone's
+	 * config. Absent/empty → anonymous clone, exactly the old behavior.
+	 * The supervisor's global rule covers the local topology; this covers
+	 * `warren serve` running bare (K8s pod), where no global rule exists.
+	 */
+	readonly token?: string;
 	readonly spawn: SpawnFn;
 	readonly timeoutMs?: number;
 	/** Filesystem probes — overrideable for tests. */
@@ -79,8 +160,13 @@ export async function cloneProjectRepo(input: CloneProjectInput): Promise<CloneP
 
 	await ensureParentDir(mkdirp, dirname(localPath));
 
+	// No token → no `env` key at all, so anonymous public-repo clones spawn
+	// exactly as before (plain inheritance, nothing for tests to see).
+	const credEnv = githubCredentialGitEnv(input.token);
+	const netEnv = Object.keys(credEnv).length > 0 ? { env: credEnv } : {};
+
 	const cloneCmd = [config.gitBinary, "clone", gitUrl, localPath];
-	const cloneResult = await trySpawn(spawn, cloneCmd, { cwd: config.root, timeoutMs });
+	const cloneResult = await trySpawn(spawn, cloneCmd, { cwd: config.root, timeoutMs, ...netEnv });
 	if (cloneResult.exitCode !== 0) {
 		// Best-effort cleanup: clone may have left a partial dir behind.
 		await rmrf(localPath).catch(() => undefined);
@@ -98,7 +184,13 @@ export async function cloneProjectRepo(input: CloneProjectInput): Promise<CloneP
 		defaultBranch = input.defaultBranch;
 	} else {
 		try {
-			defaultBranch = await detectDefaultBranch(spawn, config.gitBinary, localPath, timeoutMs);
+			defaultBranch = await detectDefaultBranch(
+				spawn,
+				config.gitBinary,
+				localPath,
+				timeoutMs,
+				netEnv,
+			);
 		} catch (err) {
 			await rmrf(localPath).catch(() => undefined);
 			throw err;
@@ -113,6 +205,7 @@ async function detectDefaultBranch(
 	gitBinary: string,
 	cwd: string,
 	timeoutMs: number,
+	netEnv: { readonly env?: Record<string, string> } = {},
 ): Promise<string> {
 	const result = await trySpawn(spawn, [gitBinary, "symbolic-ref", "refs/remotes/origin/HEAD"], {
 		cwd,
@@ -123,9 +216,11 @@ async function detectDefaultBranch(
 		if (branch !== undefined) return branch;
 	}
 	// Recover via remote set-head --auto + a second symbolic-ref read.
+	// `set-head --auto` queries the remote, so it carries the credential env.
 	const setHead = await trySpawn(spawn, [gitBinary, "remote", "set-head", "origin", "--auto"], {
 		cwd,
 		timeoutMs,
+		...netEnv,
 	});
 	if (setHead.exitCode !== 0) {
 		throw new ProjectUnavailableError(

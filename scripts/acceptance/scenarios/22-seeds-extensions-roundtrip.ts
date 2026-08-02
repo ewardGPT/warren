@@ -89,7 +89,7 @@ export const scenario: Scenario = {
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// stub-shell is seeded at boot via WARREN_SEED_AGENTS_FILE (warren-e376).
 		const project = await ensureSampleProject(http, ctx.fixtures.sampleProjectGitUrl);
 
 		// Reset in case a prior scenario (or a previous pass of this one)
@@ -120,7 +120,7 @@ export const scenario: Scenario = {
 		// ----------------------------------------------------------------
 		// Happy path — POST /runs with the real seedId. spawnRun shells
 		// out to `sd update <id> --extensions <json>` after dispatch
-		// (writeSeedExtensions, src/runs/spawn.ts) and the 201 only lands
+		// (writeSeedExtensions, src/runs/spawn/seed-extensions.ts) and the 201 only lands
 		// once that returns, so disk state is observable as soon as the
 		// response resolves.
 		// ----------------------------------------------------------------
@@ -189,7 +189,7 @@ export const scenario: Scenario = {
 		// writeSeedExtensions swallows the failure, emits a
 		// `seeds_extension_write_failed` system event, and the run still
 		// reaches a terminal state cleanly (no rollback over a logging
-		// failure — see src/runs/spawn.ts:writeSeedExtensions).
+		// failure — see src/runs/spawn/seed-extensions.ts:writeSeedExtensions).
 		// ----------------------------------------------------------------
 		const failing = await http.expectJson<CreateRunResponse>("POST", "/runs", 201, {
 			body: {

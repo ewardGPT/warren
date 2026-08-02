@@ -1,0 +1,29 @@
+# Persistent storage (design k8s-migration.md §6.2, §4.3).
+#
+#   warren-data (5Gi, RWO, ns=warren) — warren's SQLite DB (when WARREN_DB_URL is
+#     unset), warren config, and the canopy clone. Mounted at /data
+#     (WARREN_DATA_DIR) by the control-plane Deployment. On Postgres deploys this
+#     still holds config + canopy clone.
+#
+#   warren-repo-cache — NOT part of the base anymore (warren-554f). The
+#     git-mirror cache is OPT-IN: as an RWO claim shared by concurrent run pods
+#     it deadlocks the second pod in Init (Multi-Attach), so the default
+#     topology has no shared volume across run pods and every run clones fresh.
+#     Single-node clusters that want it add the claim + WARREN_K8S_REPO_CACHE_PVC
+#     back via an overlay — see README "Repo cache (opt-in)".
+#
+# storageClassName is intentionally OMITTED so each cluster's default class binds
+# (local-path on kind/k3d; standard-rwo on GKE). Overlays may pin a class.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: warren-data
+  namespace: warren
+  labels:
+    app.kubernetes.io/name: warren
+    app.kubernetes.io/component: control-plane
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi

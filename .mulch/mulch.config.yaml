@@ -32,6 +32,21 @@ domains:
   reap: {}
   quality: {}
   plan-runs: {}
+  k8s-migration: {}
+  runtime: {}
+  ecosystem: {}
+  k8s-runtime: {}
+  scheduler: {}
+  k8s: {}
+  deployment: {}
+  ops: {}
+  tooling: {}
+  quality-gates: {}
+  k8s-deploy: {}
+  testing: {}
+  types: {}
+  seeds-tracker: {}
+  security: {}
 governance:
   max_entries: 100
   warn_entries: 150

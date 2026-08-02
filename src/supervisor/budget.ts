@@ -1,11 +1,11 @@
 /**
- * Restart budget for a supervised child (SPEC §10.3).
+ * Restart budget for a supervised child (docs/design/runtime-and-supervisor.md).
  *
  * The supervisor restarts `burrow serve` on non-zero exit, but a misbehaving
  * burrow (bad config, bwrap bringup failure, kernel mismatch) shouldn't put
  * the supervisor into a tight loop. The budget is `5 restarts in 60s`: after
- * the budget is exhausted, the supervisor exits non-zero and lets Docker /
- * Fly's outer restart policy take over.
+ * the budget is exhausted, the supervisor exits non-zero and lets the
+ * orchestrator's (Docker's) outer restart policy take over.
  *
  * Pure data structure with a sliding window keyed on the supplied `now`. The
  * caller passes `now()` so tests pin the clock.

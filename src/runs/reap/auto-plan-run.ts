@@ -35,15 +35,10 @@ function resolveAutoPlanRunAgent(run: { renderedAgentJson: unknown; agentName: s
 		const fm = (json as Record<string, unknown>).frontmatter;
 		if (fm !== null && typeof fm === "object" && !Array.isArray(fm)) {
 			const override = readAutoPlanRunAgent(fm as Record<string, unknown>);
-			// Warren's plan children execute through the Sapling runtime on
-			// Burrow. Older patrol definitions pinned the former `pi` agent;
-			// normalize that stale value so reap cannot create new pi children.
-			if (override !== undefined) {
-				return override === "pi" || override === "pi-chat" ? "sapling" : override;
-			}
+			if (override !== undefined) return override;
 		}
 	}
-	return run.agentName === "pi" ? "sapling" : run.agentName;
+	return run.agentName;
 }
 
 export function parsePlanIds(body: string): Set<string> {
@@ -81,7 +76,6 @@ export function parsePlanChildren(body: string, planId: string): string[] {
 export interface DispatchAutoPlanRunsInput {
 	readonly run: {
 		id: string;
-		plotId: string | null;
 		renderedAgentJson: unknown;
 		agentName: string;
 	};
@@ -190,7 +184,6 @@ async function dispatchOnePlan(
 		trigger: "auto_plan_run",
 		ref: input.project.defaultBranch,
 		parentRunId: input.run.id,
-		...(input.run.plotId !== null ? { plotId: input.run.plotId } : {}),
 	});
 	await input.emit("auto_plan_run_created", {
 		planId,

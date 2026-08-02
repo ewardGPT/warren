@@ -20,7 +20,11 @@ export interface PollUntilTerminalInput<Row> {
 	readonly stateOf: (row: Row) => string;
 }
 
-/** Generic poll loop shared by WarrenClient wait methods. */
+/**
+ * Generic poll loop shared by {@link WarrenClient.waitForRun} and
+ * {@link WarrenClient.waitForPlanRun}: fetch a row, fire `onTick`, return
+ * once terminal, else sleep and retry until the timeout/abort fires.
+ */
 export async function pollUntilTerminal<Row>(input: PollUntilTerminalInput<Row>): Promise<Row> {
 	const { label, id, opts } = input;
 	const interval = opts.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -44,7 +48,11 @@ export async function pollUntilTerminal<Row>(input: PollUntilTerminalInput<Row>)
 	}
 }
 
-/** Promise-based delay that resolves early if `signal` aborts. */
+/**
+ * Promise-based delay that resolves early if `signal` aborts. Used by
+ * {@link WarrenClient.waitForRun}. Throws `AbortError` on abort so the
+ * outer poll loop can propagate the cancellation.
+ */
 export function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise<void>((resolve, reject) => {
 		if (signal?.aborted) {

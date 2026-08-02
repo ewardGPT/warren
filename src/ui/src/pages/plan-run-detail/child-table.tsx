@@ -11,6 +11,7 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table.tsx";
+import { formatPlanRunFailureReason } from "@/lib/labels.ts";
 import { relativeTime } from "@/lib/utils.ts";
 
 /**
@@ -19,12 +20,16 @@ import { relativeTime } from "@/lib/utils.ts";
  * failure reason. Extracted from PlanRunDetail (warren-d17f / pl-0008 step 9)
  * so the Workspace Run tab can embed the same surface instead of forking a
  * second renderer.
+ *
+ * The failure column is coordinator free text (`reason` or `reason:detail`),
+ * so it goes through `formatPlanRunFailureReason` before a visitor sees it;
+ * the raw string stays in the cell's tooltip (warren-14fc / #641).
  */
 export function PlanRunChildTable({
-	children,
+	planChildren,
 	runs,
 }: {
-	children: PlanRunChildRow[];
+	planChildren: PlanRunChildRow[];
 	runs: RunRow[];
 }) {
 	const runIndex = useMemo(() => {
@@ -35,10 +40,10 @@ export function PlanRunChildTable({
 	return (
 		<Card>
 			<CardHeader>
-				<CardTitle>Children ({children.length})</CardTitle>
+				<CardTitle>Children ({planChildren.length})</CardTitle>
 			</CardHeader>
 			<CardContent className="p-0">
-				{children.length === 0 ? (
+				{planChildren.length === 0 ? (
 					<p className="p-6 text-sm text-(--color-muted-foreground)">
 						No children — plan has no open child seeds.
 					</p>
@@ -49,7 +54,6 @@ export function PlanRunChildTable({
 								<TableHead>Seq</TableHead>
 								<TableHead>State</TableHead>
 								<TableHead>Seed</TableHead>
-								<TableHead>Repo</TableHead>
 								<TableHead>Run</TableHead>
 								<TableHead>Started</TableHead>
 								<TableHead>Ended</TableHead>
@@ -58,7 +62,7 @@ export function PlanRunChildTable({
 							</TableRow>
 						</TableHeader>
 						<TableBody>
-							{children.map((c) => {
+							{planChildren.map((c) => {
 								const linkedRun = c.runId !== null ? runIndex.get(c.runId) : undefined;
 								const prUrl = linkedRun?.prUrl ?? null;
 								return (
@@ -68,13 +72,6 @@ export function PlanRunChildTable({
 											<PlanRunChildStateBadge state={c.state} />
 										</TableCell>
 										<TableCell className="font-mono text-xs">{c.seedId}</TableCell>
-										<TableCell className="font-mono text-xs">
-											{c.executionProjectId !== null ? (
-												<span title="execution repo">{c.executionProjectId}</span>
-											) : (
-												<span className="text-(--color-muted-foreground)">—</span>
-											)}
-										</TableCell>
 										<TableCell className="font-mono text-xs">
 											{c.runId !== null ? (
 												<Link
@@ -100,11 +97,7 @@ export function PlanRunChildTable({
 													target="_blank"
 													rel="noreferrer noopener"
 													className="underline underline-offset-2 hover:text-(--color-primary)"
-													title={
-														c.prMergedAt !== null
-															? `merged ${c.prMergedAt}`
-															: "PR open"
-													}
+													title={c.prMergedAt !== null ? `merged ${c.prMergedAt}` : "PR open"}
 												>
 													PR ↗
 												</a>
@@ -112,8 +105,11 @@ export function PlanRunChildTable({
 												<span className="text-(--color-muted-foreground)">—</span>
 											)}
 										</TableCell>
-										<TableCell className="text-xs text-(--color-destructive)">
-											{c.failureReason ?? ""}
+										<TableCell
+											className="text-xs text-(--color-destructive)"
+											title={c.failureReason ?? undefined}
+										>
+											{c.failureReason === null ? "" : formatPlanRunFailureReason(c.failureReason)}
 										</TableCell>
 									</TableRow>
 								);

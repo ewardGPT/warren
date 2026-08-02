@@ -6,7 +6,8 @@ import {
 	type BridgeRunStreamResult,
 	RunEventBroker,
 } from "../runs/index.ts";
-import { makePool, reapStub } from "./bridges.test-helpers.ts";
+import type { RuntimeProvider } from "../runtime/contract.ts";
+import { makeProvider, reapStub } from "./bridges.test-helpers.ts";
 import { createBridgeRegistry } from "./bridges.ts";
 
 describe("createBridgeRegistry", () => {
@@ -22,12 +23,30 @@ describe("createBridgeRegistry", () => {
 		await db.close();
 	});
 
+	test("warren-c531: threads runtimeProvider into every bridge it starts", async () => {
+		const captured: (RuntimeProvider | undefined)[] = [];
+		const provider = { capabilities: {} } as unknown as RuntimeProvider;
+		const registry = createBridgeRegistry({
+			repos,
+			broker: new RunEventBroker(),
+			runtimeProvider: provider,
+			bridge: async (input) => {
+				captured.push(input.runtimeProvider);
+				return { written: 0, skipped: 0, errored: false };
+			},
+		});
+
+		registry.start("run_aaaaaaaaaaaa", "burrow_run_xxxxxxxxxx", "bur_a");
+		await registry.stopAll();
+		expect(captured).toEqual([provider]);
+	});
+
 	test("start() invokes the bridge factory once per runId", async () => {
 		const calls: BridgeRunStreamInput[] = [];
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async (input) => {
 				calls.push(input);
 				return { written: 0, skipped: 0, errored: false };
@@ -47,7 +66,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: () =>
 				new Promise<BridgeRunStreamResult>((resolve) => {
 					resolvers.push(() => resolve({ written: 0, skipped: 0, errored: false }));
@@ -67,7 +86,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: (input) =>
 				new Promise<BridgeRunStreamResult>((resolve) => {
 					input.signal?.addEventListener("abort", () => {
@@ -104,7 +123,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				calls += 1;
 				// First two attempts fail mid-stream (e.g., burrow's 10s
@@ -143,7 +162,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				calls += 1;
 				// Simulate the reaper finalizing between the first errored
@@ -185,7 +204,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				bridgeCalls += 1;
 				return {
@@ -228,7 +247,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => ({
 				written: 1,
 				skipped: 0,
@@ -268,7 +287,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				throw new Error("burrow has no placement record: bur_a");
 			},
@@ -319,7 +338,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				calls += 1;
 				return { written: 0, skipped: 0, errored: true };

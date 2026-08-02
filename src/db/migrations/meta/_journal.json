@@ -201,15 +201,71 @@
 		{
 			"idx": 28,
 			"version": "6",
-			"when": 1785639732773,
-			"tag": "0028_thin_darkstar",
+			"when": 1783878587302,
+			"tag": "0028_modern_spencer_smythe",
 			"breakpoints": true
 		},
 		{
 			"idx": 29,
 			"version": "6",
-			"when": 1785650112641,
-			"tag": "0029_spotty_true_believers",
+			"when": 1783885152855,
+			"tag": "0029_gray_post",
+			"breakpoints": true
+		},
+		{
+			"idx": 30,
+			"version": "6",
+			"when": 1784654847771,
+			"tag": "0030_moaning_tombstone",
+			"breakpoints": true
+		},
+		{
+			"idx": 31,
+			"version": "6",
+			"when": 1784813123072,
+			"tag": "0031_normal_johnny_blaze",
+			"breakpoints": true
+		},
+		{
+			"idx": 32,
+			"version": "6",
+			"when": 1785265054833,
+			"tag": "0032_spotty_otto_octavius",
+			"breakpoints": true
+		},
+		{
+			"idx": 33,
+			"version": "6",
+			"when": 1785268483938,
+			"tag": "0033_bouncy_psynapse",
+			"breakpoints": true
+		},
+		{
+			"idx": 34,
+			"version": "6",
+			"when": 1785446833998,
+			"tag": "0034_amazing_newton_destine",
+			"breakpoints": true
+		},
+		{
+			"idx": 35,
+			"version": "6",
+			"when": 1785456675444,
+			"tag": "0035_plain_edwin_jarvis",
+			"breakpoints": true
+		},
+		{
+			"idx": 36,
+			"version": "6",
+			"when": 1785607964074,
+			"tag": "0036_stale_skreet",
+			"breakpoints": true
+		},
+		{
+			"idx": 37,
+			"version": "6",
+			"when": 1785702687611,
+			"tag": "0037_loose_red_hulk",
 			"breakpoints": true
 		}
 	]

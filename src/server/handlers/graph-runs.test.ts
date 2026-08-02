@@ -23,7 +23,7 @@ describe("GraphRun handlers", () => {
 		const deps = {
 			repos: {
 				projects: { require: async () => ({ id: "project_1", localPath: process.cwd() }) },
-				agents: { resolve: async () => ({}) },
+				agents: { get: async () => ({}) },
 				graphRuns: {
 					create: async (input: Record<string, unknown>) => {
 						created = input;

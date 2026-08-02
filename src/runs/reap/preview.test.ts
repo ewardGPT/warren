@@ -6,14 +6,13 @@ import type { ServerPreviewConfig } from "../../warren-config/index.ts";
 import type { AnnotatePrPreviewInput, AnnotatePrPreviewResult } from "../pr-annotate.ts";
 import { reapRun } from "./index.ts";
 import {
-	BurrowClientPool,
 	type Ctx,
 	fakeBurrowClient,
 	fakeExec,
 	fakeFs,
 	fakeOpenPr,
 	makeBurrow,
-	makePool,
+	reapDeps,
 	setup,
 } from "./test-helpers.ts";
 
@@ -75,7 +74,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -104,7 +103,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -126,7 +125,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -146,7 +145,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -168,7 +167,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -187,7 +186,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -205,7 +204,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			launchPreview: launch.launch,
@@ -221,7 +220,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "failed",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
@@ -247,7 +246,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -275,7 +274,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
@@ -288,20 +287,17 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 	});
 
 	test("skips preview launch and emits reap_failed when worker is non-local (R-12 deferral)", async () => {
-		// Re-tag the burrow + run to a non-local worker so the gate fires.
-		await ctx.repos.workers.upsert({ name: "remote", url: "http://remote:8080" });
-		await ctx.repos.burrows.delete("bur_aaaaaaaaaaaa");
-		await ctx.repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "remote" });
+		// Re-tag the run to a non-local worker so the gate fires. worker_id is no
+		// longer written by dispatch (warren-3743), but the column is retained and
+		// the preview gate still reads it, so a direct attach exercises the path.
 		await ctx.repos.runs.attachBurrow(ctx.runId, { workerId: "remote" });
-		const pool = new BurrowClientPool({ repos: ctx.repos });
-		pool.register("remote", fakeBurrowClient(makeBurrow()));
 		const e = fakeExec({ revListCount: "2" });
 		const launch = fakeLaunch([]);
 		const result = await reapRun({
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: pool,
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
@@ -324,7 +320,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -357,7 +353,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
@@ -385,7 +381,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
@@ -406,7 +402,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			autoOpenPr: { enabled: true, token: "ghp_xyz", warrenBaseUrl: null },
@@ -445,7 +441,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			autoOpenPr: { enabled: true, token: "ghp_xyz", warrenBaseUrl: null },
@@ -473,7 +469,7 @@ describe("reapRun preview_launch + pr_annotate_preview (warren-f156)", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: fakeFs().fs, exec: e.exec }),
 			fs: fakeFs().fs,
 			exec: e.exec,
 			autoOpenPr: { enabled: true, token: "ghp_xyz", warrenBaseUrl: null },

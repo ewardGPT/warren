@@ -32,21 +32,16 @@ export const PREVIEW_PATH_PREFIX = "/p";
 export const WARREN_API_PATH_PREFIXES: readonly string[] = [
 	"/alerts",
 	"/analytics",
-	"/conversations",
 	"/runs",
 	"/projects",
 	"/agents",
-	"/burrows",
-	"/workers",
 	"/healthz",
 	"/readyz",
 	"/version",
 	"/metrics",
 	"/preview",
 	"/plan-runs",
-	"/graph-runs",
-	"/plot-plan-runs",
-	"/plots",
+	"/whoami",
 ];
 
 /**
@@ -66,7 +61,7 @@ export function isWarrenApiPath(pathname: string): boolean {
 /**
  * Match `run-<runId>.<host>` against `Host:`. Returns the runId on a
  * match, `null` otherwise. Tolerates an optional `:port` suffix because
- * Caddy / Fly edges sometimes preserve the upstream port in the Host
+ * Caddy / ingress edges sometimes preserve the upstream port in the Host
  * header (especially on `http://` dev deploys).
  */
 export function parseRunIdFromHost(hostHeader: string | null, suffix: string): string | null {

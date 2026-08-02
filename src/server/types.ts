@@ -1,5 +1,5 @@
 /**
- * Shared types for the warren HTTP server (SPEC §8.1).
+ * Shared types for the warren HTTP server (docs/http-api.md).
  *
  * The shape mirrors burrow's server (`@os-eco/burrow-cli` `src/server/`)
  * deliberately so a future operator who flips between the two can read
@@ -9,19 +9,19 @@
  * `db/repos/` — this file just declares the seams the wiring rides on.
  */
 
-import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { AnyWarrenDb } from "../db/client.ts";
+import type { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import type { Repos } from "../db/repos/index.ts";
-import type { RunMode } from "../db/schema.ts";
-import type { PlanRunPlotActivator, PlanRunPlotAppender } from "../plan-runs/plot-appender.ts";
-import type { PlanSynthesizer } from "../plot-plan-runs/index.ts";
 import type { PreviewAuth } from "../preview/cookie.ts";
+import type { RunPreviewsRepo } from "../preview/eviction/types.ts";
+import type { PreviewProxyHandler } from "../preview/proxy/types.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import type { refreshProject } from "../projects/manage.ts";
-import type { CanopyRegistryConfig } from "../registry/config.ts";
 import type { RunEventBroker } from "../runs/events.ts";
 import type { AutoOpenPrConfig } from "../runs/pr.ts";
+import type { BridgeRegistry } from "../runs/stream/types.ts";
+import type { RuntimeProvider } from "../runtime/contract.ts";
 import type { SeedsCliDeps } from "../seeds-cli/index.ts";
 import type { PreviewMode, WarrenConfigCache } from "../warren-config/index.ts";
 import type { IdempotencyStore } from "./idempotency.ts";
@@ -79,6 +79,23 @@ export interface RouteContext {
 	 * off the request.
 	 */
 	readonly requestId: string;
+	/**
+	 * Socket peer address from `Bun.serve`'s `server.requestIP` (warren-25f6),
+	 * or undefined on a transport that has none (unix socket) and in tests that
+	 * build a context by hand. Behind the canonical Caddy / Ingress deploy this
+	 * is the proxy, not the caller — `eventStreamClientKey` prefers
+	 * `X-Forwarded-For` and only falls back here.
+	 */
+	readonly clientIp?: string;
+	/**
+	 * The authorized caller and its capability set (warren-1ff0), from the
+	 * `AuthProvider` that admitted the request. Undefined on auth-exempt
+	 * paths (`isAuthExempt`: `/healthz` plus every non-API path, where the
+	 * gate never runs) and in tests that build a context by hand — every
+	 * gated API route has one. Handlers should branch on
+	 * `actor.capabilities.*`, never on `actor.kind`.
+	 */
+	readonly actor?: Actor;
 }
 
 export type RouteHandler = (ctx: RouteContext) => Response | Promise<Response>;
@@ -86,12 +103,19 @@ export type RouteHandler = (ctx: RouteContext) => Response | Promise<Response>;
 export interface Route {
 	readonly method: HttpMethod;
 	readonly pattern: string;
+	/**
+	 * What the route demands of its caller (warren-b875). Enforced ONCE, in
+	 * `handleRequest` — handlers never re-check. Required, so a route added
+	 * without a declared policy is a typecheck failure rather than a
+	 * silently-open surface.
+	 */
+	readonly policy: RoutePolicy;
 	readonly handler: RouteHandler;
 }
 
 /**
  * Wire-level binding for `warren serve`. TCP is the canonical V1 deploy
- * (warren is fronted by Caddy/Fly edge for TLS — see SPEC §11.D); the
+ * (warren is fronted by Caddy / cluster ingress for TLS — see SECURITY.md); the
  * unix socket option is kept for any future "warren next to a reverse
  * proxy on the same box without a port" deploy. Defaults to ephemeral
  * loopback TCP for tests.
@@ -121,39 +145,63 @@ export interface Logger {
 export interface ServerDeps {
 	readonly repos: Repos;
 	/**
-	 * Live db handle — used by the `/readyz` `db_reachable` probe
-	 * (R-13 pl-f17e step 5, warren-e2ea) so the diagnostic envelope
-	 * reports the active dialect. Tests can omit; the probe degrades
-	 * to `ok: true` with a "no db wired" message when absent.
+	 * Live db handle — used by the `/readyz` `db_reachable` probe (R-13 pl-f17e
+	 * step 5, warren-e2ea) so the diagnostic envelope reports the active dialect.
+	 * Tests can omit; the probe degrades to `ok: true`/"no db wired" when absent.
 	 */
 	readonly db?: AnyWarrenDb;
 	/**
-	 * Multi-worker burrow client pool (warren-39c3 / warren-c0c9 / pl-9ba1).
-	 * Every burrow-targeting handler routes through this: `placeFor` for new
-	 * burrows, `clientFor` for per-resource reads (cancel / steer / reap /
-	 * bridges / GET /burrows/:id), and `probe()` for /readyz.
+	 * Drizzle adapter over `db`, built ONCE at boot (warren-89a6). Handlers are
+	 * a thin surface over the domain: they consume this, they never call
+	 * `DrizzleAdapter.for(deps.db)` per request — `check:layers` fails the build
+	 * if one does. Present exactly when `db` is; tests that wire neither keep
+	 * the handlers' existing degraded paths.
 	 */
-	readonly burrowClientPool: BurrowClientPool;
+	readonly dbAdapter?: DrizzleAdapter;
+	/**
+	 * Dialect-polymorphic run-previews repo over `db`, built ONCE at boot
+	 * (warren-89a6). Same rule as `dbAdapter`: the preview-teardown handler and
+	 * the `/readyz` preview probes consume it instead of calling
+	 * `createRunPreviewsRepo(deps.db)` on every request.
+	 */
+	readonly runPreviews?: RunPreviewsRepo;
+	/** Boot-resolved runtime provider (`resolveRuntimeProvider`, honoring
+	 * `WARREN_RUNTIME`). REQUIRED (warren-f796) — handlers route through it, no
+	 * burrow-client fallback (`local` ⇒ LocalProvider, `k8s` ⇒ K8sProvider). */
+	readonly runtimeProvider: RuntimeProvider;
+	/** Local-topology `/readyz` burrow probe (warren-f796), boot-wired by the `LocalBootBackend`; absent under `k8s`. */
+	readonly burrowProbe?: () => Promise<import("../diagnostics/checks.ts").DiagnosticCheck>;
+	/** Preview sidecar resolver (warren-e24d), gated on `previewPorts`. The local
+	 * backend's combined facade resolver satisfies both preview consumer seams. */
+	readonly previewSidecars?: import("../runtime/local/preview/sidecars.ts").LocalSidecarsResolver;
+	/** K8s in-pod finalize correlation registry (warren-0d35); defaults to the
+	 * shared singleton, so prod needs no wiring — tests inject a private instance. */
+	readonly finalizeCoordinator?: import("../runtime/k8s/finalize-coordinator.ts").FinalizeCoordinator;
+	/**
+	 * Durable salvage-bundle directory (warren-cd3b). The `POST /runs/:id/salvage`
+	 * intake writes pod-captured git bundles here (`<runId>.bundle`); boot wires
+	 * `<dataDir>/salvage`. Absent ⇒ the intake refuses with a 500 rather than
+	 * silently dropping the run's only recoverable copy.
+	 */
+	readonly salvageDir?: string;
 	readonly broker: RunEventBroker;
 	readonly bridges: BridgeRegistry;
-	/**
-	 * Canopy library config — undefined when `CANOPY_REPO_URL` is unset
-	 * (warren-d3e9). `POST /agents/refresh` and the canopy clone /
-	 * canopy clean readyz probes are gated on this being defined.
-	 * Built-in agents in `src/registry/builtins/` cover the common
-	 * "no library configured" case.
-	 */
-	readonly canopyConfig?: CanopyRegistryConfig;
 	readonly projectsConfig: ProjectsConfig;
 	readonly logger: Logger;
 	/** UI dist directory for static serving; null disables `/` and `/assets/*`. */
 	readonly uiDistDir: string | null;
 	/**
-	 * Spawn seam used by `/readyz` (Phase 13 bwrap + canopy_clean probes)
+	 * Spawn seam used by `/readyz` (Phase 13 bwrap probe)
 	 * and any future shell-out from a handler. `main.ts` wires the
 	 * production `Bun.spawn` adapter; tests pass a stub.
 	 */
 	readonly spawn?: SpawnFn;
+	/**
+	 * Platform seam for the `/readyz` bwrap probe. Production omits it
+	 * (`checkBwrap` reads `process.platform`); tests force `"linux"` so
+	 * the probe path runs identically on macOS dev machines.
+	 */
+	readonly platform?: NodeJS.Platform;
 	/**
 	 * Seeds CLI deps (pl-bb70 step 4, warren-46cd). Threaded into `spawnRun`
 	 * so a successful manual dispatch with `seedId` stamps the seed's
@@ -186,7 +234,7 @@ export interface ServerDeps {
 	 */
 	readonly runBranchPrefixDefault?: string;
 	/**
-	 * Preview port allocator range (R-19 / SPEC §11.L, warren-2277).
+	 * Preview port allocator range (R-19 / docs/design/preview-environments.md, warren-2277).
 	 * Resolved from `WARREN_PREVIEW_PORT_RANGE` at boot so `/readyz`'s
 	 * `preview_port_allocator` saturation probe matches what the reap-time
 	 * launcher allocates against. Tests may omit; the probe degrades to
@@ -194,32 +242,29 @@ export interface ServerDeps {
 	 */
 	readonly previewPortRange?: { readonly start: number; readonly end: number };
 	/**
-	 * Live-preview cap (R-19 / SPEC §11.L, warren-ea6b). Resolved from
+	 * Live-preview cap (R-19 / docs/design/preview-environments.md, warren-ea6b). Resolved from
 	 * `WARREN_PREVIEW_MAX_LIVE` at boot so `/readyz`'s `preview_max_live`
-	 * saturation probe matches the eviction worker's LRU cap. Tests may
-	 * omit; the probe falls back to `DEFAULT_MAX_LIVE` so the codepath
-	 * still exercises.
+	 * saturation probe matches the eviction worker's LRU cap. Tests may omit; the
+	 * probe falls back to `DEFAULT_MAX_LIVE` so the codepath still exercises.
 	 */
 	readonly previewMaxLive?: number;
 	/**
 	 * Fallback workspace-GC TTL in ms (warren-0a9a). Resolved from
-	 * `WARREN_WORKSPACE_GC_TTL` at boot so `/readyz`'s
-	 * `stale_burrow_workspaces` probe ages burrows on the same threshold
-	 * the GC sweeper uses. Tests may omit; the probe is skipped when
-	 * absent.
+	 * `WARREN_WORKSPACE_GC_TTL` at boot so `/readyz`'s `stale_burrow_workspaces`
+	 * probe ages burrows on the GC sweeper's threshold. Tests may omit; the probe
+	 * is skipped when absent.
 	 */
 	readonly workspaceGcTtlMs?: number;
 	/**
-	 * Operator's preview host suffix (R-19 / SPEC §11.L, warren-8a10).
+	 * Operator's preview host suffix (R-19 / docs/design/preview-environments.md, warren-8a10).
 	 * Resolved at boot from `WARREN_PREVIEW_HOST`. In subdomain mode the
-	 * Host-match preview proxy preamble requires this; in path mode it
-	 * stays optional (previews ride on the warren host itself). Undefined
-	 * + subdomain mode → preview surface is off, the login handler returns
-	 * 400, and the proxy never inspects a request.
+	 * Host-match preview proxy preamble requires this; in path mode it stays
+	 * optional (previews ride on the warren host itself). Undefined + subdomain
+	 * mode → preview surface off, the login handler 400s, the proxy never inspects.
 	 */
 	readonly previewHost?: string;
 	/**
-	 * Preview routing mode (warren-edff / SPEC §11.L path addendum).
+	 * Preview routing mode (warren-edff / docs/design/preview-environments.md path addendum).
 	 * Drives the login handler's redirect validation: subdomain mode
 	 * targets `https://run-<id>.<host>/`; path mode targets the inbound
 	 * origin under `/p/<id>/`. Defaults to `subdomain` so legacy callers
@@ -228,29 +273,13 @@ export interface ServerDeps {
 	 */
 	readonly previewMode?: PreviewMode;
 	/**
-	 * Signed-cookie auth for the preview proxy (R-19 / SPEC §11.L,
+	 * Signed-cookie auth for the preview proxy (R-19 / docs/design/preview-environments.md,
 	 * warren-8a10). Bound at boot from `WARREN_API_TOKEN` (the same
 	 * bearer the rest of warren uses). Undefined when the operator
 	 * disabled the preview surface (subdomain mode with no host) or
 	 * warren booted with `--no-auth`.
 	 */
 	readonly previewAuth?: PreviewAuth;
-	/**
-	 * Test seam for the `plan_run_dispatched` Plot append in the POST
-	 * /plan-runs handler (warren-b89f / pl-7937 step 4). Production omits
-	 * this; the handler falls back to `defaultPlanRunPlotAppender`, which
-	 * opens a `UserPlotClient` against `<project>/.plot/` and best-effort
-	 * appends one event. Tests substitute a stub to assert payload shape
-	 * without touching disk.
-	 */
-	readonly planRunPlotAppender?: PlanRunPlotAppender;
-	/**
-	 * Test seam for the dispatch-time `ready` → `active` Plot promotion in
-	 * the plan-run handlers (warren-dfff / pl-e381 step 2). Production omits
-	 * this; falls back to `defaultPlanRunPlotActivator` so the auto-done
-	 * guard (`status === 'active'`) is reachable via dispatch.
-	 */
-	readonly planRunPlotActivator?: PlanRunPlotActivator;
 	/**
 	 * Project host-clone refresher (warren-6d60). Used by the plan-run
 	 * dispatch handlers (`refreshDispatchProject`) so the seeds plan is
@@ -261,163 +290,6 @@ export interface ServerDeps {
 	 */
 	readonly refreshProjectFn?: typeof refreshProject;
 	/**
-	 * Server-side Plot aggregator (warren-c167 / pl-9d6a step 2). Used by
-	 * `GET /plots` to fan out `UserPlotClient.query` across every
-	 * `hasPlot=true` project, with a 5s in-memory cache and the
-	 * empty-deployments byte-identical contract (see
-	 * `src/plots/aggregate.ts`). `bootServer` always wires the default
-	 * factory; tests stub the seam in `src/plots/aggregate.ts` and inject a
-	 * custom aggregator here. When undefined the handler returns
-	 * `EMPTY_PLOT_SUMMARIES` so a non-Plot deployment still sees a stable
-	 * 200/`[]` response.
-	 */
-	readonly plotAggregator?: import("../plots/index.ts").PlotAggregator;
-	/**
-	 * Server-side Plot creator (warren-194e / pl-9d6a step 3). Used by
-	 * `POST /plots` to open a `UserPlotClient` against the target
-	 * project's `.plot/`, call `PlotStore.create({name})`, optionally
-	 * apply an initial intent patch via `editIntent`, and return the
-	 * fresh `PlotSummary` subset. Failure surfaces synchronously (the
-	 * user is waiting on the result — see seed body). `bootServer`
-	 * always wires the default; tests substitute a stub to assert
-	 * payload shape without touching disk. When undefined the handler
-	 * falls back to `defaultPlotCreator`.
-	 */
-	readonly plotCreator?: import("../plots/index.ts").PlotCreator;
-	/**
-	 * Server-side Plot reader (warren-961e / pl-9d6a step 8). Used by
-	 * `GET /plots/:id` to open a `UserPlotClient` against the owning
-	 * project's `.plot/`, snapshot the Plot + its event log, and return
-	 * the full envelope (`{id, name, status, intent, attachments[],
-	 * event_log[]}` — `project_id` is stitched on by the handler from
-	 * the resolved `ProjectRow`). `bootServer` always wires the default;
-	 * tests substitute a stub to assert payload shape without touching
-	 * disk. When undefined the handler falls back to `defaultPlotReader`.
-	 */
-	readonly plotReader?: import("../plots/index.ts").PlotReader;
-	/**
-	 * Plan-child adopter (warren-18a9). Used by `GET /plots/:id` to
-	 * reconcile a Plot's `sd_plan` attachments (a `seeds_issue` whose
-	 * `ref` is a `pl-*` plan id) with the children of the plans they
-	 * reference: any plan child not already present as a `seeds_issue`
-	 * attachment is auto-attached so the Plot's substrate panel stays in
-	 * parity with the plan. Best-effort + fire-and-log — a reconciliation
-	 * failure never breaks the read. Gated on `seedsCli` being wired and
-	 * the owning project having `.seeds/`. When undefined the handler
-	 * falls back to `defaultPlanChildAdopter`.
-	 */
-	readonly planChildAdopter?: import("../plots/index.ts").PlanChildAdopter;
-	/**
-	 * Server-side Plot resolver (warren-961e / pl-9d6a step 8). Used by
-	 * every per-Plot handler (`GET /plots/:id` and the mutation handlers
-	 * landing later in pl-9d6a) to find the project owning a given
-	 * `plot_id`. `bootServer` wires `createPlotResolver` backed by the
-	 * same `plotAggregator` cache; tests substitute a stub to short-circuit
-	 * the project lookup. When undefined the handler returns 404 so the
-	 * empty-deployments contract stays stable.
-	 */
-	readonly plotResolver?: import("../plots/index.ts").PlotResolver;
-	/**
-	 * Server-side Plot intent editor (warren-896f / pl-9d6a step 9). Used
-	 * by `POST /plots/:id/intent` to open a `UserPlotClient` against the
-	 * owning project's `.plot/`, enforce SPEC §6's frozen-at-done rule,
-	 * apply the patch via `PlotHandle.editIntent`, and return the fresh
-	 * envelope subset (`{id, name, status, intent, attachments[],
-	 * event_log[]}` — `project_id` is stitched on by the handler from
-	 * the resolved `ProjectRow`). Failure surfaces synchronously (the
-	 * user is waiting on the result — see seed body — so this is NOT
-	 * fire-and-log, in contrast to `defaultPlanRunPlotAppender`).
-	 * `bootServer` always wires the default; tests substitute a stub to
-	 * assert payload shape without touching disk. When undefined the
-	 * handler falls back to `defaultPlotIntentEditor`.
-	 */
-	readonly plotIntentEditor?: import("../plots/index.ts").PlotIntentEditor;
-	/**
-	 * Server-side Plot rename seam (warren-bed0 / pl-b0c0 step 3). Used by
-	 * `POST /plots/:id/rename` to open a `UserPlotClient` against the
-	 * owning project's `.plot/`, mutate `plot.json#/name` under the lib's
-	 * per-Plot file lock via `UserPlotClient.rename` (which appends a
-	 * `note` event recording the from→to transition), and return the fresh
-	 * envelope subset. Failure surfaces synchronously (NOT fire-and-log
-	 * — same posture as `plotIntentEditor` / `plotStatusChanger`). Renames
-	 * are allowed in every status — the name is pure metadata, unlike the
-	 * intent body which freezes at done/archived per SPEC §6. `bootServer`
-	 * always wires the default; tests substitute a stub. When undefined
-	 * the handler falls back to `defaultPlotRenamer`.
-	 */
-	readonly plotRenamer?: import("../plots/index.ts").PlotRenamer;
-	/**
-	 * Server-side Plot status changer (warren-e868 / pl-9d6a step 10). Used
-	 * by `POST /plots/:id/status` to open a `UserPlotClient` against the
-	 * owning project's `.plot/`, enforce the SPEC §6.5 transition matrix
-	 * (defense-in-depth on top of the handler-edge check), call
-	 * `PlotHandle.setStatus`, and return the fresh summary subset +
-	 * emitted `status_changed` event. Failure surfaces synchronously
-	 * (NOT fire-and-log — same posture as `plotIntentEditor`).
-	 * `bootServer` always wires the default; tests substitute a stub.
-	 * When undefined the handler falls back to `defaultPlotStatusChanger`.
-	 */
-	readonly plotStatusChanger?: import("../plots/index.ts").PlotStatusChanger;
-	/**
-	 * Server-side Plot attach/detach seam (warren-589c / pl-9d6a step 11).
-	 * Used by `POST /plots/:id/attachments` and
-	 * `DELETE /plots/:id/attachments/:ref` to open a `UserPlotClient`
-	 * against the owning project's `.plot/`, call
-	 * `PlotHandle.attach` / `PlotHandle.detach`, and return the fresh
-	 * envelope subset (`{id, name, status, intent, attachments[],
-	 * event_log[]}` — plus `attachment` for attach, `removed_id` for
-	 * detach). Failure surfaces synchronously (NOT fire-and-log — same
-	 * posture as `plotIntentEditor` / `plotStatusChanger`).
-	 * `bootServer` always wires the default; tests substitute a stub.
-	 * When undefined the handler falls back to `defaultPlotAttacher`.
-	 */
-	readonly plotAttacher?: import("../plots/index.ts").PlotAttacher;
-	/**
-	 * Server-side Plot PR-merge seam (warren-8e39 / pl-0344 step 14).
-	 * Used by `POST /plots/:id/attachments/:ref/merge` to resolve the
-	 * `gh_pr` attachment by ref, call the GitHub merge REST API
-	 * (`PUT /repos/:o/:r/pulls/:n/merge`), and return the fresh
-	 * envelope subset plus the merge result variant. The handler
-	 * schedules a follow-up `refreshProjectClone` on success so the
-	 * local clone picks up the new merge commit. Failure surfaces
-	 * synchronously (NOT fire-and-log — the user clicked the button).
-	 * `bootServer` always wires the default; tests substitute a stub.
-	 * When undefined the handler rejects with 503 so an unwired
-	 * deployment doesn't silently swallow the click.
-	 */
-	readonly plotPrMerger?: import("../plots/index.ts").PlotPrMerger;
-	/**
-	 * Server-side Plot sync seam (warren-5bc2 / pl-5a6c).
-	 * Used by `POST /plots/:id/sync` to check for dirty `.plot/` files,
-	 * commit and push changes, and open/merge a PR.
-	 */
-	readonly plotSyncer?: import("../plots/index.ts").PlotSyncer;
-	/**
-	 * Server-side Plot question-answer seam (warren-e1ac / pl-9d6a step 12).
-	 * Used by `POST /plots/:id/questions/:event_id/answer` to open a
-	 * `UserPlotClient` against the owning project's `.plot/`, re-validate
-	 * the handler-edge concurrency invariant (the targeted `question_posed`
-	 * still exists and has no subsequent `question_answered`) against the
-	 * fresh on-disk event log, append the `question_answered` event, and
-	 * return the freshly appended event for optimistic UI splice. Failure
-	 * surfaces synchronously (NOT fire-and-log — same posture as the
-	 * intent/status/attach seams). `bootServer` always wires the default;
-	 * tests substitute a stub. When undefined the handler falls back to
-	 * `defaultPlotQuestionAnswerer`.
-	 */
-	readonly plotQuestionAnswerer?: import("../plots/index.ts").PlotQuestionAnswerer;
-	/**
-	 * Server-side plot→plan-run synthesizer (warren-99b2 / pl-f404 step 3
-	 * / SPEC §11.Q). `POST /plot-plan-runs` shells out via this seam to
-	 * mint a fresh throwaway parent seed and a seeds plan whose children
-	 * adopt the Plot's open `seeds_issue` attachments. `bootServer` wires
-	 * `createDefaultPlanSynthesizer({ seedsCli })` when `seedsCli` is
-	 * configured; tests substitute a stub to assert payload shape without
-	 * shelling out. Undefined → the handler rejects with the same
-	 * "seeds CLI not configured" error `POST /plan-runs` uses.
-	 */
-	readonly planSynthesizer?: PlanSynthesizer;
-	/**
 	 * `POST /runs` idempotency window (warren-d525). When wired, a dispatch
 	 * carrying an `Idempotency-Key` header is deduped per `(projectId, key)`
 	 * so a duplicate delivery replays the original 201 instead of spawning
@@ -427,35 +299,39 @@ export interface ServerDeps {
 	 */
 	readonly idempotencyStore?: IdempotencyStore;
 	/**
-	 * In-process counter registry backing `GET /metrics` (warren
-	 * observability Phase 1). `bootServer` wires one and also threads it
-	 * into the root logger's sink hook so warn/error log rates are counted.
-	 * Undefined → the metrics endpoint omits counters (tests, or a
-	 * deployment that didn't wire it).
+	 * Counter registry for `GET /metrics` (observability Phase 1); undefined omits the counters.
 	 */
 	readonly metricsRegistry?: import("../observability/metrics-registry.ts").MetricsRegistry;
+	/**
+	 * K8s pod-phase gauge source for `GET /metrics` (pl-829f step 16); set under WARREN_RUNTIME=k8s.
+	 */
+	readonly podMetrics?: import("../runtime/k8s/pod-metrics.ts").PodMetricsSource;
+	/**
+	 * Concurrency admission for the two NDJSON event-stream routes
+	 * (warren-25f6). `bootServer` always wires one from
+	 * `loadEventStreamLimitsFromEnv()`; tests may omit, in which case the
+	 * streams are uncapped. Also feeds the `warren_event_streams` gauge on
+	 * `GET /metrics`. See `src/server/stream-limits.ts`.
+	 */
+	readonly streamLimiter?: import("./stream-limits.ts").EventStreamLimiter;
+	/**
+	 * What `POST /projects` may register (warren-ce9b, widened to repo
+	 * granularity by warren-1841): bare owners and/or `owner/repo` pairs.
+	 * `bootServer` wires this ONLY under `WARREN_AUTH=public`, from
+	 * `WARREN_PUBLIC_ALLOWLIST`; absent (token mode, tests) ⇒ no
+	 * restriction. See `src/projects/public-allowlist.ts`; enforced inside
+	 * `addProject` (warren-0883).
+	 */
+	readonly publicAllowlist?: import("../projects/public-allowlist.ts").PublicAllowlist;
 }
 
 /**
- * The bridge registry. Per-run bridges are created when `POST /runs`
- * lands and on warren startup via `recoverActiveRunStreams`; the
- * registry tracks them so server shutdown can abort everyone in one
- * pass. Concrete impl lives in `./bridges.ts`.
+ * The bridge registry. Declared in the run-stream domain
+ * (`src/runs/stream/types.ts`) alongside the bridge it registers, and
+ * re-exported here for the server modules that consume it (warren-89a6).
+ * Concrete impl lives in `./bridges.ts`.
  */
-export interface BridgeRegistry {
-	/**
-	 * Start a bridge for the given run; idempotent against a running bridge.
-	 * `burrowId` is required so the bridge can resolve the owning worker via
-	 * `BurrowClientPool.clientFor` (warren-c0c9). `mode` (warren-df71) makes a
-	 * `'conversation'` run keep-alive across pi `agent_end` turn boundaries;
-	 * omit / `'batch'` retains the prior one-shot terminal behaviour.
-	 */
-	start(runId: string, burrowRunId: string, burrowId: string, mode?: RunMode): void;
-	/** Abort all in-flight bridges and await their drain. */
-	stopAll(): Promise<void>;
-	/** Test/diagnostic surface — number of currently-attached bridges. */
-	size(): number;
-}
+export type { BridgeRegistry };
 
 export interface ServeOptions {
 	transport?: Transport;
@@ -472,16 +348,34 @@ export interface ServeOptions {
 	 */
 	idleTimeout?: number;
 	/**
-	 * Host-match preview proxy preamble (R-19 / SPEC §11.L, warren-8a10).
+	 * Host-match preview proxy preamble (R-19 / docs/design/preview-environments.md, warren-8a10).
 	 * Runs BEFORE auth + route match. Returns a `Response` to short-circuit
 	 * the request, or `null` to fall through to the regular pipeline.
 	 * Undefined → no preview surface (zero overhead per request).
 	 */
 	previewProxy?: PreviewProxyHandler;
+	/**
+	 * Liveness probe for run-scoped callback tokens (warren-57fd). Given a run
+	 * id, resolves true while the run may still call back (non-terminal). The
+	 * request gate uses it to reject a `run` actor once its run is terminal.
+	 * `bootServer` wires it from `deps.repos.runs`; tests may omit (a run token
+	 * is then bounded only by route+id, not by liveness).
+	 */
+	runActivityCheck?: RunActivityCheck;
 }
 
-/** Host-match preview proxy preamble. See `src/preview/proxy/index.ts`. */
-export type PreviewProxyHandler = (request: Request, url: URL) => Promise<Response | null>;
+/**
+ * Resolves true while `runId` may still legitimately call back into warren
+ * (i.e. it is not terminal). See `ServeOptions.runActivityCheck`.
+ */
+export type RunActivityCheck = (runId: string) => Promise<boolean>;
+
+/**
+ * Host-match preview proxy preamble. Declared in the preview domain
+ * (`src/preview/proxy/types.ts`) and re-exported here for the server wiring
+ * that consumes it (warren-89a6).
+ */
+export type { PreviewProxyHandler };
 
 export interface ServeHandle {
 	readonly transport: Transport;
@@ -489,8 +383,83 @@ export interface ServeHandle {
 	stop(): Promise<void>;
 }
 
+/**
+ * What a caller is permitted to do — the gate branches on these, it does
+ * not re-derive them from who the caller is (warren-1ff0). Named for the
+ * permission, not the holder, mirroring `RuntimeCapabilities`
+ * (`src/runtime/contract.ts`): a flag says what the surface allows, so a
+ * later provider can grant an arbitrary subset without anyone teaching
+ * handlers a new identity vocabulary.
+ */
+export interface ActorCapabilities {
+	/** Read the public projection of runs / projects / agents. */
+	readonly readPublic: boolean;
+	/**
+	 * Read operator-only surfaces — diagnostics, the run inbox, cost
+	 * rollups, raw agent transcripts, per-project warren-config.
+	 */
+	readonly readOperator: boolean;
+	/** Dispatch runs / plan-runs and steer, pause, cancel them. */
+	readonly dispatch: boolean;
+	/** Mutate instance-level state — register projects, triggers, config. */
+	readonly admin: boolean;
+}
+
+/**
+ * One capability name. Derived from `ActorCapabilities` rather than
+ * re-listed, so a capability added there is automatically a legal route
+ * policy and the two vocabularies can't drift.
+ */
+export type CapabilityName = keyof ActorCapabilities;
+
+/**
+ * What a route demands of its caller (warren-b875). Every `ROUTE_TABLE`
+ * entry declares exactly one; there is no default and no fallthrough.
+ *
+ * `anonymous` is the only value that isn't a capability: it means the auth
+ * gate never runs for that path at all (`isAuthExempt` is derived from it),
+ * so the route answers a credential-less caller in EVERY auth mode —
+ * liveness probes and the version string the login screen reads before the
+ * user has a token. Treat it as strictly wider than `readPublic`, which
+ * still requires the bearer under the default `WARREN_AUTH=token`.
+ *
+ * Every other value names the capability the admitted actor must hold; the
+ * gate refuses with 403 when it doesn't.
+ */
+export type RoutePolicy = "anonymous" | CapabilityName;
+
+/**
+ * Identity discriminant. `operator` is the single-user V1 caller
+ * (SECURITY.md) the token provider authorizes; `anonymous` is the
+ * credential-less spectator the `WARREN_AUTH=public` provider mints
+ * (warren-851b) — it holds `readPublic` and nothing else. `run` is a
+ * sandbox calling back with its per-run scoped token (warren-57fd): it is
+ * pinned to a single run's callback surface by the request gate, not by
+ * its capability set. Further kinds land with the providers that mint them.
+ */
+export type ActorKind = "operator" | "anonymous" | "run";
+
+/**
+ * Who is making the request and what they may do. Produced by an
+ * `AuthProvider`, carried on `RouteContext.actor` so a handler consults
+ * capabilities instead of re-reading the Authorization header.
+ */
+export interface Actor {
+	readonly kind: ActorKind;
+	readonly capabilities: ActorCapabilities;
+	/**
+	 * The run a `run`-kind actor is scoped to (warren-57fd). Present ONLY on
+	 * `kind === "run"`. The request gate refuses any route outside that run's
+	 * callback surface, pins the `:id` param to this value, and rejects once
+	 * the run is terminal — the capability set alone does not constrain it.
+	 */
+	readonly runId?: string;
+}
+
 export interface AuthOk {
 	readonly ok: true;
+	/** The authorized caller. Threaded onto `RouteContext.actor`. */
+	readonly actor: Actor;
 }
 
 export interface AuthDenied {

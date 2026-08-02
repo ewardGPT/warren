@@ -5,10 +5,9 @@
  * through `index.ts`.
  *
  * See `./index.ts` for the four-signal eviction contract framing and
- * SPEC §11.L for the design lock.
+ * docs/design/preview-environments.md for the design lock.
  */
 
-import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { AnyWarrenDb } from "../../db/client.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { PreviewState } from "../../db/schema.ts";
@@ -97,7 +96,7 @@ export interface RunPreviewsRepo {
 	}): Promise<boolean>;
 	/**
 	 * Atomically claim a `starting`/`live` preview for manual teardown
-	 * (R-19 / SPEC §11.L acceptance #8, warren-d725). BEGIN IMMEDIATE
+	 * (R-19 / docs/design/preview-environments.md acceptance #8, warren-d725). BEGIN IMMEDIATE
 	 * serializes against the eviction worker's `evict` so a manual
 	 * teardown racing an LRU sweep deterministically lands in exactly
 	 * one of them — the loser sees `already-torn-down`. Returns the
@@ -110,19 +109,19 @@ export interface RunPreviewsRepo {
 export interface PreviewEvictionTickInput {
 	readonly db: AnyWarrenDb;
 	readonly repos: Repos;
-	readonly burrowClientPool: BurrowClientPool;
 	readonly warrenConfigs: WarrenConfigCache;
 	readonly broker?: RunEventBroker;
 	readonly config: PreviewEvictionConfig;
 	readonly now?: () => Date;
 	readonly logger?: PreviewEvictionLogger;
 	/**
-	 * Override the sidecar resolver (tests). Defaults to a pool-backed
-	 * resolver that looks up the worker for `burrowId` and returns its
-	 * `http.sidecars` facade. Returns `null` when the worker can't be
-	 * resolved (e.g. the burrow row was deleted while the run was still
-	 * carrying a stale `burrow_id`) so the eviction still runs db-side
-	 * but the sidecar stop is skipped with a warning.
+	 * Provider-neutral sidecar resolver (warren-e24d). Built at boot from the
+	 * runtime provider's preview seam (`createLocalSidecarsResolver`) and
+	 * threaded in gated on `RuntimeCapabilities.previewPorts`. Returns `null`
+	 * when the sandbox can't be resolved so the eviction still runs db-side but
+	 * the sidecar stop is skipped with a warning. Omitted (or a backend without
+	 * preview ports) ⇒ the sidecar stop is skipped entirely; the db-side
+	 * transition still applies.
 	 */
 	readonly resolveSidecar?: SidecarResolver;
 	/**

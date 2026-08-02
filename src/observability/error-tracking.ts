@@ -16,7 +16,7 @@
  * tracker lifecycle (init / capture / flush) and the scrubber.
  */
 
-import { SECRET_FIELDS } from "../server/main/redact.ts";
+import { SECRET_FIELDS } from "./log-redact.ts";
 
 export type EnvLike = Readonly<Record<string, string | undefined>>;
 

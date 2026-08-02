@@ -1,7 +1,7 @@
 /**
  * High-level project management: add (clone + persist), list, delete
  * (rm-rf + db). These are the operations behind `POST /projects`,
- * `GET /projects`, and `DELETE /projects/:id` (SPEC §8.1) — the HTTP
+ * `GET /projects`, and `DELETE /projects/:id` (docs/http-api.md) — the HTTP
  * server is a thin envelope around these calls.
  *
  * Atomicity contract:
@@ -11,13 +11,17 @@
  *     `git clone` returns success.
  *   - deleteProject removes the row *first*, then best-effort rms the
  *     on-disk clone (warren-5f19). The row delete and the
- *     `runs.project_id` SET-NULL cascade run as a single SQLite
- *     statement, so any concurrent referent (in-flight runs, history)
- *     is updated atomically. If the disk rmrf fails after the row is
- *     gone, the operator gets a logged warning and a stranded
- *     directory under the projects root — better than the prior
- *     ordering, where a row could remain pointing at a deleted
- *     directory and wedge subsequent dispatches against the project.
+ *     `runs.project_id` ON DELETE CASCADE (warren-41b3) run as a single
+ *     SQLite statement, so the project's runs — and, via
+ *     `events.run_id` ON DELETE CASCADE, their event transcripts — are
+ *     removed atomically with the row rather than orphaned with
+ *     `project_id = NULL`. Doing this before the disk rm guarantees we
+ *     never leave a `projects` row pointing at a missing directory. If
+ *     the disk rmrf fails after the row is gone, the operator gets a
+ *     logged warning and a stranded directory under the projects root —
+ *     better than the prior ordering, where a row could remain pointing
+ *     at a deleted directory and wedge subsequent dispatches against the
+ *     project.
  *
  * The `localPath` returned by the clone is re-validated against the
  * configured projects root before any rm: defense-in-depth so a
@@ -40,6 +44,7 @@ import {
 } from "./clone.ts";
 import type { ProjectsConfig } from "./config.ts";
 import { ProjectUnavailableError } from "./errors.ts";
+import { assertGitUrlAllowlisted, type PublicAllowlist } from "./public-allowlist.ts";
 import {
 	detectProjectFeatures,
 	type RefreshProjectCloneResult,
@@ -52,9 +57,22 @@ export interface AddProjectInput {
 	readonly config: ProjectsConfig;
 	readonly gitUrl: string;
 	readonly defaultBranch?: string;
+	/**
+	 * GitHub token for private-repo clones (`GITHUB_TOKEN`), forwarded to
+	 * `cloneProjectRepo` — see `CloneProjectInput.token`. Absent/empty →
+	 * anonymous clone.
+	 */
+	readonly token?: string;
 	readonly spawn: SpawnFn;
 	readonly timeoutMs?: number;
 	readonly now?: () => Date;
+	/**
+	 * Public-instance allowlist (warren-ce9b), enforced HERE so every
+	 * registration surface — `POST /projects` and the
+	 * `warren add-project` CLI — holds the same line (warren-0883).
+	 * `undefined` (token mode) ⇒ no restriction.
+	 */
+	readonly publicAllowlist?: PublicAllowlist;
 	/** Inject the cloner; defaults to the live `cloneProjectRepo`. */
 	readonly clone?: typeof cloneProjectRepo;
 	/**
@@ -67,6 +85,10 @@ export interface AddProjectInput {
 
 export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 	const { repo, config, gitUrl } = input;
+	// warren-ce9b/0883: on a public instance only allowlisted repos may
+	// ever be registered — refused here, BEFORE anything is cloned, from
+	// the single enforcement site every surface shares.
+	assertGitUrlAllowlisted(input.publicAllowlist, gitUrl);
 	const parsed = parseGitHubUrl(gitUrl);
 
 	const existing = await repo.findByGitUrl(gitUrl);
@@ -83,6 +105,7 @@ export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 		owner: parsed.owner,
 		name: parsed.name,
 		defaultBranch: input.defaultBranch,
+		token: input.token,
 		spawn: input.spawn,
 		timeoutMs: input.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
 	});
@@ -94,7 +117,6 @@ export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 		gitUrl,
 		localPath: clone.localPath,
 		defaultBranch: clone.defaultBranch,
-		hasPlot: features.hasPlot,
 		hasSeeds: features.hasSeeds,
 		now: input.now?.(),
 	});
@@ -106,6 +128,11 @@ export interface RefreshProjectInput {
 	readonly id: string;
 	/** Branch, tag, or SHA. Defaults to the project row's tracked default_branch. */
 	readonly ref?: string;
+	/**
+	 * GitHub token for private-repo fetches (`GITHUB_TOKEN`), forwarded to
+	 * `refreshProjectClone` — see `RefreshProjectCloneInput.token`.
+	 */
+	readonly token?: string;
 	readonly spawn: SpawnFn;
 	readonly timeoutMs?: number;
 	readonly now?: () => Date;
@@ -165,15 +192,26 @@ export async function refreshProject(input: RefreshProjectInput): Promise<Refres
 		config,
 		localPath: row.localPath,
 		ref,
+		token: input.token,
 		spawn: input.spawn,
 		timeoutMs: input.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
 		armHooks,
 	});
 
+	// Drop the cached envelope AGAIN after the fetch/reset lands
+	// (warren-e376). The invalidate-before covers readers that were
+	// already in flight when the refresh started, but a reader that
+	// STARTS mid-refresh (e.g. the 1s trigger-scheduler tick in the
+	// acceptance harness) parses the working tree mid-swap — possibly
+	// the pre-fetch tree or a partially checked-out one — and commits
+	// that stale envelope as the post-refresh cache entry. Scenario 15's
+	// Run Now 404'd on exactly this. Invalidating after the reset forces
+	// the next get() to parse the settled tree.
+	input.warrenConfigs?.invalidate(id);
+
 	const updated = await repo.recordRefresh({
 		id: row.id,
 		headSha: result.headSha,
-		hasPlot: result.features.hasPlot,
 		hasSeeds: result.features.hasSeeds,
 		now: input.now?.(),
 	});
@@ -205,12 +243,13 @@ export async function deleteProject(input: DeleteProjectInput): Promise<ProjectR
 	const row = await repo.require(id);
 	assertPathUnderRoot(row.localPath, config.root);
 
-	// Row first. The FK on `runs.project_id` is `ON DELETE SET NULL`, so
-	// SQLite atomically orphans every referencing run inside the same
-	// implicit transaction. Doing this before the disk rm guarantees we
-	// never leave a `projects` row pointing at a missing directory —
-	// that combination wedged subsequent dispatches against the project
-	// (warren-5f19).
+	// Row first. The FK on `runs.project_id` is `ON DELETE CASCADE`
+	// (warren-41b3), so SQLite atomically deletes every referencing run —
+	// and, via `events.run_id` ON DELETE CASCADE, their event transcripts —
+	// inside the same implicit transaction. Doing this before the disk rm
+	// guarantees we never leave a `projects` row pointing at a missing
+	// directory — that combination wedged subsequent dispatches against
+	// the project (warren-5f19).
 	await repo.delete(id);
 	input.warrenConfigs?.invalidate(id);
 

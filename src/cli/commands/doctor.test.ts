@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { AnyWarrenDb } from "../../db/client.ts";
 import type { CliContext, CliSpawn, EnvLike } from "../output.ts";
 import { type DoctorCheck, runDoctor } from "./doctor.ts";
 
@@ -25,7 +26,7 @@ function captureContext(
 }
 
 describe("runDoctor", () => {
-	test("flags missing WARREN_API_TOKEN and exits 1; CANOPY_REPO_URL is informational", async () => {
+	test("flags missing WARREN_API_TOKEN and exits 1", async () => {
 		const { context } = captureContext({});
 		const result = await runDoctor(
 			context,
@@ -38,11 +39,6 @@ describe("runDoctor", () => {
 		expect(result.exitCode).toBe(1);
 		const tokenCheck = result.checks.find((c: DoctorCheck) => c.name === "WARREN_API_TOKEN");
 		expect(tokenCheck?.ok).toBe(false);
-		// CANOPY_REPO_URL is now optional (warren-d3e9): unset is ok with an
-		// informational message, not a failure.
-		const canopyCheck = result.checks.find((c: DoctorCheck) => c.name === "CANOPY_REPO_URL");
-		expect(canopyCheck?.ok).toBe(true);
-		expect(canopyCheck?.message).toContain("no canopy library configured");
 	});
 
 	test("doctor passes with no canopy library configured (warren-d3e9)", async () => {
@@ -98,29 +94,9 @@ describe("runDoctor", () => {
 		expect(result.exitCode).toBe(1);
 	});
 
-	test("flags a missing canopy clone directory", async () => {
-		const { context } = captureContext({
-			WARREN_API_TOKEN: "tok",
-			CANOPY_REPO_URL: "https://example.com/agents.git",
-			WARREN_CANOPY_DIR: "/nonexistent/canopy",
-		});
-		const result = await runDoctor(
-			context,
-			{
-				existsSync: (p) => p !== "/nonexistent/canopy",
-				probeBurrow: async () => undefined,
-			},
-			{},
-		);
-		const canopyClone = result.checks.find((c: DoctorCheck) => c.name === "canopy_clone");
-		expect(canopyClone?.ok).toBe(false);
-		expect(canopyClone?.message).toContain("/nonexistent/canopy");
-	});
-
 	test("returns exit 0 when every check passes", async () => {
 		const { context } = captureContext({
 			WARREN_API_TOKEN: "tok",
-			CANOPY_REPO_URL: "https://example.com/agents.git",
 		});
 		const result = await runDoctor(
 			context,
@@ -152,6 +128,7 @@ describe("runDoctor", () => {
 			{
 				existsSync: () => true,
 				probeBurrow: async () => undefined,
+				platform: "linux",
 			},
 			{},
 		);
@@ -161,38 +138,9 @@ describe("runDoctor", () => {
 		expect(bwrap?.hint).toContain("bubblewrap");
 	});
 
-	test("flags a dirty canopy clone with the refresh hint", async () => {
-		const { context } = captureContext(
-			{
-				WARREN_API_TOKEN: "tok",
-				CANOPY_REPO_URL: "https://example.com/agents.git",
-			},
-			async (cmd) => {
-				if (cmd.includes("status") && cmd.includes("--porcelain")) {
-					return { stdout: " M agents/foo.md\n", stderr: "", exitCode: 0 };
-				}
-				return { stdout: "bubblewrap 0.8.0", stderr: "", exitCode: 0 };
-			},
-		);
-		const result = await runDoctor(
-			context,
-			{
-				existsSync: () => true,
-				probeBurrow: async () => undefined,
-			},
-			{},
-		);
-		expect(result.exitCode).toBe(1);
-		const clean = result.checks.find((c: DoctorCheck) => c.name === "canopy_clean");
-		expect(clean?.ok).toBe(false);
-		expect(clean?.message).toContain("1 local mutation");
-		expect(clean?.hint).toContain("/agents/refresh");
-	});
-
 	test("emits all expected check names in order", async () => {
 		const { context } = captureContext({
 			WARREN_API_TOKEN: "tok",
-			CANOPY_REPO_URL: "https://example.com/agents.git",
 		});
 		const result = await runDoctor(
 			context,
@@ -205,21 +153,45 @@ describe("runDoctor", () => {
 		const names = result.checks.map((c) => c.name);
 		expect(names).toEqual([
 			"WARREN_API_TOKEN",
-			"CANOPY_REPO_URL",
 			"warren_db",
 			"db_reachable",
-			"canopy_clone",
-			"canopy_clean",
 			"projects_root",
 			"bwrap",
 			"warren_config",
 			"warren_config_deprecations",
-			"cross_repo_plan_targets",
 			"preview_port_allocator",
 			"stale_burrow_workspaces",
 			"preview_auth_strength",
 			"burrow_reachable",
 		]);
+	});
+
+	test("under WARREN_RUNTIME=k8s, skips burrow/bwrap/stale probes and says so", async () => {
+		const { context } = captureContext({
+			WARREN_API_TOKEN: "tok",
+			CANOPY_REPO_URL: "https://example.com/agents.git",
+			WARREN_RUNTIME: "k8s",
+		});
+		const result = await runDoctor(
+			context,
+			{
+				existsSync: () => true,
+				// A throwing probe would fail the check under local; under k8s it must
+				// never be consulted at all.
+				probeBurrow: async () => {
+					throw new Error("burrow must not be probed under k8s");
+				},
+			},
+			{},
+		);
+		const names = result.checks.map((c) => c.name);
+		expect(names).not.toContain("bwrap");
+		expect(names).not.toContain("stale_burrow_workspaces");
+		expect(names).not.toContain("burrow_reachable");
+		const runtime = result.checks.find((c: DoctorCheck) => c.name === "runtime_backend");
+		expect(runtime?.ok).toBe(true);
+		expect(runtime?.message).toContain("k8s");
+		expect(result.exitCode).toBe(0);
 	});
 
 	test("warren_db reports the resolved dialect for WARREN_DB_URL", async () => {
@@ -306,5 +278,52 @@ describe("runDoctor", () => {
 		const wc = result.checks.find((c: DoctorCheck) => c.name === "warren_config");
 		expect(wc?.ok).toBe(true);
 		expect(wc?.message).toContain("no projects registered");
+	});
+
+	describe("--verbose (warren-2d14)", () => {
+		// A db handle whose SELECT 1 fails with text that names host/role —
+		// exactly the disclosure warren-51de keeps off the check message.
+		const RAW_DRIVER_TEXT = "ECONNREFUSED 10.0.0.9:5432 role warren_admin";
+		const failingDb = (): AnyWarrenDb =>
+			({
+				dialect: "sqlite",
+				raw: {
+					query: () => ({
+						get: () => {
+							throw new Error(RAW_DRIVER_TEXT);
+						},
+					}),
+				},
+				drizzle: {},
+				close: async () => {},
+			}) as unknown as AnyWarrenDb;
+
+		test("writes the raw driver text to stderr while the check message keeps the reason code", async () => {
+			const { context, err } = captureContext({ WARREN_API_TOKEN: "tok" });
+			const result = await runDoctor(
+				context,
+				{ existsSync: () => true, probeBurrow: async () => undefined, db: failingDb() },
+				{ verbose: true },
+			);
+			const reach = result.checks.find((c: DoctorCheck) => c.name === "db_reachable");
+			expect(reach?.ok).toBe(false);
+			expect(reach?.message).toBe("probe failed (reason=unreachable)");
+			expect(reach?.message).not.toContain(RAW_DRIVER_TEXT);
+			expect(err.join("")).toContain("warren doctor verbose:");
+			expect(err.join("")).toContain(RAW_DRIVER_TEXT);
+		});
+
+		test("default output drops the raw driver text entirely (unchanged behavior)", async () => {
+			const { context, err } = captureContext({ WARREN_API_TOKEN: "tok" });
+			const result = await runDoctor(
+				context,
+				{ existsSync: () => true, probeBurrow: async () => undefined, db: failingDb() },
+				{},
+			);
+			const reach = result.checks.find((c: DoctorCheck) => c.name === "db_reachable");
+			expect(reach?.ok).toBe(false);
+			expect(reach?.message).toBe("probe failed (reason=unreachable)");
+			expect(err.join("")).not.toContain(RAW_DRIVER_TEXT);
+		});
 	});
 });

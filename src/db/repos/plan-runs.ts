@@ -63,14 +63,6 @@ export interface CreatePlanRunInput {
 	dispatcherHandle?: string;
 	trigger?: string;
 	/**
-	 * Back-link to the Plot this plan-run was dispatched against
-	 * (warren-06dc / pl-7937 Phase 2). Null/undefined when the project
-	 * hasn't opted into Plots or the dispatch omitted plot_id. Validation
-	 * that the project actually has a `.plot/` directory happens at handler
-	 * level via `project.hasPlot` — the repo writes whatever it's handed.
-	 */
-	plotId?: string | null;
-	/**
 	 * Back-link to the run that created this plan-run via auto_plan_run
 	 * (warren-d9a2). When set, the coordinator gates on the parent run's
 	 * PR being merged before dispatching the first child.
@@ -101,7 +93,6 @@ export interface UpdateChildInput {
 
 export interface PlanRunChildPatch {
 	runId?: string | null;
-	executionProjectId?: string | null;
 	state?: PlanRunChildState;
 	startedAt?: string | null;
 	endedAt?: string | null;
@@ -111,7 +102,6 @@ export interface PlanRunChildPatch {
 
 const CHILD_PATCH_KEYS = [
 	"runId",
-	"executionProjectId",
 	"state",
 	"startedAt",
 	"endedAt",
@@ -158,7 +148,6 @@ export class PlanRunsRepo {
 			modelOverride: input.modelOverride ?? null,
 			dispatcherHandle: input.dispatcherHandle ?? "operator",
 			trigger: input.trigger ?? "manual",
-			plotId: input.plotId ?? null,
 			parentRunId: input.parentRunId ?? null,
 			state: input.state ?? "queued",
 			failureReason: null,
@@ -171,7 +160,6 @@ export class PlanRunsRepo {
 			seq: c.seq,
 			seedId: c.seedId,
 			runId: null,
-			executionProjectId: null,
 			state: c.state ?? "pending",
 			createdAt: nowIso,
 			updatedAt: nowIso,

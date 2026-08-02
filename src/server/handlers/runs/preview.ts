@@ -1,11 +1,15 @@
 import { ValidationError } from "../../../core/errors.ts";
 import type { PreviewAuth } from "../../../preview/cookie.ts";
-import { createRunPreviewsRepo } from "../../../preview/eviction/index.ts";
 import { teardownPreview } from "../../../preview/teardown.ts";
 import { jsonResponse } from "../../response.ts";
 import type { RouteHandler, ServerDeps } from "../../types.ts";
 import { optionalString, readJsonBodyOrEmpty, requireParam } from "../index.ts";
 
+/**
+ * Validate that the preview surface is configured for `mode` and return the
+ * narrowed {@link PreviewAuth}, so callers avoid non-null assertions on the
+ * optional `deps.previewAuth`.
+ */
 function validatePreviewConfig(deps: ServerDeps, mode: "subdomain" | "path"): PreviewAuth {
 	if (deps.previewAuth === undefined) {
 		throw new ValidationError("preview surface is not configured on this warren", {
@@ -23,15 +27,16 @@ function validatePreviewConfig(deps: ServerDeps, mode: "subdomain" | "path"): Pr
 }
 
 /**
- * `GET /runs/:id/preview/login?token=<bearer>&redirect=<absolute-url>`
- * (R-19 / SPEC §11.L, warren-8a10; path-mode redirect warren-edff;
- * per-run cookie name warren-63e1).
+ * `POST /runs/:id/preview/login` with an optional `{redirect}` JSON body
+ * (R-19 / docs/design/preview-environments.md, warren-8a10; path-mode redirect warren-edff;
+ * per-run cookie name warren-63e1; bearer-out-of-the-URL warren-e1b0).
  *
  * The signed-cookie handshake the preview proxy depends on. A browser
  * hitting a preview origin directly can't carry an Authorization header,
- * so the operator opens this URL on the warren host, the handler
- * validates the bearer in the query, sets a scoped `warren_preview*`
- * cookie, and 302s to the preview.
+ * so the UI calls this endpoint on the warren origin *with* the bearer in
+ * the `Authorization` header, the handler sets a scoped `warren_preview*`
+ * cookie via `Set-Cookie`, and answers 200 with the preview URL the
+ * caller should then navigate to.
  *
  *   - **Subdomain mode** (`deps.previewMode === "subdomain"`): cookie name
  *     `warren_preview`, `Domain=.<host>; Path=/`; redirect must be
@@ -43,14 +48,16 @@ function validatePreviewConfig(deps: ServerDeps, mode: "subdomain" | "path"): Pr
  *     every same-origin request so referer-based asset routing in the
  *     proxy preamble can authenticate sub-resource loads.
  *
- * This route is auth-exempt (`isAuthExempt` whitelists `/preview/login`)
- * because the standard bearer gate would 401 the browser before the
- * handler ever ran. The handler does its own bearer check via
- * `previewAuth.verifyLoginToken` (constant-time compare against the
- * configured `WARREN_API_TOKEN`).
+ * warren-e1b0 replaced the original `GET …?token=<bearer>` shape: a
+ * bearer in a query string lands in browser history, `Referer` headers,
+ * and every proxy/analytics log on the path. The route is now bearer-
+ * gated by the standard `Authorization` gate like every other `/runs/*`
+ * route (it is no longer in `isAuthExempt`), and returning the target as
+ * JSON rather than a 302 keeps the credential in the header where it
+ * belongs.
  *
  * `redirect` is constrained to the run's own preview surface — anything
- * else is rejected so a stolen login link can't become an open redirect.
+ * else is rejected so a forged body can't become an open redirect.
  *
  * 400 when `previewAuth` is null (subdomain mode with no host, or
  * warren booted with `--no-auth`); the proxy is also disabled in those
@@ -62,20 +69,12 @@ export function previewLoginHandler(deps: ServerDeps): RouteHandler {
 		const mode: "subdomain" | "path" = deps.previewMode ?? "subdomain";
 		const previewAuth = validatePreviewConfig(deps, mode);
 
-		const token = ctx.url.searchParams.get("token");
-		if (!previewAuth.verifyLoginToken(token)) {
-			return jsonResponse(401, {
-				error: {
-					code: "unauthorized",
-					message: "preview login requires a valid ?token=<WARREN_API_TOKEN>",
-				},
-			});
-		}
 		// 404 fast if the run isn't known — issuing a cookie for a nonexistent
 		// run would let an attacker pre-seed a session keyed off a future id.
 		await deps.repos.runs.require(runId);
 
-		const redirect = ctx.url.searchParams.get("redirect");
+		const body = await readJsonBodyOrEmpty(ctx);
+		const redirect = body !== null ? (optionalString(body, "redirect") ?? null) : null;
 		const redirectTarget =
 			mode === "path"
 				? resolvePathPreviewRedirect(redirect, runId, ctx.url.origin)
@@ -95,13 +94,11 @@ export function previewLoginHandler(deps: ServerDeps): RouteHandler {
 
 		const now = deps.now?.() ?? new Date();
 		const cookie = previewAuth.signCookie(runId, now);
-		return new Response(null, {
-			status: 302,
-			headers: {
-				location: redirectTarget,
-				"set-cookie": cookie.setCookieHeader,
-			},
-		});
+		return jsonResponse(
+			200,
+			{ url: redirectTarget },
+			{ headers: { "set-cookie": cookie.setCookieHeader } },
+		);
 	};
 }
 
@@ -145,7 +142,7 @@ function resolvePathPreviewRedirect(
 }
 
 /**
- * `POST /runs/:id/preview/teardown` (R-19 / SPEC §11.L acceptance #8,
+ * `POST /runs/:id/preview/teardown` (R-19 / docs/design/preview-environments.md acceptance #8,
  * warren-d725).
  *
  * Idempotent operator-driven teardown of the per-run preview. Bearer-
@@ -155,7 +152,7 @@ function resolvePathPreviewRedirect(
  *
  * Responds 200 on every CAS outcome (`torn-down`, `already-torn-down`,
  * `already-failed`, `never-launched`); 404 on unknown runId; 503 when
- * `deps.db` is undefined (no repo layer wired). Works on both sqlite
+ * `deps.runPreviews` is unwired (no repo layer). Works on both sqlite
  * and postgres dialects — `createRunPreviewsRepo` is dialect-
  * polymorphic (warren-adfb), so the eviction-worker CAS path that
  * teardown rides on is already exercised on pg in production. The
@@ -168,7 +165,8 @@ export function previewTeardownHandler(deps: ServerDeps): RouteHandler {
 		const body = await readJsonBodyOrEmpty(ctx);
 		const actor = body !== null ? optionalString(body, "actor") : undefined;
 
-		if (deps.db === undefined) {
+		const previews = deps.runPreviews;
+		if (previews === undefined) {
 			return jsonResponse(503, {
 				error: {
 					code: "preview_teardown_unavailable",
@@ -177,12 +175,13 @@ export function previewTeardownHandler(deps: ServerDeps): RouteHandler {
 			});
 		}
 
-		const previews = createRunPreviewsRepo(deps.db);
 		const result = await teardownPreview({
 			runId,
 			repos: deps.repos,
 			previews,
-			burrowClientPool: deps.burrowClientPool,
+			// warren-e24d: provider-neutral sidecar resolver (absent under a backend
+			// without preview ports — the sidecar stop is then skipped).
+			...(deps.previewSidecars !== undefined ? { resolveSidecar: deps.previewSidecars } : {}),
 			broker: deps.broker,
 			...(actor !== undefined ? { actor } : {}),
 			...(deps.now !== undefined ? { now: deps.now } : {}),

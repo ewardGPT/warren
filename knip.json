@@ -16,12 +16,12 @@
 				"drizzle.config.*.ts",
 				"**/*.test.ts"
 			],
-			"project": ["src/**/*.ts", "scripts/**/*.ts"],
-			"ignore": ["src/ui/**"]
+			"project": ["src/**/*.ts", "scripts/**/*.ts"]
 		},
 		"src/ui": {
 			"entry": ["index.html"],
-			"project": ["src/**/*.{ts,tsx}"]
+			"project": ["src/**/*.{ts,tsx}"],
+			"ignoreDependencies": ["@fontsource-variable/.+"]
 		}
 	}
 }

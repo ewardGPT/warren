@@ -9,7 +9,8 @@
  * open-but-unmergeable PR fails the plan rather than hanging forever.
  */
 
-import { type PlanRunRow, RUN_TERMINAL_STATES, type RunRow } from "../db/schema.ts";
+import { isTerminalRunState } from "../core/wire.ts";
+import type { PlanRunRow, RunRow } from "../db/schema.ts";
 import type { AdvanceResult, CoordinatorEmitFn, CoordinatorRepos } from "./coordinator.ts";
 
 /**
@@ -202,7 +203,7 @@ export function isFatalHttpError(result: {
 }
 
 export function isTerminalRun(run: RunRow): boolean {
-	return (RUN_TERMINAL_STATES as readonly string[]).includes(run.state);
+	return isTerminalRunState(run.state);
 }
 
 /**

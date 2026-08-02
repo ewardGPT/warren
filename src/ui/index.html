@@ -15,17 +15,16 @@
 			// index.css (warren-23fe) replace the old duplicated OS-pref @media
 			// block, and what makes the `dark:` Tailwind variant
 			// (@custom-variant dark) track the toggle.
-			(function () {
+			(() => {
 				try {
-					var stored = localStorage.getItem("warren.theme");
-					var choice =
+					const stored = localStorage.getItem("warren.theme");
+					const choice =
 						stored === "light" || stored === "dark" || stored === "system"
 							? stored
 							: "system";
-					var resolved =
+					const resolved =
 						choice === "system"
-							? window.matchMedia &&
-								window.matchMedia("(prefers-color-scheme: dark)").matches
+							? window.matchMedia?.("(prefers-color-scheme: dark)").matches
 								? "dark"
 								: "light"
 							: choice;

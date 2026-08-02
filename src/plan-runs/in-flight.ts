@@ -1,24 +1,21 @@
 /**
- * In-flight child handling + execution-routing helpers for the PlanRun
- * coordinator (extracted from coordinator.ts to keep that file under its
- * size budget; pl-fb43 step 5 / warren-d9f3).
+ * In-flight child handling for the PlanRun coordinator (extracted from
+ * coordinator.ts to keep that file under its size budget).
  *
  * `handleInFlight` is the merge/PR-poll half of the coordinator's decision
  * loop: given the one in-flight child, it advances the child's state
  * (running → pr_open → merged / failed) and returns either `{kind:"merged"}`
  * (so the caller falls through to dispatch the next child) or a terminal
- * `AdvanceResult`. The execution-routing helpers (`executionFields`,
- * `resolveExecutionFields`, `defaultResolveExecution`, `failChildAndPlan`)
- * are shared between this module and the dispatch arm in coordinator.ts.
+ * `AdvanceResult`.
  */
 
 import type { PlanRunChildRow, PlanRunRow, RunRow } from "../db/schema.ts";
+import { SeedNotFoundError } from "../seeds-cli/index.ts";
 import type {
 	AdvanceResult,
-	ChildExecution,
+	CoordinatorCloseChildSeedFn,
 	CoordinatorEmitFn,
 	CoordinatorRepos,
-	CoordinatorResolveExecutionFn,
 	CoordinatorShowSeedFn,
 } from "./coordinator.ts";
 import {
@@ -31,83 +28,6 @@ import {
 } from "./merge-gate.ts";
 import type { PrMergeChecker } from "./pr-merge.ts";
 
-export const defaultResolveExecution: CoordinatorResolveExecutionFn = async (planRun) => ({
-	executionProjectId: planRun.projectId,
-	repoRef: null,
-});
-
-/**
- * Legibility fields stamped onto `plan_run.dispatched/advanced/merged`
- * event payloads (and the Plot mirror) so a human tailing events — or an
- * agent reading the coordination Plot — can see which repo each child
- * targeted without cross-referencing the run row (pl-fb43 step 5).
- */
-export function executionFields(execution: ChildExecution): Record<string, unknown> {
-	return {
-		executionProjectId: execution.executionProjectId,
-		...(execution.repoRef !== null ? { repo: execution.repoRef } : {}),
-	};
-}
-
-/**
- * Best-effort execution fields for events emitted after the dispatch tick
- * (the `merged` payloads in handleInFlight). The child was dispatched in a
- * prior tick so the spawn-time `ChildExecution` is no longer in hand;
- * re-resolve from the seed. Legibility-only — any failure yields `{}` so a
- * transient seed read never fails an already-merged child.
- */
-async function resolveExecutionFields(
-	planRun: PlanRunRow,
-	child: PlanRunChildRow,
-	showSeed: CoordinatorShowSeedFn,
-	resolveExecution: CoordinatorResolveExecutionFn,
-): Promise<Record<string, unknown>> {
-	try {
-		const seed = await showSeed(planRun.projectId, child.seedId);
-		return executionFields(await resolveExecution(planRun, seed.extensions));
-	} catch {
-		return {};
-	}
-}
-
-export interface FailChildAndPlanInput {
-	readonly repos: CoordinatorRepos;
-	readonly planRun: PlanRunRow;
-	readonly seq: number;
-	readonly anchorRunId: string | null;
-	readonly reason: string;
-	readonly emit: CoordinatorEmitFn;
-	readonly now: () => Date;
-}
-
-/**
- * Mark a child + its plan failed and emit `plan_run.failed` on the anchor
- * run (when one exists). Shared by the dispatch-time failure paths
- * (pl-fb43 step 5 unresolved-repo) so advancePlanRun stays under the
- * cognitive-complexity ceiling.
- */
-export async function failChildAndPlan(input: FailChildAndPlanInput): Promise<AdvanceResult> {
-	const endedAt = input.now().toISOString();
-	await input.repos.planRuns.updateChild({
-		planRunId: input.planRun.id,
-		seq: input.seq,
-		patch: { state: "failed", failureReason: input.reason, endedAt },
-		now: input.now(),
-	});
-	await input.repos.planRuns.transitionTo(input.planRun.id, "failed", {
-		endedAt,
-		failureReason: input.reason,
-	});
-	if (input.anchorRunId !== null) {
-		await input.emit(input.anchorRunId, "plan_run.failed", {
-			planRunId: input.planRun.id,
-			failedSeq: input.seq,
-			reason: input.reason,
-		});
-	}
-	return { kind: "plan_failed", failedSeq: input.seq, reason: input.reason };
-}
-
 export interface HandleInFlightInput {
 	readonly planRun: PlanRunRow;
 	readonly child: PlanRunChildRow;
@@ -115,10 +35,20 @@ export interface HandleInFlightInput {
 	readonly checkPrMerged: PrMergeChecker;
 	readonly emit: CoordinatorEmitFn;
 	readonly showSeed: CoordinatorShowSeedFn;
-	readonly resolveExecution: CoordinatorResolveExecutionFn;
 	readonly mergeTimeoutMs: number;
 	readonly now: () => Date;
 	readonly reopenPr?: CoordinatorReopenPrFn; // warren-22de: (re)open PR before failing
+	readonly closeChildSeed?: CoordinatorCloseChildSeedFn; // warren-3806: host-side seed close on merge
+}
+
+/**
+ * warren-3806: fire the host-side child-seed close the instant a child
+ * transitions to `merged`. Best-effort — the seam owns its own error
+ * handling, so this never throws into the coordinator loop.
+ */
+async function fireCloseChildSeed(input: HandleInFlightInput): Promise<void> {
+	if (input.closeChildSeed === undefined) return;
+	await input.closeChildSeed({ planRun: input.planRun, child: input.child });
 }
 
 export type HandleInFlightDecision =
@@ -192,20 +122,7 @@ async function resolveMissingPrUrl(
 ): Promise<PrUrlResolution> {
 	const { repos, planRun, child, emit, mergeTimeoutMs, now, reopenPr } = input;
 	if (await hasEmptyPushEvent(repos, run.id)) {
-		const mergedAt = now().toISOString();
-		await repos.planRuns.updateChild({
-			planRunId: planRun.id,
-			seq: child.seq,
-			patch: { state: "merged", prMergedAt: mergedAt, endedAt: mergedAt },
-			now: now(),
-		});
-		await emit(run.id, "plan_run.merged", {
-			planRunId: planRun.id,
-			mergedChildSeq: child.seq,
-			trivial: true,
-			...(await resolveExecutionFields(planRun, child, input.showSeed, input.resolveExecution)),
-		});
-		return { kind: "decision", decision: { kind: "merged" } };
+		return await resolveEmptyPush(input, run);
 	}
 	const prReopen = await resolveChildPrReopen({ run, mergeTimeoutMs, now, reopenPr });
 	if (prReopen.kind === "expired") {
@@ -223,6 +140,70 @@ async function resolveMissingPrUrl(
 	}
 	await repos.runs.setPrUrl(run.id, prReopen.url);
 	return { kind: "url", url: prReopen.url };
+}
+
+type ChildSeedResolution = "resolved" | "unresolved" | "transient";
+
+/**
+ * warren-2a8c: is the in-flight child's seed still resolvable? An empty
+ * push is only a *trivial merge* when the agent had a real work item and
+ * legitimately produced no diff. A child whose seed does not resolve
+ * (the K8s durability failure of warren-486c, a typo'd id, a wrong repo,
+ * an unmerged branch) pushed nothing because it *could not do the work* —
+ * that must fail with a typed reason, not be scored a phantom success.
+ *
+ * Only a definitive `SeedNotFoundError` is terminal; any other (transient:
+ * timeout / lock / malformed) failure stays retryable so a flaky seed
+ * store never converts a genuine trivial merge into a spurious failure.
+ * This mirrors the dispatch-arm semantics in coordinator.ts.
+ */
+async function resolveChildSeed(input: HandleInFlightInput): Promise<ChildSeedResolution> {
+	try {
+		await input.showSeed(input.planRun.projectId, input.child.seedId);
+		return "resolved";
+	} catch (err) {
+		return err instanceof SeedNotFoundError ? "unresolved" : "transient";
+	}
+}
+
+/**
+ * Settle a succeeded child that pushed nothing (`reap.empty_push`). Merges
+ * trivially only when the child's seed resolved (warren-2a8c); otherwise
+ * fails terminally with `child_seed_not_resolved:<seedId>` (unresolved) or
+ * retries next tick (transient seed-store failure).
+ */
+async function resolveEmptyPush(input: HandleInFlightInput, run: RunRow): Promise<PrUrlResolution> {
+	const { repos, planRun, child, emit, now } = input;
+	const seed = await resolveChildSeed(input);
+	if (seed === "unresolved") {
+		return {
+			kind: "decision",
+			decision: await failChild(input, run, `child_seed_not_resolved:${child.seedId}`),
+		};
+	}
+	if (seed === "transient") {
+		return {
+			kind: "decision",
+			decision: {
+				kind: "result",
+				result: { kind: "noop", reason: `seed_check_failed:${run.id}` },
+			},
+		};
+	}
+	const mergedAt = now().toISOString();
+	await repos.planRuns.updateChild({
+		planRunId: planRun.id,
+		seq: child.seq,
+		patch: { state: "merged", prMergedAt: mergedAt, endedAt: mergedAt },
+		now: now(),
+	});
+	await emit(run.id, "plan_run.merged", {
+		planRunId: planRun.id,
+		mergedChildSeq: child.seq,
+		trivial: true,
+	});
+	await fireCloseChildSeed(input);
+	return { kind: "decision", decision: { kind: "merged" } };
 }
 
 type FirstObservation =
@@ -309,8 +290,8 @@ async function pollMergeState(
 			mergedChildSeq: child.seq,
 			prUrl: effectivePrUrl,
 			mergedAt: polled.mergedAt,
-			...(await resolveExecutionFields(planRun, child, input.showSeed, input.resolveExecution)),
 		});
+		await fireCloseChildSeed(input);
 		return { kind: "merged" };
 	}
 	if (polled.kind === "open") {
@@ -323,8 +304,8 @@ async function pollMergeState(
 		}
 		return await failChild(input, run, "pr_closed_without_merge", extra);
 	}
-	// `missing_token` or transient `http_error` (status 0 or 5xx that
-	// survived pr-merge.ts retries) — keep waiting.
+	// `missing_token`, `rate_limited` (429 that survived pr-merge.ts
+	// retries), or transient `http_error` (status 0 or 5xx) — keep waiting.
 	return { kind: "result", result: { kind: "waiting_for_merge" } };
 }
 

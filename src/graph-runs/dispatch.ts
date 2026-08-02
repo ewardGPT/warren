@@ -2,11 +2,11 @@
  * Spawn wrapper for the GraphRun coordinator.
  */
 
-import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import { spawnRun } from "../runs/index.ts";
+import type { RuntimeProvider } from "../runtime/contract.ts";
 import type { SeedsCliDeps } from "../seeds-cli/index.ts";
 import type { BridgeRegistry } from "../server/types.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
@@ -14,7 +14,7 @@ import type { CoordinatorSpawnFn } from "./coordinator.ts";
 
 export interface CreateGraphRunSpawnInput {
 	readonly repos: Repos;
-	readonly burrowClientPool: BurrowClientPool;
+	readonly runtimeProvider: RuntimeProvider;
 	readonly bridges: BridgeRegistry;
 	readonly warrenConfigs: WarrenConfigCache;
 	readonly projectsConfig: ProjectsConfig;
@@ -31,7 +31,7 @@ export function createGraphRunSpawn(input: CreateGraphRunSpawnInput): Coordinato
 		const project = await input.repos.projects.require(graphRun.projectId);
 		const result = await spawnRunFn({
 			repos: input.repos,
-			burrowClientPool: input.burrowClientPool,
+			runtimeProvider: input.runtimeProvider,
 			agentName: agentName ?? graphRun.agentName,
 			projectId: graphRun.projectId,
 			prompt,

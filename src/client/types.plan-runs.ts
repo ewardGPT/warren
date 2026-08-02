@@ -2,34 +2,23 @@
  * Plan-run wire types (warren-8ffc), split out of `./types.ts`
  * (warren-fcc8) to keep that file under its line budget.
  */
+import type { PlanRunChildState, PlanRunState } from "../core/wire.ts";
 import type { RunRow } from "./types.ts";
 
 /* Plan-runs — typed facade over /plan-runs (warren-8ffc).                 */
 /* Wire envelope is camelCase, mirroring /runs.                            */
+/*                                                                         */
+/* The plan-run lifecycle vocabulary is DEFINED ONCE in `src/core/wire.ts` */
+/* (warren-b229) and re-exported here; never redeclare one of these names. */
 /* ----------------------------------------------------------------------- */
 
-export type PlanRunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
-
-export const PLAN_RUN_TERMINAL_STATES: ReadonlySet<PlanRunState> = new Set([
-	"succeeded",
-	"failed",
-	"cancelled",
-]);
-
-export function isTerminalPlanRunState(
-	state: PlanRunState,
-): state is "succeeded" | "failed" | "cancelled" {
-	return PLAN_RUN_TERMINAL_STATES.has(state);
-}
-
-export type PlanRunChildState =
-	| "pending"
-	| "dispatched"
-	| "running"
-	| "pr_open"
-	| "merged"
-	| "failed"
-	| "skipped";
+export {
+	isTerminalPlanRunState,
+	PLAN_RUN_TERMINAL_STATES,
+	type PlanRunChildState,
+	type PlanRunState,
+	type PlanRunTerminalState,
+} from "../core/wire.ts";
 
 export interface PlanRunRow {
 	id: string;
@@ -47,7 +36,6 @@ export interface PlanRunRow {
 	createdAt: string;
 	startedAt: string | null;
 	endedAt: string | null;
-	plotId: string | null;
 }
 
 export interface PlanRunChildRow {
@@ -74,7 +62,6 @@ export interface CreatePlanRunInput {
 	providerOverride?: string;
 	modelOverride?: string;
 	dispatcherHandle?: string;
-	plotId?: string;
 }
 
 export interface CreatePlanRunResponse {

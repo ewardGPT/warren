@@ -1,9 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	ariaSortFor,
-	nextSortState,
-	type SortState,
-} from "./sortable-table-head.helpers.ts";
+import { ariaSortFor, nextSortState, type SortState } from "./sortable-table-head.helpers.ts";
 
 type Key = "name" | "started";
 

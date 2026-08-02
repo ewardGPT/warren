@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
-import { RunEventBroker } from "../runs/index.ts";
-import type { DestroyBurrowWorkspaceByIdInput } from "../runs/reap/destroy.ts";
+import { type ReapRunInput, type ReapRunResult, RunEventBroker } from "../runs/index.ts";
 import { reconcileLostBurrowRun } from "./bridge-reconnect.ts";
-import { makePool } from "./bridges.test-helpers.ts";
+import { makeProvider } from "./bridges.test-helpers.ts";
 import { createBridgeRegistry } from "./bridges.ts";
 
 /**
@@ -51,7 +50,7 @@ describe("runWithReconnect bridge_stalled/bridge_recovered (warren-6376)", () =>
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				calls += 1;
 				// Five errored reconnects with no progress, then a clean end.
@@ -79,7 +78,7 @@ describe("runWithReconnect bridge_stalled/bridge_recovered (warren-6376)", () =>
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				calls += 1;
 				// 3 errored (→ stall), then a reconnect that streams events
@@ -107,7 +106,7 @@ describe("runWithReconnect bridge_stalled/bridge_recovered (warren-6376)", () =>
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			// Burrow is up but unresponsive: every reconnect errors with
 			// burrowRunMissing:false, so the loop would spin forever without
 			// the hard ceiling (warren-af76).
@@ -138,52 +137,59 @@ describe("runWithReconnect bridge_stalled/bridge_recovered (warren-6376)", () =>
 		expect((lost[0]?.payloadJson as { finalized: boolean }).finalized).toBe(true);
 	});
 
-	test("tears down the burrow workspace after finalizing (warren-4f01)", async () => {
+	test("tears down the workspace via provider.terminate on the stall-ceiling path (warren-4f01/warren-5a3f)", async () => {
 		const runId = await seedRun();
-		const pool = await makePool(repos);
-		const seen: DestroyBurrowWorkspaceByIdInput[] = [];
+		// The boot-resolved backend is always threaded now (warren-5a3f): the
+		// reconciler tears down through `provider.terminate` — no domain-side burrow
+		// call, works for both K8s pod delete and burrow destroy.
+		const { provider, terminateCalls } = makeProvider();
 		await reconcileLostBurrowRun({
 			runId,
 			burrowRunId: "rb_a",
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: pool,
+			runtimeProvider: provider,
 			failureReason: "burrow_unreachable",
-			destroyWorkspace: async (input) => {
-				seen.push(input);
-				await input.emit("reap.workspace_destroyed", { burrowId: input.burrowId });
-				return true;
-			},
 		});
 
-		// Run finalized terminal, AND the workspace teardown fired with the
-		// run's burrow + mode so the bwrap/pi sandbox doesn't leak on the host.
+		// Run finalized terminal, AND the run's sandbox was torn down through the seam.
 		const run = await repos.runs.get(runId);
 		expect(run?.state).toBe("failed");
-		expect(seen).toHaveLength(1);
-		expect(seen[0]?.burrowId).toBe("bur_a");
-		expect(seen[0]?.mode).toBe("batch");
-		expect(seen[0]?.burrowClientPool).toBe(pool);
+		expect(terminateCalls).toEqual([{ runId, sandboxId: "bur_a", providerRunId: "rb_a" }]);
 
 		const kinds = (await repos.events.listByRun(runId)).map((e) => e.kind);
 		expect(kinds).toContain("reap.workspace_destroyed");
 	});
 
-	test("skips teardown when no pool is supplied (warren-4f01)", async () => {
-		const runId = await seedRun();
-		let called = false;
+	test("skips teardown when the run has no sandbox id (warren-4f01)", async () => {
+		// A run with no burrow_id ⇒ nothing to tear down, but the run still
+		// finalizes terminal and the teardown seam is never invoked.
+		const project = await repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/data/projects/x/y2",
+			defaultBranch: "main",
+		});
+		const run = await repos.runs.create({
+			agentName: "refactor-bot",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: {},
+			trigger: "manual",
+			burrowRunId: "rb_nosandbox1",
+		});
+		const { provider, terminateCalls } = makeProvider();
 		await reconcileLostBurrowRun({
-			runId,
-			burrowRunId: "rb_a",
+			runId: run.id,
+			burrowRunId: "rb_nosandbox1",
 			repos,
 			broker: new RunEventBroker(),
-			destroyWorkspace: async () => {
-				called = true;
-				return true;
-			},
+			runtimeProvider: provider,
 		});
-		expect(called).toBe(false);
-		expect((await repos.runs.get(runId))?.state).toBe("failed");
+		expect(terminateCalls).toEqual([]);
+		const kinds = (await repos.events.listByRun(run.id)).map((e) => e.kind);
+		expect(kinds).not.toContain("reap.workspace_destroyed");
+		expect(kinds).not.toContain("reap.workspace_destroy_failed");
+		expect((await repos.runs.get(run.id))?.state).toBe("failed");
 	});
 
 	test("no bridge_stalled when reconnects stay under threshold", async () => {
@@ -192,7 +198,7 @@ describe("runWithReconnect bridge_stalled/bridge_recovered (warren-6376)", () =>
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				calls += 1;
 				return calls <= 2
@@ -208,5 +214,121 @@ describe("runWithReconnect bridge_stalled/bridge_recovered (warren-6376)", () =>
 
 		const kinds = (await repos.events.listByRun(runId)).map((e) => e.kind);
 		expect(kinds).not.toContain("bridge_stalled");
+	});
+});
+
+/**
+ * warren-a7cb: reap orchestration routes through the RuntimeProvider seam.
+ * The inline terminal-detect reap forwards the active provider, and the lost-run
+ * reconcile tears down through `provider.terminate` so both backends (K8s pod
+ * delete / burrow destroy) are covered — without a direct burrow call.
+ */
+describe("reap orchestration through the provider seam (warren-a7cb)", () => {
+	let db: WarrenDb;
+	let repos: Repos;
+
+	beforeEach(async () => {
+		db = await openDatabase({ path: ":memory:" });
+		repos = createRepos(db);
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	async function seedRun(): Promise<string> {
+		const project = await repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/data/projects/x/y",
+			defaultBranch: "main",
+		});
+		const run = await repos.runs.create({
+			agentName: "refactor-bot",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: {},
+			trigger: "manual",
+			burrowId: "bur_a",
+			burrowRunId: "rb_a",
+		});
+		return run.id;
+	}
+
+	test("inline terminal-detect reap forwards the active runtimeProvider", async () => {
+		const runId = await seedRun();
+		const { provider } = makeProvider();
+		let seen: ReapRunInput | undefined;
+		const registry = createBridgeRegistry({
+			repos,
+			broker: new RunEventBroker(),
+			runtimeProvider: provider,
+			bridge: async () => ({
+				written: 1,
+				skipped: 0,
+				errored: false,
+				terminalDetected: { outcome: "succeeded" },
+			}),
+			reap: async (input): Promise<ReapRunResult> => {
+				seen = input;
+				return { state: "succeeded", alreadyTerminal: false } as unknown as ReapRunResult;
+			},
+		});
+
+		registry.start(runId, "rb_a", "bur_a");
+		while (registry.size() > 0) await new Promise((r) => setTimeout(r, 0));
+
+		// The reap saw the SAME provider instance the registry was booted with, so
+		// under WARREN_RUNTIME=k8s finalize + terminate run in-pod, not over burrow.
+		expect(seen?.runtimeProvider).toBe(provider);
+	});
+
+	test("reconcile tears down via provider.terminate and emits workspace_destroyed", async () => {
+		const runId = await seedRun();
+		const { provider, terminateCalls } = makeProvider();
+		await reconcileLostBurrowRun({
+			runId,
+			burrowRunId: "rb_a",
+			repos,
+			broker: new RunEventBroker(),
+			runtimeProvider: provider,
+			failureReason: "burrow_run_lost",
+		});
+
+		// terminate() got the seam handle (opaque ids), NOT a burrow-typed call.
+		expect(terminateCalls).toHaveLength(1);
+		expect(terminateCalls[0]).toEqual({ runId, sandboxId: "bur_a", providerRunId: "rb_a" });
+
+		const destroyed = (await repos.events.listByRun(runId)).find(
+			(e) => e.kind === "reap.workspace_destroyed",
+		);
+		expect(destroyed).toBeDefined();
+		expect(destroyed?.payloadJson).toMatchObject({
+			burrowId: "bur_a",
+			archived: false,
+			deletedEvents: 3,
+			deletedRuns: 1,
+		});
+		expect((await repos.runs.get(runId))?.state).toBe("failed");
+	});
+
+	test("reconcile degrades a terminate failure to workspace_destroy_failed", async () => {
+		const runId = await seedRun();
+		const { provider } = makeProvider({ throwOnTerminate: new Error("pod delete 500") });
+		await reconcileLostBurrowRun({
+			runId,
+			burrowRunId: "rb_a",
+			repos,
+			broker: new RunEventBroker(),
+			runtimeProvider: provider,
+		});
+
+		const failed = (await repos.events.listByRun(runId)).find(
+			(e) => e.kind === "reap.workspace_destroy_failed",
+		);
+		expect(failed).toBeDefined();
+		expect(failed?.payloadJson).toMatchObject({ burrowId: "bur_a", step: "destroy" });
+		// The run still finalized despite the best-effort teardown failure.
+		expect((await repos.runs.get(runId))?.state).toBe("failed");
 	});
 });

@@ -28,6 +28,7 @@ import { projectsApi, runAnalyticsApi } from "@/api/client.ts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import { PageHeader } from "@/components/ui/page-header.tsx";
 import { responsiveFormControl } from "@/components/ui/responsive.ts";
+import { useCapabilities } from "@/hooks/use-capabilities.ts";
 import {
 	AvgContextPerAgentChart,
 	FailureReasonChart,
@@ -35,11 +36,11 @@ import {
 	TopSeedsByContextChart,
 } from "./run-analytics/Charts.tsx";
 import { CommandCategoryChart, StuckCommandTable } from "./run-analytics/CommandMining.tsx";
-import { TokenConsumptionChart } from "./run-analytics/TokenConsumptionChart.tsx";
 import { InsightCallouts } from "./run-analytics/Insights.tsx";
 import { KpiCards } from "./run-analytics/KpiCards.tsx";
 import { GroupTable } from "./run-analytics/Tables.tsx";
-import { TokenKpiCards, TokenGroupTable } from "./run-analytics/TokenStats.tsx";
+import { TokenConsumptionChart } from "./run-analytics/TokenConsumptionChart.tsx";
+import { TokenGroupTable, TokenKpiCards } from "./run-analytics/TokenStats.tsx";
 
 /** Default date window: last 30 days. Mirrors the server default. */
 function defaultFrom(): string {
@@ -78,6 +79,9 @@ export function RunAnalyticsPage() {
 			),
 	});
 
+	const caps = useCapabilities();
+	const isOperator = caps.can("readOperator");
+
 	const behavior = useQuery({
 		queryKey: ["analytics", "behavior", { projectId, from, to }],
 		queryFn: ({ signal }) =>
@@ -89,6 +93,11 @@ export function RunAnalyticsPage() {
 				},
 				signal,
 			),
+		// `GET /analytics/behavior` is readOperator — don't fire a
+		// guaranteed 403 for a spectator (warren-bba5); the behavior
+		// sections below are hidden for non-operators anyway. Mirrors the
+		// PreviewCard gating in RunDetail.tsx.
+		enabled: isOperator,
 	});
 
 	const data = analytics.data;
@@ -157,13 +166,12 @@ export function RunAnalyticsPage() {
 			{analytics.isError ? (
 				<Card>
 					<CardContent className="py-6 text-sm text-(--color-destructive)">
-						Failed to load run analytics.{" "}
-						{(analytics.error as Error | null)?.message ?? ""}
+						Failed to load run analytics. {(analytics.error as Error | null)?.message ?? ""}
 					</CardContent>
 				</Card>
 			) : null}
 
-			<InsightCallouts insights={behaviorData?.insights ?? []} />
+			{isOperator ? <InsightCallouts insights={behaviorData?.insights ?? []} /> : null}
 
 			<KpiCards totals={data?.totals} />
 
@@ -171,7 +179,10 @@ export function RunAnalyticsPage() {
 				<RunsOverTimeChart timeSeries={data?.timeSeries ?? []} />
 				<FailureReasonChart byFailureReason={data?.byFailureReason ?? []} />
 				<AvgContextPerAgentChart byAgent={data?.byAgent ?? []} />
-				<TopSeedsByContextChart topSeeds={data?.topSeedsByContext ?? []} />
+				{/* topSeedsByContext is redacted server-side for spectators
+				    (warren-bba5) — hide the chart rather than render a
+				    permanent "No data in this window." empty state. */}
+				{isOperator ? <TopSeedsByContextChart topSeeds={data?.topSeedsByContext ?? []} /> : null}
 			</div>
 
 			<div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -191,11 +202,10 @@ export function RunAnalyticsPage() {
 				/>
 			</div>
 
-			{behavior.isError ? (
+			{isOperator && behavior.isError ? (
 				<Card>
 					<CardContent className="py-6 text-sm text-(--color-destructive)">
-						Failed to load command behavior.{" "}
-						{(behavior.error as Error | null)?.message ?? ""}
+						Failed to load command behavior. {(behavior.error as Error | null)?.message ?? ""}
 					</CardContent>
 				</Card>
 			) : null}
@@ -225,10 +235,12 @@ export function RunAnalyticsPage() {
 				/>
 			</div>
 
-			<div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-				<CommandCategoryChart byCategory={behaviorData?.mining.byCategory ?? []} />
-				<StuckCommandTable byStuckScore={behaviorData?.mining.byStuckScore ?? []} />
-			</div>
+			{isOperator ? (
+				<div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+					<CommandCategoryChart byCategory={behaviorData?.mining.byCategory ?? []} />
+					<StuckCommandTable byStuckScore={behaviorData?.mining.byStuckScore ?? []} />
+				</div>
+			) : null}
 		</div>
 	);
 }

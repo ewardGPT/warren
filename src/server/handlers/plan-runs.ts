@@ -1,42 +1,37 @@
 /**
  * PlanRun HTTP handlers (warren-f923 / pl-a258 step 6).
+ *
  * Extracted from `src/server/handlers/index.ts` (warren-a2b4 /
- * pl-9088 step 2). Shared parsing helpers and the
- * `assertPlotIdDispatchable` gate are re-imported from the index
+ * pl-9088 step 2). Shared parsing helpers are re-imported from the index
  * module; the NDJSON streaming plumbing (`bridgeAbort`,
  * `asNdjsonStream`, `eventToNdjson`) is re-imported from `./runs.ts`
  * so the plan-run stream handler stays byte-identical to the
  * pre-split shape.
  */
-import { join } from "node:path";
+
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
-import { resolveChildExecution } from "../../plan-runs/dispatch.ts";
-import {
-	PlanHasNoOpenChildrenError,
-	ProjectLacksPlotError,
-	ProjectLacksSeedsError,
-} from "../../plan-runs/errors.ts";
-import { buildPlanRunGraph } from "../../plan-runs/graph.ts";
-import {
-	defaultPlanRunPlotActivator,
-	defaultPlanRunPlotAppender,
-	emitPlanRunDispatchedToPlot,
-	promotePlotToActiveOnDispatch,
-} from "../../plan-runs/plot-appender.ts";
-import { cancelRun, resolveDispatcherHandle } from "../../runs/index.ts";
+import { PlanHasNoOpenChildrenError, ProjectLacksSeedsError } from "../../plan-runs/errors.ts";
+import { cancelRun } from "../../runs/index.ts";
 import { showPlan, showSeed } from "../../seeds-cli/index.ts";
 import { jsonResponse, ndjsonResponse } from "../response.ts";
+import { reserveEventStreamSlot } from "../stream-limits.ts";
 import type { RouteHandler, ServerDeps } from "../types.ts";
 import { refreshDispatchProject } from "./dispatch-refresh.ts";
 import {
-	assertPlotIdDispatchable,
 	optionalString,
 	parseBoolean,
 	readJsonBody,
 	requireParam,
 	requireString,
 } from "./index.ts";
-import { asNdjsonStream, bridgeAbort, eventToNdjson } from "./runs/index.ts";
+import { projectPlanRun, projectPlanRunChild } from "./plan-runs-projection.ts";
+import {
+	asNdjsonStream,
+	bridgeAbort,
+	cancelRunWiring,
+	eventToNdjson,
+	projectRun,
+} from "./runs/index.ts";
 
 /* ----------------------------------------------------------------------- */
 /* Plan runs (warren-f923 / pl-a258 step 6)                                 */
@@ -67,28 +62,14 @@ function parsePlanRunStateFilter(raw: string | null): PlanRunStateFilter | undef
  *
  * Handler order (warren-f923):
  *   (1) load project; 404 if missing.
- *   (2) reject when project.hasSeeds is false (ProjectLacksSeedsError mirrors
- *       the plot reject shape at warren-a8c3 — same ValidationError → 400
- *       envelope, stable code so HTTP consumers can branch on it).
- *   (2b) reject when plot_id is set but project.hasPlot is false
- *       (ProjectLacksPlotError, warren-c900 / pl-7937 Phase 2). Same 400
- *       envelope; raised before the seeds-CLI fan-out so a non-Plot project
- *       never grows a half-validated plan-run.
- *
- *   Gates (2) and (2b) are **stacked, not independent** (warren-909c /
- *   pl-7937 step 6): seeds is the base, plot is the optional layer on top.
- *   A project missing .seeds/ is rejected as `project_lacks_seeds` even
- *   when plot_id is supplied — plot_id never short-circuits the .seeds/
- *   requirement, and PlanRun-with-plot only lights up when BOTH .seeds/
- *   AND .plot/ are present.
+ *   (2) reject when project.hasSeeds is false (ProjectLacksSeedsError) —
+ *       400 envelope with a stable code so HTTP consumers can branch on it.
  *   (3) call showPlan; assert plan.status is in (approved, active, done) and
  *       at least one open child exists (PlanHasNoOpenChildrenError).
- *   (4) resolve agent via repos.agents.resolve with the project-tier fallback
- *       (mx-644fb5 — same posture as spawnRun).
+ *   (4) resolve agent via repos.agents.get from the global registry.
  *   (5/6) build + persist plan_runs + plan_run_children rows in a single
  *       repo.create call (the repo runs them in a transaction so a half-
- *       inserted PlanRun never appears to listActive). plot_id rides through
- *       the same call (default null when omitted).
+ *       inserted PlanRun never appears to listActive).
  *   (7) return 201 with {planRun, children}.
  */
 export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
@@ -102,7 +83,6 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 		const providerOverride = optionalString(body, "providerOverride");
 		const modelOverride = optionalString(body, "modelOverride");
 		const dispatcherHandle = optionalString(body, "dispatcherHandle");
-		const plotId = optionalString(body, "plotId");
 
 		// (1) project lookup — NotFoundError → 404.
 		const project = await deps.repos.projects.require(projectId);
@@ -117,26 +97,7 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 			);
 		}
 
-		// (2b) hasPlot gate — symmetric to single-run's spawn-time check
-		// (src/runs/spawn/dispatch.ts, warren-a8c3). Empty-string plot_id is treated
-		// as "not provided" to match the single-run handler's posture.
-		if (plotId !== undefined && plotId !== "" && !project.hasPlot) {
-			throw new ProjectLacksPlotError(
-				`project ${project.id} has no .plot/ directory; plot_id is not accepted`,
-				{
-					recoveryHint:
-						"either omit plot_id on POST /plan-runs, or run `plot init` in the project clone and refresh the project so warren picks up the .plot/ directory",
-				},
-			);
-		}
-
-		// (2c) warren-bae5 / pl-5310 step 2: plot_id format + existence
-		// validation, mirroring createRunHandler's check. Layered AFTER
-		// ProjectLacksPlotError so the more-specific project-shape error
-		// still wins when both apply.
-		await assertPlotIdDispatchable({ plotId, plotResolver: deps.plotResolver });
-
-		// (2d) warren-6d60: refresh the project host clone before the plan
+		// warren-6d60: refresh the project host clone before the plan
 		// walk so a plan pushed moments earlier is read off fresh on-disk
 		// state. See `refreshDispatchProject`.
 		const dispatchProject = await refreshDispatchProject(deps, project, ref);
@@ -162,18 +123,19 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 				recoveryHint: "run `sd plan submit <seed-id>` to populate the plan's children",
 			});
 		}
+		// Probe every child seed's status — if all are already closed there is
+		// nothing to dispatch. Each child is read in parallel since the seeds
+		// CLI is shell-out + filesystem read, not network.
 		const seedsCli = deps.seedsCli;
-		const childSeeds = await Promise.all(
+		const childStatuses = await Promise.all(
 			plan.children.map((seedId) =>
-				showSeed(seedsCli, dispatchProject.localPath, seedId).then((seed) => ({ seedId, seed })),
+				showSeed(seedsCli, dispatchProject.localPath, seedId).then((s) => ({
+					seedId,
+					status: s.status,
+				})),
 			),
 		);
-		await Promise.all(
-			childSeeds.map(({ seed }) =>
-				resolveChildExecution(deps.repos, { projectId: project.id }, seed.extensions),
-			),
-		);
-		const hasOpenChild = childSeeds.some(({ seed }) => seed.status !== "closed");
+		const hasOpenChild = childStatuses.some((c) => c.status !== "closed");
 		if (!hasOpenChild) {
 			throw new PlanHasNoOpenChildrenError(
 				`plan ${planId} has no open children; every child seed is closed`,
@@ -183,12 +145,10 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 			);
 		}
 
-		// (4) agent resolve with project-tier fallback (mx-644fb5).
-		const agent = await deps.repos.agents.resolve(agentName, { projectId: project.id });
+		// (4) resolve the agent from the global registry.
+		const agent = await deps.repos.agents.get(agentName);
 		if (agent === null) {
-			throw new NotFoundError(`agent not found: ${agentName}`, {
-				recoveryHint: "POST /agents/refresh to re-discover from canopy",
-			});
+			throw new NotFoundError(`agent not found: ${agentName}`);
 		}
 
 		// (5/6) persist.
@@ -202,41 +162,8 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 			...(providerOverride !== undefined ? { providerOverride } : {}),
 			...(modelOverride !== undefined ? { modelOverride } : {}),
 			...(dispatcherHandle !== undefined ? { dispatcherHandle } : {}),
-			...(plotId !== undefined && plotId !== "" ? { plotId } : {}),
 			...(deps.now !== undefined ? { now: deps.now() } : {}),
 		});
-
-		// (6b) warren-b89f / pl-7937 step 4: emit one `plan_run_dispatched`
-		// event onto the bound Plot — fire-and-log, mirrors the single-run
-		// `defaultPlotAppender` posture in src/runs/spawn/plot-append.ts. The
-		// PlanRun row is durably persisted by this point, so a Plot-write
-		// failure logs `plan_run.plot_append_failed` and the POST still
-		// returns 201.
-		if (result.planRun.plotId !== null) {
-			await emitPlanRunDispatchedToPlot({
-				appender: deps.planRunPlotAppender ?? defaultPlanRunPlotAppender,
-				logger: deps.logger,
-				plotDir: join(dispatchProject.localPath, ".plot"),
-				plotId: result.planRun.plotId,
-				handle: resolveDispatcherHandle(result.planRun.dispatcherHandle),
-				planRunId: result.planRun.id,
-				planId: result.planRun.planId,
-				childrenCount: result.children.length,
-			});
-
-			// (6c) warren-dfff / pl-e381 step 2: promote the bound Plot
-			// `ready` → `active` at dispatch so the auto-done guard
-			// (`status === 'active'`) is reachable via dispatch as well as
-			// operator action. Fire-and-log; never affects the 201.
-			await promotePlotToActiveOnDispatch({
-				activator: deps.planRunPlotActivator ?? defaultPlanRunPlotActivator,
-				logger: deps.logger,
-				plotDir: join(dispatchProject.localPath, ".plot"),
-				plotId: result.planRun.plotId,
-				handle: resolveDispatcherHandle(result.planRun.dispatcherHandle),
-				planRunId: result.planRun.id,
-			});
-		}
 
 		// (7) wire response — coordinator picks the row up on its next tick.
 		return jsonResponse(201, {
@@ -260,7 +187,9 @@ export function listPlanRunsHandler(deps: ServerDeps): RouteHandler {
 				projectId,
 				state !== undefined ? state : undefined,
 			);
-			return jsonResponse(200, { planRuns: rows });
+			return jsonResponse(200, {
+				planRuns: rows.map((row) => projectPlanRun(row, ctx.actor)),
+			});
 		}
 		// No project filter — return active PlanRuns when no state requested,
 		// or the operator's chosen state across every project.
@@ -274,13 +203,30 @@ export function listPlanRunsHandler(deps: ServerDeps): RouteHandler {
 					projects.map((p) => deps.repos.planRuns.listByProjectAndState(p.id, state)),
 				)
 			).flat();
-			return jsonResponse(200, { planRuns: all });
+			return jsonResponse(200, {
+				planRuns: all.map((row) => projectPlanRun(row, ctx.actor)),
+			});
 		}
-		return jsonResponse(200, { planRuns: await deps.repos.planRuns.listActive() });
+		const active = await deps.repos.planRuns.listActive();
+		return jsonResponse(200, {
+			planRuns: active.map((row) => projectPlanRun(row, ctx.actor)),
+		});
 	};
 }
 
-/** `GET /plan-runs/:id` returns rows, child runs, and the truthful execution graph. */
+/**
+ * `GET /plan-runs/:id` — full detail page payload: row + children + the
+ * fanned-out `runs[]` from runs.listByIds(child.runId for each non-null)
+ * so the UI's detail page renders in one round-trip.
+ *
+ * `runs[]` goes through the SAME `projectRun` the `/runs` routes use
+ * (warren-c405): this route is `readPublic`, so serving the rows raw handed
+ * a spectator every field `REDACTED_RUN_FIELDS` withholds elsewhere.
+ * `planRun` and `children` go through `projectPlanRun` / `projectPlanRunChild`
+ * (warren-8793): this pair was the last `readPublic` body served with no
+ * field allowlist, leaking `promptTemplate`, the dispatch overrides,
+ * `dispatcherHandle`, and raw internal error strings on `failureReason`.
+ */
 export function getPlanRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
@@ -289,10 +235,9 @@ export function getPlanRunHandler(deps: ServerDeps): RouteHandler {
 		const runIds = children.map((c) => c.runId).filter((v): v is string => v !== null);
 		const runs = await deps.repos.runs.listByIds(runIds);
 		return jsonResponse(200, {
-			planRun,
-			children,
-			runs,
-			graph: buildPlanRunGraph(planRun, children),
+			planRun: projectPlanRun(planRun, ctx.actor),
+			children: children.map((child) => projectPlanRunChild(child, ctx.actor)),
+			runs: runs.map((run) => projectRun(run, ctx.actor)),
 		});
 	};
 }
@@ -337,7 +282,7 @@ export function cancelPlanRunHandler(deps: ServerDeps): RouteHandler {
 				await cancelRun({
 					runId: inFlight.runId,
 					repos: deps.repos,
-					burrowClientPool: deps.burrowClientPool,
+					...cancelRunWiring(deps), // warren-b223: provider + burrow-bound inline reap
 					broker: deps.broker,
 					reason: `plan_run_cancelled:${planRun.id}`,
 					...(deps.now !== undefined ? { now: deps.now } : {}),
@@ -384,6 +329,15 @@ export function streamPlanRunEventsHandler(deps: ServerDeps): RouteHandler {
 		const planRun = await deps.repos.planRuns.require(id);
 		const follow = parseBoolean(ctx.url.searchParams.get("follow"), "follow") ?? false;
 		const ctrl = bridgeAbort(ctx.request.signal);
+		// Same concurrency admission as the single-run twin (warren-25f6): a
+		// plan-run stream fans in every child, so it is the more expensive of
+		// the two to leave uncapped.
+		const slot = reserveEventStreamSlot({
+			limiter: deps.streamLimiter,
+			ctx,
+			ctrl,
+			route: "GET /plan-runs/:id/events",
+		});
 
 		const source = tailPlanRunEvents({
 			planRun,
@@ -392,7 +346,14 @@ export function streamPlanRunEventsHandler(deps: ServerDeps): RouteHandler {
 			follow,
 			signal: ctrl.signal,
 		});
-		return ndjsonResponse(asNdjsonStream(source, (row) => eventToNdjson(row, null), ctrl));
+		return ndjsonResponse(
+			asNdjsonStream(
+				source,
+				(row) => eventToNdjson(row, ctx.actor),
+				ctrl,
+				() => slot.release(),
+			),
+		);
 	};
 }
 

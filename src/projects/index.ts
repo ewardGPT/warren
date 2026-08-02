@@ -5,6 +5,11 @@
  */
 
 export {
+	detectProjectFeatures,
+	PROJECT_FEATURE_DIRS,
+	type ProjectFeatureFlags,
+} from "./capabilities.ts";
+export {
 	type CloneProjectInput,
 	type CloneProjectResult,
 	cloneProjectRepo,
@@ -19,7 +24,7 @@ export {
 	loadProjectsConfigFromEnv,
 	type ProjectsConfig,
 } from "./config.ts";
-export { ProjectUnavailableError, TargetProjectUnresolvedError } from "./errors.ts";
+export { ProjectUnavailableError } from "./errors.ts";
 export {
 	type AddProjectInput,
 	addProject,
@@ -31,15 +36,8 @@ export {
 	refreshProject,
 } from "./manage.ts";
 export {
-	detectProjectFeatures,
-	PROJECT_FEATURE_DIRS,
-	type ProjectFeatureFlags,
 	type RefreshProjectCloneInput,
 	type RefreshProjectCloneResult,
 	refreshProjectClone,
 } from "./refresh.ts";
-export {
-	type ResolveTargetRepos,
-	resolveTargetProject,
-} from "./resolve-target.ts";
 export { type ParsedGitHubUrl, parseGitHubUrl } from "./url.ts";

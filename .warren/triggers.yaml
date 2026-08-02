@@ -1,23 +1,21 @@
-# .warren/triggers.yaml — scheduled runs for this project (SPEC §11.I, R-06).
+# .warren/triggers.yaml — scheduled runs for this project (docs/design/scheduler.md, R-06).
 #
 # Each entry is a cron-style trigger. Warren ticks once a minute and
 # spawns a run when a trigger is due. Today only `kind: cron` is
 # implemented; the `kind:` discriminator leaves room for future
 # webhook-style triggers without a breaking schema rev.
 #
-# Required fields: id, kind, role. Cron and loop triggers also require cron.
+# Required fields: id, kind, cron, role.
 # Optional fields: seed, timezone (default UTC), prompt.
 #
 # Field rules (TriggersConfigSchema in src/warren-config/schema.ts):
 #   id        kebab/snake-case (lowercase, digits, dots, dashes, _). Unique.
-#   kind      'cron', 'goal', or 'loop'
-#   cron      5 or 6 whitespace-separated fields (croner-compatible) for cron/loop
+#   kind      'cron'
+#   cron      5 or 6 whitespace-separated fields (croner-compatible)
 #   seed      seed id the agent reads + writes (e.g. warren-xxxx)
 #   role      registered agent name (kebab/snake-case)
 #   timezone  IANA tz name, e.g. America/Los_Angeles
 #   prompt    pre-filled into the agent; multi-line ok via `|`
-#   stopPrompt / maxRuns  goal stop condition and bounded attempts
-#   maxIterations         loop safety cap
 #
 # Example (uncomment to enable):
 #
@@ -30,88 +28,49 @@
 #   prompt: |
 #     Run the housekeeping checklist and file seeds for anything off.
 
-- id: nightwatch-patrol
-  kind: cron
-  cron: '0 2 * * *'
-  role: nightwatch
-  maxCostUsd: 2
-  timezone: America/Los_Angeles
-  prompt: |
-    Scan this repo for quality issues. Follow your procedure exactly.
-    Today's date is {{date}}. If you find issues, file a plan. If the
-    codebase is clean, report clean and exit.
+# ---------------------------------------------------------------------
+# NO TRIGGERS ARE ACTIVE. This is deliberate, not a temporary outage.
+#
+# Warren used to schedule six agents against its own repo: two patrols
+# (nightwatch, bugwatch) and a four-agent "Audit Warden" population
+# (gatewatch, ratchetwatch, tastewatch, warden-digest). Operator decision
+# 2026-07-28 (warren-a781): the audit population is retired outright and
+# nothing runs on a schedule here.
+#
+# Why the wardens went: they billed tokens nightly to file findings that
+# accumulated faster than anyone triaged them — ~90 seeds across their
+# lifetime, and the four still open at retirement were all obsolete. The
+# standards they enforced did not depend on them. Article I and Article
+# IX are human review rules, and Article II's ratchets are already
+# mechanical gates — check:size, check:coverage, check:debt and
+# check:bundle-size run on every PR whether or not an agent watches them.
+# An auditor that only restates what a gate already enforces is a
+# scheduled bill, not a control.
+#
+# nightwatch is KEPT as warren's worked example of an autonomous agent.
+# It survives as a built-in TS module (src/registry/builtins/nightwatch.ts)
+# with test coverage — one patrol demonstrates the whole loop warren
+# exists to show: patrol -> seeds plan -> auto_plan_run -> PR. bugwatch
+# also still ships as a built-in for operators who want it; neither is
+# scheduled on this instance.
+#
+# To re-enable the example, uncomment the block below. Note warren-af3f:
+# cron-triggered patrols succeeded only 32% of the time in production
+# (never_started and dropped_commit are the two dominant failure modes).
+# Fix that before scheduling anything nightly.
+#
+# An empty trigger list is valid — warren parses this file and schedules
+# nothing.
+# ---------------------------------------------------------------------
 
-- id: bugwatch-triage
-  kind: cron
-  cron: '0 5 * * 0,3'
-  role: bugwatch
-  maxCostUsd: 2
-  timezone: America/Los_Angeles
-  prompt: |
-    Triage open bug seeds and plan fixes. Follow your procedure exactly.
-    Today's date is {{date}}. If no bugs qualify, report clean and exit.
+# - id: nightwatch-patrol
+#   kind: cron
+#   cron: '0 2 * * 0'          # weekly, Sunday 02:00
+#   role: nightwatch
+#   timezone: America/Los_Angeles
+#   prompt: |
+#     Scan this repo for quality issues. Follow your procedure exactly.
+#     Today's date is {{date}}. If you find issues, file a plan. If the
+#     codebase is clean, report clean and exit.
 
-# Audit population (docs/CONSTITUTION.md). gatewatch + ratchetwatch are
-# mechanical auditors with plan+dispatch authority (auto_plan_run);
-# tastewatch is the report-only taste auditor — its weekly digest seed is
-# the human's five-minute calibration read. Article IX: changes to these
-# entries require explicit human review.
-
-- id: gatewatch-patrol
-  kind: cron
-  cron: '10 3 * * *'
-  role: gatewatch
-  maxCostUsd: 2
-  timezone: America/Los_Angeles
-  prompt: |
-    Audit the last 36 hours of merged history for gate-integrity
-    violations per docs/CONSTITUTION.md. Follow your procedure exactly.
-    Today's date is {{date}}. Dedupe against open audit seeds before
-    filing. Deliver each finding to the standing warden conversation
-    (well-known title "Audit Warden") over POST /conversations/:id/messages
-    in addition to filing the seed — the existing 202 steering channel, no
-    new endpoint or dispatch path. If the window is clean, report clean
-    and exit.
-
-- id: ratchetwatch-patrol
-  kind: cron
-  cron: '40 3 * * *'
-  role: ratchetwatch
-  maxCostUsd: 2
-  timezone: America/Los_Angeles
-  prompt: |
-    Measure ratchet slack (coverage floors, grandfather lists, bundle
-    creep, debt markers) per docs/CONSTITUTION.md Article II and plan
-    mechanical tightenings only. Follow your procedure exactly. Today's
-    date is {{date}}. Deliver each finding to the standing warden
-    conversation (well-known title "Audit Warden") over
-    POST /conversations/:id/messages in addition to filing the seed/plan
-    — the existing 202 steering channel, no new endpoint or dispatch path.
-    If everything is tight, report tight and exit.
-
-- id: warden-digest
-  kind: cron
-  cron: '0 5 * * 0'
-  role: warden-digest
-  maxCostUsd: 1
-  timezone: America/Los_Angeles
-  prompt: |
-    Re-wake the Audit Warden conversation if its anchoring run has idled,
-    then post the weekly synthesis message so Leveret triages the week's
-    accumulated auditor findings and proposes plans. Follow your procedure
-    exactly. Today's date is {{date}}.
-
-- id: tastewatch-digest
-  kind: cron
-  cron: '0 4 * * 0'
-  role: tastewatch
-  maxCostUsd: 1
-  timezone: America/Los_Angeles
-  prompt: |
-    Produce the weekly taste digest: stratified sample of the week's
-    merged commits judged against docs/CONSTITUTION.md, auditor
-    precision table, divergence trend, at most one proposed amendment.
-    Exactly one digest seed. Deliver the digest to the standing warden
-    conversation (well-known title "Audit Warden") over
-    POST /conversations/:id/messages — the existing 202 steering channel,
-    report-only, no dispatch or new path. Today's date is {{date}}.
+[]

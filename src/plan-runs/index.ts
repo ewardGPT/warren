@@ -6,6 +6,11 @@
  */
 
 export {
+	type CloseMergedChildSeedInput,
+	type CloseMergedChildSeedResult,
+	closeMergedChildSeed,
+} from "./close-child-seed.ts";
+export {
 	DEFAULT_PLAN_RUN_MERGE_TIMEOUT_MS,
 	DEFAULT_PLAN_RUN_TICK_MS,
 	type EnvLike,
@@ -16,6 +21,7 @@ export {
 	type AdvancePlanRunInput,
 	type AdvanceResult,
 	advancePlanRun,
+	type CoordinatorCloseChildSeedFn,
 	type CoordinatorEmitFn,
 	type CoordinatorReopenPrFn,
 	type CoordinatorRepos,
@@ -23,45 +29,12 @@ export {
 	type CoordinatorSpawnFn,
 	type CoordinatorSpawnInput,
 	type CoordinatorSpawnResult,
-	type CoordinatorTransitionPlotFn,
 	DEFAULT_MERGE_TIMEOUT_MS,
-	isChildTerminal,
 	PLAN_RUN_EVENT_KINDS,
 	type PlanRunEventKind,
 } from "./coordinator.ts";
-export {
-	type CreatePlanRunSpawnInput,
-	createPlanRunSpawn,
-	createResolveExecution,
-	resolveChildExecution,
-} from "./dispatch.ts";
-export {
-	PlanHasNoOpenChildrenError,
-	PlanRunDispatchError,
-	ProjectLacksPlotError,
-	ProjectLacksSeedsError,
-} from "./errors.ts";
-export {
-	type ActivatePlanRunPlotInput,
-	type AppendPlanRunDispatchedInput,
-	defaultPlanRunPlotActivator,
-	defaultPlanRunPlotAppender,
-	type EmitPlanRunDispatchedInput,
-	emitPlanRunDispatchedToPlot,
-	type PlanRunPlotActivationResult,
-	type PlanRunPlotActivator,
-	type PlanRunPlotAppender,
-	type PromotePlotToActiveInput,
-	promotePlotToActiveOnDispatch,
-} from "./plot-appender.ts";
-export {
-	type AutoTransitionPlotToDoneInput,
-	type AutoTransitionResult,
-	autoTransitionPlotToDone,
-	defaultPlotStatusSetter,
-	type PlotStatusSetter,
-	type SetPlotStatusToDoneInput,
-} from "./plot-transition.ts";
+export { type CreatePlanRunSpawnInput, createPlanRunSpawn } from "./dispatch.ts";
+export { PlanHasNoOpenChildrenError, ProjectLacksSeedsError } from "./errors.ts";
 export {
 	type CreatePrMergeCheckerInput,
 	createPrMergeChecker,

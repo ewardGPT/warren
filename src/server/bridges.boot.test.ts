@@ -1,9 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { RunEventBroker } from "../runs/index.ts";
-import { makePool, stub } from "./bridges.test-helpers.ts";
+import { makeProvider } from "./bridges.test-helpers.ts";
 import { bootBridges, createBridgeRegistry } from "./bridges.ts";
 
 describe("bootBridges", () => {
@@ -40,7 +39,6 @@ describe("bootBridges", () => {
 			burrowId: "bur_xxxxxxxxxxxx",
 			burrowRunId: "run_zzzzzzzzzzzz",
 		});
-		await repos.burrows.create({ id: "bur_xxxxxxxxxxxx", workerId: "local" });
 
 		const r2 = await repos.runs.create({
 			agentName: "refactor-bot",
@@ -55,7 +53,7 @@ describe("bootBridges", () => {
 		const result = await bootBridges({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async (input) => {
 				calls.push(input.runId);
 				return { written: 0, skipped: 0, errored: false };
@@ -68,11 +66,13 @@ describe("bootBridges", () => {
 		await result.registry.stopAll();
 	});
 
-	test("warren-018a: skips runs whose burrow_id has no `burrows` placement row", async () => {
+	test("warren-3743: resumes every run with burrow ids (no placement-row gate)", async () => {
 		const project = (await repos.projects.listAll())[0];
 		if (!project) throw new Error("project missing");
 
-		// r1 — placed: burrow row exists.
+		// The `burrows` placement table was dropped in warren-3743, so the old
+		// "pre-pl-9ba1 orphan" skip (reason: no_placement) no longer applies —
+		// any active run carrying a burrow_id + burrow_run_id resumes.
 		const r1 = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
@@ -84,9 +84,7 @@ describe("bootBridges", () => {
 			burrowId: "bur_aaaaaaaaaaaa",
 			burrowRunId: "rb_aaaaaaaaaa",
 		});
-		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
 
-		// r2 — pre-pl-9ba1 orphan: burrow_id is set but no `burrows` row.
 		const r2 = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
@@ -95,24 +93,24 @@ describe("bootBridges", () => {
 			trigger: "manual",
 		});
 		await repos.runs.attachBurrow(r2.id, {
-			burrowId: "bur_orphanorphan",
-			burrowRunId: "rb_orphan_aaaa",
+			burrowId: "bur_secondsecond",
+			burrowRunId: "rb_second_aaaa",
 		});
 
 		const calls: string[] = [];
 		const result = await bootBridges({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async (input) => {
 				calls.push(input.runId);
 				return { written: 0, skipped: 0, errored: false };
 			},
 		});
 
-		expect(result.resumed.map((r) => r.runId)).toEqual([r1.id]);
-		expect(result.skipped).toEqual([{ runId: r2.id, reason: "no_placement" }]);
-		expect(calls).toEqual([r1.id]);
+		expect(result.resumed.map((r) => r.runId).sort()).toEqual([r1.id, r2.id].sort());
+		expect(result.skipped).toEqual([]);
+		expect(calls.sort()).toEqual([r1.id, r2.id].sort());
 		await result.registry.stopAll();
 	});
 
@@ -131,29 +129,21 @@ describe("bootBridges", () => {
 			burrowId: "bur_lostlostlost",
 			burrowRunId: "rb_ghostghost1",
 		});
-		await repos.burrows.create({ id: "bur_lostlostlost", workerId: "local" });
 		await repos.runs.markRunning(r.id);
 
-		// Burrow stub that 404s on GET /runs/:id (ghost).
-		const ghostClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(
-				async () =>
-					new Response(
-						JSON.stringify({
-							error: { code: "not_found", message: "run not found: rb_ghostghost1" },
-						}),
-						{ status: 404, headers: { "content-type": "application/json" } },
-					),
-			),
+		// Ghost run: `status().exists === false` (a GC'd pod / burrow 404). The
+		// teardown terminate also fails (the sandbox is already gone), preserving the
+		// warren-4f01 `reap.workspace_destroy_failed` audit expectation below.
+		const { provider } = makeProvider({
+			exists: false,
+			throwOnTerminate: new Error("run not found: rb_ghostghost1"),
 		});
-		const pool = await makePool(repos, ghostClient);
 
 		const calls: string[] = [];
 		const result = await bootBridges({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: pool,
+			runtimeProvider: provider,
 			bridge: async (input) => {
 				calls.push(input.runId);
 				return { written: 0, skipped: 0, errored: false };
@@ -187,14 +177,13 @@ describe("bootBridges", () => {
 			burrowId: "bur_a",
 			burrowRunId: "rb_a",
 		});
-		await repos.burrows.create({ id: "bur_a", workerId: "local" });
 		await repos.runs.markRunning(r.id);
 
 		let calls = 0;
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 			bridge: async () => {
 				calls += 1;
 				return { written: 0, skipped: 0, errored: false, burrowRunMissing: true as const };
@@ -216,7 +205,7 @@ describe("bootBridges", () => {
 		const result = await bootBridges({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: await makePool(repos),
+			runtimeProvider: makeProvider().provider,
 		});
 		expect(result.resumed.length).toBe(0);
 		expect(result.skipped.length).toBe(0);

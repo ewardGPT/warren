@@ -1,1 +1,8 @@
 blank_issues_enabled: true
+contact_links:
+  - name: Discord — questions, help, and feedback
+    url: https://discord.gg/4r6r5jUEFE
+    about: Ask a question or get help running warren. Bug reports and feature requests still belong in an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/jayminwest/warren/security/advisories
+    about: Report privately through a GitHub security advisory. Never open a public issue for a vulnerability.

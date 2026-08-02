@@ -2,15 +2,15 @@
  * Cost analytics view (warren-cf63 / pl-b0c0 step 6).
  *
  * Centralized spend breakdown over `runs.cost_usd`. Renders a totals
- * header card + a date-range / project filter, then a grid of eight
- * dimension cards (date, project, plan, plot, run, agent, model,
- * provider) each showing a sortable-by-cost table of buckets.
+ * header card + a date-range / project filter, then a grid of seven
+ * dimension cards (date, project, plan, run, agent, model, provider)
+ * each showing a sortable-by-cost table of buckets.
  *
  * The server (`GET /analytics/cost`) returns every dimension in one
  * payload so the page is a single round-trip; the date dimension is
- * pre-sorted chronologically and the other seven are pre-sorted by
+ * pre-sorted chronologically and the other six are pre-sorted by
  * cost desc with a `key` tiebreaker. Buckets whose group key is null
- * (e.g. a run with no `plotId`) land in a `__none__` bucket per
+ * (e.g. a run with no `planId`) land in a `__none__` bucket per
  * dimension and render as an em-dash so the operator can see how
  * much spend is unattributed to that dimension.
  *
@@ -29,10 +29,7 @@ import {
 } from "@/api/client.ts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import { PageHeader } from "@/components/ui/page-header.tsx";
-import {
-	responsiveCardHeaderRow,
-	responsiveFormControl,
-} from "@/components/ui/responsive.ts";
+import { responsiveCardHeaderRow, responsiveFormControl } from "@/components/ui/responsive.ts";
 import {
 	Table,
 	TableBody,
@@ -47,7 +44,6 @@ const DIMENSIONS: { id: CostDimension; label: string; subtitle: string }[] = [
 	{ id: "date", label: "By date", subtitle: "Daily spend (YYYY-MM-DD)" },
 	{ id: "project", label: "By project", subtitle: "Spend per project" },
 	{ id: "plan", label: "By plan", subtitle: "Spend per seeds plan" },
-	{ id: "plot", label: "By plot", subtitle: "Spend per Plot" },
 	{ id: "agent", label: "By agent", subtitle: "Spend per agent" },
 	{ id: "model", label: "By model", subtitle: "Spend per provider model" },
 	{ id: "provider", label: "By provider", subtitle: "Spend per runtime provider" },
@@ -120,10 +116,7 @@ export function CostAnalyticsPage() {
 				<CardContent>
 					<div className="flex flex-wrap items-end gap-4">
 						<div className="flex flex-col gap-1">
-							<label
-								htmlFor="ca-from"
-								className="text-xs text-(--color-muted-foreground)"
-							>
+							<label htmlFor="ca-from" className="text-xs text-(--color-muted-foreground)">
 								From
 							</label>
 							<input
@@ -135,10 +128,7 @@ export function CostAnalyticsPage() {
 							/>
 						</div>
 						<div className="flex flex-col gap-1">
-							<label
-								htmlFor="ca-to"
-								className="text-xs text-(--color-muted-foreground)"
-							>
+							<label htmlFor="ca-to" className="text-xs text-(--color-muted-foreground)">
 								To
 							</label>
 							<input
@@ -150,10 +140,7 @@ export function CostAnalyticsPage() {
 							/>
 						</div>
 						<div className="flex flex-col gap-1">
-							<label
-								htmlFor="ca-project"
-								className="text-xs text-(--color-muted-foreground)"
-							>
+							<label htmlFor="ca-project" className="text-xs text-(--color-muted-foreground)">
 								Project
 							</label>
 							<select
@@ -195,8 +182,7 @@ export function CostAnalyticsPage() {
 			{analytics.isError ? (
 				<Card>
 					<CardContent className="py-6 text-sm text-(--color-destructive)">
-						Failed to load cost analytics.{" "}
-						{(analytics.error as Error | null)?.message ?? ""}
+						Failed to load cost analytics. {(analytics.error as Error | null)?.message ?? ""}
 					</CardContent>
 				</Card>
 			) : null}
@@ -302,8 +288,6 @@ function labelForDimension(dim: CostDimension): string {
 			return "Project";
 		case "plan":
 			return "Plan";
-		case "plot":
-			return "Plot";
 		case "run":
 			return "Run";
 		case "agent":
@@ -331,15 +315,6 @@ function renderBucketKey(
 					className="font-mono text-xs underline-offset-2 hover:underline"
 				>
 					{projectLabels.get(key) ?? key}
-				</Link>
-			);
-		case "plot":
-			return (
-				<Link
-					to={`/plots/${encodeURIComponent(key)}`}
-					className="font-mono text-xs underline-offset-2 hover:underline"
-				>
-					{key}
 				</Link>
 			);
 		case "run":

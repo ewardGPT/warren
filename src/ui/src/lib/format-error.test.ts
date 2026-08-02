@@ -12,9 +12,7 @@ describe("formatError", () => {
 	});
 
 	test("formats {code, message} envelope as 'code: message'", () => {
-		expect(formatError({ code: "http_404", message: "not found" })).toBe(
-			"http_404: not found",
-		);
+		expect(formatError({ code: "http_404", message: "not found" })).toBe("http_404: not found");
 	});
 
 	test("falls back to .message for plain Error", () => {

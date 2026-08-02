@@ -1,11 +1,19 @@
 /**
- * SQLite physical schema for warren's durable state (SPEC §9).
+ * SQLite physical schema for warren's durable state (docs/design/runtime-and-supervisor.md).
  *
- * Twelve tables: agents (canopy registry cache), projects (cloned repos), runs
+ * Tables: agents (canopy registry cache), projects (cloned repos), runs
  * (warren-side run rows that mirror burrow's lifecycle), events (write-through
- * cache of burrow's stream — see SPEC §9 "event durability rationale"), triggers
- * (R-06 scheduler bookkeeping), workers + burrows (multi-worker placement
- * registry), planRuns + planRunChildren, plots, and conversations + messages.
+ * cache of burrow's stream — see the event-durability rationale in
+ * docs/design/runtime-and-supervisor.md), triggers
+ * (R-06 scheduler bookkeeping), planRuns + planRunChildren, and
+ * runInbox. The plots projection table was dropped in warren-0b13 (0031)
+ * as part of the plot deletion pass (pl-3a79). The conversations + messages
+ * tables were dropped in
+ * warren-d93e (0030) as part of the conversations deletion pass
+ * (pl-3a79). The workers + burrows multi-worker placement
+ * tables were dropped in warren-3743 (0028) once LocalProvider absorbed the
+ * single-burrow runtime; `runs.worker_id` is retained (nullable, unwritten)
+ * for historical rows only.
  *
  * Timestamps are ISO8601 TEXT, mirroring the burrow event envelope `ts` field
  * so we don't translate at the stream boundary. JSON columns use drizzle's
@@ -27,13 +35,12 @@ import {
 	text,
 	uniqueIndex,
 } from "drizzle-orm/sqlite-core";
-import type { PlotProjectionState } from "./columns.ts";
 import {
 	CLONE_KINDS,
-	CONVERSATION_STATES,
 	EVENT_STREAMS,
+	INBOX_PRIORITIES,
+	INBOX_STATES,
 	INDEX_NAMES,
-	MESSAGE_ROLES,
 	PLAN_RUN_CHILD_STATES,
 	PLAN_RUN_STATES,
 	PREVIEW_STATES,
@@ -41,47 +48,30 @@ import {
 	RUN_MODES,
 	RUN_STATES,
 	TABLE_NAMES,
-	WORKER_STATES,
 } from "./columns.ts";
 import { createSqliteGraphTables } from "./sqlite-graph.ts";
 
 /**
- * Canopy registry cache. Three tiers of rows live here, addressed by
- * (name, project_id):
+ * Agent registry cache. Rows are identified by `name` alone — the global
+ * registry seeded from `src/registry/builtins/`, plus any same-named
+ * library override. A synthetic rowid PK backs the table; a single unique
+ * index on `name` enforces registry identity (warren-f787, which removed
+ * the per-project `.canopy/` tier and its `project_id` column).
  *
- *   - built-in   (`source = 'builtin'`)        — `project_id IS NULL`
- *   - library    (`source = 'library'`)        — `project_id IS NULL`
- *   - project    (`source = 'project:<id>'`)   — `project_id = <id>`
- *
- * R-03 (pl-fef5, warren-094a) replaced the single-column `name` primary
- * key with a synthetic rowid PK so the project tier can carry duplicate
- * names across projects. Identity is enforced at the index layer:
- *
- *   - composite unique on (project_id, name) for project-tier rows.
- *   - partial unique on (name) WHERE project_id IS NULL for the global
- *     tier — SQLite treats NULL as distinct in plain unique indexes, so
- *     the composite alone would allow two `(NULL, "claude-code")` rows.
- *
- * `runs.agent_name` used to FK to `agents.name`; with composite identity
- * the FK is unrepresentable in SQLite (no composite FK from a single
- * column), so it was dropped. The agents table is a soft cache —
- * spawn-time lookups fall back to "global" if a project-tier row is
- * missing and `POST /agents/refresh` re-discovers from canopy.
+ * `runs.agent_name` does not FK to `agents.name` — the agents table is a
+ * soft cache, re-seeded on boot, so a run row keeps its frozen
+ * `rendered_agent_json` even if the agent row is later removed.
  */
 export const agents = sqliteTable(
 	TABLE_NAMES.agents,
 	{
 		id: integer("id").primaryKey({ autoIncrement: true }),
-		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
 		name: text("name").notNull(),
 		renderedJson: text("rendered_json", { mode: "json" }).notNull(),
 		registeredAt: text("registered_at").notNull(),
 		lastRefreshed: text("last_refreshed").notNull(),
 	},
-	(t) => [
-		uniqueIndex(INDEX_NAMES.agentsProjectName).on(t.projectId, t.name),
-		uniqueIndex(INDEX_NAMES.agentsGlobalName).on(t.name).where(sql`${t.projectId} IS NULL`),
-	],
+	(t) => [uniqueIndex(INDEX_NAMES.agentsName).on(t.name)],
 );
 
 export const projects = sqliteTable(
@@ -94,13 +84,6 @@ export const projects = sqliteTable(
 		addedAt: text("added_at").notNull(),
 		lastFetchedAt: text("last_fetched_at"),
 		lastHeadSha: text("last_head_sha"),
-		// Plot opt-in gating flag (warren-4e20). True iff a `.plot/` directory
-		// exists at the clone root at the time of the most recent
-		// addProject / refreshProjectClone. The dispatch path reads this to
-		// gate `plot_id` validation and PLOT_ID/PLOT_ACTOR env injection
-		// (warren-a8c3, warren-e26f). Defaults to false so legacy rows
-		// written before this column existed match the no-`.plot/` shape.
-		hasPlot: integer("has_plot", { mode: "boolean" }).notNull().default(false),
 		// Seeds opt-in gating flag (warren-9990 / pl-a258 step 1). True iff a
 		// `.seeds/` directory exists at the clone root at the time of the
 		// most recent addProject / refreshProjectClone. The PlanRun API
@@ -122,23 +105,30 @@ export const runs = sqliteTable(
 		// is a soft cache anyway — spawn resolves `(agentName, projectId)`
 		// with global fallback at the application layer.
 		agentName: text("agent_name").notNull(),
-		// Nullable + ON DELETE SET NULL so deleting a project orphans its
-		// runs instead of being blocked by the FK. The UI's delete-project
-		// dialog promises 'Run history for this project is kept' (warren-5f19);
-		// before this change, an FK constraint failure on delete combined
-		// with the disk-first ordering in deleteProject left the project
-		// row orphaned from its on-disk clone.
-		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		// Nullable, ON DELETE CASCADE (warren-41b3). Deleting a project
+		// removes its runs (and, via events.run_id CASCADE, their event
+		// transcripts) rather than orphaning them with project_id = NULL.
+		// The prior SET NULL intent (warren-5f19) preserved run history
+		// across de-registration, but that leaked unattributable private
+		// transcripts on public instances and grew the events table without
+		// bound — 58% of production runs and 81% of events were orphans.
+		// Removing the orphan class outright is the fail-closed fix.
+		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
+		// Provider-side sandbox id (burrow id under LocalProvider). Load-bearing:
+		// the bridge/reconnect path (`bootBridges`, `server/bridge-reconnect.ts`)
+		// reads it after a host restart to re-attach the run's live event stream.
+		// Nullable — a run that fails before dispatch never gets one.
 		burrowId: text("burrow_id"),
+		// Provider-side run/dispatch id (burrow run id under LocalProvider).
+		// Load-bearing alongside `burrow_id` for the same resume path (it scopes
+		// cancel / steer / status against the sandbox). Nullable, same reason.
 		burrowRunId: text("burrow_run_id"),
-		// Denormalized worker placement (warren-135b / pl-9ba1 step 2).
-		// Copy of `burrows.worker_id` written at run-create time so streaming /
-		// cancel / steer paths can route to the owning worker without a join.
-		// Plain text (no FK to `workers.name`) because the zero-config single-
-		// worker deploy uses a synthetic local worker that has no row in the
-		// `workers` table. Nullable for back-compat with rows written before
-		// this column landed; new rows always set it once `BurrowClientPool`
-		// (step 3) and the spawn wiring (step 4) land.
+		// Retired multi-worker placement copy (warren-135b / pl-9ba1 step 2).
+		// The workers + burrows placement tables were dropped in warren-3743 once
+		// LocalProvider absorbed the single-burrow runtime; new runs write NULL.
+		// The column is retained (nullable, unwritten) so historical rows keep
+		// their value. All reads tolerate NULL (preview / proxy treat null as the
+		// local worker). The `runs_worker_state_idx` index is likewise retained.
 		workerId: text("worker_id"),
 		// Optional back-link to the seeds issue this run was dispatched against
 		// (pl-bb70 step 3, warren-805a). Threaded through POST /runs → spawnRun →
@@ -148,16 +138,6 @@ export const runs = sqliteTable(
 		// Plain text (no FK to seeds) — seeds live in the project workspace, not
 		// in warren's database, and the seed-id space is per-project.
 		seedId: text("seed_id"),
-		// Optional back-link to the Plot this run was dispatched against
-		// (warren-a8c3). Gated on the owning project's
-		// `hasPlot` flag at handler-level — POST /runs rejects a plot_id when
-		// (warren-e26f) injects PLOT_ID + PLOT_ACTOR into the sandbox env,
-		// emits a `run_dispatched` event into the Plot (warren-e848), and
-		// reap mirrors plot deltas back into warren's event stream tagged
-		// with this plot_id (warren-7e0f). Nullable: legacy rows and runs
-		// dispatched without a plot leave it null. Plain text, no FK.
-		// live in the project workspace, not in warren's database.
-		plotId: text("plot_id"),
 		renderedAgentJson: text("rendered_agent_json", { mode: "json" }).notNull(),
 		state: text("state", { enum: RUN_STATES }).notNull(),
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
@@ -174,6 +154,15 @@ export const runs = sqliteTable(
 		prUrl: text("pr_url"),
 		// Operator-requested target branch (warren-1f81, #419); null = none.
 		targetBranch: text("target_branch"),
+		// Salvage-before-destroy (warren-cd3b). When a reap's branch push never
+		// landed, the workspace's committed work is captured BEFORE destroy:
+		// `salvage_ref` is the rescue branch pushed to origin
+		// (`warren/rescue/<runId>`) when that push landed; `salvage_path` is the
+		// durable warren-side git-bundle file (`<dataDir>/salvage/<runId>.bundle`)
+		// when a bundle was captured (pod-POSTed under k8s, host-written under
+		// local). Both null ⇒ no salvage was captured (or none was needed).
+		salvageRef: text("salvage_ref"),
+		salvagePath: text("salvage_path"),
 		// Per-run cost + token accounting (warren-a7dc). All nullable: only the
 		// pi runtime reports session-cumulative stats via get_session_stats today,
 		// and even there the value is best-effort (null when the bridge can't
@@ -184,7 +173,7 @@ export const runs = sqliteTable(
 		tokensOutput: integer("tokens_output"),
 		tokensCacheRead: integer("tokens_cache_read"),
 		tokensCacheWrite: integer("tokens_cache_write"),
-		// Per-run preview environment columns (R-19 / SPEC §11.L). All nullable
+		// Per-run preview environment columns (R-19 / docs/design/preview-environments.md). All nullable
 		// because only projects that opt in via `.warren/defaults.json`'s
 		// `preview` block exercise this path; non-opted-in runs leave every
 		// field null. Populated by reap's `preview_launch` sub-step, the
@@ -202,16 +191,6 @@ export const runs = sqliteTable(
 		// primitive (pl-0344 step 3 / warren-1117). Fixed at run-create time.
 		// Defaults to `batch` so legacy rows match the historical shape.
 		mode: text("mode", { enum: RUN_MODES }).notNull().default("batch"),
-		// Pause bookkeeping (pl-0344 step 1 / warren-67b6). Populated when the
-		// supervisor (pl-0344 step 5 / warren-2976) detects a blocking
-		// `question_posed` event on the linked Plot and transitions the run
-		// `running → paused`. `paused_at` is the ISO8601 transition timestamp;
-		// `paused_question_event_id` is the Plot event id awaiting an answer.
-		// Both nullable: only set while the run is in the `paused` state. On
-		// resume (`paused → running`), the row may keep or clear these — the
-		// supervisor clears them once the answering turn is dispatched.
-		pausedAt: text("paused_at"),
-		pausedQuestionEventId: text("paused_question_event_id"),
 		// Continuation back-link (warren-4b11): when an operator re-runs a
 		// terminated run "with a follow-up", the new run is spawned with the
 		// prior run's pushed branch as the workspace base (instead of the
@@ -234,7 +213,6 @@ export const runs = sqliteTable(
 		index(INDEX_NAMES.runsProjectStarted).on(t.projectId, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsAgentStarted).on(t.agentName, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsWorkerState).on(t.workerId, t.state),
-		index(INDEX_NAMES.runsPlotId).on(t.plotId),
 		index(INDEX_NAMES.runsMode).on(t.mode),
 		index(INDEX_NAMES.runsPrUrl).on(t.prUrl),
 	],
@@ -244,9 +222,12 @@ export const events = sqliteTable(
 	TABLE_NAMES.events,
 	{
 		id: integer("id").primaryKey({ autoIncrement: true }),
+		// ON DELETE CASCADE (warren-41b3) so a run's event transcript is
+		// removed with the run — including the cascade from a deleted
+		// project (runs.project_id ON DELETE CASCADE).
 		runId: text("run_id")
 			.notNull()
-			.references(() => runs.id),
+			.references(() => runs.id, { onDelete: "cascade" }),
 		burrowEventSeq: integer("burrow_event_seq").notNull(),
 		ts: text("ts").notNull(),
 		kind: text("kind").notNull(),
@@ -265,10 +246,12 @@ export const events = sqliteTable(
  * One row per (project, trigger-id-from-.warren/triggers.yaml). The PK is a
  * composite string `<projectId>:<triggerId>` so the scheduler tick can write
  * back last/next fire timestamps without juggling a separate generated id —
- * Trigger definitions stay in .warren/triggers.yaml (R-02); only mutable
- * Scheduler bookkeeping lives here. last_run_id points at the most recent dispatched run
- * (ON DELETE SET NULL so deleting a run row doesn't orphan the trigger). project_id is the cascade root —
- * deleting the project
+ * the trigger's authoring identity in YAML is what survives across restarts.
+ *
+ * The trigger definition itself stays in .warren/triggers.yaml (R-02); only
+ * mutable scheduler bookkeeping lives here. last_run_id points at the most
+ * recent dispatched run (ON DELETE SET NULL so deleting a run row doesn't
+ * orphan the trigger). project_id is the cascade root — deleting the project
  * drops its triggers, mirroring the .warren/ clone going away with it.
  */
 export const triggers = sqliteTable(
@@ -286,67 +269,6 @@ export const triggers = sqliteTable(
 		completedAt: text("completed_at"),
 	},
 	(t) => [index(INDEX_NAMES.triggersProject).on(t.projectId)],
-);
-
-/**
- * Multi-worker placement registry (warren-b0a3 / pl-9ba1 step 1, parent
- * warren-6747).
- *
- * Each row is one burrow worker warren can dispatch to. `name` is the stable
- * operator-chosen handle (used in URLs like `POST /workers/:name/drain` and
- * referenced by `burrows.worker_id` / `runs.worker_id` once those columns
- * land in step 2). `url` is the transport target (`unix:///var/run/burrow.sock`
- * or `http://host:port`); `BurrowClientPool` (step 3) builds an `HttpClient`
- * per row keyed by name.
- *
- * The bearer token is intentionally NOT stored here: the deploy uses a single
- * shared `BURROW_API_TOKEN` env var across the pool (plan alternative #3 —
- * VPC-private threat model; rotation = one env-var update across the fleet).
- *
- * Zero-row table is the steady state for today's single-worker deploys —
- * `BurrowClientPool` synthesizes a local row from `WARREN_BURROW_*` env vars
- * when this table is empty, preserving back-compat (acceptance #1). Operators
- * with a `[workers]` block in warren config materialize rows here at boot
- * (step 7 lands that loader).
- */
-export const workers = sqliteTable(TABLE_NAMES.workers, {
-	name: text("name").primaryKey(),
-	url: text("url").notNull(),
-	state: text("state", { enum: WORKER_STATES }).notNull().default("healthy"),
-	addedAt: text("added_at").notNull(),
-});
-
-/**
- * Per-burrow worker assignment (warren-135b / pl-9ba1 step 2).
- *
- * Source of truth for `{burrow_id → worker_id}`. One row per burrow warren
- * has provisioned; written at burrow-create time (step 4 wires the spawn
- * flow), read by `clientFor({burrowId})` on every sticky-by-burrow request
- * (stream / cancel / steer / events tail) so warren routes to the worker
- * that physically holds the sandbox + burrow-side SQLite row.
- *
- * `runs.worker_id` is a denormalized copy of this column written at
- * run-create time so streaming paths don't have to join.
- *
- * `worker_id` is plain text without a FK to `workers.name` because the
- * zero-config single-worker deploy uses a synthetic local worker that has
- * no row in `workers` (back-compat with today's `WARREN_BURROW_*` env-var
- * deploys; the loader in step 7 materializes rows only when a `[workers]`
- * block is configured).
- *
- * Sticky-by-burrow is the design (plan risk #5): if the row's `worker_id`
- * points at an `unreachable` worker, `placeForBurrow` fails loudly rather
- * than silently migrating. Operators drain + remove a dead worker to clear
- * orphans (`warren doctor` will surface them as `worker_missing`).
- */
-export const burrows = sqliteTable(
-	TABLE_NAMES.burrows,
-	{
-		id: text("id").primaryKey(),
-		workerId: text("worker_id").notNull(),
-		addedAt: text("added_at").notNull(),
-	},
-	(t) => [index(INDEX_NAMES.burrowsWorker).on(t.workerId)],
 );
 
 /**
@@ -382,14 +304,6 @@ export const planRuns = sqliteTable(
 		modelOverride: text("model_override"),
 		dispatcherHandle: text("dispatcher_handle").notNull().default("operator"),
 		trigger: text("trigger").notNull().default("manual"),
-		// Optional back-link to the Plot this plan-run was dispatched against
-		// (warren-06dc / pl-7937 Phase 2; mirrors `runs.plot_id`). Gated on the
-		// owning project's `hasPlot` flag at handler level. When set, the
-		// coordinator forwards it to every child run's spawn input (PLOT_ID/
-		// PLOT_ACTOR injection, per-child `run_dispatched`) and auto-transitions
-		// the bound Plot to `done` once every child is terminal. Nullable;
-		// plain text, no FK — Plots live in the project workspace.
-		plotId: text("plot_id"),
 		// Back-link to the parent run that created this plan-run via
 		// auto_plan_run (warren-d9a2). When set, the coordinator gates on
 		// the parent run's PR being merged before dispatching the first
@@ -407,7 +321,6 @@ export const planRuns = sqliteTable(
 	(t) => [
 		index(INDEX_NAMES.planRunsProjectState).on(t.projectId, t.state),
 		index(INDEX_NAMES.planRunsState).on(t.state),
-		index(INDEX_NAMES.planRunsPlotId).on(t.plotId),
 	],
 );
 
@@ -433,9 +346,6 @@ export const planRunChildren = sqliteTable(
 		seq: integer("seq").notNull(),
 		seedId: text("seed_id").notNull(),
 		runId: text("run_id").references(() => runs.id, { onDelete: "set null" }),
-		// Execution project the coordinator routed this child to (pl-fb43
-		// step 6 / warren-57f6). Nullable (pending/skipped + legacy rows).
-		executionProjectId: text("execution_project_id"),
 		state: text("state", { enum: PLAN_RUN_CHILD_STATES }).notNull(),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -451,108 +361,60 @@ export const planRunChildren = sqliteTable(
 	],
 );
 
+export type AgentDbRow = typeof agents.$inferSelect;
+export type AgentInsert = typeof agents.$inferInsert;
+export type ProjectRow = typeof projects.$inferSelect;
+export type ProjectInsert = typeof projects.$inferInsert;
+export type RunRow = typeof runs.$inferSelect;
+export type RunInsert = typeof runs.$inferInsert;
+export type EventRow = typeof events.$inferSelect;
+export type EventInsert = typeof events.$inferInsert;
+export type TriggerRow = typeof triggers.$inferSelect;
+export type TriggerInsert = typeof triggers.$inferInsert;
+/**
+ * Run inbox (warren-3d0b, pl-829f step 18). The durable steering channel for
+ * pod-per-run K8s runs: with no live socket into the sandbox, warren persists
+ * each steering message here and the in-pod agent harness polls
+ * `GET /runs/:id/inbox` over the Service-DNS callback URL to drain it. The
+ * K8sProvider's `sendMessage` writes the row; the poll endpoint claims unread
+ * rows priority-desc then FIFO-by-`seq` and atomically flips them `delivered`.
+ *
+ * `run_id` FKs `runs.id` ON DELETE CASCADE (a run's undelivered steers die with
+ * it). `seq` is monotonic per run (allocated max+1 under the enqueue
+ * transaction, mirroring `messages.seq`) so FIFO ordering within a priority
+ * class is deterministic even when two rows share a `created_at` millisecond.
+ * `state` defaults to `unread`; `delivered_at` is the ISO-8601 claim timestamp,
+ * null until a poll delivers the row. Mirrors the seam `Message` shape
+ * (`src/runtime/contract.ts`) so the provider maps a row onto it without loss.
+ */
+export const runInbox = sqliteTable(
+	TABLE_NAMES.runInbox,
+	{
+		id: text("id").primaryKey(),
+		runId: text("run_id")
+			.notNull()
+			.references(() => runs.id, { onDelete: "cascade" }),
+		seq: integer("seq").notNull(),
+		body: text("body").notNull(),
+		priority: text("priority", { enum: INBOX_PRIORITIES }).notNull().default("normal"),
+		fromActor: text("from_actor").notNull().default("operator"),
+		state: text("state", { enum: INBOX_STATES }).notNull().default("unread"),
+		createdAt: text("created_at").notNull(),
+		deliveredAt: text("delivered_at"),
+	},
+	(t) => [index(INDEX_NAMES.runInboxRunState).on(t.runId, t.state)],
+);
+
+export type PlanRunRow = typeof planRuns.$inferSelect;
+export type PlanRunInsert = typeof planRuns.$inferInsert;
+export type PlanRunChildRow = typeof planRunChildren.$inferSelect;
+export type PlanRunChildInsert = typeof planRunChildren.$inferInsert;
+export type RunInboxRow = typeof runInbox.$inferSelect;
+export type RunInboxInsert = typeof runInbox.$inferInsert;
+
 const graphTables = createSqliteGraphTables({ projects, runs });
 export const { graphRuns, graphRunChildren } = graphTables;
-
-export type {
-	AgentInsert,
-	AgentRow,
-	BurrowInsert,
-	BurrowRow,
-	EventInsert,
-	EventRow,
-	ProjectInsert,
-	ProjectRow,
-	RunInsert,
-	RunRow,
-	TriggerInsert,
-	TriggerRow,
-	WorkerInsert,
-	WorkerRow,
-} from "./sqlite-types.ts";
-/** Git-backed Plot projection cache; `state_json` remains the source of truth. */
-export const plots = sqliteTable(
-	TABLE_NAMES.plots,
-	{
-		id: text("id").primaryKey(),
-		projectId: text("project_id")
-			.notNull()
-			.references(() => projects.id, { onDelete: "cascade" }),
-		status: text("status").notNull(),
-		title: text("title"),
-		updatedAt: text("updated_at").notNull(),
-		stateJson: text("state_json", { mode: "json" }).$type<PlotProjectionState>().notNull(),
-	},
-	(t) => [
-		index(INDEX_NAMES.plotsProjectUpdated).on(t.projectId, t.updatedAt),
-		index(INDEX_NAMES.plotsStatus).on(t.status),
-	],
-);
-
-/** Leveret conversations bind to a Plot; transcript rows live in `messages`. */
-export const conversations = sqliteTable(
-	TABLE_NAMES.conversations,
-	{
-		id: text("id").primaryKey(),
-		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
-		// Plot binding. Nullable in schema for forward-compat though v1 always
-		// sets it at conversation-create. Plain text, no FK — Plots are git-backed.
-		plotId: text("plot_id"),
-		// Anchoring mode:'conversation' run. Rotates on re-wake (warren-6ccf);
-		// nullable between rotations. Plain text for symmetry with run back-links.
-		anchoringRunId: text("anchoring_run_id"),
-		status: text("status", { enum: CONVERSATION_STATES }).notNull().default("active"),
-		title: text("title"),
-		submittedPrUrl: text("submitted_pr_url"), // send-off PR ref (warren-756d)
-		submittedPrNumber: integer("submitted_pr_number"),
-		plannerAgent: text("planner_agent"), // send-off planner agent (warren-756d)
-		plannerRunId: text("planner_run_id"), // merge-poller dispatch guard (warren-b872)
-		createdAt: text("created_at").notNull(),
-		lastActivityAt: text("last_activity_at").notNull(),
-		closedAt: text("closed_at"),
-	},
-	(t) => [
-		index(INDEX_NAMES.conversationsProject).on(t.projectId),
-		index(INDEX_NAMES.conversationsPlot).on(t.plotId),
-	],
-);
-
-/**
- * Messages (warren-0b91). The conversation transcript, one
- * row per turn, `seq` monotonic per conversation. `conversation_id` FKs
- * `conversations.id` ON DELETE CASCADE. `content` is TEXT (free-form turn body
- * or a JSON-encoded tool payload). `run_id` optionally back-links the
- * anchoring run that produced the turn; nullable for host-written rows.
- */
-export const messages = sqliteTable(
-	TABLE_NAMES.messages,
-	{
-		id: text("id").primaryKey(),
-		conversationId: text("conversation_id")
-			.notNull()
-			.references(() => conversations.id, { onDelete: "cascade" }),
-		seq: integer("seq").notNull(),
-		role: text("role", { enum: MESSAGE_ROLES }).notNull(),
-		content: text("content").notNull(),
-		runId: text("run_id"),
-		createdAt: text("created_at").notNull(),
-	},
-	(t) => [index(INDEX_NAMES.messagesConversationSeq).on(t.conversationId, t.seq)],
-);
-
-export type {
-	ConversationInsert,
-	ConversationRow,
-	GraphRunChildInsert,
-	GraphRunChildRow,
-	GraphRunInsert,
-	GraphRunRow,
-	MessageInsert,
-	MessageRow,
-	PlanRunChildInsert,
-	PlanRunChildRow,
-	PlanRunInsert,
-	PlanRunRow,
-	PlotInsert,
-	PlotRow,
-} from "./sqlite-types.ts";
+export type GraphRunRow = typeof graphRuns.$inferSelect;
+export type GraphRunInsert = typeof graphRuns.$inferInsert;
+export type GraphRunChildRow = typeof graphRunChildren.$inferSelect;
+export type GraphRunChildInsert = typeof graphRunChildren.$inferInsert;

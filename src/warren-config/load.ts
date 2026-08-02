@@ -6,6 +6,15 @@
  *   malformed file  → field is `null`, one entry in `errors`
  *   valid file      → field is the parsed value, no entry in `errors`
  *
+ * That contract is read-only: the loader never throws on a bad file, and it
+ * never guesses at a partial value. It does NOT mean a malformed file is
+ * harmless. Since warren-02aa the spawn path treats an `errors[]` entry
+ * against a guardrail-bearing file (`config.yaml` / `defaults.json`) as
+ * dispatch-blocking — see `assertGuardrailConfigUsable` in
+ * `src/runs/spawn/agent-cache.ts`. Consumers that merely RENDER config
+ * (doctor, readyz, the UI) keep reading `defaults: null` + `errors`;
+ * consumers that ACT on guardrails must fail closed.
+ *
  * Warren-5840 hoists global defaults into YAML and splits the preview block
  * into its own file. Backcompat precedence:
  *
@@ -35,7 +44,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import yaml from "js-yaml";
+import { load } from "js-yaml";
 import { formatError } from "../core/errors.ts";
 import { type PrTemplateOverrides, parsePrTemplate } from "../runs/pr-template.ts";
 import { WARREN_CONFIG_DIR, WARREN_CONFIG_FILES, warrenConfigRelativePath } from "./config.ts";
@@ -153,6 +162,35 @@ interface LoadDefaultsInput extends LoadOneInput {
 	readonly warnings: WarrenConfigFileError[];
 }
 
+/**
+ * Parse the YAML document for one `.warren/` file, treating empty or
+ * comment-only content as "absent" (`undefined`) rather than an error.
+ * js-yaml v5 `load()` throws when the input contains no document — a bare
+ * `# comment` file included — so the emptiness check strips comment lines
+ * before trimming to preserve the v4 behaviour where such files parsed to
+ * `undefined` (warren-381c).
+ */
+function loadYamlDocument(
+	raw: string,
+	relPath: string,
+	errors: WarrenConfigFileError[],
+): { readonly ok: true; readonly document: unknown } | { readonly ok: false } {
+	const trimmed = raw.replace(/^\s*#.*$/gm, "").trim();
+	if (trimmed === "") {
+		return { ok: true, document: undefined };
+	}
+	try {
+		return { ok: true, document: load(raw, { filename: relPath }) };
+	} catch (err) {
+		errors.push({
+			file: relPath,
+			code: WARREN_CONFIG_FILE_ERROR_CODES.parseError,
+			message: `YAML parse error: ${formatError(err)}`,
+		});
+		return { ok: false };
+	}
+}
+
 async function loadTriggers(input: LoadOneInput): Promise<TriggersConfig | null> {
 	const relPath = warrenConfigRelativePath("triggers");
 	const absPath = join(input.projectPath, WARREN_CONFIG_DIR, WARREN_CONFIG_FILES.triggers);
@@ -173,19 +211,12 @@ async function loadTriggers(input: LoadOneInput): Promise<TriggersConfig | null>
 		return null;
 	}
 
-	let document: unknown;
-	try {
-		document = yaml.load(raw, { filename: relPath });
-	} catch (err) {
-		input.errors.push({
-			file: relPath,
-			code: WARREN_CONFIG_FILE_ERROR_CODES.parseError,
-			message: `YAML parse error: ${formatError(err)}`,
-		});
+	const parsed = loadYamlDocument(raw, relPath, input.errors);
+	if (!parsed.ok) {
 		return null;
 	}
 
-	const result = parseTriggersConfig(document);
+	const result = parseTriggersConfig(parsed.document);
 	if (!result.ok) {
 		input.errors.push({
 			file: relPath,
@@ -274,24 +305,12 @@ async function loadConfigYaml(
 		return null;
 	}
 
-	const trimmed = raw.trim();
-	let document: unknown;
-	if (trimmed === "") {
-		document = undefined;
-	} else {
-		try {
-			document = yaml.load(raw, { filename: relPath });
-		} catch (err) {
-			input.errors.push({
-				file: relPath,
-				code: WARREN_CONFIG_FILE_ERROR_CODES.parseError,
-				message: `YAML parse error: ${formatError(err)}`,
-			});
-			return null;
-		}
+	const parsed = loadYamlDocument(raw, relPath, input.errors);
+	if (!parsed.ok) {
+		return null;
 	}
 
-	const result = parseConfigFile(document);
+	const result = parseConfigFile(parsed.document);
 	if (!result.ok) {
 		input.errors.push({
 			file: relPath,
@@ -377,24 +396,12 @@ async function loadPreviewFile(input: LoadOneInput): Promise<DefaultsConfig["pre
 		return null;
 	}
 
-	const trimmed = raw.trim();
-	let document: unknown;
-	if (trimmed === "") {
-		document = undefined;
-	} else {
-		try {
-			document = yaml.load(raw, { filename: relPath });
-		} catch (err) {
-			input.errors.push({
-				file: relPath,
-				code: WARREN_CONFIG_FILE_ERROR_CODES.parseError,
-				message: `YAML parse error: ${formatError(err)}`,
-			});
-			return null;
-		}
+	const parsed = loadYamlDocument(raw, relPath, input.errors);
+	if (!parsed.ok) {
+		return null;
 	}
 
-	const result = parsePreviewFile(document);
+	const result = parsePreviewFile(parsed.document);
 	if (!result.ok) {
 		input.errors.push({
 			file: relPath,

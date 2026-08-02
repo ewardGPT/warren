@@ -6,8 +6,8 @@ import { spawnRun } from "./index.ts";
 import {
 	makeAgentJson,
 	makeBurrowClient,
-	makePool,
-	readCanopyFrontmatter,
+	makeProvider,
+	readAgentEnvelopeFrontmatter,
 	setupRepos,
 } from "./test-helpers.ts";
 
@@ -39,7 +39,7 @@ describe("readCachedAgent (via spawnRun)", () => {
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: await makePool(repos, client),
+			runtimeProvider: makeProvider(client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -57,83 +57,12 @@ describe("readCachedAgent (via spawnRun)", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: await makePool(repos, client),
+				runtimeProvider: makeProvider(client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
 			}),
 		).rejects.toBeInstanceOf(RunSpawnError);
-	});
-});
-
-describe("agent tier resolution (R-03 / warren-0a7e)", () => {
-	let db: WarrenDb;
-	let repos: Repos;
-
-	beforeEach(async () => {
-		({ db, repos } = await setupRepos());
-	});
-	afterEach(async () => {
-		await db.close();
-	});
-
-	test("prefers the project-tier agent when one exists for the spawn's project", async () => {
-		await repos.agents.upsert({
-			name: "refactor-bot",
-			projectId: "prj_xxxxxxxxxxxx",
-			renderedJson: makeAgentJson({
-				sections: { system: "project tier system" },
-				frontmatter: { source: "project:prj_xxxxxxxxxxxx" },
-			}),
-		});
-		const { client } = makeBurrowClient();
-		const result = await spawnRun({
-			repos,
-			burrowClientPool: await makePool(repos, client),
-			agentName: "refactor-bot",
-			projectId: "prj_xxxxxxxxxxxx",
-			prompt: "p",
-		});
-		const stored = (await repos.runs.require(result.run.id)).renderedAgentJson as {
-			sections: Record<string, string>;
-			frontmatter: Record<string, unknown>;
-		};
-		expect(stored.sections.system).toBe("project tier system");
-		expect(stored.frontmatter.source).toBe("project:prj_xxxxxxxxxxxx");
-	});
-
-	test("falls back to the global-tier agent when no project-tier row matches", async () => {
-		// Only the global `refactor-bot` exists (seeded in beforeEach); no
-		// project-tier row for `prj_xxxxxxxxxxxx`. The unrelated project-tier
-		// row on a DIFFERENT project must not leak across.
-		await repos.projects.create({
-			id: "prj_otherrrrrrr",
-			gitUrl: "https://github.com/x/z.git",
-			localPath: "/data/projects/x/z",
-			defaultBranch: "main",
-		});
-		await repos.agents.upsert({
-			name: "refactor-bot",
-			projectId: "prj_otherrrrrrr",
-			renderedJson: makeAgentJson({
-				sections: { system: "other project system" },
-				frontmatter: { source: "project:prj_otherrrrrrr" },
-			}),
-		});
-		const { client } = makeBurrowClient();
-		const result = await spawnRun({
-			repos,
-			burrowClientPool: await makePool(repos, client),
-			agentName: "refactor-bot",
-			projectId: "prj_xxxxxxxxxxxx",
-			prompt: "p",
-		});
-		const stored = (await repos.runs.require(result.run.id)).renderedAgentJson as {
-			sections: Record<string, string>;
-			frontmatter: Record<string, unknown>;
-		};
-		expect(stored.sections.system).toBe("be a refactor agent");
-		expect(stored.frontmatter.source).toBeUndefined();
 	});
 });
 
@@ -159,7 +88,7 @@ describe("provider/model override resolution (warren-618b / warren-f8c0)", () =>
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: await makePool(repos, client),
+			runtimeProvider: makeProvider(client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",
@@ -169,8 +98,8 @@ describe("provider/model override resolution (warren-618b / warren-f8c0)", () =>
 
 		// The seed payload shipped on POST /burrows carries the override-applied
 		// agent envelope verbatim (buildSeedFiles materializes the resolved
-		// frontmatter into `.canopy/agent.json`).
-		const seededFm = readCanopyFrontmatter(calls);
+		// frontmatter into `.warren/agent.json`).
+		const seededFm = readAgentEnvelopeFrontmatter(calls);
 		expect(seededFm.provider).toBe("openai");
 		expect(seededFm.model).toBe("gpt-4o");
 		// Original builtin frontmatter preserved
@@ -202,7 +131,7 @@ describe("provider/model override resolution (warren-618b / warren-f8c0)", () =>
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: await makePool(repos, client),
+			runtimeProvider: makeProvider(client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",
@@ -221,7 +150,7 @@ describe("provider/model override resolution (warren-618b / warren-f8c0)", () =>
 			},
 		});
 
-		const seededFm = readCanopyFrontmatter(calls);
+		const seededFm = readAgentEnvelopeFrontmatter(calls);
 		expect(seededFm.provider).toBe("anthropic");
 		expect(seededFm.model).toBe("claude-opus-4-7");
 		expect(seededFm.source).toBe("builtin");
@@ -243,7 +172,7 @@ describe("provider/model override resolution (warren-618b / warren-f8c0)", () =>
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: await makePool(repos, client),
+			runtimeProvider: makeProvider(client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",
@@ -280,7 +209,7 @@ describe("provider/model override resolution (warren-618b / warren-f8c0)", () =>
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: await makePool(repos, client),
+			runtimeProvider: makeProvider(client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",

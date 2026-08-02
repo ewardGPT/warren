@@ -1,9 +1,9 @@
 import {
 	AnimatePresence,
+	domAnimation,
 	type HTMLMotionProps,
 	LazyMotion,
 	MotionConfig,
-	domAnimation,
 	m,
 	useReducedMotion,
 } from "framer-motion";
@@ -130,12 +130,7 @@ export function StreamItem({
 	className?: string;
 }) {
 	return (
-		<m.div
-			variants={FADE_IN_VARIANTS}
-			initial="hidden"
-			animate="visible"
-			className={className}
-		>
+		<m.div variants={FADE_IN_VARIANTS} initial="hidden" animate="visible" className={className}>
 			{children}
 		</m.div>
 	);

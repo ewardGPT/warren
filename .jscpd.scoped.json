@@ -1,0 +1,16 @@
+{
+	"pattern": "{src/cli,src/client,src/ui/src/api,src/server/handlers}/**/*.{ts,tsx}",
+	"ignore": [
+		"**/node_modules/**",
+		"**/__golden__/**",
+		"**/*.test.ts",
+		"**/*.test.tsx",
+		"**/*test-helpers.ts"
+	],
+	"minTokens": 40,
+	"threshold": 0,
+	"reporters": ["json"],
+	"absolute": false,
+	"gitignore": true,
+	"silent": true
+}

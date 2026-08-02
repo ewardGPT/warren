@@ -8,13 +8,8 @@ import { readTargetRepo } from "../../../seeds-cli/warren-extensions.ts";
 import type { IdempotentDispatch } from "../../idempotency.ts";
 import { jsonResponse } from "../../response.ts";
 import type { RouteHandler, ServerDeps } from "../../types.ts";
-import {
-	assertPlotIdDispatchable,
-	defaultSpawn,
-	optionalString,
-	readJsonBody,
-	requireString,
-} from "../index.ts";
+import { optionalObject } from "../body-fields.ts";
+import { defaultSpawn, optionalString, readJsonBody, requireString } from "../index.ts";
 
 /**
  * Defaults derived from a prior run for the `cloneFromRunId` re-run path
@@ -148,7 +143,6 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const body = await readJsonBody(ctx);
 		const seedId = optionalString(body, "seedId");
-		const plotId = optionalString(body, "plotId");
 		const ref = optionalString(body, "ref");
 		// warren-709e (#419): an explicit target branch the run must push to
 		// instead of the composed `${prefix}/${runId}`. Persisted on the run row
@@ -167,28 +161,31 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 		} = await resolveDispatchFields(deps, body);
 		const seedDispatch = await resolveSeedDispatch(deps, seedId, projectId, prompt);
 
-		await assertPlotIdDispatchable({ plotId, plotResolver: deps.plotResolver });
-
 		const options: Parameters<typeof spawnRun>[0] = {
 			repos: deps.repos,
-			burrowClientPool: deps.burrowClientPool,
+			// warren-245d: thread the resolved runtime provider so POST /runs
+			// dispatches through the K8sProvider under WARREN_RUNTIME=k8s. Without
+			// this, spawnRun fell back to the burrow LocalProvider and every K8s
+			// dispatch 503'd `burrow_unreachable`. Mirrors conversations.ts.
+			runtimeProvider: deps.runtimeProvider,
 			agentName,
 			projectId: seedDispatch.projectId,
 			prompt: seedDispatch.prompt,
-			seedProjectId: seedDispatch.seedProjectId,
 			...(seedDispatch.executionRepo !== undefined
 				? { executionRepo: seedDispatch.executionRepo }
 				: {}),
 			mode: "batch",
 			projectsConfig: deps.projectsConfig,
 			projectSpawn: deps.spawn ?? defaultSpawn,
-			metadata: body.metadata as Record<string, unknown> | undefined,
+			githubToken: deps.autoOpenPr?.gitToken,
+			// warren-b27c: shape-checked, not cast. An array or scalar `metadata`
+			// used to sail through the cast and reach persistence typed as a record.
+			metadata: optionalObject(body, "metadata"),
 			now: deps.now,
 			ref,
 			providerOverride,
 			modelOverride,
 			seedId,
-			plotId,
 			...(targetBranch !== undefined ? { targetBranch } : {}),
 			...(parentRunId !== undefined ? { parentRunId } : {}),
 			...(cloneKind !== undefined ? { cloneKind } : {}),

@@ -7,7 +7,7 @@ describe("createGraphRunSpawn", () => {
 		let received: Record<string, unknown> | undefined;
 		const spawn = createGraphRunSpawn({
 			repos: { projects: { require: async () => ({ defaultBranch: "main" }) } } as never,
-			burrowClientPool: {} as never,
+			runtimeProvider: {} as never,
 			bridges: { start: (...args: string[]) => void starts.push(args.join(":")) } as never,
 			warrenConfigs: {} as never,
 			projectsConfig: {} as never,

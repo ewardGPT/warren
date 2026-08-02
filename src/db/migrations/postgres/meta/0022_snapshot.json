@@ -1,5 +1,5 @@
 {
-	"id": "d58b9be0-c13a-4c88-bacc-14c7b5caef3b",
+	"id": "678d3afd-8c36-4765-8bfa-16d8f40643cc",
 	"prevId": "f0b465f6-132a-4bc2-9957-0c6475336b57",
 	"version": "7",
 	"dialect": "postgresql",
@@ -95,53 +95,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.burrows": {
-			"name": "burrows",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"worker_id": {
-					"name": "worker_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {
-				"burrows_worker_idx": {
-					"name": "burrows_worker_idx",
-					"columns": [
-						{
-							"expression": "worker_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"policies": {},
@@ -1065,12 +1018,6 @@
 					"primaryKey": false,
 					"notNull": false
 				},
-				"merge_wait_started_at": {
-					"name": "merge_wait_started_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
 				"prompt": {
 					"name": "prompt",
 					"type": "text",
@@ -1407,44 +1354,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.workers": {
-			"name": "workers",
-			"schema": "",
-			"columns": {
-				"name": {
-					"name": "name",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"url": {
-					"name": "url",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"state": {
-					"name": "state",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"default": "'healthy'"
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"policies": {},

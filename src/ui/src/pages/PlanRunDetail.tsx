@@ -2,18 +2,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CircleStop } from "lucide-react";
 import { useParams } from "react-router-dom";
 import { planRunsApi } from "@/api/client.ts";
-import { PlotMetaCardContent } from "@/components/PlotMetaCardContent.tsx";
-import type { PlanRunChildRow, PlanRunRow, RunRow } from "@/api/types.ts";
-import { PLAN_RUN_TERMINAL_STATES } from "@/api/types.ts";
+import type { PlanRunRow, RunRow } from "@/api/types.ts";
+import { isTerminalPlanRunState } from "@/api/types.ts";
+import { OperatorOnly } from "@/components/OperatorOnly.tsx";
 import { PlanRunStateBadge } from "@/components/PlanRunStateBadge.tsx";
 import { Alert } from "@/components/ui/alert.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import { Spinner } from "@/components/ui/spinner.tsx";
 import { formatError } from "@/lib/format-error.ts";
+import { formatPlanRunFailureReason } from "@/lib/labels.ts";
 import { formatTimestamp, relativeTime } from "@/lib/utils.ts";
 import { PlanRunChildTable } from "./plan-run-detail/child-table.tsx";
-import { PlanRunGraphView } from "./plan-run-detail/graph-view.tsx";
 import { formatCostUsd } from "./RunDetail.tsx";
 
 const ACTIVE_STATES = new Set<PlanRunRow["state"]>(["queued", "running"]);
@@ -28,7 +28,7 @@ export function PlanRunDetailPage() {
 		refetchInterval: (q) => {
 			const data = q.state.data;
 			if (!data) return 5000;
-			return PLAN_RUN_TERMINAL_STATES.includes(data.planRun.state) ? false : 5000;
+			return isTerminalPlanRunState(data.planRun.state) ? false : 5000;
 		},
 	});
 
@@ -48,7 +48,7 @@ export function PlanRunDetailPage() {
 		);
 	}
 	if (!detail.data) return null;
-	const { planRun, children, runs, graph } = detail.data;
+	const { planRun, children, runs } = detail.data;
 	const canCancel = ACTIVE_STATES.has(planRun.state);
 	const cost = summarizeRunCost(runs);
 
@@ -60,11 +60,10 @@ export function PlanRunDetailPage() {
 						<h1 className="font-mono text-xl font-semibold">{planRun.id}</h1>
 						<PlanRunStateBadge state={planRun.state} />
 						{planRun.state === "failed" && planRun.failureReason !== null ? (
-							<span
-								className="font-mono text-xs text-(--color-destructive)"
-								title={planRun.failureReason}
-							>
-								{planRun.failureReason}
+							// Prose for the visitor, raw reason in the tooltip for the
+							// operator (warren-14fc / #641).
+							<span className="text-xs text-(--color-destructive)" title={planRun.failureReason}>
+								{formatPlanRunFailureReason(planRun.failureReason)}
 							</span>
 						) : null}
 					</div>
@@ -75,17 +74,19 @@ export function PlanRunDetailPage() {
 					</p>
 				</div>
 				{canCancel ? (
-					<div className="flex flex-col items-end gap-1">
-						<Button
-							variant="destructive"
-							onClick={() => cancel.mutate()}
-							disabled={cancel.isPending}
-						>
-							<CircleStop className="h-4 w-4" />
-							{cancel.isPending ? "Cancelling…" : "Cancel"}
-						</Button>
-						<CancelStatus mutation={cancel} />
-					</div>
+					<OperatorOnly>
+						<div className="flex flex-col items-end gap-1">
+							<Button
+								variant="destructive"
+								onClick={() => cancel.mutate()}
+								disabled={cancel.isPending}
+							>
+								<CircleStop className="h-4 w-4" />
+								{cancel.isPending ? "Cancelling…" : "Cancel"}
+							</Button>
+							<CancelStatus mutation={cancel} />
+						</div>
+					</OperatorOnly>
 				) : null}
 			</header>
 
@@ -94,12 +95,9 @@ export function PlanRunDetailPage() {
 					<span className="font-mono text-xs">{planRun.planId}</span>
 				</MetaCard>
 				<MetaCard label="Agent">{planRun.agentName}</MetaCard>
-				<MetaCard label="Coordination">
-					<span className="font-mono text-xs" title="coordination project (where the seeds live)">
-						{planRun.projectId}
-					</span>
+				<MetaCard label="Project">
+					<span className="font-mono text-xs">{planRun.projectId}</span>
 				</MetaCard>
-				<MetaCard label="Executes across">{renderExecutionRepos(planRun, children)}</MetaCard>
 				<MetaCard label="Dispatcher">{planRun.dispatcherHandle}</MetaCard>
 				<MetaCard label="Trigger">{planRun.trigger}</MetaCard>
 				<MetaCard label="Children">{children.length}</MetaCard>
@@ -133,11 +131,6 @@ export function PlanRunDetailPage() {
 						<span className="font-mono text-xs">{planRun.ref}</span>
 					</MetaCard>
 				) : null}
-				{planRun.plotId !== null ? (
-					<MetaCard label="Plot">
-						<PlotMetaCardContent plotId={planRun.plotId} />
-					</MetaCard>
-				) : null}
 				<MetaCard label="Created">{relativeTime(planRun.createdAt)}</MetaCard>
 			</div>
 
@@ -152,8 +145,7 @@ export function PlanRunDetailPage() {
 				</CardContent>
 			</Card>
 
-			<PlanRunChildTable children={children} runs={runs} />
-			<PlanRunGraphView graph={graph} />
+			<PlanRunChildTable planChildren={children} runs={runs} />
 		</div>
 	);
 }
@@ -164,52 +156,12 @@ function CancelStatus({
 	mutation: ReturnType<typeof useMutation<unknown, Error, void>>;
 }) {
 	if (mutation.isError) {
-		return (
-			<p className="text-xs text-(--color-destructive)">{formatError(mutation.error)}</p>
-		);
+		return <p className="text-xs text-(--color-destructive)">{formatError(mutation.error)}</p>;
 	}
 	if (mutation.isSuccess) {
-		return (
-			<p className="text-xs text-emerald-700 dark:text-emerald-300">
-				Cancel forwarded.
-			</p>
-		);
+		return <p className="text-xs text-emerald-700 dark:text-emerald-300">Cancel forwarded.</p>;
 	}
 	return null;
-}
-
-/**
- * Distinct execution repos a plan-run dispatches across (pl-fb43 step 6 /
- * warren-57f6). Children inherit the coordination project unless their
- * seed carries an `extensions.repo` tag, so the common single-repo case
- * renders as the coordination project itself; a cross-repo plan lists each
- * distinct execution project. Children not yet dispatched (null
- * `executionProjectId`) are ignored until the coordinator stamps them.
- */
-function renderExecutionRepos(planRun: PlanRunRow, children: PlanRunChildRow[]): React.ReactNode {
-	const distinct = new Set<string>();
-	for (const c of children) {
-		if (c.executionProjectId !== null) distinct.add(c.executionProjectId);
-	}
-	if (distinct.size === 0) {
-		return (
-			<span className="font-mono text-xs text-(--color-muted-foreground)">
-				{planRun.projectId}
-			</span>
-		);
-	}
-	return (
-		<div className="flex flex-wrap gap-1">
-			{[...distinct].map((repo) => (
-				<span
-					key={repo}
-					className="rounded bg-(--color-muted) px-1.5 py-0.5 font-mono text-xs"
-				>
-					{repo}
-				</span>
-			))}
-		</div>
-	);
 }
 
 function MetaCard({ label, children }: { label: string; children: React.ReactNode }) {

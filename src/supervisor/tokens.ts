@@ -11,7 +11,7 @@
  * "missing Authorization header" once boot finishes. Worse, if BURROW_API_TOKEN
  * alone is missing, `burrow serve` exits with `[validation_error]` and the
  * supervisor restart-loops it five times before giving up — ten boot-loop
- * lines in fly logs for one missing secret. Validate at the supervisor
+ * lines in the container logs for one missing secret. Validate at the supervisor
  * before anything spawns and exit with a single, pointed error.
  *
  * `WARREN_BURROW_NO_AUTH=1` bypasses validation: burrow serves without
@@ -48,7 +48,7 @@ export class TokenValidationError extends Error {
 
 const SHARED_HINT =
 	"Generate one secret and set both vars to it: TOKEN=$(openssl rand -hex 32); export BURROW_API_TOKEN=$TOKEN WARREN_BURROW_TOKEN=$TOKEN. " +
-	"On Fly: fly secrets set BURROW_API_TOKEN=$TOKEN WARREN_BURROW_TOKEN=$TOKEN. " +
+	"On a cluster, put both in the same Secret so they always match. " +
 	"For loopback dev only, set WARREN_BURROW_NO_AUTH=1 to skip auth entirely.";
 
 export function validateBurrowAuthTokens(cfg: TokenValidationConfig): TokenValidationResult {

@@ -7,14 +7,13 @@ This page enumerates every HTTP route registered by warren's `Bun.serve` router.
 
 To refresh: `bun run gen:docs`. To check (CI mode): `bun run gen:docs:check`.
 
-Total routes: **64**.
+Total routes: **39**.
 
 ## /agents
 
 | Method | Pattern | Handler | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/agents` | `listAgentsHandler` |  |
-| `POST` | `/agents/refresh` | `refreshAgentsHandler` |  |
 | `GET` | `/agents/:name` | `getAgentHandler` |  |
 
 ## /alerts
@@ -30,31 +29,6 @@ Total routes: **64**.
 | `GET` | `/analytics/cost` | `listCostAnalyticsHandler` |  |
 | `GET` | `/analytics/runs` | `listRunAnalyticsHandler` |  |
 | `GET` | `/analytics/behavior` | `listBehaviorAnalyticsHandler` |  |
-
-## /burrows
-
-| Method | Pattern | Handler | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/burrows` | `listBurrowsHandler` |  |
-| `GET` | `/burrows/:id` | `getBurrowHandler` |  |
-
-## /conversations
-
-| Method | Pattern | Handler | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/conversations` | `listConversationsHandler` |  |
-| `POST` | `/conversations` | `createConversationHandler` |  |
-| `GET` | `/conversations/:id` | `getConversationHandler` |  |
-| `POST` | `/conversations/:id/messages` | `postConversationMessageHandler` |  |
-| `POST` | `/conversations/:id/send-off` | `sendOffConversationHandler` |  |
-| `POST` | `/conversations/:id/re-wake` | `rewakeConversationHandler` |  |
-
-## /graph-runs
-
-| Method | Pattern | Handler | Notes |
-| --- | --- | --- | --- |
-| `POST` | `/graph-runs` | `createGraphRunHandler` |  |
-| `GET` | `/graph-runs/:id` | `getGraphRunHandler` |  |
 
 ## /healthz
 
@@ -76,32 +50,7 @@ Total routes: **64**.
 | `POST` | `/plan-runs` | `createPlanRunHandler` |  |
 | `GET` | `/plan-runs/:id` | `getPlanRunHandler` |  |
 | `POST` | `/plan-runs/:id/cancel` | `cancelPlanRunHandler` |  |
-| `POST` | `/plan-runs/:id/resume` | `resumePlanRunHandler` |  |
 | `GET` | `/plan-runs/:id/events` | `streamPlanRunEventsHandler` |  |
-
-## /plot-plan-runs
-
-| Method | Pattern | Handler | Notes |
-| --- | --- | --- | --- |
-| `POST` | `/plot-plan-runs` | `createPlotPlanRunHandler` |  |
-
-## /plots
-
-| Method | Pattern | Handler | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/plots` | `listPlotsHandler` |  |
-| `POST` | `/plots` | `createPlotHandler` |  |
-| `GET` | `/plots/needs-attention/count` | `needsAttentionCountHandler` | Static path — must precede `/plots/:id` so the param route doesn't swallow `needs-attention` as an :id. |
-| `GET` | `/plots/:id/summary` | `getPlotSummaryHandler` | Static-suffix path — must precede `/plots/:id` so the param route doesn't swallow `summary` as the rest of the id. |
-| `GET` | `/plots/:id` | `getPlotHandler` |  |
-| `POST` | `/plots/:id/intent` | `editPlotIntentHandler` |  |
-| `POST` | `/plots/:id/rename` | `renamePlotHandler` |  |
-| `POST` | `/plots/:id/sync` | `syncPlotHandler` |  |
-| `POST` | `/plots/:id/status` | `changePlotStatusHandler` |  |
-| `POST` | `/plots/:id/attachments` | `attachPlotHandler` |  |
-| `POST` | `/plots/:id/attachments/:ref/merge` | `mergePlotPrAttachmentHandler` | Specific path — must precede `/plots/:id/attachments/:ref` so the DELETE-by-ref route doesn't swallow `<ref>/merge` as a ref. |
-| `DELETE` | `/plots/:id/attachments/:ref` | `detachPlotHandler` |  |
-| `POST` | `/plots/:id/questions/:event_id/answer` | `answerPlotQuestionHandler` |  |
 
 ## /preview
 
@@ -122,7 +71,6 @@ Total routes: **64**.
 | `GET` | `/projects/:id/seeds/:seedId` | `getProjectSeedHandler` |  |
 | `POST` | `/projects/:id/triggers/:triggerId/run` | `runProjectTriggerHandler` |  |
 | `POST` | `/projects/:id/refresh` | `refreshProjectHandler` |  |
-| `POST` | `/projects/:id/agents/refresh` | `refreshProjectAgentsHandler` |  |
 | `DELETE` | `/projects/:id` | `deleteProjectHandler` |  |
 
 ## /readyz
@@ -139,10 +87,13 @@ Total routes: **64**.
 | `POST` | `/runs` | `createRunHandler` |  |
 | `GET` | `/runs/:id` | `getRunHandler` |  |
 | `GET` | `/runs/:id/events` | `streamRunEventsHandler` |  |
-| `GET` | `/runs/:id/session` | `wakeSessionHandler` |  |
+| `GET` | `/runs/:id/inbox` | `pollRunInboxHandler` | warren-3d0b: the in-pod steering poll for the K8s backend. Bearer-gated like every /runs route; the pod carries its per-run SCOPED token (warren-57fd). Destructive on read (it claims unread messages), so for a non-run caller it is operator-only (warren-b875). |
+| `GET` | `/runs/:id/finalize-intent` | `getRunFinalizeIntentHandler` | warren-0d35: the in-pod finalize callback for the K8s backend — the pod fetches the reap intent, runs the workspace-dependent half in place, and POSTs the FinalizeResult back. Bearer-gated; the pod carries its per-run scoped token (warren-57fd). |
+| `POST` | `/runs/:id/finalize-result` | `postRunFinalizeResultHandler` |  |
+| `POST` | `/runs/:id/salvage` | `postRunSalvageHandler` | warren-cd3b: the in-pod salvage intake — the pod POSTs the work it captured (rescue ref + git bundle) when the finalize branch push failed or no reap intent ever arrived, BEFORE its emptyDir dies with the pod. |
 | `POST` | `/runs/:id/steer` | `steerRunHandler` |  |
 | `POST` | `/runs/:id/cancel` | `cancelRunHandler` |  |
-| `GET` | `/runs/:id/preview/login` | `previewLoginHandler` |  |
+| `POST` | `/runs/:id/preview/login` | `previewLoginHandler` | warren-e1b0: POST, not GET — the bearer rides the `Authorization` header like every other /runs route instead of a `?token=` query string that would land in history / Referer / proxy logs. |
 | `POST` | `/runs/:id/preview/teardown` | `previewTeardownHandler` |  |
 
 ## /version
@@ -151,9 +102,8 @@ Total routes: **64**.
 | --- | --- | --- | --- |
 | `GET` | `/version` | `versionHandler` |  |
 
-## /workers
+## /whoami
 
 | Method | Pattern | Handler | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/workers` | `listWorkersHandler` |  |
-| `POST` | `/workers/:name/drain` | `drainWorkerHandler` |  |
+| `GET` | `/whoami` | `whoamiHandler` | warren-e195: `readPublic`, not `anonymous` — an exempt route gets no actor to name. |

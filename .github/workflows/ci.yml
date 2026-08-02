@@ -6,32 +6,22 @@ on:
   push:
     branches: [main]
 
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.1
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: .bun-version
 
-      - name: Cache bun dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: bun-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            bun-
-
       - run: bun install
       - run: bun run lint
       - run: bun run typecheck
       - run: bun run check:agents
+      - run: bun run gen:docs:check
+      - run: bun run gen:openapi:check
       - run: bun run check:size
       - run: bun run check:debt
       - run: bun run check:dups
@@ -67,50 +57,33 @@ jobs:
           path: coverage/lcov.info
           if-no-files-found: warn
 
-  coverage-gate:
-    needs: [ci]
+  # Builds the release container image on every PR so a broken Dockerfile
+  # or an un-regenerated lockfile is caught before it reaches a release
+  # tag, not after (warren-3380). Build only — no push, no registry login.
+  # GitHub Actions layer caching (type=gha) keeps it affordable. This is a
+  # CI-only job, deliberately not a check:all gate (the manifest is frozen).
+  #
+  # amd64-only, even though the released public image is multi-arch
+  # (warren-fe9f): an arm64 build runs under QEMU emulation and would slow
+  # every PR by many minutes. The release-time arm64 failure risk this
+  # leaves open is bounded by the draft-until-image-exists ordering
+  # (warren-89f2) — a broken arm64 build fails release.yml's deploy job and
+  # blocks promotion, never a published release pointing at a missing
+  # image.
+  docker-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build container image (no push)
+        uses: docker/build-push-action@v7
         with:
-          path: warren
-
-      - uses: actions/checkout@v6.0.2
-        with:
-          repository: mudrii/eval-harness
-          token: ${{ secrets.GITHUB_TOKEN }}
-          path: eval-harness
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install eval-harness
-        working-directory: eval-harness
-        run: pip install -e .
-
-      - name: Emit coverage evidence from JUnit
-        working-directory: eval-harness
-        run: |
-          JUNIT_PATH="../warren/test-results/junit.xml"
-          if [ -f "$JUNIT_PATH" ]; then
-            python3 -c "
-            import sys; sys.path.insert(0, '.')
-            from eval_harness.runners.warren_runner import emit_evidence_from_junit, get_test_suite_results_from_xml
-            from pathlib import Path
-            xml = Path('$JUNIT_PATH').read_bytes()
-            suites = get_test_suite_results_from_xml(xml)
-            total = sum(s['tests'] for s in suites)
-            records = emit_evidence_from_junit(xml, Path('../warren'))
-            print(f'{len(records)} evidence record(s) for warren ({total} tests parsed)')
-            "
-          else
-            echo "No JUnit file found"
-          fi
-
-      - name: Run coverage gate
-        working-directory: eval-harness
-        continue-on-error: true
-        run: |
-          echo "=== Coverage Gate: warren ==="
-          evalh coverage gate --profile pull_request --project warren 2>&1
+          context: .
+          push: false
+          load: false
+          tags: warren:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

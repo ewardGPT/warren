@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { RunEvent } from "@os-eco/burrow-cli";
 import { detectRuntimeTerminal, isPiAgentEnd } from "./terminal-detect.ts";
+import type { StreamEventView } from "./types.ts";
 
 /**
  * warren-6fcc / pl-5516 step 2: focused unit coverage for
@@ -19,11 +19,8 @@ import { detectRuntimeTerminal, isPiAgentEnd } from "./terminal-detect.ts";
  * function so we don't drag the full bridge fixture in just to assert the
  * branch.
  */
-function envelope(payload: Record<string, unknown>): RunEvent {
+function envelope(payload: Record<string, unknown>): StreamEventView {
 	return {
-		id: 0,
-		burrowId: "bur_x",
-		runId: "run_x",
 		seq: 1,
 		kind: "state_change",
 		stream: "system",
@@ -92,6 +89,27 @@ describe("detectRuntimeTerminal — claude-code result", () => {
 	test("result without is_error is succeeded", () => {
 		expect(detectRuntimeTerminal(envelope({ type: "result", is_error: false }))).toBe("succeeded");
 		expect(detectRuntimeTerminal(envelope({ type: "result" }))).toBe("succeeded");
+	});
+});
+
+describe("detectRuntimeTerminal — provenance gate (warren-6646)", () => {
+	test.each([
+		{ type: "result", is_error: false },
+		{ type: "agent_end" },
+	])("refuses an agent-authored terminal envelope (%p)", (payload) => {
+		const forged = { ...envelope(payload), origin: "agent" };
+		expect(detectRuntimeTerminal(forged)).toBeNull();
+		expect(isPiAgentEnd(forged)).toBe(false);
+	});
+
+	test("honors an explicitly warren-authored terminal envelope", () => {
+		const ev = { ...envelope({ type: "result", is_error: false }), origin: "warren" };
+		expect(detectRuntimeTerminal(ev)).toBe("succeeded");
+	});
+
+	test("an untagged event stays trusted (burrow RunEvent predates the tag)", () => {
+		expect(detectRuntimeTerminal(envelope({ type: "result", is_error: true }))).toBe("failed");
+		expect(isPiAgentEnd(envelope({ type: "agent_end" }))).toBe(true);
 	});
 });
 

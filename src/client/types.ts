@@ -1,79 +1,60 @@
-export type RunState = "queued" | "running" | "paused" | "succeeded" | "failed" | "cancelled";
+/* ----------------------------------------------------------------------- */
+/* Canonical wire vocabulary (warren-b229).                                 */
+/*                                                                          */
+/* Run / preview lifecycle states, the failure-cause discriminator, run     */
+/* mode and the inbox classes are DEFINED ONCE in `src/core/wire.ts` and    */
+/* re-exported here so the SDK's import surface is unchanged. Never         */
+/* redeclare one of these names — `check:wire-types` (warren-d371) fails    */
+/* the build if you do.                                                     */
+/* ----------------------------------------------------------------------- */
+import type {
+	AgentRow,
+	CloneKind,
+	EventStream,
+	InboxPriority,
+	InboxState,
+	PreviewState,
+	RunFailureReason,
+	RunMode,
+	RunState,
+} from "../core/wire.ts";
 
-export type RunTerminalState = "succeeded" | "failed" | "cancelled";
+export {
+	type AgentRow,
+	type AgentSource,
+	type CloneKind,
+	type EventStream,
+	type InboxState,
+	isTerminalRunState,
+	type PreviewState,
+	RUN_TERMINAL_STATES,
+	type RunFailureReason,
+	type RunMode,
+	type RunState,
+	type RunTerminalState,
+} from "../core/wire.ts";
 
-/** Canonical set of terminal run states. Mirrors src/db/schema.ts RUN_TERMINAL_STATES. */
-export const RUN_TERMINAL_STATES: ReadonlySet<RunState> = new Set([
-	"succeeded",
-	"failed",
-	"cancelled",
-]);
+/**
+ * Identity discriminant reported by `GET /whoami` (warren-e195). Mirrors
+ * `ActorKind` in src/server/types.ts.
+ */
+export type ActorIdentity = "operator" | "anonymous";
 
-export function isTerminalRunState(state: RunState): state is RunTerminalState {
-	return RUN_TERMINAL_STATES.has(state);
-}
+/** One capability name. Mirrors `CapabilityName` in src/server/types.ts. */
+export type CapabilityName = "readPublic" | "readOperator" | "dispatch" | "admin";
 
-export type RunFailureReason =
-	| "never_started"
-	| "no_model_response"
-	| "crashed"
-	| "timed_out"
-	| "burrow_run_lost"
-	| "burrow_unreachable"
-	| "dropped_commit"
-	| "provider_error";
-
-export type PreviewState = "starting" | "live" | "failed" | "torn-down";
-
-export type AgentSource = "builtin" | "library" | `project:${string}`;
-
-export interface AgentRow {
-	name: string;
-	renderedJson: unknown;
-	registeredAt: string;
-	lastRefreshed: string;
-	source?: AgentSource;
-}
-
-export interface RefreshSkipped {
-	name: string;
-	reason: string;
-	code: string;
-}
-
-export interface CloneResult {
-	cloned: boolean;
-	localDir: string;
-}
-
-export interface ListAgentsQuery {
-	projectId?: string;
+/**
+ * `GET /whoami` — who warren thinks the caller is and what it may do.
+ * `capabilities` holds only the granted names, so a client checks
+ * membership rather than a boolean flag.
+ */
+export interface WhoamiResponse {
+	identity: ActorIdentity;
+	capabilities: CapabilityName[];
 }
 
 export interface ListAgentsResponse {
 	agents: AgentRow[];
-}
-
-export interface RefreshProjectAgentsResult {
-	projectId: string;
-	registered: AgentRow[];
-	skipped: RefreshSkipped[];
-	removed: string[];
-}
-
-export interface ProjectRefreshErrorRow {
-	projectId: string;
-	code: string;
-	message: string;
-}
-
-export interface RefreshAgentsResponse {
-	clone: CloneResult;
-	registered: AgentRow[];
-	skipped: RefreshSkipped[];
-	removed: string[];
-	projects: RefreshProjectAgentsResult[];
-	projectErrors: ProjectRefreshErrorRow[];
 }
 
 export interface ProjectRow {
@@ -84,7 +65,6 @@ export interface ProjectRow {
 	addedAt: string;
 	lastFetchedAt: string | null;
 	lastHeadSha: string | null;
-	hasPlot: boolean;
 	hasSeeds: boolean;
 }
 
@@ -95,11 +75,10 @@ export interface RunRow {
 	burrowId: string | null;
 	burrowRunId: string | null;
 	seedId: string | null;
-	plotId: string | null;
 	/** Chain back-link (warren-4b11 / warren-e96f); null for root runs. */
 	parentRunId: string | null;
-	cloneKind: "replicate" | "continue" | null;
-	mode: "batch" | "conversation";
+	cloneKind: CloneKind | null;
+	mode: RunMode;
 	renderedAgentJson: unknown;
 	state: RunState;
 	failureReason: RunFailureReason | null;
@@ -109,6 +88,14 @@ export interface RunRow {
 	trigger: string;
 	prUrl: string | null;
 	targetBranch: string | null;
+	/**
+	 * Salvage-before-destroy (warren-cd3b): where a finalize_failed run's
+	 * committed work was captured. `salvageRef` is the `warren/rescue/<runId>`
+	 * branch on origin; `salvagePath` is the durable git-bundle file. Both null
+	 * when no salvage was captured (or none was needed).
+	 */
+	salvageRef: string | null;
+	salvagePath: string | null;
 	costUsd: number | null;
 	tokensInput: number | null;
 	tokensOutput: number | null;
@@ -127,9 +114,8 @@ export interface RunEvent {
 	seq: number;
 	ts: string;
 	kind: string;
-	stream: "stdout" | "stderr" | "system" | null;
+	stream: EventStream | null;
 	payload: unknown;
-	plotId: string | null;
 }
 
 export interface StreamRunEventsOptions {
@@ -160,7 +146,6 @@ export interface CreateRunInput {
 	providerOverride?: string;
 	modelOverride?: string;
 	seedId?: string;
-	plotId?: string;
 	dispatcherHandle?: string;
 	/** Continuation parent (warren-4b11): seed the workspace from this run's branch. */
 	continueFromRunId?: string;
@@ -183,7 +168,6 @@ export interface DispatchRunInput {
 	/** Maps to CreateRunInput.providerOverride. */
 	provider?: string;
 	seedId?: string;
-	plotId?: string;
 	dispatcherHandle?: string;
 	/** Maps to CreateRunInput.continueFromRunId (warren-4b11). */
 	continueFromRunId?: string;
@@ -230,8 +214,12 @@ export interface RefreshProjectResponse {
 	ref: string;
 }
 
-/** Burrow inbox message priority. Mirrors `MESSAGE_PRIORITIES` from `@os-eco/burrow-cli`. */
-export type MessagePriority = "low" | "normal" | "high" | "urgent";
+/**
+ * Burrow inbox message priority. Alias of the canonical `InboxPriority`
+ * (`src/core/wire.ts`), kept under the SDK's historical name; both mirror
+ * `MESSAGE_PRIORITIES` from `@os-eco/burrow-cli`.
+ */
+export type MessagePriority = InboxPriority;
 
 /** Burrow inbox message row returned by `POST /runs/:id/steer`. */
 export interface InboxMessage {
@@ -239,8 +227,8 @@ export interface InboxMessage {
 	burrowId: string;
 	fromActor: string;
 	body: string;
-	priority: MessagePriority;
-	state: "unread" | "delivered" | "failed";
+	priority: InboxPriority;
+	state: InboxState;
 	deliveredAtRunId: string | null;
 	createdAt: string;
 	deliveredAt: string | null;
@@ -249,7 +237,7 @@ export interface InboxMessage {
 export interface SteerRunInput {
 	/** Steering body — non-empty after trim. */
 	body: string;
-	priority?: MessagePriority;
+	priority?: InboxPriority;
 	/** Actor identifier recorded on the burrow message. */
 	fromActor?: string;
 }
@@ -266,151 +254,6 @@ export interface ListRunsResponse {
 	costTotalUsd: number | null;
 	costPricedCount: number;
 }
-
-/* ----------------------------------------------------------------------- */
-/* Plots — typed facade over /plots endpoints (warren-8ffc). Wire envelope */
-/* is snake_case end-to-end (mirror of @os-eco/plot-cli) and surfaced      */
-/* verbatim; inputs accept camelCase and map to snake_case at the boundary */
-/* (parallel to dispatch() mapping branch/model/provider onto the runs     */
-/* wire).                                                                   */
-/* ----------------------------------------------------------------------- */
-
-export type PlotStatus = "drafting" | "ready" | "active" | "done" | "archived";
-
-export const PLOT_STATUSES: readonly PlotStatus[] = [
-	"drafting",
-	"ready",
-	"active",
-	"done",
-	"archived",
-];
-
-export const NEEDS_ATTENTION_REASONS = [
-	"paused_run",
-	"merged_pr_unreviewed",
-	"stale_draft",
-] as const;
-export type NeedsAttentionReason = (typeof NEEDS_ATTENTION_REASONS)[number];
-
-export interface PlotSummary {
-	id: string;
-	name: string;
-	status: PlotStatus;
-	/** First ~160 chars of `intent.goal`, with ellipsis when truncated. */
-	intent_goal_preview: string;
-	attachments_count: number;
-	last_event_ts: string;
-	last_event_actor: string;
-	project_id: string;
-	/** Populated only by `GET /plots?filter=needs_attention`. */
-	reasons?: NeedsAttentionReason[];
-}
-
-export const ATTACHMENT_TYPES = [
-	"seeds_issue",
-	"mulch_record",
-	"agent_run",
-	"gh_pr",
-	"gh_issue",
-	"file",
-] as const;
-export type AttachmentType = (typeof ATTACHMENT_TYPES)[number];
-
-export interface PlotIntent {
-	goal: string;
-	non_goals: string[];
-	constraints: string[];
-	success_criteria: string[];
-}
-
-export interface PlotAttachment {
-	id: string;
-	type: AttachmentType;
-	ref: string;
-	role: string;
-	added_at: string;
-	added_by: string;
-}
-
-export interface PlotEvent {
-	type: string;
-	actor: string;
-	at: string;
-	data: Record<string, unknown>;
-}
-
-/** Snapshot of warren runs in state=paused bound to this plot. */
-export interface PausedRunInfo {
-	run_id: string;
-	paused_at: string;
-	paused_question_event_id: string;
-	pause_timeout_ms: number;
-}
-
-export interface PlotEnvelope {
-	id: string;
-	name: string;
-	status: PlotStatus;
-	intent: PlotIntent;
-	attachments: PlotAttachment[];
-	event_log: PlotEvent[];
-	project_id: string;
-	paused_runs: PausedRunInfo[];
-}
-
-export interface ListPlotsResponse {
-	plots: PlotSummary[];
-}
-
-export interface ListPlotsFilter {
-	status?: PlotStatus;
-	/** `?filter=needs_attention` — rows carry a `reasons` array. */
-	needsAttention?: boolean;
-}
-
-/** Optional partial intent body accepted on `POST /plots`. */
-export interface CreatePlotIntentPatch {
-	goal?: string;
-	non_goals?: string[];
-	constraints?: string[];
-	success_criteria?: string[];
-}
-
-export interface CreatePlotInput {
-	projectId: string;
-	name?: string;
-	intent?: CreatePlotIntentPatch;
-	dispatcherHandle?: string;
-}
-
-/** `POST /plots/:id/intent` — flat top-level fields (no `intent:` wrapper). */
-export interface EditPlotIntentInput {
-	goal?: string;
-	non_goals?: string[];
-	constraints?: string[];
-	success_criteria?: string[];
-	dispatcherHandle?: string;
-}
-
-export interface ChangePlotStatusInput {
-	next: PlotStatus;
-	dispatcherHandle?: string;
-}
-
-export interface ChangePlotStatusResponse {
-	summary: PlotSummary;
-	event: PlotEvent;
-}
-
-export type PlotSyncResponse =
-	| { kind: "no_op" }
-	| {
-			kind: "synced";
-			branch: string;
-			prUrl: string;
-			prNumber?: number;
-			merged: boolean;
-	  };
 
 /* ----------------------------------------------------------------------- */
 /* Plan-runs — typed facade over /plan-runs (warren-8ffc).                 */

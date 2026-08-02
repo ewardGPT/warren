@@ -44,6 +44,15 @@ export interface PreviewSidecarsClient {
 	): Promise<{ readonly state: string; readonly exitCode: number | null }>;
 }
 
+/**
+ * Resolve the sidecars facade for a run's sandbox (warren-e24d preview seam).
+ * The reap preview sub-step calls this to obtain a `PreviewSidecarsClient` for
+ * the run's sandbox; `null` when the sandbox can't be resolved. Built at boot
+ * from the runtime provider (`createLocalSidecarsResolver`); absent under a
+ * backend without `previewPorts`.
+ */
+export type PreviewSidecarResolver = (sandboxId: string) => Promise<PreviewSidecarsClient | null>;
+
 /* ----------------------------------------------------------------------- */
 /* Launch inputs / outputs                                                  */
 /* ----------------------------------------------------------------------- */
@@ -171,7 +180,7 @@ export const DEFAULT_SETUP_POLL_MS = 1_000;
  * connection but the dev server is mid-compile and never flushes bytes)
  * blocks the deadline check indefinitely. 2s is a conservative upper bound —
  * a dev server that can't return any byte for `GET /` within 2s is not
- * "ready" in the §11.L sense even if it's alive.
+ * "ready" in the docs/design/preview-environments.md sense even if it's alive.
  */
 export const PROBE_PER_CALL_TIMEOUT_MS = 2_000;
 /** Stderr tail size copied into `preview_failure_message`. */

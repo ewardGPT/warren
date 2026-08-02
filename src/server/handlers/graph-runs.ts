@@ -84,7 +84,7 @@ export function createGraphRunHandler(deps: ServerDeps): RouteHandler {
 				: {}),
 		};
 
-		await deps.repos.agents.resolve(agent, { projectId });
+		await deps.repos.agents.get(agent);
 
 		const files = await resolveScopeFiles(project.localPath, scope);
 		if (files.length === 0) {

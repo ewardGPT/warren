@@ -28,13 +28,12 @@ import type { PlanRunRow } from "../db/schema.ts";
 import {
 	type AdvanceResult,
 	advancePlanRun,
+	type CoordinatorCloseChildSeedFn,
 	type CoordinatorEmitFn,
 	type CoordinatorReopenPrFn,
 	type CoordinatorRepos,
-	type CoordinatorResolveExecutionFn,
 	type CoordinatorShowSeedFn,
 	type CoordinatorSpawnFn,
-	type CoordinatorTransitionPlotFn,
 	type PlanRunEventKind,
 } from "./coordinator.ts";
 import type { PrMergeChecker } from "./pr-merge.ts";
@@ -50,19 +49,10 @@ export interface PlanRunTickDeps {
 	readonly showSeed: CoordinatorShowSeedFn;
 	readonly checkPrMerged: PrMergeChecker;
 	readonly spawn: CoordinatorSpawnFn;
-	/** pl-fb43 step 5: per-child execution-repo resolver (default = coordination project). */
-	readonly resolveExecution?: CoordinatorResolveExecutionFn;
 	readonly now?: () => Date;
 	readonly logger?: PlanRunTickLogger;
 	/** Test seam — defaults to {@link defaultEmit} writing to events table. */
 	readonly emit?: CoordinatorEmitFn;
-	/**
-	 * Optional Plot auto-done hook (warren-b290 / pl-7937 step 5). When
-	 * wired, the coordinator calls it on the plan_succeeded transition
-	 * for any PlanRun that carries a non-null `plot_id`. Omit to skip
-	 * — tests and deployments without `.plot/` projects leave it unwired.
-	 */
-	readonly transitionPlot?: CoordinatorTransitionPlotFn;
 	/**
 	 * Bounded wall-clock merge-wait budget (ms) forwarded to
 	 * {@link advancePlanRun} (warren-3937). Omit to use the coordinator
@@ -76,10 +66,12 @@ export interface PlanRunTickDeps {
 	 */
 	readonly reopenPr?: CoordinatorReopenPrFn;
 	/**
-	 * Max dispatch rounds per advance call (warren-guard). Omit to use the
-	 * coordinator default ({@link DEFAULT_MAX_ROUNDS}); 0 disables the cap.
+	 * Optional host-side child-seed close seam (warren-3806). When provided,
+	 * the coordinator closes a plan-run child's seed on the project's default
+	 * branch the instant the child transitions to `merged`, so seed closure
+	 * never depends on agent initiative. Omit to leave it unwired (tests).
 	 */
-	readonly maxRounds?: number;
+	readonly closeChildSeed?: CoordinatorCloseChildSeedFn;
 }
 
 export interface PlanRunAdvanceLog {
@@ -100,7 +92,7 @@ export async function runPlanRunTick(deps: PlanRunTickDeps): Promise<PlanRunTick
 	const active: PlanRunRow[] = await deps.repos.planRuns.listActive();
 	for (const planRun of active) {
 		try {
-			const result = await advanceOne(planRun, deps, emit);
+			const result = await advancePlanRun(buildAdvanceInput(deps, planRun, emit));
 			advances.push({ planRunId: planRun.id, result });
 			logAdvance(deps.logger, planRun.id, result);
 		} catch (err) {
@@ -113,26 +105,29 @@ export async function runPlanRunTick(deps: PlanRunTickDeps): Promise<PlanRunTick
 	return { advances, errors };
 }
 
-function advanceOne(
-	planRun: PlanRunRow,
+/**
+ * Assemble the per-PlanRun {@link advancePlanRun} input, threading only the
+ * optional seams that were actually wired (only-if-present spreads). Extracted
+ * from {@link runPlanRunTick} so the tick body stays under the cognitive-
+ * complexity ceiling (warren-d3a6 / warren-3806).
+ */
+function buildAdvanceInput(
 	deps: PlanRunTickDeps,
+	planRun: PlanRunRow,
 	emit: CoordinatorEmitFn,
-): Promise<AdvanceResult> {
-	const advanceArgs: Parameters<typeof advancePlanRun>[0] = {
+): Parameters<typeof advancePlanRun>[0] {
+	return {
 		planRun,
 		repos: deps.repos as CoordinatorRepos,
 		showSeed: deps.showSeed,
 		checkPrMerged: deps.checkPrMerged,
 		spawn: deps.spawn,
 		emit,
-		...(deps.resolveExecution !== undefined ? { resolveExecution: deps.resolveExecution } : {}),
-		...(deps.transitionPlot !== undefined ? { transitionPlot: deps.transitionPlot } : {}),
 		...(deps.mergeTimeoutMs !== undefined ? { mergeTimeoutMs: deps.mergeTimeoutMs } : {}),
 		...(deps.reopenPr !== undefined ? { reopenPr: deps.reopenPr } : {}),
-		...(deps.maxRounds !== undefined ? { maxRounds: deps.maxRounds } : {}),
+		...(deps.closeChildSeed !== undefined ? { closeChildSeed: deps.closeChildSeed } : {}),
 		...(deps.now !== undefined ? { now: deps.now } : {}),
 	};
-	return advancePlanRun(advanceArgs);
 }
 
 function logAdvance(

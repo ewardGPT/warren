@@ -20,13 +20,19 @@
 		"noUncheckedSideEffectImports": true,
 		"noUncheckedIndexedAccess": true,
 
-		"baseUrl": ".",
+		// TS 7 removed `baseUrl`; `paths` resolve relative to this file, so the
+		// mapping must be explicitly relative.
 		"paths": {
-			"@/*": ["src/*"]
+			"@/*": ["./src/*"]
 		},
 		"skipLibCheck": true,
 		"types": []
 	},
-	"include": ["src"],
+	// `../core/wire.ts` is the canonical wire vocabulary (warren-b229). It is
+	// outside this package's `src/` on purpose — it is the one module the
+	// server, the SDK and this UI all import so the enums can never drift.
+	// A composite project must list every file it compiles, so naming it here
+	// is what makes `import "../../../core/wire.ts"` resolve under `tsc -b`.
+	"include": ["src", "../core/wire.ts"],
 	"exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }

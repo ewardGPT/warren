@@ -1,6 +1,7 @@
-import { BurrowClient, BurrowClientPool } from "../../burrow-client/index.ts";
+import { BurrowClient } from "../../burrow-client/index.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import { RunEventBroker } from "../../runs/index.ts";
+import { resolveRuntimeProvider } from "../../runtime/registry.ts";
 import { createBridgeRegistry } from "../bridges.ts";
 import type { BridgeRegistry, ServeHandle, ServerDeps } from "../types.ts";
 
@@ -8,11 +9,8 @@ import type { BridgeRegistry, ServeHandle, ServerDeps } from "../types.ts";
  * Shared test helpers and stubs for run-related handler tests (warren-6566).
  */
 
-export async function poolFor(repos: Repos, client: BurrowClient): Promise<BurrowClientPool> {
-	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
-	const pool = new BurrowClientPool({ repos });
-	pool.register("local", client);
-	return pool;
+export async function poolFor(_repos: Repos, client: BurrowClient): Promise<BurrowClient> {
+	return client;
 }
 
 export const silentLogger = {
@@ -102,30 +100,30 @@ export async function depsFor(
 	burrowClient: BurrowClient,
 	bridges?: BridgeRegistry,
 	extras?: {
-		plotResolver?: import("../../plots/index.ts").PlotResolver;
-		seedsCli?: ServerDeps["seedsCli"];
+		finalizeCoordinator?: import("../../runtime/k8s/finalize-coordinator.ts").FinalizeCoordinator;
+		/** Event-stream concurrency caps (warren-25f6). Omitted ⇒ uncapped. */
+		streamLimiter?: import("../stream-limits.ts").EventStreamLimiter;
+		/** Salvage-bundle intake dir (warren-cd3b). Omitted ⇒ the route 500s. */
+		salvageDir?: string;
+		/** Seeds CLI wiring (cross-repo seed routing, map #29). */
+		seedsCli?: import("../../seeds-cli/index.ts").SeedsCliDeps;
 	},
 ): Promise<ServerDeps> {
 	const broker = new RunEventBroker();
-	const burrowClientPool = await poolFor(repos, burrowClient);
+	await poolFor(repos, burrowClient);
 	return {
 		repos,
-		burrowClientPool,
+		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
 		broker,
+		seedsCli: extras?.seedsCli,
 		bridges:
 			bridges ??
 			createBridgeRegistry({
 				repos,
 				broker,
-				burrowClientPool,
+				runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
 				bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 			}),
-		canopyConfig: {
-			repoUrl: "https://example/agents.git",
-			localDir: "/tmp/cn",
-			cnBinary: "cn",
-			gitBinary: "git",
-		},
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
 		logger: silentLogger,
 		uiDistDir: null,
@@ -139,8 +137,11 @@ export async function depsFor(
 			}
 			return { stdout: "", stderr: "", exitCode: 0 };
 		},
-		...(extras?.plotResolver !== undefined ? { plotResolver: extras.plotResolver } : {}),
-		...(extras?.seedsCli !== undefined ? { seedsCli: extras.seedsCli } : {}),
+		...(extras?.finalizeCoordinator !== undefined
+			? { finalizeCoordinator: extras.finalizeCoordinator }
+			: {}),
+		...(extras?.streamLimiter !== undefined ? { streamLimiter: extras.streamLimiter } : {}),
+		...(extras?.salvageDir !== undefined ? { salvageDir: extras.salvageDir } : {}),
 	};
 }
 

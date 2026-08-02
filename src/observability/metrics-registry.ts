@@ -4,8 +4,8 @@
  *
  * Counters are monotonic process-lifetime totals (e.g. log lines by level,
  * scheduler failures). They live in memory only — warren is single-instance
- * (one Fly Machine), so Fly's managed Prometheus scrapes the live process and
- * a deploy resets the counters to zero, which Grafana's `rate()`/`increase()`
+ * (one control-plane process), so the Prometheus scraper reads the live process
+ * and a deploy resets the counters to zero, which Grafana's `rate()`/`increase()`
  * handle correctly via the counter-reset semantics. Gauges (runs-by-state,
  * cost, active bridges) are NOT stored here; the `/metrics` handler reads
  * those live from SQLite + the bridge registry at scrape time.

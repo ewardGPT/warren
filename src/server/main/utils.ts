@@ -6,37 +6,14 @@
 
 import { type AnyWarrenDb, WARREN_DB_POOL_MAX_ENV } from "../../db/client.ts";
 import { parseDatabaseUrl } from "../../db/url.ts";
-import type { SpawnFn, SpawnOptions, SpawnResult } from "../../projects/clone.ts";
+import { defaultSpawn } from "../../projects/clone.ts";
 import type { EnvLike } from "../config.ts";
 
 /**
- * Production `Bun.spawn` adaptor matching the SpawnFn shape the registry +
- * projects modules expect. One of three identical copies, alongside
- * `defaultSpawn` in src/cli/output.ts and src/server/handlers/index.ts;
- * the duplication is deliberate so neither surface imports the other.
+ * The production `Bun.spawn` adaptor, re-exported so `bootServer` keeps
+ * importing its process helpers from one module.
  */
-export const defaultSpawn: SpawnFn = async (
-	cmd: readonly string[],
-	opts: SpawnOptions,
-): Promise<SpawnResult> => {
-	const proc = Bun.spawn({
-		cmd: [...cmd],
-		cwd: opts.cwd,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const timer =
-		opts.timeoutMs !== undefined && opts.timeoutMs > 0
-			? setTimeout(() => proc.kill(), opts.timeoutMs)
-			: null;
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
-	if (timer !== null) clearTimeout(timer);
-	return { stdout, stderr, exitCode: exitCode ?? 0 };
-};
+export { defaultSpawn };
 
 export async function closeDatabase(db: AnyWarrenDb): Promise<void> {
 	try {

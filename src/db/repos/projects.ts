@@ -1,8 +1,7 @@
 /**
  * Repository for the `projects` table.
  *
- * Projects are GitHub repos cloned under /data/projects/<owner>/<name> (SPEC
- * §5). The repo only owns the row; cloning, default-branch detection, and
+ * Projects are GitHub repos cloned under /data/projects/<owner>/<name> (docs/design/runtime-and-supervisor.md). The repo only owns the row; cloning, default-branch detection, and
  * filesystem layout are Phase 4's domain.
  */
 
@@ -19,14 +18,8 @@ export interface CreateProjectInput {
 	localPath: string;
 	defaultBranch: string;
 	/**
-	 * Plot opt-in flag (warren-4e20). Defaults to false when omitted so
-	 * tests / callers that haven't probed the clone yet still get a
-	 * well-formed row; the column is NOT NULL.
-	 */
-	hasPlot?: boolean;
-	/**
 	 * Seeds opt-in flag (warren-9990 / pl-a258 step 1). Defaults to false
-	 * when omitted; mirrors hasPlot's nullability shape.
+	 * when omitted; the column is NOT NULL.
 	 */
 	hasSeeds?: boolean;
 	now?: Date;
@@ -35,12 +28,6 @@ export interface CreateProjectInput {
 export interface RecordRefreshInput {
 	id: string;
 	headSha: string;
-	/**
-	 * Latest probe outcome (warren-4e20). Omitted means "leave the prior
-	 * value" — refresh callers always supply it now, but historic callers
-	 * (manual triggers, tests) may not.
-	 */
-	hasPlot?: boolean;
 	/**
 	 * Latest probe outcome (warren-9990). Omitted means "leave the prior
 	 * value" — refresh callers always supply it.
@@ -69,7 +56,6 @@ export class ProjectsRepo {
 			addedAt: (input.now ?? new Date()).toISOString(),
 			lastFetchedAt: null,
 			lastHeadSha: null,
-			hasPlot: input.hasPlot ?? false,
 			hasSeeds: input.hasSeeds ?? false,
 		};
 		await this.adapter.runWrite(this.db.insert(this.projects).values(row));
@@ -81,15 +67,11 @@ export class ProjectsRepo {
 		const patch: {
 			lastFetchedAt: string;
 			lastHeadSha: string;
-			hasPlot?: boolean;
 			hasSeeds?: boolean;
 		} = {
 			lastFetchedAt,
 			lastHeadSha: input.headSha,
 		};
-		if (input.hasPlot !== undefined) {
-			patch.hasPlot = input.hasPlot;
-		}
 		if (input.hasSeeds !== undefined) {
 			patch.hasSeeds = input.hasSeeds;
 		}

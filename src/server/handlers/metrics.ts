@@ -2,10 +2,12 @@
  * `GET /metrics` — Prometheus exposition endpoint (warren observability
  * Phase 1).
  *
- * Auth-exempt (like `/healthz`) so Fly's managed Prometheus can scrape it over
- * the private network without a bearer token; the body carries no secrets
- * (aggregate counts + counters only). Fly scrapes this when `fly.toml` declares
- * a `[[metrics]]` block pointing at `/metrics`.
+ * Bearer-gated like the rest of the API (warren-682a): behind a public
+ * Ingress the scrape surface leaks operational shape (run counts, pod
+ * phases, queue depth), so the historical Fly-era auth exemption is gone.
+ * In-cluster Prometheus sends the control-plane token via the
+ * ServiceMonitor's `authorization.credentials`
+ * (deploy/k8s/servicemonitor.yaml).
  *
  * Two sources, assembled per scrape:
  *   - **Gauges** read live from SQLite (`countRunsByState` / `aggregateRunCost`,
@@ -14,11 +16,11 @@
  *   - **Counters** from the in-process `MetricsRegistry` (log-line rates by
  *     level, fed by the pino sink). Absent registry → counters omitted.
  *
- * When `deps.db` is unwired (tests), the DB gauges are skipped and only the
- * bridge gauge + any counters render, so the endpoint never throws.
+ * When `deps.dbAdapter` is unwired (tests), the DB gauges are skipped and
+ * only the bridge gauge + any counters render, so the endpoint never throws.
+ * The adapter is boot-wired (warren-89a6); this handler does not build one.
  */
 
-import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import { aggregateRunCost, countRunsByState } from "../../db/repos/runs-stats.ts";
 import type { CounterSnapshot } from "../../observability/metrics-registry.ts";
 import {
@@ -26,15 +28,17 @@ import {
 	type PromMetric,
 	renderPrometheus,
 } from "../../observability/prometheus.ts";
+import { buildPodPhaseMetrics } from "../../runtime/k8s/pod-metrics.ts";
 import { textResponse } from "../response.ts";
+import { METRIC_EVENT_STREAMS } from "../stream-limits.ts";
 import type { RouteHandler, ServerDeps } from "../types.ts";
 
 export function metricsHandler(deps: ServerDeps): RouteHandler {
 	return async () => {
 		const metrics: PromMetric[] = [];
 
-		if (deps.db !== undefined) {
-			const adapter = DrizzleAdapter.for(deps.db);
+		const adapter = deps.dbAdapter;
+		if (adapter !== undefined) {
 			const [byState, cost] = await Promise.all([
 				countRunsByState(adapter),
 				aggregateRunCost(adapter),
@@ -53,6 +57,25 @@ export function metricsHandler(deps: ServerDeps): RouteHandler {
 		metrics.push(
 			gauge("warren_active_bridges", "Currently-attached run-stream bridges.", deps.bridges.size()),
 		);
+
+		if (deps.streamLimiter !== undefined) {
+			// Event-stream saturation (warren-25f6): the numerator for the
+			// WARREN_MAX_EVENT_STREAMS cap, so an operator can see the instance
+			// approaching the point where new streams get a 503.
+			metrics.push(
+				gauge(
+					METRIC_EVENT_STREAMS,
+					"Currently-attached NDJSON event-stream connections.",
+					deps.streamLimiter.active(),
+				),
+			);
+		}
+
+		if (deps.podMetrics !== undefined) {
+			// K8s pod-phase gauges, read live from the pod-watcher cache at scrape
+			// (pl-829f step 16). Absent under LocalProvider — nothing appended.
+			metrics.push(...buildPodPhaseMetrics(deps.podMetrics.metricsSnapshot()));
+		}
 
 		if (deps.metricsRegistry !== undefined) {
 			metrics.push(...countersToMetrics(deps.metricsRegistry.snapshot()));

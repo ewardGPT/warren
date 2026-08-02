@@ -39,7 +39,6 @@ describe("startPreviewEvictionWorker", () => {
 		const handle = startPreviewEvictionWorker({
 			db,
 			repos,
-			burrowClientPool: undefined as never,
 			warrenConfigs: configs,
 			config: { ...BASE_CONFIG, disabled: true },
 			resolveSidecar: sidecars.resolver,
@@ -56,7 +55,6 @@ describe("startPreviewEvictionWorker", () => {
 		const handle = startPreviewEvictionWorker({
 			db,
 			repos,
-			burrowClientPool: undefined as never,
 			warrenConfigs: createWarrenConfigCache({
 				load: async () => ({
 					triggers: null,

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { WarrenDb } from "../../db/client.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import { spawnRun } from "./index.ts";
-import { makeBurrowClient, makePool, setupRepos } from "./test-helpers.ts";
+import { makeBurrowClient, makeProvider, setupRepos } from "./test-helpers.ts";
 
 /**
  * Durable spawn-failure trail (warren-fc6e / pl-f700 step 2): a spawn that
@@ -35,7 +35,7 @@ describe("spawnRun: durable spawn failure", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: await makePool(repos, client),
+				runtimeProvider: makeProvider(client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
@@ -55,7 +55,7 @@ describe("spawnRun: durable spawn failure", () => {
 		expect(payload.burrowId).toBeUndefined();
 	});
 
-	test("records the provisioned burrow id on the spawn_failed event when dispatch fails", async () => {
+	test("records a spawn_failed event when dispatch fails (burrow id owned by the provider)", async () => {
 		const { client } = makeBurrowClient({
 			runsCreateStatus: 500,
 			runsCreateBody: { error: { code: "internal_error", message: "boom" } },
@@ -63,7 +63,7 @@ describe("spawnRun: durable spawn failure", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: await makePool(repos, client),
+				runtimeProvider: makeProvider(client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
@@ -79,6 +79,10 @@ describe("spawnRun: durable spawn failure", () => {
 			burrowId?: string;
 		};
 		expect(payload.message).toContain("boom");
-		expect(payload.burrowId).toBe("bur_aaaaaaaaaaaa");
+		// warren-1f56: `provider.create` collapses provision+dispatch and owns the
+		// burrow-half rollback, so the domain never learns the burrow id on a
+		// dispatch-step failure — the event elides it (the provider already
+		// destroyed the burrow, so there is nothing stranded to reference).
+		expect(payload.burrowId).toBeUndefined();
 	});
 });

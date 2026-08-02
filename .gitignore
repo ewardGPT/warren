@@ -13,9 +13,13 @@ data/
 bun.lockb.bak
 .run-plan-logs/
 supabase/
-.plot/.index.db
-.plot/.index.db-shm
-.plot/.index.db-wal
+# plot was removed from warren; the leftover local records stay untracked
+.plot/
+
+# warren seeds the rendered agent envelope here per run (warren-5585); the
+# surrounding .warren/ config files (config.yaml, preview.yaml, triggers.yaml)
+# stay tracked. Ignore the single seeded file, not the directory.
+.warren/agent.json
 .claude/settings.local.json
 
 # pi agent session transcripts: leaked run logs (prompts, thinking, tool
@@ -26,5 +30,15 @@ supabase/
 test-results/
 coverage/
 
-# Factory MCP config contains secrets (e.g. SUPABASE_ACCESS_TOKEN)
-.factory/mcp.json
+# live GKE deployment values (real project ids / identity) — template: overlays/gke
+deploy/k8s/overlays/gke-live/
+
+# local design-sync working dirs + MCP config (may contain secrets)
+.design-sync/
+.ds-sync/
+.mcp.json
+
+# working design/planning docs that are not yet (or never will be) a seeds
+# plan. Thinking-in-progress lives here so it has a home outside the tracker
+# and outside git history; promote anything durable into docs or `sd plan`.
+local-planning/

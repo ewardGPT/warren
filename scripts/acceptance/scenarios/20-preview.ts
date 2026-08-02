@@ -23,8 +23,9 @@
  *
  *   - `Host: run-<id>.<preview-host>` without a cookie → 401 (the proxy
  *     points the browser at `/runs/:id/preview/login`).
- *   - `GET /runs/:id/preview/login?token=…&redirect=…` → 302 + `Set-Cookie:
- *     warren_preview=…`.
+ *   - `POST /runs/:id/preview/login` with `Authorization: Bearer …` and
+ *     an optional `{redirect}` body → 200 + `Set-Cookie: warren_preview=…`
+ *     (warren-e1b0 — the bearer never rides a query string).
  *   - Replay the same `Host` header with the issued cookie → 200; the
  *     upstream body proves the proxy forwarded into the sidecar.
  *
@@ -52,7 +53,7 @@
  *     hands out has nothing listening on it and the readiness probe
  *     times out. Documented in burrow's `inbound-forward.ts` and warren
  *     `mx-1d31f0`; same posture as scenarios 13/14.
- *   - **Postgres dialect** — the SPEC §11.L port allocator and eviction
+ *   - **Postgres dialect** — the docs/design/preview-environments.md port allocator and eviction
  *     worker are sqlite-only today (R-13 follow-up, mx-b82a55). When the
  *     harness is dispatched with `WARREN_TEST_DIALECT=postgres` the
  *     scenario skips with a documented `pl-f17e` follow-up reference;
@@ -168,7 +169,7 @@ async function runVariantA(ctx: ScenarioCtx): Promise<void> {
 		ctx.logger.info(`scenario-20A: warren ready at ${handle.warrenUrl}`);
 
 		const http = new WarrenHttp({ baseUrl: handle.warrenUrl, token: handle.token });
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// stub-shell is seeded at boot via WARREN_SEED_AGENTS_FILE (warren-e376).
 		const project = await ensureProject(http, sample.gitUrl);
 
 		const created = await http.expectJson<CreateRunResponse>("POST", "/runs", 201, {
@@ -300,7 +301,7 @@ async function runVariantB(ctx: ScenarioCtx): Promise<void> {
 		ctx.logger.info(`scenario-20B: warren ready at ${handle.warrenUrl}`);
 
 		const http = new WarrenHttp({ baseUrl: handle.warrenUrl, token: handle.token });
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// stub-shell is seeded at boot via WARREN_SEED_AGENTS_FILE (warren-e376).
 		const project = await ensureProject(http, sample.gitUrl);
 
 		const created = await http.expectJson<CreateRunResponse>("POST", "/runs", 201, {

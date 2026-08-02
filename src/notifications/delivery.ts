@@ -4,10 +4,7 @@ import type { TerminalNotificationEnvelope } from "./signature.ts";
 import { buildSignedNotification } from "./signature.ts";
 
 export function buildTerminalNotification(
-	run: Pick<
-		RunRow,
-		"id" | "projectId" | "seedId" | "plotId" | "prUrl" | "costUsd" | "startedAt" | "endedAt"
-	>,
+	run: Pick<RunRow, "id" | "projectId" | "seedId" | "prUrl" | "costUsd" | "startedAt" | "endedAt">,
 	state: RunTerminalState,
 	failureReason: RunFailureReason | null,
 ): TerminalNotificationEnvelope {
@@ -21,8 +18,8 @@ export function buildTerminalNotification(
 		runId: run.id,
 		projectId: run.projectId,
 		seedId: run.seedId,
-		plotId: run.plotId,
 		state,
+		plotId: null,
 		prUrl: run.prUrl,
 		costUsd: run.costUsd,
 		durationMs: started !== null && Number.isFinite(ended) ? Math.max(0, ended - started) : null,

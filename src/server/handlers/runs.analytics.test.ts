@@ -1,31 +1,28 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClientPool } from "../../burrow-client/index.ts";
+import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import type { RunFailureReason, RunState } from "../../db/schema.ts";
 import { RunEventBroker } from "../../runs/index.ts";
+import { resolveRuntimeProvider } from "../../runtime/registry.ts";
 import { NO_AUTH } from "../auth.ts";
 import { createBridgeRegistry } from "../bridges.ts";
 import { startServer } from "../server.ts";
 import type { Logger, ServeHandle, ServerDeps } from "../types.ts";
 
-const silentLogger: Logger = {
-	info() {},
-	warn() {},
-	error() {},
-};
+const silentLogger: Logger = { info() {}, warn() {}, error() {} };
 
 function depsFor(repos: Repos): ServerDeps {
 	const broker = new RunEventBroker();
-	const pool = new BurrowClientPool({ repos });
+	const client = new BurrowClient({ config: { transport: { kind: "unix", path: "/tmp/x.sock" } } });
 	return {
 		repos,
-		burrowClientPool: pool,
+		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => client }),
 		broker,
 		bridges: createBridgeRegistry({
 			repos,
 			broker,
-			burrowClientPool: pool,
+			runtimeProvider: resolveRuntimeProvider({ burrowClient: () => client }),
 			bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 		}),
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },

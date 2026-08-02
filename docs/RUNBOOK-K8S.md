@@ -1,0 +1,841 @@
+# Warren on Kubernetes — Operations Runbook
+
+Operator playbook for warren's **K8sProvider** topology: the control plane runs as a `Deployment`, and each agent run gets its own pod.
+This runbook is the durable operations document.
+It covers deploy, secrets, RBAC, garbage collection, admission control, observability, and incident response.
+
+**Scope.** This runbook covers the `WARREN_RUNTIME=k8s` topology only.
+For the default self-host topology (one container, burrow-backed `LocalProvider`), see the [README](../README.md) quickstart.
+That path needs none of this document.
+
+**Cross-references** (read these documents, do not duplicate them here):
+
+- [`deploy/k8s/README.md`](../deploy/k8s/README.md) — the manifest **quick start**: `kubectl apply -k`, overlay layout, secret-creation commands, and the host-mode kubeconfig-401 workaround. This runbook links into it and does not restate it.
+- [`docs/design/k8s-migration.md`](design/k8s-migration.md) and [`runtime-provider-contract.md`](design/runtime-provider-contract.md) — the architecture decisions behind everything in this runbook. Both are historical records of work that shipped in v0.10.0.
+
+---
+
+## 0. The runtime-provider model
+
+Warren selects its run backend once at boot from `WARREN_RUNTIME` (`src/runtime/registry.ts`).
+Unset or `local` selects the burrow-backed `LocalProvider`, the self-host default.
+The value `k8s` selects the `K8sProvider`.
+Both implement the same eight-method `RuntimeProvider` contract (`src/runtime/contract.ts`), so the domain (`src/runs/*`) is identical across topologies.
+Only workspace materialization, event streaming, steering transport, and finalize differ.
+
+Under `k8s` **there is no burrow**: no `burrow serve` sibling, no unix socket, no bwrap.
+Each run is a bare pod (`restartPolicy: Never`) in the `warren-runs` namespace, and the pod boundary is the sandbox.
+A bad `WARREN_RUNTIME` value fails loud at boot (`UnknownRuntimeError`) — it never falls back silently.
+
+Key consequence for operators: everything burrow-shaped in the self-host docs is **dead weight under `k8s`** and must stay unset (§2.4).
+That list covers the four bwrap security flags, `BURROW_API_TOKEN` / `WARREN_BURROW_TOKEN`, `BURROW_DATA_DIR`, and the supervisor.
+
+---
+
+## 1. Deploy
+
+### 1.1 Hosted target — GKE Autopilot
+
+Autopilot is the reference hosted target (deployed live 2026-07-13, warren-4e36).
+Autopilot manages nodes, bills per-pod requests, and enforces restricted PodSecurity.
+The pod-spec builder (`src/runtime/k8s/pod-spec.ts`) already complies: non-root uid 1000, `drop: [ALL]`, `seccompProfile: RuntimeDefault`, no privilege escalation, `restartPolicy: Never`.
+
+One-time provisioning:
+
+```bash
+export PROJECT_ID=...  REGION=us-west1  CLUSTER=warren
+export AR=${REGION}-docker.pkg.dev/${PROJECT_ID}/warren
+
+gcloud services enable container.googleapis.com artifactregistry.googleapis.com
+gcloud artifacts repositories create warren --repository-format=docker --location=${REGION}
+gcloud auth configure-docker ${REGION}-docker.pkg.dev
+gcloud container clusters create-auto ${CLUSTER} --region=${REGION} --release-channel=regular
+gcloud container clusters get-credentials ${CLUSTER} --region=${REGION}
+```
+
+Autopilot gotchas that bite:
+
+- **Autopilot raises requests to equal limits.** The builder emits requests cpu 1 / mem 2Gi and limits cpu 4 / mem 4Gi. Autopilot admits the pod at 4 cpu / 4Gi *requests* — that is what you pay for. Check the admitted spec on the first run: `kubectl -n warren-runs get pod <run> -o yaml | grep -A6 resources`. If the cost matters, set per-project `resources` so that request equals limit on purpose (`.warren/config.yaml`, `src/warren-config/resources-config.ts`).
+- **Apple Silicon → amd64.** Autopilot schedules amd64. Build all three images with `docker buildx build --platform linux/amd64`, or they CrashLoop with `exec format error`.
+
+### 1.2 Three images
+
+The manifests reference tags only — you build and push the images separately.
+The helper script is `deploy/docker/build-images.sh`.
+See [`deploy/k8s/README.md`](../deploy/k8s/README.md) for `--load-k3d`, `--load-kind`, and `--only`.
+
+| Image | Env var | Dockerfile | Role |
+|---|---|---|---|
+| `warren` (control plane) | referenced by the Deployment | root `Dockerfile` | boots `warren serve` directly (Deployment overrides ENTRYPOINT away from the supervisor — no burrow child under k8s) |
+| `warren-agent` | `WARREN_K8S_AGENT_IMAGE` (default `warren-agent:latest`) | `deploy/docker/Dockerfile.agent` | the run pod's toolchain: bun, node, git, the coding-agent CLIs + os-eco CLIs; runs `bun run agent:run` (`src/runtime/k8s/agent-entrypoint.ts`) |
+| `warren-workspace-init` | `WARREN_K8S_INIT_IMAGE` (default `warren-workspace-init:latest`) | `deploy/docker/Dockerfile.workspace-init` | lightweight bun+git init container; runs `bun run workspace:init` (`src/runtime/k8s/workspace-init.ts`) |
+
+The `:latest` defaults name no registry.
+The Deployment **must** set `WARREN_K8S_AGENT_IMAGE` / `WARREN_K8S_INIT_IMAGE` to fully-qualified registry paths, or the cluster has nothing to pull.
+Pin the images by digest on GKE.
+
+### 1.3 Apply the manifests
+
+Everything is kustomize — pick an overlay.
+Full detail (secret creation, overlay differences, ingress notes) lives in [`deploy/k8s/README.md`](../deploy/k8s/README.md).
+Do not re-derive that detail here.
+
+```bash
+kubectl apply -k deploy/k8s/overlays/gke     # GKE Autopilot
+kubectl apply -k deploy/k8s/overlays/kind    # local kind / k3d dev
+```
+
+The base creates:
+
+- Two namespaces: `warren` for the control plane, `warren-runs` for run pods.
+- A ServiceAccount plus the RBAC Role and RoleBinding (§4).
+- A ResourceQuota with its paired LimitRange.
+- One PVC: `warren-data` (5Gi). The `warren-repo-cache` claim is opt-in via overlay (§5.3, warren-554f).
+- The Deployment, the Service, and the Ingress.
+
+Apply `servicemonitor.yaml` separately — it needs the Prometheus Operator CRD.
+
+### 1.4 Local dev (kind / k3d)
+
+The `overlays/kind` overlay pins `imagePullPolicy: Never` (load images into the node first), nginx ingress, and a shrunk repo-cache PVC.
+
+One caveat will waste an afternoon.
+A control plane **on your host** against a k3d/kind cluster gets an **HTTP 401 on every K8s API call**.
+Bun's `fetch` cannot present the kubeconfig client cert against the self-signed cluster CA.
+In-cluster ServiceAccount bearer-token auth (the production path) does not have this problem.
+Two workarounds (`kubectl proxy`, or a token kubeconfig with `--insecure-skip-tls-verify`) are in [`deploy/k8s/README.md`](../deploy/k8s/README.md) under "Host-mode local dev".
+
+### 1.5 Database — Postgres in practice
+
+Nothing in code *forces* Postgres under `k8s` — `run_inbox` has both a sqlite and a postgres migration.
+But SQLite on a `ReadWriteOnce` PVC is a single-replica trap.
+Set `WARREN_DB_URL=postgres://...` deliberately.
+Agent run pods never get the DB URL — only the control plane does (§3, blast-radius minimization).
+
+Supabase Postgres is the reference backend. Three of its gotchas each cost a deploy session (warren-4e36):
+
+- **The URL must carry `sslmode=require&uselibpqcompat=true`.** Without the compat flag, `pg-connection-string` reads `sslmode=require` as verify-full and rejects the pooler certificate chain with `SELF_SIGNED_CERT_IN_CHAIN`.
+- **Point at the session pooler host, not the direct host.** `db.<ref>.supabase.co` resolves over IPv6 only, and GKE Autopilot pods speak IPv4 by default. Use `aws-1-<region>.pooler.supabase.com:5432` with the tenant username form `postgres.<ref>`. The older `aws-0-` pooler generation answers "tenant not found".
+- **Single-quote the value in a shell.** The `&` in the query string forks the command otherwise.
+
+**Pre-migration snapshot (rollback anchor).** Before the Fly→GKE cutover, the operator took a full `pg_dump -Fc` snapshot of the production DB on 2026-07-13: `~/warren-backups/warren-supabase-2026-07-13.dump` on the operator workstation (1.7 GB, from an 11 GB source DB that is almost all `events`). A `pg_restore --list` check confirmed the TOC holds all 12 then-public tables, including the since-dropped `workers`/`burrows`. This snapshot is the restore point for anything that predates the cutover.
+
+### 1.6 Automated CI/CD (GitHub Actions)
+
+`.github/workflows/deploy-gke.yml` automates §1.2 (build and push) and §1.3 (apply).
+A GKE roll-forward thus never needs `build-images.sh` plus `kubectl apply -k` by hand (warren-bd79).
+The manual flow above stays the break-glass fallback, and it is the only path for kind/k3d local dev (§1.4).
+
+**Build and push** (the `build-push` job).
+The job runs when `release.yml` calls this workflow after it cuts a release (`workflow_call`, pinned to the released SHA), and on a manual dispatch.
+There is deliberately **no push trigger** (warren-8b5f).
+A push to `main` used to build, the release from that same push then called this workflow again, and thus every release built twice.
+
+The job builds all three images with `docker buildx --platform linux/amd64` — Autopilot is amd64, and arm64 CrashLoops with `exec format error`.
+The images are: root `Dockerfile` → `warren`, `deploy/docker/Dockerfile.agent` → `warren-agent`, and `deploy/docker/Dockerfile.workspace-init` → `warren-workspace-init`.
+The job tags each image with the full commit SHA **and** `latest`.
+It pushes to the same `<region>-docker.pkg.dev/<project>/<repo>` Artifact Registry that `cloudbuild.yaml` targets.
+The layer cache is GHA-scoped per image.
+
+**Deploy** (the `deploy` job).
+The job runs only when a caller opts in via the `deploy` input.
+`release.yml` sets that input after it publishes a release, or a manual dispatch ticks it.
+A branch push never deploys by itself.
+
+The job pulls cluster credentials (`get-gke-credentials`).
+The job then renders the gitignored `gke-live` overlay *on the runner* (never committed — see `.gitignore`), layered on the committed `gke` template.
+The render pins all three images to the commit SHA: control-plane image via kustomize `images:`, agent and init images via the Deployment env patch.
+Then `kubectl apply -k` runs, with a `rollout status` gate after it.
+That render is exactly the documented `gke-live` pattern (`deploy/k8s/overlays/gke/kustomization.yaml` header), produced from CI vars instead of a hand-maintained local overlay.
+
+**Post-deploy checks** close the job with two assertions, both fatal.
+First, the rolled-out control-plane image must be the exact SHA the job just built.
+Second, on the release path, the job polls `GET https://$WARREN_INGRESS_HOST/version` until it reports the released semver.
+That poll proves that the ingress serves the new code, not just that the Deployment spec points at it (warren-8b5f).
+
+Auth is **GCP Workload Identity Federation** (`google-github-actions/auth`) — no long-lived JSON service-account keys.
+A repo admin must configure:
+
+| Kind | Name | Meaning |
+|---|---|---|
+| secret | `GCP_WORKLOAD_IDENTITY_PROVIDER` | full WIF provider resource (`projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<provider>`) |
+| secret | `GCP_SERVICE_ACCOUNT` | deployer SA email; needs `roles/artifactregistry.writer` + `roles/container.developer` and a WIF binding to this repo |
+| var | `GCP_PROJECT_ID` | GCP project (for example `warren-502318`) — **required** |
+| var | `GCP_REGION` | Artifact Registry / cluster region (default `us-west1`) |
+| var | `GCP_AR_REPO` | Artifact Registry repo name (default `warren`) |
+| var | `GKE_CLUSTER` | Autopilot cluster name (default `warren`) |
+| var | `GKE_LOCATION` | cluster location (default `GCP_REGION`) |
+| var | `WARREN_GIT_AUTHOR_EMAIL` | agent-commit author (`<id>+warren@users.noreply.github.com`); defaults to a noreply address if unset |
+| var | `WARREN_INGRESS_HOST` | public hostname; patches the Ingress host + ManagedCertificate domain (both placeholders in the committed template) and is the target of the post-deploy `/version` smoke test. Optional for a build-only dispatch; **required** on the release path, which fails without it |
+
+This workflow is the only deploy pipeline.
+`release.yml` calls this workflow directly (`workflow_call`) after it publishes a GitHub release, and passes the released commit SHA.
+The call builds the SHA-pinned images and rolls the cluster forward.
+
+We deliberately avoid a `release: [published]` trigger.
+GitHub suppresses workflow runs for events that the default `GITHUB_TOKEN` creates, and releases come from that token.
+So that trigger would never fire (warren-cb81).
+There is no Fly.io deploy (warren-b65c removed it).
+
+### 1.7 Edge abuse control — Cloud Armor (warren-48d3)
+
+Warren has **no per-IP HTTP rate limit in application code**.
+The 429s the app can emit belong to a different layer: dispatch admission (§5.5) and the event-stream caps (`src/server/stream-limits.ts`).
+
+A Cloud Armor policy on the load balancer absorbs volumetric L3/L7 abuse, so the abuse never reaches the single-replica control plane's CPU.
+
+Cloudflare cannot do this job for `warren.run`.
+The DNS record must stay **DNS-only / grey-cloud**, or Google's HTTP-01 `ManagedCertificate` validation fails (`deploy/k8s/overlays/gke/managedcertificate.yaml`).
+Grey-cloud means no Cloudflare WAF and no Cloudflare rate limit — hence Cloud Armor.
+
+**Two halves, both required.** A Cloud Armor policy is a GCP *project* resource, so only the attachment is a manifest:
+
+| Half | Where | Applied by |
+|---|---|---|
+| the rules | `deploy/gcp/cloud-armor.sh` | `deploy/gcp/cloud-armor.sh --project $PROJECT_ID` (idempotent; `--dry-run` prints the calls) |
+| the attachment | `deploy/k8s/overlays/gke/backendconfig.yaml` + the Service's `cloud.google.com/backend-config` annotation | `kubectl apply -k` (the normal deploy) |
+
+Run the script **before** the first apply.
+The `BackendConfig` reference is inert until the named policy exists, and neither `kubectl apply` nor the Ingress controller complains about a missing policy.
+
+```bash
+deploy/gcp/cloud-armor.sh --project "$PROJECT_ID"
+
+# Confirm the policy reached the LB backend (the acceptance check):
+gcloud compute backend-services list --global \
+  --format='table(name,securityPolicy)'
+```
+
+**Rules and thresholds** (`warren-armor`):
+
+| Priority | Rule | Action | Why this threshold |
+|---|---|---|---|
+| 1000 | per-IP rate limit, 600 req / 60s, 300s ban | `rate-based-ban`, exceed → `deny-429` | 10 rps sustained per IP. A first SPA load is ~10 requests, so this is ~2 orders of magnitude above a real user. Banning (not throttling) means a flood stops being evaluated request-by-request. |
+| 2000 | `protocolattack-v33-stable` sensitivity 1 | `deny-403` | matches HTTP framing (request smuggling, header injection), never a payload |
+| 2100 | `scannerdetection-v33-stable` sensitivity 1 | `deny-403` | matches known scanner UAs/paths |
+| 9000–9300 | `sqli` / `xss` / `rce` / `lfi` v33-stable | `deny-403` **`--preview`** | log-only on purpose — see below |
+
+**Why the injection rule sets are preview-only.**
+Warren's request bodies are agent prompts and rendered agent JSON: arbitrary prose, shell, SQL, and HTML by design.
+A prompt that says *"drop table users"* is a legitimate dispatch.
+
+To enforce `sqli`/`xss`/`rce`/`lfi` would 403 real work, so those rule sets run in preview.
+Preview mode gives forensic signal and a measurable false-positive rate.
+`scripts/cloud-armor.test.ts` fails if anyone drops the `--preview` flag.
+
+**Rule 1000 does not touch event streams.**
+Two independent reasons, both worth a re-check after any change here:
+
+- Cloud Armor rate limits count **requests**, not bytes or seconds. A long-lived `GET /runs/:id/events` NDJSON stream costs one request at open. Rule 1000 never re-counts the stream and never severs it.
+- The GCE backend-service timeout defaults to **30s**, which *would* sever every stream. `backendconfig.yaml` sets `timeoutSec: 3600`. Check after a deploy: watch a run for more than 30s in the UI, or run `curl -N -H "Authorization: Bearer $TOK" https://$HOST/runs/$ID/events` against a **live** run. Since warren-7bff the bare request follows a non-terminal run by default. The connection must stay open and stream new events until the run finishes. A replay-then-close in under a second against a `state=running` run is the warren-7bff regression. Pass `?follow=0` to force replay-then-close.
+
+**Tuning.** Thresholds are env overrides on the script — re-run it to reconcile:
+
+```bash
+WARREN_ARMOR_RATE_LIMIT_COUNT=1200 WARREN_ARMOR_BAN_DURATION_SEC=120 \
+  deploy/gcp/cloud-armor.sh --project "$PROJECT_ID"
+```
+
+When a shared egress IP gets banned, raise the **count**, not the interval width — `--enforce-on-key=IP` groups everyone behind one NAT.
+That key is only correct while DNS stays unproxied.
+If a proxy ever sits in front of the LB, every request keys off the proxy's address.
+The rule must then move to `--enforce-on-key=XFF-IP`.
+
+The per-client event-stream cap has the same keying problem in-process (warren-46a7): GCLB appends `<client-ip>, <lb-ip>` after whatever X-Forwarded-For the caller supplied, so the left-most hop is client-forgeable.
+`eventStreamClientKey` therefore counts from the right, skipping `WARREN_EVENT_STREAM_TRUSTED_PROXY_HOPS` infrastructure hops — the GKE overlay pins it to `1` (the LB's own address).
+If a proxy ever sits in front of the LB, raise it by the hops that proxy appends — otherwise every spectator shares one per-client allowance.
+
+**Do not burst-test from your own network.** The warren-63e4 synthetic burst verification trips rule 1000 exactly as designed — and the 300s ban then applies to *your* IP too.
+Your own browser gets 429s off the UI and API for five minutes, mid-verification.
+Run the burst from an external vantage point instead (Cloud Shell is the cheap one), or accept the self-lockout.
+
+If you do lock yourself out, port-forward past the load balancer — Cloud Armor evaluates at the LB, and the pod never sees its 429:
+
+```bash
+kubectl port-forward -n warren deploy/warren 8080:8080
+# UI and API now on http://localhost:8080 for the rest of the ban window
+```
+
+For go-live verification, pre-clear your IP with a temporary higher-priority allow rule (priority 500 sits above rule 1000):
+
+```bash
+gcloud compute security-policies rules create 500 \
+  --security-policy=warren-armor --src-ip-ranges="$OPERATOR_IP/32" \
+  --action=allow --project "$PROJECT_ID"
+
+# After verification, delete it — a standing allow rule bypasses the rate limit forever.
+gcloud compute security-policies rules delete 500 \
+  --security-policy=warren-armor --project "$PROJECT_ID"
+```
+
+**Kill switch** (fastest first):
+
+```bash
+# 1. Detach the policy from the backend entirely (~1-2 min to take effect).
+kubectl -n warren patch backendconfig warren --type=merge \
+  -p '{"spec":{"securityPolicy":{"name":""}}}'
+
+# 2. Or neutralize one rule without detaching (rule 1000 = the rate limit).
+gcloud compute security-policies rules update 1000 \
+  --security-policy=warren-armor --preview --project "$PROJECT_ID"
+
+# 3. Unban a single IP that got caught: drop its ban by lowering the duration,
+#    or allow-list it above the rate limit.
+gcloud compute security-policies rules create 500 \
+  --security-policy=warren-armor --src-ip-ranges=203.0.113.7/32 \
+  --action=allow --project "$PROJECT_ID"
+```
+
+Option 1 is a **live edit** — the next `kubectl apply -k` restores the reference.
+A durable disable means an edit to `backendconfig.yaml`.
+
+**Observability.** Cloud Armor decisions ride on LB request logs.
+`backendconfig.yaml` turns those logs on (`logging.enable: true`, full sample rate).
+Lower the sample rate if log volume becomes a cost problem during a spike.
+
+```bash
+# Enforced denials
+gcloud logging read \
+  'jsonPayload.enforcedSecurityPolicy.outcome="DENY"' --limit=20 --freshness=1h
+
+# Preview-rule matches — the false-positive rate for the 9000-series
+gcloud logging read \
+  'jsonPayload.previewSecurityPolicy.outcome="DENY"' --limit=20 --freshness=1h
+```
+
+**Budget alerts.** The GCP project holds live `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` values in `warren-secrets`.
+An abuse spike bills through Autopilot pods and Anthropic usage before anyone notices.
+Set a project budget alert once (the command needs the billing account id, so it stays manual):
+
+```bash
+gcloud billing accounts list
+gcloud billing budgets create \
+  --billing-account="$BILLING_ACCOUNT_ID" \
+  --display-name="warren monthly" \
+  --budget-amount=200USD \
+  --filter-projects="projects/$PROJECT_ID" \
+  --threshold-rule=percent=0.5 \
+  --threshold-rule=percent=0.9 \
+  --threshold-rule=percent=1.0
+```
+
+Anthropic bills its own spend, not GCP — set a separate limit in the Anthropic console.
+Warren's own per-run cost rollup (`/analytics/cost`) is operator-gated and is the in-app view of the same problem.
+
+---
+
+## 2. Secrets
+
+### 2.1 What exists and where
+
+Two namespaces hold secrets — the run namespace deliberately gets a smaller credential set than the control plane.
+
+| Secret / key | Namespace | Consumed as | Purpose |
+|---|---|---|---|
+| `warren-secrets/warren-api-token` | `warren` | `WARREN_API_TOKEN` | bearer auth on every route except `/healthz`; also the in-pod callback token and the preview-cookie HMAC seed |
+| `warren-secrets/warren-db-url` | `warren` | `WARREN_DB_URL` | Postgres DSN (omit → SQLite on `warren-data`) |
+| `warren-secrets/github-token` | `warren` | `GITHUB_TOKEN` | control-plane git push / private clone |
+| `warren-secrets/anthropic-api-key` | `warren` | `ANTHROPIC_API_KEY` | injected into agent pod env at dispatch |
+| `warren-secrets/sentry-dsn` | `warren` | `SENTRY_DSN` | error reporting (optional) |
+| `warren-secrets/warren-auth` | `warren` | `WARREN_AUTH` | auth posture: `token` (default) or `public`; **not a secret** — it lives here so the flip and the revert stay a Secret edit plus a rollout restart |
+| `warren-secrets/warren-public-allowlist` | `warren` | `WARREN_PUBLIC_ALLOWLIST` | comma-separated owners (`my-org`) and/or repos (`some-owner/some-repo`) a public instance may hold; read **only** under `WARREN_AUTH=public`, where an empty value refuses the boot |
+| `warren-git-token/token` | `warren-runs` | `WARREN_GIT_TOKEN` (init pod) | init-container clone/push; **optional** — public repos clone without it, private repos **fail silently** if it is missing |
+| `warren-anthropic-key/api-key` | `warren-runs` | agent pod `secretKeyRef` | OPTIONAL agent key source (`WARREN_K8S_ANTHROPIC_SECRET_NAME`/`_KEY`); a run whose key rides the dispatch env still schedules when this Secret is absent |
+
+`base/secrets.yaml` ships **placeholder templates** so that `kustomize build` resolves — never `kubectl apply` it as-is.
+Create secrets imperatively.
+The exact `kubectl create secret generic` commands are in [`deploy/k8s/README.md`](../deploy/k8s/README.md) ("Secrets — never commit real values").
+
+### 2.2 The `warren-runs` isolation boundary
+
+Run pods receive only the credentials a compromised pod is permitted to hold: the Anthropic key (agent), `WARREN_API_TOKEN` (callback), and `WARREN_GIT_TOKEN` (init clone/push).
+They do **not** get the DB URL, and they cannot read Secrets from the K8s API — the RBAC Role grants no `secrets` verb (§4).
+Secrets reach pods as env values that the control plane stamps into the pod spec, not as API reads by the pod.
+
+### 2.3 Rotation
+
+There is one bearer token, and it is not scoped or versioned (see [SECURITY.md](../SECURITY.md)).
+
+- **`WARREN_API_TOKEN`.** A rotation invalidates in-flight callback auth and every preview cookie (the HMAC key derives from it). Rotate during a quiet window: update `warren-secrets`, then `kubectl -n warren rollout restart deploy/warren`. In-flight run pods hold the old token in their env, so their finalize callback will fail. Drain first (§7.6), or accept that active runs reap degraded.
+- **`GITHUB_TOKEN` / `WARREN_GIT_TOKEN`.** Update both copies — the control-plane `warren-secrets/github-token` and the run-namespace `warren-git-token/token` are the same PAT by convention. Rollout-restart the control plane. New run pods pick the new value up at the next dispatch. Old pods keep the token in their spec until they exit.
+- **`ANTHROPIC_API_KEY`.** Update `warren-secrets` (the control-plane env source) and the optional `warren-anthropic-key` if you use the `secretKeyRef` path. Rollout-restart.
+
+Rotation is coarse (edit the Secret, restart) because V1 has no token expiry or scopes.
+The restart is not optional. The public event stream builds its secret-literal matcher from `process.env` once, at the first public event, and never rebuilds it. Rotate any secret that reaches warren via env, then restart warren. Until the restart, public event projections do not redact the new value.
+Per-user identity and short-lived per-run GitHub App tokens are roadmap items (R-09, R-18).
+
+### 2.4 Secrets you must NOT set under k8s
+
+`BURROW_API_TOKEN`, `WARREN_BURROW_TOKEN`, `BURROW_DATA_DIR`, and the four bwrap security overrides are LocalProvider-only.
+Nothing reads them under `WARREN_RUNTIME=k8s`, so in the cluster they are dead weight that causes confusion.
+Do not `--from-env-file` a self-host `.env` straight into `warren-secrets` — cherry-pick the keys in the table above.
+
+### 2.5 The public-instance posture
+
+`WARREN_AUTH` selects who may reach the instance without a bearer token.
+The default `token` keeps every route gated.
+`public` admits credential-less spectators to a read-only public projection covering runs, projects, agents and the event stream.
+`WARREN_PUBLIC_ALLOWLIST` names what such an instance may hold.
+Each entry is either a bare owner (`my-org`) or one repo (`some-owner/some-repo`).
+Use repo entries when the owner also holds private repos, because an owner entry admits every repo beneath it.
+
+Neither value is a credential.
+Both live in `warren-secrets` for one reason: rollback speed.
+An operator flips the posture, and reverts it, with a Secret edit plus a rollout restart.
+A literal `value:` in the overlay would turn that revert into a commit, a release and a deploy.
+
+```bash
+kubectl -n warren patch secret warren-secrets --type merge -p \
+  '{"stringData":{"warren-auth":"public","warren-public-allowlist":"<owner>|<owner>/<repo>[,...]"}}'
+kubectl -n warren rollout restart deploy/warren
+```
+
+To revert, set `warren-auth` back to `token` and restart again.
+The Secret edit alone changes nothing, because a `secretKeyRef` resolves at pod start.
+
+Both keys fail safe.
+An absent or blank `WARREN_AUTH` resolves to `token`, and an unrecognized value refuses the boot outright.
+No degenerate value ever reaches `public`.
+Public mode with an empty allowlist also refuses the boot, and a rolling update never routes traffic to a pod that fails to start.
+A misconfigured flip therefore leaves the previous pod in service rather than exposing one.
+
+The allowlist proves the OWNER, not that each repo under it is public.
+Put an org on the list only when you accept every repo in it becoming visible.
+`scripts/public-auth-wiring.test.ts` guards the wiring that carries both keys into the container.
+
+---
+
+## 3. Control-plane configuration (env)
+
+The Deployment env below turns on and tunes the K8s backend.
+Manifest values live in `deploy/k8s/base/deployment.yaml` plus the overlays.
+
+| Env | Value / default | Meaning |
+|---|---|---|
+| `WARREN_RUNTIME` | `k8s` | selects `K8sProvider` (default `local`) |
+| `WARREN_K8S_NAMESPACE` | `warren-runs` | namespace run pods land in |
+| `WARREN_K8S_AGENT_IMAGE` / `WARREN_K8S_INIT_IMAGE` | registry paths | the run pod + init images (§1.2) |
+| `WARREN_K8S_CALLBACK_SERVICE` / `_NAMESPACE` / `_PORT` | `warren` / `warren` / `8080` | the in-pod callback URL = Service DNS `warren.warren.svc.cluster.local:8080` (provider-owned; do not set `WARREN_API_URL` by hand) |
+| `WARREN_K8S_REPO_CACHE_PVC` | unset (cache OFF by default, warren-554f) | opt-in: names the shared repo-cache claim; set it (plus the PVC) via an overlay to enable the cache — see §5.3 |
+| `WARREN_K8S_REPO_CACHE_PATH` | `/repo-cache` | mount path for the cache |
+| `WARREN_K8S_MAX_QUEUE_DEPTH` | `50` | admission: total non-terminal pods; `0` disables (§5.5) |
+| `WARREN_K8S_MAX_PENDING_PODS` | `20` | admission: Pending pods; `0` disables |
+| `WARREN_K8S_MAX_PROJECT_CONCURRENCY` | unset (unlimited) | admission: global per-project default |
+| `WARREN_K8S_ANTHROPIC_SECRET_NAME` / `_KEY` | `warren-anthropic-key` / `api-key` | optional agent-key `secretKeyRef` |
+| `WARREN_K8S_GIT_SECRET_NAME` / `_KEY` | `warren-git-token` / `token` | init-container git token source |
+| `WARREN_K8S_EPHEMERAL_STORAGE_REQUEST_MIB` / `_LIMIT_MIB` | `10240` / `10240` (10Gi) | cluster-wide default ephemeral-storage budget (request + limit + emptyDir `sizeLimit`). A per-project `resources` block beats it (§7.3.1) |
+| `WARREN_AUTH` | unset ⇒ `token` | auth posture (§2.5); `public` admits credential-less spectators to the public projection |
+| `WARREN_PUBLIC_ALLOWLIST` | unset | owners and/or `owner/repo` entries a public instance may hold; required under `WARREN_AUTH=public` |
+
+The provider injects these into pods (never set them by hand): `WARREN_API_URL`, `WARREN_RUN_ID`, `WARREN_REPO_URL`, `WARREN_BRANCH`, `WARREN_BASE_BRANCH`, `WARREN_WORKSPACE_PATH`, `WARREN_SEED_MANIFEST`.
+
+---
+
+## 4. RBAC — what the Role grants and why
+
+The control-plane ServiceAccount (`warren` in namespace `warren`) gets a `Role` plus `RoleBinding` in `warren-runs` **only** — no ClusterRole, no cluster-wide grant (`deploy/k8s/base/rbac.yaml`, design Q4 / R5).
+The verbs are exactly what `src/runtime/k8s/` exercises:
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `pods` | `get, list, watch, create, delete` | dispatch (create), the pod-watcher informer (list/watch), status reads (get), reap + GC (delete) |
+| `pods/log` | `get, watch` | the pod-log NDJSON event stream (§6.1 / §5.1) |
+| `configmaps` | `get, list, create, delete` | per-run seed-file ConfigMaps — create at dispatch, list/delete at GC |
+
+Two verb families are absent on purpose:
+
+- No `update` or `patch` — warren replaces objects, and never mutates them in place.
+- No `secrets` read — the control plane injects agent secrets as pod env, and run pods never read them from the API. That is the §2.2 blast-radius boundary.
+
+Check the grants on any cluster:
+
+```bash
+kubectl auth can-i --as=system:serviceaccount:warren:warren \
+  create pods -n warren-runs          # → yes
+kubectl auth can-i --as=system:serviceaccount:warren:warren \
+  get secrets -n warren-runs          # → no
+kubectl auth can-i --as=system:serviceaccount:warren:warren \
+  create pods -n default              # → no (namespace-scoped)
+```
+
+If dispatch fails with a `403 Forbidden` from the K8s API, check this Role first.
+A missing verb shows up as pods that never get created, or as an informer that never attaches.
+`configmaps` and `watch` are the common gaps — the plan text under-specified them.
+
+---
+
+## 5. Garbage collection & resource growth
+
+Three things accumulate, and each has its own reaper.
+Left unbounded, they exhaust the namespace quota (§5.4) or the cache PVC.
+
+### 5.1 Pod GC loop (terminal pods + seed ConfigMaps)
+
+`src/runtime/k8s/pod-gc.ts` boots alongside the pod-watcher under k8s (`src/server/main/runtime-wiring.ts`).
+K8s itself never reaps bare pods with `restartPolicy: Never`.
+And **pod logs — the event stream's durable store — vanish when the pod goes away.**
+
+The loop:
+
+- Sweeps every **5 min** (`DEFAULT_GC_INTERVAL_MS`).
+- Deletes pods in `Succeeded`/`Failed` phase older than **30 min** (`DEFAULT_GC_MAX_AGE_MS`, design R6). Age comes from the latest container `terminated.finishedAt`, with `creationTimestamp` as the fallback.
+- Then deletes any run-labelled ConfigMap whose run-id has no kept pod behind it. That reclaims both the just-deleted pods' seed ConfigMaps and truly orphaned ones.
+- Is best-effort: a single delete failure logs and skips, and never wedges the sweep. `warren_pod_gc_deletions_total{resource}` counts reclaims.
+
+Implication: **a run's events stay queryable from the pod log for only ~30 min after the run finishes.**
+But the log-follow bridge already persists them into warren's events table during the run, so the durable record survives GC.
+If you need the raw pod for forensics, capture `kubectl -n warren-runs get pod <run> -o yaml` before the window closes, or lengthen the window in code.
+
+### 5.2 `never_started` row GC (scheduler retry hygiene)
+
+A persistently-unreachable runtime used to mint one `never_started` run row per 60s cron tick, forever (~200 rows in 3h on GKE, warren-a0a2).
+The bounded cron-retry tracker (`src/triggers/cron-retry.ts`) now caps consecutive transient spawn failures at **5 per slot** (`MAX_CRON_TRANSIENT_RETRIES`, ≈ a 5-min outage window).
+After the fifth failure it consumes the slot and emits `scheduler.cron_gave_up`.
+Each failed attempt GC's the previous attempt's `never_started` row, so at most one such row survives per failed slot.
+
+The counters are in-memory state, so a control-plane restart resets them.
+That is acceptable — the worst case is one extra bounded burst after a restart.
+
+### 5.3 Repo-cache (opt-in) growth
+
+The repo-cache is **off by default** as of warren-554f.
+The base has no `warren-repo-cache` PVC, and `deployment.yaml` does not set `WARREN_K8S_REPO_CACHE_PVC`, so every run clones fresh.
+The claim is `ReadWriteOnce` and shared by all run pods.
+Concurrent run pods on different nodes deadlock on it (Multi-Attach), and the second run stalls in Init.
+Direct clones cost seconds against 5–20min runs.
+RWX storage (like GKE Filestore, 1TiB minimum) costs too much to share a disk of small mirrors.
+
+Single-node clusters may opt back in via an overlay that adds the claim and re-sets the env — see `deploy/k8s/README.md` "Repo cache (opt-in)".
+Before adding a second node, either turn the cache back off or migrate the claim to a `ReadWriteMany` class (design R2).
+
+When enabled, `warren-repo-cache` is a **shared clone cache**, never a working tree — the working tree is the per-pod `emptyDir`.
+The init container keeps a per-repo bare mirror at `/repo-cache` (`<sha256(url)>.git`, `git clone --mirror`, then `git fetch` on reuse).
+A run then costs a `git fetch` plus a fast local clone instead of a full network clone (warren-e908, design §4.3 / R2).
+
+The number of distinct repos times their object-store size bounds growth — run count does not.
+If the cache fills: expand the PVC, or clear `WARREN_K8S_REPO_CACHE_PVC` to turn the cache off (runs then clone fresh — slower, with no disk growth).
+A wedged or corrupt mirror never blocks a run: any cache failure falls back to a direct network clone automatically (§7.5).
+
+### 5.4 Namespace quota (the hard backstop)
+
+`warren-runs` carries a `ResourceQuota` (50 pods, 100 CPU / 200Gi requests, 200 CPU / 200Gi limits) plus a paired `LimitRange` (`warren-runs-defaults`).
+The LimitRange is load-bearing, not decorative.
+A compute ResourceQuota rejects any pod whose containers do not **all** declare requests and limits, and the `workspace-init` container declares none.
+The LimitRange supplies its defaults, so the pod admits.
+If you keep the quota, keep the LimitRange — otherwise every dispatch fails with `must specify requests.cpu`.
+This quota is the hard ceiling behind warren's soft admission caps (§5.5).
+
+### 5.5 Admission control knobs
+
+Soft controls sit in front of the scheduler (`src/runtime/k8s/admission.ts`, design §3.3).
+`K8sProvider.create()` evaluates them before any pod write.
+Counts come off the pod-watcher snapshot — the pods *are* the queue, with no runs-table read.
+A rejection throws `RuntimeAdmissionError` → **HTTP 429** plus `Retry-After: 30`, with a machine-readable `reason`.
+Checks run most-specific-first:
+
+| Reason | Knob (default) | Trips when |
+|---|---|---|
+| `project_concurrency_exceeded` | `.warren/config.yaml` `admission.maxConcurrentRuns`, else `WARREN_K8S_MAX_PROJECT_CONCURRENCY` (unlimited) | the dispatching project already has ≥ cap non-terminal run pods |
+| `cluster_pending_saturated` | `WARREN_K8S_MAX_PENDING_PODS` (20) | ≥ cap run pods stuck `Pending` (cluster can't schedule what it has) |
+| `queue_depth_exceeded` | `WARREN_K8S_MAX_QUEUE_DEPTH` (50) | ≥ cap total non-terminal run pods |
+
+Set any knob to `0` to turn that cap off.
+`warren_run_admission_rejections_total{reason}` makes rejections observable.
+
+---
+
+## 6. Observability
+
+### 6.1 Prometheus metrics
+
+Warren exposes `GET /metrics` (bearer-auth).
+The K8s-specific families live in `src/runtime/k8s/pod-metrics.ts`, wired via the pod-watcher.
+Apply `deploy/k8s/servicemonitor.yaml` on clusters that run the Prometheus Operator.
+The file stays out of the kustomize base because it needs the `monitoring.coreos.com/v1` CRD.
+
+| Metric | Type | Alert-worthy signal |
+|---|---|---|
+| `warren_run_oom_killed_total` | counter | rising ⇒ agent memory limits too low, or a runaway prompt |
+| `warren_run_evicted_total` | counter | rising ⇒ pods evicted under node pressure, usually ephemeral-storage exhaustion (§7.3.1) — raise `resources.limits.ephemeralStorageMiB` |
+| `warren_run_pod_phase{phase}` | gauge | a growing `Pending` series ⇒ cluster can't schedule (pairs with `cluster_pending_saturated`) |
+| `warren_pod_pending_duration_seconds` | gauge | age of the longest-pending pod; sustained high ⇒ scheduling starvation |
+| `warren_workspace_init_duration_seconds` | gauge | last clone time; spikes ⇒ cold cache / slow git |
+| `warren_pod_watch_reconnects_total` | counter | frequent reconnects ⇒ flaky API-server watch |
+| `warren_workspace_init_failures_total` | counter | rising ⇒ clone/materialize failures (bad token, unreachable origin) |
+| `warren_pod_log_parse_failures_total` | counter | occasional is normal (stray agent stdout); a flood ⇒ malformed event stream |
+| `warren_pod_gc_deletions_total{resource}` | counter | should track completed runs; flatline while pods pile up ⇒ GC wedged (§7) |
+| `warren_run_admission_rejections_total{reason}` | counter | rising ⇒ hitting an admission cap (§5.5) |
+
+(The two `_duration_seconds` metrics render as gauges, not histograms — warren's dependency-free metrics core exposes only gauge and counter.)
+
+### 6.2 `/readyz` per topology
+
+`GET /readyz` (`src/server/handlers/diagnostics.ts`) runs deeper checks than the liveness `/healthz`.
+It is **topology-aware**: the burrow socket, bwrap, and stale-burrow-workspace probes only run when `resolveRuntimeKind() === "local"`, and return `[]` under k8s (warren-c128).
+Without that gate they would forever report "burrow unreachable" and wrongly degrade a healthy K8s control plane.
+Under k8s, `/readyz` covers: DB reachable, agents registered, the warren-config parse, and the preview-allocator and auth checks.
+
+The Deployment probes point at the **auth-exempt `/healthz`**.
+`/readyz` needs the bearer, so gate readiness on it only via a probe with `httpHeaders: [{name: Authorization, value: "Bearer …"}]`.
+Use `/readyz` for deploy gating, not hot-path liveness.
+
+### 6.3 Structured log events worth alerting on
+
+One pino JSON line per event lands on stdout (`kubectl -n warren logs deploy/warren | jq`).
+Alert on these:
+
+- **`scheduler.cron_gave_up`** (error level) — a cron slot burned all 5 retries against an unreachable runtime and gave up (§5.2). Persistent recurrence means the K8s backend is unreachable or misconfigured. Investigate before every cron trigger silently stops firing.
+- **`reap.pr_open_context_degraded`** — under k8s, warren rebuilds the PR body's commits and files-changed sections. It fetches the pushed run branch into the project clone under a temp ref (`refs/warren/pr-open/<runId>`, warren-ab66). This event fires when that fetch fails. The PR still opens, but with empty commit and diff sections. Occasional is tolerable — sustained recurrence means the project clone cannot fetch the run branch (token or network).
+- **`reap.preview_skipped_unsupported`** — a project ships `.warren/preview.yaml`, but the K8s provider has `previewPorts: false` (Service/Ingress previews are a deferred feature), so no preview launches. Expected on k8s. Alert only if it surprises you — someone expected previews on this topology.
+
+### 6.4 First triage commands
+
+```bash
+kubectl -n warren get pods                              # control plane Ready?
+kubectl -n warren logs deploy/warren --tail=200 | jq
+kubectl -n warren-runs get pods -l warren.io/run-id     # run pods + phases
+kubectl -n warren-runs describe pod <run>               # events: scheduling, OOM, pull errors
+```
+
+---
+
+## 7. Incident response playbooks
+
+Symptom → diagnosis → remedy.
+Each playbook rests on verified behavior.
+
+### 7.1 Runtime unreachable — dispatches fail, `scheduler.cron_gave_up` recurs
+
+**Symptom.** New runs never start.
+Cron triggers log `scheduler.cron_gave_up` every slot.
+A manual dispatch returns a 5xx or hangs.
+
+**Diagnose.** Is the problem the K8s API, or the control plane?
+
+```bash
+kubectl -n warren logs deploy/warren --tail=200 | jq 'select(.level >= 50)'
+kubectl auth can-i --as=system:serviceaccount:warren:warren create pods -n warren-runs
+```
+
+A `403` means an RBAC regression (§4).
+A `401` off-cluster means the Bun-fetch client-cert issue (host-mode only, §1.4) — impossible for an in-cluster pod.
+Connection errors mean the API server is unreachable, or the kubeconfig is wrong.
+
+**Remedy.** Fix the RBAC binding or the kubeconfig/ServiceAccount mount, then `kubectl -n warren rollout restart deploy/warren`.
+The cron-retry backoff means that triggers resume on their next slot once the runtime recovers — no manual replay.
+
+### 7.2 Pod stuck `Pending`
+
+**Symptom.** A run sits `queued`/`running` in warren while its pod sits `Pending`.
+`warren_pod_pending_duration_seconds` climbs.
+New dispatches start to return `429 cluster_pending_saturated`.
+
+**Diagnose.**
+
+```bash
+kubectl -n warren-runs describe pod run-<id>   # Events section is authoritative
+```
+
+Common causes:
+
+- The cluster lacks capacity for the requests — Autopilot is busy with node scale-up, so wait.
+- The ResourceQuota has no free slots (§5.4).
+- The image pull fails (`ErrImagePull` — wrong registry path or missing pull creds).
+- The LimitRange got dropped, so the init container has no requests (`must specify requests.cpu`).
+
+**Remedy.**
+
+- Capacity: wait, or raise the quota.
+- Quota full: the pod GC clears terminal pods at 30 min and frees slots, or raise the quota. The admission 429 protects the cluster — honor the `Retry-After`.
+- Image pull: point `WARREN_K8S_AGENT_IMAGE`/`_INIT_IMAGE` at a pullable ref.
+- Lost LimitRange: re-apply `resourcequota.yaml`.
+
+### 7.3 OOMKilled runs
+
+**Symptom.** A run flips to `failed` within seconds.
+`warren_run_oom_killed_total` increments.
+`describe pod` shows `Last State: Terminated, Reason: OOMKilled`.
+
+**Diagnose.** The fast fail is by design — the kubelet killed the container at its `memory.limit`.
+The pod-watcher saw `terminated.reason == OOMKilled` in ~1-2s and marked the run `failed (oom_killed)`.
+The question is whether the limit is too low, or the run is a genuine runaway.
+Check the prompt and the workload against the 4Gi default limit.
+
+**Remedy.** For a legitimately heavy run, raise the per-project memory limit (`.warren/config.yaml` resources, `src/warren-config/resources-config.ts`) so that request and limit fit the workload.
+On Autopilot, remember that billing follows request == limit.
+For a runaway, fix the agent or the prompt — do not paper over it with a cluster-wide limit raise.
+There is no blind retry: `restartPolicy: Never` means an OOM ends the pod, and warren surfaces the failure immediately instead of a re-run from scratch.
+
+#### 7.3.1 Evicted runs (ephemeral-storage exhaustion)
+
+**Symptom.** A run flips to `failed (evicted)`, and `warren_run_evicted_total` increments.
+`describe pod` shows `Status: Failed`, `Reason: Evicted`, and the message `Pod ephemeral local storage usage exceeds the total limit of containers …`.
+A container shows `Terminated, Reason: ContainerStatusUnknown, Exit Code: 137`.
+
+**Diagnose.** The agent's `/workspace` (an emptyDir with the clone plus `bun install`) outgrew the pod's ephemeral-storage budget, and the kubelet reclaimed the pod.
+The `Evicted` pod reason — not the container's `ContainerStatusUnknown` code — is the reliable witness (`src/runtime/k8s/status-map.ts`).
+The run thus finalizes as `failed (evicted)` rather than a generic error.
+
+**You do not need kubectl to read the cause (warren-4a95).**
+The evicted pod — and its kubectl events — age out of the API within the hour.
+Warren therefore captures the kubelet's own `status.message` at observation time, in three places.
+For an ephemeral-storage eviction that message reads `Pod ephemeral local storage usage exceeds the total limit of containers 10Gi`.
+
+1. the run's event stream — the `watchdog_terminal_reconciled` system event's `providerDetail` payload field.
+2. warren's logs — the pod-watcher's `run pod evicted by kubelet` warn line (`detail` field) and the watchdog's reconcile line (`terminalDetail` field).
+3. the finalize-failure message, when the pod went terminal before its finalize POST could land.
+
+A detail that says ephemeral-storage exhaustion means the workspace outgrew the budget.
+A detail that names node pressure means the node ran out of disk, and the remedy is cluster capacity rather than a bigger budget.
+
+**On GKE Autopilot, a pod with no explicit ephemeral-storage request gets a 1Gi default.**
+A real clone plus install blows past that in minutes.
+Warren now sets an explicit 10Gi request and limit on BOTH the agent and workspace-init containers, plus a matching emptyDir `sizeLimit` (warren-653f).
+The default budget is thus generous.
+
+**Remedy.** For a legitimately large repo or toolchain, raise the ephemeral-storage budget.
+UI builds are the classic case: a root `bun install` plus a `src/ui` install plus a Vite build can outgrow 10Gi.
+Per-project, in `.warren/config.yaml`:
+
+```yaml
+resources:
+  requests:
+    ephemeralStorageMiB: 20480   # 20 GiB
+  limits:
+    ephemeralStorageMiB: 20480   # request == limit (Autopilot forces it)
+```
+
+Cluster-wide, set the default every run starts from (warren-4a95):
+
+```
+WARREN_K8S_EPHEMERAL_STORAGE_REQUEST_MIB=20480
+WARREN_K8S_EPHEMERAL_STORAGE_LIMIT_MIB=20480
+```
+
+A per-project `resources` block beats the env default. The env default beats the compiled-in 10Gi.
+Bounds are 64 MiB..1 TiB for both knobs (`src/warren-config/resources-config.ts`, `pickMiB` in `src/runtime/k8s/pod-spec.ts`) — an invalid env value falls back to the default.
+When the block is absent, the `DEFAULT_K8S_EPHEMERAL_STORAGE_*_MIB` 10Gi default applies.
+On Autopilot, the pod-level ephemeral-storage limit is the SUM of the container limits.
+Both containers at 10Gi thus give a 20Gi pod budget, with the emptyDir capped at the per-container limit for a "workspace too big" signal.
+
+### 7.4 Admission 429s
+
+**Symptom.** Dispatch returns `429` with `Retry-After: 30` and a `reason`.
+
+**Diagnose.** Read the `reason` (§5.5):
+
+- `project_concurrency_exceeded` — one project saturated its own cap.
+- `cluster_pending_saturated` — too many Pending pods cluster-wide.
+- `queue_depth_exceeded` — total non-terminal pods hit the ceiling.
+
+Cross-check `warren_run_admission_rejections_total{reason}` and the `warren_run_pod_phase{phase}` gauges.
+
+**Remedy.** The 429s work as intended — a soft control sheds load before the cluster thrashes.
+If the cap is genuinely too tight for your capacity, raise the matching knob (§3 env, or per-project `admission.maxConcurrentRuns`) and rollout-restart.
+For `cluster_pending_saturated`, the real fix is more cluster capacity (§7.2), not a higher cap.
+Clients must honor `Retry-After` and back off.
+
+### 7.5 Repo-cache corruption
+
+Applies only when the opt-in cache is enabled (§5.3). By default there is no cache and every run clones fresh.
+
+**Symptom.** Init containers log clone or fetch failures against `/repo-cache`, and `warren_workspace_init_failures_total` rises.
+Runs can still complete, only slower.
+
+**Diagnose.** The cache is best-effort.
+A corrupt bare mirror (`/repo-cache/<sha256(url)>.git`) makes the init container fall back to a direct network clone.
+A wedged mirror thus **degrades latency, not correctness**.
+Confirm via the init container log:
+
+```bash
+kubectl -n warren-runs logs run-<id> -c workspace-init
+```
+
+**Remedy.** Exec into a pod that mounts the PVC (or a debug pod) and delete the bad mirror directory — the next run re-mirrors it clean.
+Or clear `WARREN_K8S_REPO_CACHE_PVC` to turn the cache off while you investigate (all runs then clone fresh).
+Because RWO pins the cache to one node, corruption stays single-node-scoped.
+The cache is only safe single-node — the RWO Multi-Attach deadlock is why it is opt-in (warren-554f).
+
+### 7.6 Draining the control plane for maintenance
+
+There is no in-flight-run migration — the control plane is a single replica, and SSE sessions are sticky.
+
+To take the control plane down cleanly:
+
+1. Pause dispatch — stop the scheduler (for example, set `WARREN_PLAN_RUN_DISABLED=1` and remove the cron triggers), or accept the bounded cron-retry backoff.
+2. Let active run pods finish — watch `kubectl -n warren-runs get pods`.
+3. Then `rollout restart`.
+
+Run pods are independent of the control-plane pod.
+They keep running across a control-plane restart, and reconcile via the pod-watcher when the control plane returns.
+But a run that finalizes while the control plane is down will retry its callback, and can reap degraded.
+
+### 7.7 Node failure (single-node clusters)
+
+On a single-node cluster, or when a run pod's node dies, the pod vanishes from the API without a clean termination event.
+The reduced **5-min watchdog** (not the legacy 45-min one) then marks the run `failed`.
+It fires once the watch confirms that the pod is gone while the run row still says `running`.
+The DB (Postgres, external) survives, and the control plane restarts via its Deployment.
+Warren loses in-flight runs — it does not resume them.
+
+### 7.8 Run stuck `running` after its pod completed (reap hang, warren-c433)
+
+**Symptom.** A run row stays `state=running` with `endedAt=null` long after `kubectl -n warren-runs get pods` shows the pod as `Succeeded`/`Failed`.
+The last log line is the run-state poller's `observed burrow terminal; draining stream before abort`.
+
+**Root cause (fixed).** The pod-log follow never hit EOF after the pod exited.
+The post-terminal stream teardown parked on `iterator.return()` forever.
+So reap — and the in-pod finalize handshake — never fired.
+
+Mitigations now in place:
+
+- A **5s bound** (`DEFAULT_STREAM_TEARDOWN_MS`) now caps the post-terminal stream teardown. A hung pod-log pump can no longer wedge the bridge's path to reap.
+- The heartbeat watchdog gained a **terminal-reconcile net**. Each tick, the watchdog probes `status()` for a `running` run idle past `WARREN_RUN_TERMINAL_RECONCILE_GRACE_MS` (default 2 min, `0` disables). If the pod is terminal-or-gone but the row still says `running`, the watchdog force-finalizes through reap with the pod's actual outcome. A `succeeded` pod re-drives the in-pod finalize. A still-polling pod parks and picks the intent up. An already-lapsed pod degrades to the documented finalize-timeout `FinalizeResult`. The net emits a `watchdog.terminal_reconciled` event on the run.
+
+If a run still wedges:
+
+- Check the control-plane logs for `watchdog reconciled terminal-but-stuck run`.
+- If the net is off (`WARREN_RUN_TERMINAL_RECONCILE_GRACE_MS=0`), turn it back on.
+- Or `kubectl -n warren-runs delete pod <pod>` to force the pod-gone path.
+
+---
+
+## 8. Capability degradations on k8s (know before you promise)
+
+The K8sProvider does not match every LocalProvider capability.
+The domain branches on `RuntimeCapabilities` (`src/runtime/contract.ts`).
+Operators must know the gaps:
+
+- **Preview environments are off** (`previewPorts: false`). A `.warren/preview.yaml` produces no preview and logs `reap.preview_skipped_unsupported`. Service/Ingress previews are a deferred feature.
+- **Steering latency is ~5s, not real-time.** Steer writes a `run_inbox` row, and the in-pod agent polls `GET /runs/:id/inbox`. That trade gains reliability (it survives pod and control-plane restarts) at a latency cost against the LocalProvider stdin path.
+- **Network policy is coarse.** No per-domain allowlist exists under k8s v1 (`networkPolicy: "coarse"`, against the LocalProvider's `domain-allowlist`).
+- **The repo cache is opt-in and RWO — single-node only.** The cache is off by default (warren-554f). If you enable it, move `warren-repo-cache` to a `ReadWriteMany` class (GKE Filestore CSI, or Longhorn on bare metal) **before** you add a second node. Otherwise concurrent run pods deadlock on the RWO claim (Multi-Attach, design R2). Do not provision Filestore only to run single-node. Leaving the cache off is the cheaper default.
+
+---
+
+## 9. Quick reference
+
+```bash
+# Health
+kubectl -n warren get deploy,svc,pods
+curl -s localhost:8080/healthz                      # via port-forward (auth-exempt)
+curl -s -H "Authorization: Bearer $TOK" localhost:8080/readyz | jq
+curl -s -H "Authorization: Bearer $TOK" localhost:8080/metrics | grep warren_run
+
+# Run pods
+kubectl -n warren-runs get pods -l warren.io/run-id
+kubectl -n warren-runs logs run-<id> -c workspace-init      # clone phase
+kubectl -n warren-runs logs run-<id>                        # agent NDJSON stream
+kubectl -n warren-runs describe pod run-<id>                # scheduling / OOM events
+
+# RBAC sanity
+kubectl auth can-i --as=system:serviceaccount:warren:warren create pods -n warren-runs
+
+# Edge (Cloud Armor, §1.7)
+gcloud compute backend-services list --global --format='table(name,securityPolicy)'
+gcloud compute security-policies rules list --security-policy=warren-armor
+gcloud logging read 'jsonPayload.enforcedSecurityPolicy.outcome="DENY"' --limit=20
+
+# Roll the control plane
+kubectl -n warren rollout restart deploy/warren
+```

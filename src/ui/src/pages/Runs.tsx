@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { agentsApi, projectsApi, runsApi } from "@/api/client.ts";
+import { OperatorOnly, useOperatorHint } from "@/components/OperatorOnly.tsx";
 import { StateBadge } from "@/components/StateBadge.tsx";
 import { Alert } from "@/components/ui/alert.tsx";
 import { Button } from "@/components/ui/button.tsx";
@@ -94,6 +95,7 @@ export function RunsPage() {
 		queryFn: ({ signal }) => runsApi.list(filterApi, signal),
 		refetchInterval: 5000,
 	});
+	const emptyHint = useOperatorHint("Dispatch one above.");
 
 	// Click cycles: inactive → desc → asc → (back to started/desc default).
 	const toggleSort = (key: SortKey): void => {
@@ -127,10 +129,14 @@ export function RunsPage() {
 	}, [projects.data]);
 
 	// All-time totals from the server (warren-ee50). Survives pagination
-	// — unlike the prior "sum the visible page" approach.
+	// — unlike the prior "sum the visible page" approach. `costTotalUsd` is
+	// absent from a spectator's envelope (warren-946f drops the
+	// instance-wide rollup), so it stays `undefined` rather than 0 and the
+	// tile below renders on presence — a coalesced 0 would read as a real
+	// "$0.00 all-time" headline (warren-f53e).
 	const totalRuns = runs.data?.total ?? 0;
 	const costTotals = {
-		total: runs.data?.costTotalUsd ?? 0,
+		total: runs.data?.costTotalUsd,
 		priced: runs.data?.costPricedCount ?? 0,
 	};
 	const visibleCount = runs.data?.runs.length ?? 0;
@@ -143,11 +149,13 @@ export function RunsPage() {
 		<div className="space-y-6">
 			<PageHeader
 				title="Runs"
-				description="Agent runs dispatched into burrow sandboxes."
+				description="Agent runs dispatched into isolated sandboxes."
 				actions={
-					<Link to="/runs/new">
-						<Button>Dispatch a run</Button>
-					</Link>
+					<OperatorOnly>
+						<Link to="/runs/new">
+							<Button>Dispatch a run</Button>
+						</Link>
+					</OperatorOnly>
 				}
 			/>
 
@@ -166,11 +174,7 @@ export function RunsPage() {
 
 			<StaggerList className="flex flex-wrap gap-2">
 				<FadeInItem>
-					<FilterPill
-						active={filter === "all"}
-						label="All"
-						onClick={() => setFilter("all")}
-					/>
+					<FilterPill active={filter === "all"} label="All" onClick={() => setFilter("all")} />
 				</FadeInItem>
 				{agents.data?.agents.map((a) => (
 					<FadeInItem key={`a-${a.name}`}>
@@ -195,7 +199,7 @@ export function RunsPage() {
 			<Card>
 				<CardHeader className={responsiveCardHeaderRow}>
 					<CardTitle>{totalRuns} runs</CardTitle>
-					{showCost && costTotals.priced > 0 ? (
+					{showCost && costTotals.total !== undefined && costTotals.priced > 0 ? (
 						<span
 							className="font-mono text-xs text-(--color-muted-foreground)"
 							title={`${costTotals.priced} of ${totalRuns} runs have a recorded cost (all-time)`}
@@ -206,7 +210,9 @@ export function RunsPage() {
 				</CardHeader>
 				<CardContent className="p-0">
 					{runs.isLoading ? (
-						<div className="p-6"><Spinner label="Loading runs" /></div>
+						<div className="p-6">
+							<Spinner label="Loading runs" />
+						</div>
 					) : runs.isError ? (
 						<div className="p-6">
 							<Alert variant="danger" title="Failed to load runs">
@@ -214,10 +220,7 @@ export function RunsPage() {
 							</Alert>
 						</div>
 					) : runs.data?.runs.length === 0 ? (
-						<EmptyState
-							title="No runs match this filter"
-							description="Dispatch one above."
-						/>
+						<EmptyState title="No runs match this filter" description={emptyHint} />
 					) : (
 						<Table>
 							<TableHeader>
@@ -226,11 +229,7 @@ export function RunsPage() {
 									<TableHead className="whitespace-nowrap">ID</TableHead>
 									<TableHead className="whitespace-nowrap">Agent</TableHead>
 									<TableHead className="whitespace-nowrap">Project</TableHead>
-									<SortableTableHead
-										columnKey="started"
-										sort={sortState}
-										onSort={toggleSort}
-									>
+									<SortableTableHead columnKey="started" sort={sortState} onSort={toggleSort}>
 										Started
 									</SortableTableHead>
 									{showCost ? (
@@ -345,4 +344,3 @@ export function RunsPage() {
 		</div>
 	);
 }
-

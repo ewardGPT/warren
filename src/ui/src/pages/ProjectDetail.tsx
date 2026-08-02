@@ -10,22 +10,19 @@ import type {
 	WarrenConfigFileError,
 	WarrenConfigResponse,
 } from "@/api/types.ts";
+import { OperatorOnly } from "@/components/OperatorOnly.tsx";
 import { Alert } from "@/components/ui/alert.tsx";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
-import {
-	Card,
-	CardContent,
-	CardHeader,
-	CardTitle,
-	cardVariants,
-} from "@/components/ui/card.tsx";
+import { Card, CardContent, CardHeader, CardTitle, cardVariants } from "@/components/ui/card.tsx";
 import { Spinner } from "@/components/ui/spinner.tsx";
+import { useCapabilities } from "@/hooks/use-capabilities.ts";
 import { formatError } from "@/lib/format-error.ts";
 import { cn, formatTimestamp } from "@/lib/utils.ts";
 
 export function ProjectDetailPage() {
 	const { id = "" } = useParams<{ id: string }>();
+	const caps = useCapabilities();
 
 	// Reuse the projects-list cache rather than introducing a GET /projects/:id —
 	// the list endpoint is the only project-row source today (warren-435b shipped
@@ -36,10 +33,13 @@ export function ProjectDetailPage() {
 		queryFn: ({ signal }) => projectsApi.list(signal),
 	});
 
+	// `GET /projects/:id/warren-config` carries trigger prompt text and
+	// quality-gate command strings and is readOperator, so a spectator
+	// never fires it (warren-f53e).
 	const warrenConfig = useQuery({
 		queryKey: ["projects", id, "warren-config"],
 		queryFn: ({ signal }) => projectsApi.warrenConfig(id, signal),
-		enabled: id.length > 0,
+		enabled: id.length > 0 && caps.can("readOperator"),
 	});
 
 	const project: ProjectRow | undefined = projects.data?.projects.find((p) => p.id === id);
@@ -74,12 +74,17 @@ export function ProjectDetailPage() {
 			) : (
 				<>
 					<ProjectMetaCard project={project} />
-					<WarrenConfigPanel
-						projectId={id}
-						query={warrenConfig.data}
-						isLoading={warrenConfig.isLoading}
-						error={warrenConfig.error}
-					/>
+					{/* The panel's own reads are readOperator and it hosts the
+					    `Run now` trigger dispatch, so it is gated whole rather
+					    than button by button (warren-f53e). */}
+					<OperatorOnly capability="readOperator">
+						<WarrenConfigPanel
+							projectId={id}
+							query={warrenConfig.data}
+							isLoading={warrenConfig.isLoading}
+							error={warrenConfig.error}
+						/>
+					</OperatorOnly>
 				</>
 			)}
 		</div>
@@ -94,15 +99,19 @@ function ProjectMetaCard({ project }: { project: ProjectRow }) {
 			</CardHeader>
 			<CardContent>
 				<dl className="grid grid-cols-1 gap-x-6 gap-y-3 text-sm md:grid-cols-2">
-					<MetaRow label="Local path" value={<code className="text-xs">{project.localPath}</code>} />
+					{/* Host-layout disclosure — absent from a spectator's row
+					    (warren-4f6c), so render on presence (warren-f53e). */}
+					{project.localPath !== undefined ? (
+						<MetaRow
+							label="Local path"
+							value={<code className="text-xs">{project.localPath}</code>}
+						/>
+					) : null}
 					<MetaRow label="Default branch" value={project.defaultBranch} />
 					<MetaRow
 						label="Last HEAD"
 						value={
-							<code
-								className="text-xs"
-								title={project.lastHeadSha ?? "never fetched"}
-							>
+							<code className="text-xs" title={project.lastHeadSha ?? "never fetched"}>
 								{project.lastHeadSha !== null ? project.lastHeadSha.slice(0, 12) : "—"}
 							</code>
 						}
@@ -110,9 +119,7 @@ function ProjectMetaCard({ project }: { project: ProjectRow }) {
 					<MetaRow
 						label="Last fetched"
 						value={
-							project.lastFetchedAt !== null
-								? formatTimestamp(project.lastFetchedAt)
-								: "never"
+							project.lastFetchedAt !== null ? formatTimestamp(project.lastFetchedAt) : "never"
 						}
 					/>
 					<MetaRow label="Added" value={formatTimestamp(project.addedAt)} />
@@ -178,9 +185,7 @@ function WarrenConfigError({ error }: { error: unknown }) {
 	if (error instanceof ApiError && error.status === 503) {
 		return (
 			<Alert variant="danger" title={error.message}>
-				{error.hint !== undefined ? (
-					<span className="text-xs">{error.hint}</span>
-				) : null}
+				{error.hint !== undefined ? <span className="text-xs">{error.hint}</span> : null}
 			</Alert>
 		);
 	}
@@ -229,9 +234,7 @@ function TriggersBlock({ projectId }: { projectId: string }) {
 							isRunning={runNow.isPending && runNow.variables === t.id}
 							onRunNow={() => runNow.mutate(t.id)}
 							runError={
-								runNow.isError && runNow.variables === t.id
-									? formatError(runNow.error)
-									: null
+								runNow.isError && runNow.variables === t.id ? formatError(runNow.error) : null
 							}
 						/>
 					))}
@@ -254,10 +257,7 @@ function TriggerRow({
 }) {
 	return (
 		<li
-			className={cn(
-				cardVariants({ variant: "flat" }),
-				"bg-(--color-muted)/30 px-3 py-2 text-sm",
-			)}
+			className={cn(cardVariants({ variant: "flat" }), "bg-(--color-muted)/30 px-3 py-2 text-sm")}
 		>
 			<div className="flex flex-wrap items-center justify-between gap-2">
 				<div className="flex flex-wrap items-baseline gap-2">
@@ -267,18 +267,10 @@ function TriggerRow({
 					</Badge>
 					<code className="text-xs text-(--color-muted-foreground)">{trigger.cron}</code>
 					{trigger.timezone !== undefined ? (
-						<span className="text-xs text-(--color-muted-foreground)">
-							tz: {trigger.timezone}
-						</span>
+						<span className="text-xs text-(--color-muted-foreground)">tz: {trigger.timezone}</span>
 					) : null}
 				</div>
-				<Button
-					type="button"
-					variant="outline"
-					size="sm"
-					onClick={onRunNow}
-					disabled={isRunning}
-				>
+				<Button type="button" variant="outline" size="sm" onClick={onRunNow} disabled={isRunning}>
 					{isRunning ? "Dispatching…" : "Run now"}
 				</Button>
 			</div>
@@ -339,7 +331,10 @@ function TriggerRow({
 function DefaultsBlock({
 	defaults,
 	sourceFile,
-}: { defaults: DefaultsConfig | null; sourceFile: string | null }) {
+}: {
+	defaults: DefaultsConfig | null;
+	sourceFile: string | null;
+}) {
 	const isEmpty =
 		defaults !== null &&
 		defaults.defaultRole === undefined &&
@@ -389,9 +384,7 @@ function DefaultsBlock({
 function ErrorsBlock({ errors }: { errors: WarrenConfigFileError[] }) {
 	return (
 		<section>
-			<h3 className="mb-2 text-sm font-semibold text-(--color-destructive)">
-				Validation errors
-			</h3>
+			<h3 className="mb-2 text-sm font-semibold text-(--color-destructive)">Validation errors</h3>
 			<ul className="space-y-2">
 				{errors.map((e) => (
 					<li

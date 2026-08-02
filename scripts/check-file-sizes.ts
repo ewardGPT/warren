@@ -3,7 +3,7 @@
  * Per-file line-count guard (warren-4553, plan pl-7b06 step 7).
  *
  * Walks every TypeScript file under `src/` and `scripts/` (excluding
- * `src/ui/`, `__golden__/`, and `node_modules/`) and enforces a budget
+ * `src/ui/dist/`, `__golden__/`, and `node_modules/`) and enforces a budget
  * recorded in `scripts/file-size-budgets.json`:
  *
  *   - Files NOT listed in `budgets` must be ≤ `threshold` lines.
@@ -30,7 +30,7 @@ const BUDGETS_PATH = resolve(REPO_ROOT, "scripts/file-size-budgets.json");
 const SCAN_ROOTS = ["src", "scripts"] as const;
 const EXTENSIONS = [".ts", ".tsx"] as const;
 const EXCLUDE_DIR_SEGMENTS = ["node_modules", "__golden__"] as const;
-const EXCLUDE_PATH_PREFIXES = ["src/ui/"] as const;
+const EXCLUDE_PATH_PREFIXES = ["src/ui/dist/"] as const;
 
 type BudgetsFile = {
 	threshold: number;

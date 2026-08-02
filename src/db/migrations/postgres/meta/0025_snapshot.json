@@ -1,6 +1,6 @@
 {
-	"id": "41c7c121-a6a7-49a1-a696-0e8bbd1366d3",
-	"prevId": "2e6a09cf-cd10-408a-a7e8-394f00a6c1b2",
+	"id": "3b3830e5-280d-443f-ba0a-444d8e2bccc8",
+	"prevId": "2719c680-cb5a-4b64-9cdb-90f060e3d0c8",
 	"version": "7",
 	"dialect": "postgresql",
 	"tables": {
@@ -92,186 +92,6 @@
 					"columnsFrom": ["project_id"],
 					"columnsTo": ["id"],
 					"onDelete": "cascade",
-					"onUpdate": "no action"
-				}
-			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.burrows": {
-			"name": "burrows",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"worker_id": {
-					"name": "worker_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {
-				"burrows_worker_idx": {
-					"name": "burrows_worker_idx",
-					"columns": [
-						{
-							"expression": "worker_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.conversations": {
-			"name": "conversations",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"project_id": {
-					"name": "project_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"plot_id": {
-					"name": "plot_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"anchoring_run_id": {
-					"name": "anchoring_run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"status": {
-					"name": "status",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"default": "'active'"
-				},
-				"title": {
-					"name": "title",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"submitted_pr_url": {
-					"name": "submitted_pr_url",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"submitted_pr_number": {
-					"name": "submitted_pr_number",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"planner_agent": {
-					"name": "planner_agent",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"planner_run_id": {
-					"name": "planner_run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"created_at": {
-					"name": "created_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"last_activity_at": {
-					"name": "last_activity_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"closed_at": {
-					"name": "closed_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				}
-			},
-			"indexes": {
-				"conversations_project_idx": {
-					"name": "conversations_project_idx",
-					"columns": [
-						{
-							"expression": "project_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				},
-				"conversations_plot_idx": {
-					"name": "conversations_plot_idx",
-					"columns": [
-						{
-							"expression": "plot_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {
-				"conversations_project_id_projects_id_fk": {
-					"name": "conversations_project_id_projects_id_fk",
-					"tableFrom": "conversations",
-					"tableTo": "projects",
-					"columnsFrom": ["project_id"],
-					"columnsTo": ["id"],
-					"onDelete": "set null",
 					"onUpdate": "no action"
 				}
 			},
@@ -380,350 +200,6 @@
 					"columnsFrom": ["run_id"],
 					"columnsTo": ["id"],
 					"onDelete": "no action",
-					"onUpdate": "no action"
-				}
-			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.graph_run_children": {
-			"name": "graph_run_children",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"graph_run_id": {
-					"name": "graph_run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"seq": {
-					"name": "seq",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"phase": {
-					"name": "phase",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"run_id": {
-					"name": "run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"state": {
-					"name": "state",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"file_path": {
-					"name": "file_path",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"finding_json": {
-					"name": "finding_json",
-					"type": "jsonb",
-					"primaryKey": false,
-					"notNull": false
-				}
-			},
-			"indexes": {
-				"graph_run_children_graph_run_idx": {
-					"name": "graph_run_children_graph_run_idx",
-					"columns": [
-						{
-							"expression": "graph_run_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						},
-						{
-							"expression": "state",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				},
-				"graph_run_children_run_idx": {
-					"name": "graph_run_children_run_idx",
-					"columns": [
-						{
-							"expression": "run_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {
-				"graph_run_children_graph_run_id_graph_runs_id_fk": {
-					"name": "graph_run_children_graph_run_id_graph_runs_id_fk",
-					"tableFrom": "graph_run_children",
-					"tableTo": "graph_runs",
-					"columnsFrom": ["graph_run_id"],
-					"columnsTo": ["id"],
-					"onDelete": "cascade",
-					"onUpdate": "no action"
-				},
-				"graph_run_children_run_id_runs_id_fk": {
-					"name": "graph_run_children_run_id_runs_id_fk",
-					"tableFrom": "graph_run_children",
-					"tableTo": "runs",
-					"columnsFrom": ["run_id"],
-					"columnsTo": ["id"],
-					"onDelete": "set null",
-					"onUpdate": "no action"
-				}
-			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.graph_runs": {
-			"name": "graph_runs",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"project_id": {
-					"name": "project_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"template": {
-					"name": "template",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"agent_name": {
-					"name": "agent_name",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"default": "'claude-code'"
-				},
-				"state": {
-					"name": "state",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"scope_json": {
-					"name": "scope_json",
-					"type": "jsonb",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"verify_enabled": {
-					"name": "verify_enabled",
-					"type": "boolean",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"synthesize_enabled": {
-					"name": "synthesize_enabled",
-					"type": "boolean",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"max_fan_out": {
-					"name": "max_fan_out",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": true,
-					"default": 16
-				},
-				"failure_reason": {
-					"name": "failure_reason",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"created_at": {
-					"name": "created_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"started_at": {
-					"name": "started_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"ended_at": {
-					"name": "ended_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				}
-			},
-			"indexes": {
-				"graph_runs_project_state_idx": {
-					"name": "graph_runs_project_state_idx",
-					"columns": [
-						{
-							"expression": "project_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						},
-						{
-							"expression": "state",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				},
-				"graph_runs_state_idx": {
-					"name": "graph_runs_state_idx",
-					"columns": [
-						{
-							"expression": "state",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {
-				"graph_runs_project_id_projects_id_fk": {
-					"name": "graph_runs_project_id_projects_id_fk",
-					"tableFrom": "graph_runs",
-					"tableTo": "projects",
-					"columnsFrom": ["project_id"],
-					"columnsTo": ["id"],
-					"onDelete": "cascade",
-					"onUpdate": "no action"
-				}
-			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.messages": {
-			"name": "messages",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"conversation_id": {
-					"name": "conversation_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"seq": {
-					"name": "seq",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"role": {
-					"name": "role",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"content": {
-					"name": "content",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"run_id": {
-					"name": "run_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"created_at": {
-					"name": "created_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {
-				"messages_conversation_seq_idx": {
-					"name": "messages_conversation_seq_idx",
-					"columns": [
-						{
-							"expression": "conversation_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						},
-						{
-							"expression": "seq",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {
-				"messages_conversation_id_conversations_id_fk": {
-					"name": "messages_conversation_id_conversations_id_fk",
-					"tableFrom": "messages",
-					"tableTo": "conversations",
-					"columnsFrom": ["conversation_id"],
-					"columnsTo": ["id"],
-					"onDelete": "cascade",
 					"onUpdate": "no action"
 				}
 			},
@@ -946,12 +422,6 @@
 					"notNull": true,
 					"default": "'manual'"
 				},
-				"plot_id": {
-					"name": "plot_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
 				"parent_run_id": {
 					"name": "parent_run_id",
 					"type": "text",
@@ -1025,123 +495,12 @@
 					"concurrently": false,
 					"method": "btree",
 					"with": {}
-				},
-				"plan_runs_plot_id_idx": {
-					"name": "plan_runs_plot_id_idx",
-					"columns": [
-						{
-							"expression": "plot_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
 				}
 			},
 			"foreignKeys": {
 				"plan_runs_project_id_projects_id_fk": {
 					"name": "plan_runs_project_id_projects_id_fk",
 					"tableFrom": "plan_runs",
-					"tableTo": "projects",
-					"columnsFrom": ["project_id"],
-					"columnsTo": ["id"],
-					"onDelete": "cascade",
-					"onUpdate": "no action"
-				}
-			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.plots": {
-			"name": "plots",
-			"schema": "",
-			"columns": {
-				"id": {
-					"name": "id",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"project_id": {
-					"name": "project_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"status": {
-					"name": "status",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"title": {
-					"name": "title",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"updated_at": {
-					"name": "updated_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"state_json": {
-					"name": "state_json",
-					"type": "jsonb",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {
-				"plots_project_updated_idx": {
-					"name": "plots_project_updated_idx",
-					"columns": [
-						{
-							"expression": "project_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						},
-						{
-							"expression": "updated_at",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				},
-				"plots_status_idx": {
-					"name": "plots_status_idx",
-					"columns": [
-						{
-							"expression": "status",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				}
-			},
-			"foreignKeys": {
-				"plots_project_id_projects_id_fk": {
-					"name": "plots_project_id_projects_id_fk",
-					"tableFrom": "plots",
 					"tableTo": "projects",
 					"columnsFrom": ["project_id"],
 					"columnsTo": ["id"],
@@ -1201,13 +560,6 @@
 					"primaryKey": false,
 					"notNull": false
 				},
-				"has_plot": {
-					"name": "has_plot",
-					"type": "boolean",
-					"primaryKey": false,
-					"notNull": true,
-					"default": false
-				},
 				"has_seeds": {
 					"name": "has_seeds",
 					"type": "boolean",
@@ -1234,6 +586,108 @@
 				}
 			},
 			"foreignKeys": {},
+			"compositePrimaryKeys": {},
+			"uniqueConstraints": {},
+			"policies": {},
+			"checkConstraints": {},
+			"isRLSEnabled": false
+		},
+		"public.run_inbox": {
+			"name": "run_inbox",
+			"schema": "",
+			"columns": {
+				"id": {
+					"name": "id",
+					"type": "text",
+					"primaryKey": true,
+					"notNull": true
+				},
+				"run_id": {
+					"name": "run_id",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"seq": {
+					"name": "seq",
+					"type": "integer",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"body": {
+					"name": "body",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"priority": {
+					"name": "priority",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"default": "'normal'"
+				},
+				"from_actor": {
+					"name": "from_actor",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"default": "'operator'"
+				},
+				"state": {
+					"name": "state",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true,
+					"default": "'unread'"
+				},
+				"created_at": {
+					"name": "created_at",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": true
+				},
+				"delivered_at": {
+					"name": "delivered_at",
+					"type": "text",
+					"primaryKey": false,
+					"notNull": false
+				}
+			},
+			"indexes": {
+				"run_inbox_run_state_idx": {
+					"name": "run_inbox_run_state_idx",
+					"columns": [
+						{
+							"expression": "run_id",
+							"isExpression": false,
+							"asc": true,
+							"nulls": "last"
+						},
+						{
+							"expression": "state",
+							"isExpression": false,
+							"asc": true,
+							"nulls": "last"
+						}
+					],
+					"isUnique": false,
+					"concurrently": false,
+					"method": "btree",
+					"with": {}
+				}
+			},
+			"foreignKeys": {
+				"run_inbox_run_id_runs_id_fk": {
+					"name": "run_inbox_run_id_runs_id_fk",
+					"tableFrom": "run_inbox",
+					"tableTo": "runs",
+					"columnsFrom": ["run_id"],
+					"columnsTo": ["id"],
+					"onDelete": "cascade",
+					"onUpdate": "no action"
+				}
+			},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"policies": {},
@@ -1286,12 +740,6 @@
 					"primaryKey": false,
 					"notNull": false
 				},
-				"plot_id": {
-					"name": "plot_id",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
 				"rendered_agent_json": {
 					"name": "rendered_agent_json",
 					"type": "jsonb",
@@ -1318,12 +766,6 @@
 				},
 				"ended_at": {
 					"name": "ended_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
-				},
-				"merge_wait_started_at": {
-					"name": "merge_wait_started_at",
 					"type": "text",
 					"primaryKey": false,
 					"notNull": false
@@ -1523,21 +965,6 @@
 					"method": "btree",
 					"with": {}
 				},
-				"runs_plot_id_idx": {
-					"name": "runs_plot_id_idx",
-					"columns": [
-						{
-							"expression": "plot_id",
-							"isExpression": false,
-							"asc": true,
-							"nulls": "last"
-						}
-					],
-					"isUnique": false,
-					"concurrently": false,
-					"method": "btree",
-					"with": {}
-				},
 				"runs_mode_idx": {
 					"name": "runs_mode_idx",
 					"columns": [
@@ -1625,19 +1052,6 @@
 					"type": "text",
 					"primaryKey": false,
 					"notNull": false
-				},
-				"fire_count": {
-					"name": "fire_count",
-					"type": "integer",
-					"primaryKey": false,
-					"notNull": true,
-					"default": 0
-				},
-				"completed_at": {
-					"name": "completed_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": false
 				}
 			},
 			"indexes": {
@@ -1677,44 +1091,6 @@
 					"onUpdate": "no action"
 				}
 			},
-			"compositePrimaryKeys": {},
-			"uniqueConstraints": {},
-			"policies": {},
-			"checkConstraints": {},
-			"isRLSEnabled": false
-		},
-		"public.workers": {
-			"name": "workers",
-			"schema": "",
-			"columns": {
-				"name": {
-					"name": "name",
-					"type": "text",
-					"primaryKey": true,
-					"notNull": true
-				},
-				"url": {
-					"name": "url",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				},
-				"state": {
-					"name": "state",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true,
-					"default": "'healthy'"
-				},
-				"added_at": {
-					"name": "added_at",
-					"type": "text",
-					"primaryKey": false,
-					"notNull": true
-				}
-			},
-			"indexes": {},
-			"foreignKeys": {},
 			"compositePrimaryKeys": {},
 			"uniqueConstraints": {},
 			"policies": {},

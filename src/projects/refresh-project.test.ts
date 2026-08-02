@@ -43,7 +43,7 @@ describe("refreshProject", () => {
 				return {
 					headSha: "abcd1234abcd1234abcd1234abcd1234abcd1234",
 					ref: input.ref,
-					features: { hasPlot: false, hasSeeds: false },
+					features: { hasSeeds: false },
 				};
 			},
 			now: () => new Date("2026-05-09T19:00:00.000Z"),
@@ -81,7 +81,7 @@ describe("refreshProject", () => {
 				return {
 					headSha: "deadbeef".repeat(5),
 					ref: input.ref,
-					features: { hasPlot: false, hasSeeds: false },
+					features: { hasSeeds: false },
 				};
 			},
 		});
@@ -134,7 +134,7 @@ describe("refreshProject", () => {
 				refresh: async () => ({
 					headSha: "x",
 					ref: "",
-					features: { hasPlot: false, hasSeeds: false },
+					features: { hasSeeds: false },
 				}),
 			}),
 		).rejects.toBeInstanceOf(ValidationError);
@@ -150,64 +150,10 @@ describe("refreshProject", () => {
 				refresh: async () => ({
 					headSha: "x",
 					ref: "main",
-					features: { hasPlot: false, hasSeeds: false },
+					features: { hasSeeds: false },
 				}),
 			}),
 		).rejects.toMatchObject({ code: "not_found" });
-	});
-
-	test("persists the .plot/ probe outcome onto the project row (warren-4e20)", async () => {
-		const row = await addProject({
-			repo,
-			config: CFG,
-			gitUrl: "https://github.com/x/y.git",
-			spawn: NOOP_SPAWN,
-			clone: fakeClone(),
-			detectFeatures: () => ({ hasPlot: false, hasSeeds: false }),
-		});
-		expect(row.hasPlot).toBe(false);
-
-		const result = await refreshProject({
-			repo,
-			config: CFG,
-			id: row.id,
-			spawn: NOOP_SPAWN,
-			refresh: async (input) => ({
-				headSha: "1234".repeat(10),
-				ref: input.ref,
-				features: { hasPlot: true, hasSeeds: false },
-			}),
-		});
-
-		expect(result.project.hasPlot).toBe(true);
-		const persisted = await repo.require(row.id);
-		expect(persisted.hasPlot).toBe(true);
-	});
-
-	test("flips hasPlot back to false when .plot/ is removed upstream", async () => {
-		const row = await addProject({
-			repo,
-			config: CFG,
-			gitUrl: "https://github.com/x/y.git",
-			spawn: NOOP_SPAWN,
-			clone: fakeClone(),
-			detectFeatures: () => ({ hasPlot: true, hasSeeds: false }),
-		});
-		expect(row.hasPlot).toBe(true);
-
-		const result = await refreshProject({
-			repo,
-			config: CFG,
-			id: row.id,
-			spawn: NOOP_SPAWN,
-			refresh: async (input) => ({
-				headSha: "5678".repeat(10),
-				ref: input.ref,
-				features: { hasPlot: false, hasSeeds: false },
-			}),
-		});
-
-		expect(result.project.hasPlot).toBe(false);
 	});
 
 	test("persists hasSeeds=true after probe (warren-9990)", async () => {
@@ -217,7 +163,7 @@ describe("refreshProject", () => {
 			gitUrl: "https://github.com/x/y.git",
 			spawn: NOOP_SPAWN,
 			clone: fakeClone(),
-			detectFeatures: () => ({ hasPlot: false, hasSeeds: false }),
+			detectFeatures: () => ({ hasSeeds: false }),
 		});
 		expect(row.hasSeeds).toBe(false);
 
@@ -229,7 +175,7 @@ describe("refreshProject", () => {
 			refresh: async (input) => ({
 				headSha: "1234".repeat(10),
 				ref: input.ref,
-				features: { hasPlot: false, hasSeeds: true },
+				features: { hasSeeds: true },
 			}),
 		});
 
@@ -245,7 +191,7 @@ describe("refreshProject", () => {
 			gitUrl: "https://github.com/x/y.git",
 			spawn: NOOP_SPAWN,
 			clone: fakeClone(),
-			detectFeatures: () => ({ hasPlot: false, hasSeeds: true }),
+			detectFeatures: () => ({ hasSeeds: true }),
 		});
 		expect(row.hasSeeds).toBe(true);
 
@@ -257,7 +203,7 @@ describe("refreshProject", () => {
 			refresh: async (input) => ({
 				headSha: "5678".repeat(10),
 				ref: input.ref,
-				features: { hasPlot: false, hasSeeds: false },
+				features: { hasSeeds: false },
 			}),
 		});
 
@@ -292,13 +238,16 @@ describe("refreshProject", () => {
 				return {
 					headSha: "deadbeef".repeat(5),
 					ref: input.ref,
-					features: { hasPlot: false, hasSeeds: false },
+					features: { hasSeeds: false },
 				};
 			},
 		});
 
-		expect(order).toEqual([`invalidate:${row.id}`, "refresh"]);
-		expect(cache.invalidations).toEqual([row.id]);
+		// warren-e376: a second invalidate AFTER the refresh closes the
+		// hole where a reader that starts mid-refresh (1s scheduler tick)
+		// caches a stale mid-swap parse (acceptance scenario 15 404).
+		expect(order).toEqual([`invalidate:${row.id}`, "refresh", `invalidate:${row.id}`]);
+		expect(cache.invalidations).toEqual([row.id, row.id]);
 	});
 
 	test("invalidates even when refresh throws (cache stays empty)", async () => {
@@ -361,7 +310,7 @@ describe("refreshProject git-hooks knob (warren-8f4c)", () => {
 				return {
 					headSha: "a".repeat(40),
 					ref: input.ref,
-					features: { hasPlot: false, hasSeeds: false },
+					features: { hasSeeds: false },
 				};
 			},
 		});
@@ -381,7 +330,7 @@ describe("refreshProject git-hooks knob (warren-8f4c)", () => {
 		const skipHooksCache: WarrenConfigCache = {
 			get: async () => ({
 				triggers: null,
-				defaults: { agent: { pauseTimeoutMs: 1_800_000, skipGitHooks: true } },
+				defaults: { agent: { skipGitHooks: true } },
 				prTemplate: null,
 				sourceFile: null,
 				errors: [],
@@ -404,7 +353,7 @@ describe("refreshProject git-hooks knob (warren-8f4c)", () => {
 				return {
 					headSha: "b".repeat(40),
 					ref: input.ref,
-					features: { hasPlot: false, hasSeeds: false },
+					features: { hasSeeds: false },
 				};
 			},
 		});

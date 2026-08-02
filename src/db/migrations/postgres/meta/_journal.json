@@ -159,15 +159,71 @@
 		{
 			"idx": 22,
 			"version": "7",
-			"when": 1785639749981,
-			"tag": "0022_married_loners",
+			"when": 1783878587571,
+			"tag": "0022_woozy_kylun",
 			"breakpoints": true
 		},
 		{
 			"idx": 23,
 			"version": "7",
-			"when": 1785650114001,
-			"tag": "0023_dusty_ironclad",
+			"when": 1783885153191,
+			"tag": "0023_nervous_blazing_skull",
+			"breakpoints": true
+		},
+		{
+			"idx": 24,
+			"version": "7",
+			"when": 1784654848612,
+			"tag": "0024_perfect_proteus",
+			"breakpoints": true
+		},
+		{
+			"idx": 25,
+			"version": "7",
+			"when": 1784813003621,
+			"tag": "0025_black_santa_claus",
+			"breakpoints": true
+		},
+		{
+			"idx": 26,
+			"version": "7",
+			"when": 1785265057128,
+			"tag": "0026_optimal_stryfe",
+			"breakpoints": true
+		},
+		{
+			"idx": 27,
+			"version": "7",
+			"when": 1785268484222,
+			"tag": "0027_lumpy_silvermane",
+			"breakpoints": true
+		},
+		{
+			"idx": 28,
+			"version": "7",
+			"when": 1785446835000,
+			"tag": "0028_abnormal_mysterio",
+			"breakpoints": true
+		},
+		{
+			"idx": 29,
+			"version": "7",
+			"when": 1785456676276,
+			"tag": "0029_mean_penance",
+			"breakpoints": true
+		},
+		{
+			"idx": 30,
+			"version": "7",
+			"when": 1785607965211,
+			"tag": "0030_freezing_thunderball",
+			"breakpoints": true
+		},
+		{
+			"idx": 31,
+			"version": "7",
+			"when": 1785702695789,
+			"tag": "0031_real_kronos",
 			"breakpoints": true
 		}
 	]

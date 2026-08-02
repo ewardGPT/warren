@@ -1,5 +1,5 @@
 /**
- * Prefixed ID generators (SPEC §7).
+ * Prefixed ID generators (docs/http-api.md).
  *
  * Each ID is a stable two-part string: a domain prefix and a 12-char
  * lowercase base32 suffix (~60 bits of entropy). Prefixes are reserved per
@@ -23,6 +23,12 @@ const PREFIXES = {
 	planRun: "plnr",
 	conversation: "conv",
 	message: "msg",
+	/** One in-pod finalize attempt (pl-829f step 20 / warren-0d35). Correlates a
+	 * `K8sProvider.finalize` request with the in-pod harness's result POST. */
+	finalizeAttempt: "fin",
+	/** Graph-run coordinator rows (graph-engineering pilot, map #29). */
+	graphRun: "grun",
+	graphRunChild: "grunch",
 } as const;
 
 export type IdKind = keyof typeof PREFIXES;

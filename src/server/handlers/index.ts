@@ -1,14 +1,13 @@
 /**
- * Handlers for warren's HTTP API (SPEC §8.1) — route-table composer
+ * Handlers for warren's HTTP API (docs/http-api.md) — route-table composer
  * and shared parsing helpers.
  *
  * Domain handlers live alongside in `./agents.ts`, `./projects.ts`,
  * `./burrows.ts`, `./workers.ts`, `./runs.ts`, `./plan-runs.ts`,
- * `./plots.ts`, `./plot-plan-runs.ts`, `./diagnostics.ts`, and
- * `./meta.ts`. Each is a thin envelope around a function in `runs/`,
- * `registry/`, `projects/`, or `db/repos/` — the modules already do
- * validation, state machines, and burrow shell-out, so handlers only
- * shape the wire IO.
+ * `./diagnostics.ts`, and `./meta.ts`. Each is a thin envelope around a
+ * function in `runs/`, `registry/`, `projects/`, or `db/repos/` — the
+ * modules already do validation, state machines, and burrow shell-out,
+ * so handlers only shape the wire IO.
  *
  * Streaming surface (`GET /runs/:id/events?follow=1`) bridges
  * `tailRunEvents` onto NDJSON. Cleanup follows the same pattern burrow
@@ -23,7 +22,7 @@
  * this hook the run dispatches into burrow but warren never persists
  * any of its events — a regression Phase 6 would otherwise re-introduce.
  *
- * `POST /agents/refresh` is sync from the wire's POV (the canopy clone +
+ * `POST /projects/:id/agents/refresh` is sync from the wire's POV (the
  * per-prompt render runs to completion before responding). We don't
  * stream progress events; if a refresh starts taking minutes the right
  * answer is to add a Phase 13-style readyz/doctor signal, not to bolt a
@@ -31,28 +30,12 @@
  */
 
 import { ValidationError } from "../../core/errors.ts";
-import { isValidPlotIdFormat, PlotIdInvalidError, PlotIdNotFoundError } from "../../plots/index.ts";
-import type { SpawnFn, SpawnOptions, SpawnResult } from "../../projects/clone.ts";
-import type { Route, RouteContext, RouteHandler, ServerDeps } from "../types.ts";
-import {
-	getAgentHandler,
-	listAgentsHandler,
-	refreshAgentsHandler,
-	refreshProjectAgentsHandler,
-} from "./agents.ts";
+import { defaultSpawn } from "../../projects/clone.ts";
+import type { Route, RouteContext, RouteHandler, RoutePolicy, ServerDeps } from "../types.ts";
+import { getAgentHandler, listAgentsHandler } from "./agents.ts";
 import { healAlertHandler } from "./alerts.ts";
-import { getBurrowHandler, listBurrowsHandler } from "./burrows.ts";
-import {
-	createConversationHandler,
-	getConversationHandler,
-	listConversationsHandler,
-	postConversationMessageHandler,
-	rewakeConversationHandler,
-	sendOffConversationHandler,
-} from "./conversations.ts";
 import { readyzHandler } from "./diagnostics.ts";
-import { createGraphRunHandler, getGraphRunHandler } from "./graph-runs.ts";
-import { healthzHandler, previewConfigHandler, versionHandler } from "./meta.ts";
+import { healthzHandler, previewConfigHandler, versionHandler, whoamiHandler } from "./meta.ts";
 import { metricsHandler } from "./metrics.ts";
 import {
 	cancelPlanRunHandler,
@@ -61,23 +44,6 @@ import {
 	listPlanRunsHandler,
 	streamPlanRunEventsHandler,
 } from "./plan-runs.ts";
-import { resumePlanRunHandler } from "./plan-runs-resume.ts";
-import { createPlotPlanRunHandler } from "./plot-plan-runs.ts";
-import {
-	answerPlotQuestionHandler,
-	attachPlotHandler,
-	changePlotStatusHandler,
-	createPlotHandler,
-	detachPlotHandler,
-	editPlotIntentHandler,
-	getPlotHandler,
-	getPlotSummaryHandler,
-	listPlotsHandler,
-	mergePlotPrAttachmentHandler,
-	needsAttentionCountHandler,
-	renamePlotHandler,
-	syncPlotHandler,
-} from "./plots/index.ts";
 import {
 	createProjectHandler,
 	deleteProjectHandler,
@@ -93,47 +59,26 @@ import {
 import {
 	cancelRunHandler,
 	createRunHandler,
+	getRunFinalizeIntentHandler,
 	getRunHandler,
 	listBehaviorAnalyticsHandler,
 	listCostAnalyticsHandler,
 	listRunAnalyticsHandler,
 	listRunsHandler,
+	pollRunInboxHandler,
+	postRunFinalizeResultHandler,
+	postRunSalvageHandler,
 	previewLoginHandler,
 	previewTeardownHandler,
 	steerRunHandler,
 	streamRunEventsHandler,
-	wakeSessionHandler,
 } from "./runs/index.ts";
-import { drainWorkerHandler, listWorkersHandler } from "./workers.ts";
 
 /**
- * Default `Bun.spawn` adaptor matching the SpawnFn shape the registry +
- * projects modules expect. One of three identical copies, alongside
- * `defaultSpawn` in src/cli/output.ts and src/server/main/utils.ts;
- * the duplication is deliberate so neither surface imports the other.
+ * The production `Bun.spawn` adaptor, re-exported so the domain handlers
+ * keep importing their shared helpers from this one module.
  */
-export const defaultSpawn: SpawnFn = async (
-	cmd: readonly string[],
-	opts: SpawnOptions,
-): Promise<SpawnResult> => {
-	const proc = Bun.spawn({
-		cmd: [...cmd],
-		cwd: opts.cwd,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const timer =
-		opts.timeoutMs !== undefined && opts.timeoutMs > 0
-			? setTimeout(() => proc.kill(), opts.timeoutMs)
-			: null;
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
-	if (timer !== null) clearTimeout(timer);
-	return { stdout, stderr, exitCode: exitCode ?? 0 };
-};
+export { defaultSpawn };
 
 /* ----------------------------------------------------------------------- */
 /* Body / param parsing                                                     */
@@ -207,44 +152,6 @@ export function parseNonNegativeInt(raw: string | null, label: string): number |
 	return n;
 }
 
-/**
- * Validate `plotId` at the dispatch edge (POST /runs, POST /plan-runs).
- * Both inputs are normalized so an undefined / empty string passes
- * through unchanged — "no plot bound" is a first-class shape.
- *
- * Format check is always-on (`isValidPlotIdFormat`). Existence check
- * runs only when `plotResolver` is wired on ServerDeps (production
- * wires it in src/server/main/index.ts). Test harnesses that omit the
- * resolver get format-only validation, which matches the existing
- * per-Plot handler posture in this file (`deps.plotResolver !==
- * undefined ? ... : null`).
- *
- * warren-bae5 / pl-5310 step 2 — fold-in of warren-a353.
- */
-export async function assertPlotIdDispatchable(input: {
-	readonly plotId: string | undefined;
-	readonly plotResolver?: import("../../plots/index.ts").PlotResolver;
-}): Promise<void> {
-	const { plotId, plotResolver } = input;
-	if (plotId === undefined || plotId === "") return;
-	if (!isValidPlotIdFormat(plotId)) {
-		throw new PlotIdInvalidError(
-			`plot_id ${JSON.stringify(plotId)} is not a valid Plot ID (expected shape: plot-<lower-alphanum>+)`,
-			{
-				recoveryHint:
-					"Plot IDs look like `plot-3e72876d`. Visit /plots to copy the canonical id of an existing Plot.",
-			},
-		);
-	}
-	if (plotResolver === undefined) return;
-	const owning = await plotResolver.resolve(plotId);
-	if (owning === null) {
-		throw new PlotIdNotFoundError(`plot_id ${plotId} does not match any known Plot`, {
-			recoveryHint: "Verify the Plot exists at /plots, or omit plot_id to dispatch an unbound run.",
-		});
-	}
-}
-
 /* ----------------------------------------------------------------------- */
 /* Route table                                                              */
 /* ----------------------------------------------------------------------- */
@@ -252,144 +159,218 @@ export async function assertPlotIdDispatchable(input: {
 interface RouteEntry {
 	readonly method: Route["method"];
 	readonly pattern: string;
+	/**
+	 * The capability this route demands (warren-b875). Required — TypeScript
+	 * refuses an entry that omits it, so a new route can never default to
+	 * open. Enforced once, in `handleRequest` (`src/server/server.ts`).
+	 */
+	readonly policy: RoutePolicy;
 	readonly build: (deps: ServerDeps) => RouteHandler;
 }
 
+/**
+ * Every route and the capability it requires (warren-b875).
+ *
+ * The classification, in one place so the whole surface can be read at once:
+ *
+ * - `anonymous` — no auth gate at all. `/healthz` (liveness probes carry no
+ *   token) and `/version` (the login screen reads it before the user has
+ *   one). `isAuthExempt` is DERIVED from these two entries, so the exemption
+ *   list can't drift from the policy table.
+ * - `readPublic` — the demo surface a `WARREN_AUTH=public` spectator sees: the
+ *   run / project / agent / plan-run listings and details, the run event stream,
+ *   `/whoami` (the caller's own identity), and `/analytics/runs`. Each is served
+ *   through a public projection (pl-b82d steps 14-16) before an instance is
+ *   actually exposed; the policy is what makes the projection reachable, not
+ *   what makes it safe.
+ * - `readOperator` — reads that are NOT for spectators. `/readyz` and
+ *   `/metrics` are operator diagnostics (the latter deliberately not
+ *   auth-exempt, warren-682a). `/analytics/cost` is the instance-wide USD
+ *   rollup (per-run cost on a run detail is a deliberate exception).
+ *   `/analytics/behavior` and the per-project seeds / ready-plans reads
+ *   surface project internals. `/projects/:id/triggers` and
+ *   `/projects/:id/warren-config` carry trigger prompt text, `qualityGate`
+ *   command strings, and admission caps. `/preview/config` discloses
+ *   `WARREN_PREVIEW_HOST`. `GET /runs/:id/inbox` is here for a stronger
+ *   reason than disclosure: it MUTATES on read (`src/runs/inbox.ts` claims
+ *   unread rows and flips them to delivered), so an anonymous poll would
+ *   silently drain the operator's steering queue.
+ * - `dispatch` — starts or steers agent work: the run and plan-run
+ *   lifecycle, the trigger fire, the pod's finalize callback, and the
+ *   `/alerts/heal` intake (a webhook that dispatches a healer run).
+ * - `admin` — instance-level mutation: registering / deleting / refreshing
+ *   projects and the agent registry.
+ *
+ * Default-deny is the rule: a route absent from the public list above is
+ * `readOperator` or narrower, and there is nowhere to declare "open".
+ */
 const ROUTE_TABLE: readonly RouteEntry[] = [
-	{ method: "GET", pattern: "/healthz", build: () => healthzHandler() },
-	{ method: "GET", pattern: "/readyz", build: readyzHandler },
-	{ method: "GET", pattern: "/version", build: () => versionHandler() },
-	{ method: "GET", pattern: "/metrics", build: metricsHandler },
+	{ method: "GET", pattern: "/healthz", policy: "anonymous", build: () => healthzHandler() },
+	{ method: "GET", pattern: "/readyz", policy: "readOperator", build: readyzHandler },
+	{ method: "GET", pattern: "/version", policy: "anonymous", build: () => versionHandler() },
+	{ method: "GET", pattern: "/metrics", policy: "readOperator", build: metricsHandler },
+	// warren-e195: `readPublic`, not `anonymous` — an exempt route gets no actor to name.
+	{ method: "GET", pattern: "/whoami", policy: "readPublic", build: () => whoamiHandler() },
 
-	{ method: "GET", pattern: "/agents", build: listAgentsHandler },
-	{ method: "POST", pattern: "/agents/refresh", build: refreshAgentsHandler },
-	{ method: "GET", pattern: "/agents/:name", build: getAgentHandler },
+	{ method: "GET", pattern: "/agents", policy: "readPublic", build: listAgentsHandler },
+	{ method: "GET", pattern: "/agents/:name", policy: "readPublic", build: getAgentHandler },
 
 	// warren-3db0: closed-loop alert intake. Token-gated via the standard
 	// bearer gate (not auth-exempt); webhook senders carry the bearer.
-	{ method: "POST", pattern: "/alerts/heal", build: healAlertHandler },
+	{ method: "POST", pattern: "/alerts/heal", policy: "dispatch", build: healAlertHandler },
 
-	{ method: "GET", pattern: "/projects", build: listProjectsHandler },
-	{ method: "POST", pattern: "/projects", build: createProjectHandler },
-	{ method: "GET", pattern: "/projects/:id/warren-config", build: getProjectWarrenConfigHandler },
-	{ method: "GET", pattern: "/projects/:id/triggers", build: getProjectTriggersHandler },
+	{ method: "GET", pattern: "/projects", policy: "readPublic", build: listProjectsHandler },
+	{ method: "POST", pattern: "/projects", policy: "admin", build: createProjectHandler },
+	{
+		method: "GET",
+		pattern: "/projects/:id/warren-config",
+		policy: "readOperator",
+		build: getProjectWarrenConfigHandler,
+	},
+	{
+		method: "GET",
+		pattern: "/projects/:id/triggers",
+		policy: "readOperator",
+		build: getProjectTriggersHandler,
+	},
 	// Static path — must precede `/projects/:id/seeds/:seedId` so the param
 	// route doesn't swallow `plans` as a seed id.
-	{ method: "GET", pattern: "/projects/:id/seeds/plans", build: listProjectSeedPlansHandler },
-	{ method: "GET", pattern: "/projects/:id/ready-plans", build: listReadyPlansHandler },
-	{ method: "GET", pattern: "/projects/:id/seeds/:seedId", build: getProjectSeedHandler },
+	{
+		method: "GET",
+		pattern: "/projects/:id/seeds/plans",
+		policy: "readOperator",
+		build: listProjectSeedPlansHandler,
+	},
+	{
+		method: "GET",
+		pattern: "/projects/:id/ready-plans",
+		policy: "readOperator",
+		build: listReadyPlansHandler,
+	},
+	{
+		method: "GET",
+		pattern: "/projects/:id/seeds/:seedId",
+		policy: "readOperator",
+		build: getProjectSeedHandler,
+	},
 	{
 		method: "POST",
 		pattern: "/projects/:id/triggers/:triggerId/run",
+		policy: "dispatch",
 		build: runProjectTriggerHandler,
 	},
-	{ method: "POST", pattern: "/projects/:id/refresh", build: refreshProjectHandler },
 	{
 		method: "POST",
-		pattern: "/projects/:id/agents/refresh",
-		build: refreshProjectAgentsHandler,
+		pattern: "/projects/:id/refresh",
+		policy: "admin",
+		build: refreshProjectHandler,
 	},
-	{ method: "DELETE", pattern: "/projects/:id", build: deleteProjectHandler },
+	{ method: "DELETE", pattern: "/projects/:id", policy: "admin", build: deleteProjectHandler },
 
-	{ method: "GET", pattern: "/burrows", build: listBurrowsHandler },
-	{ method: "GET", pattern: "/burrows/:id", build: getBurrowHandler },
-
-	{ method: "GET", pattern: "/workers", build: listWorkersHandler },
-	{ method: "POST", pattern: "/workers/:name/drain", build: drainWorkerHandler },
-
-	{ method: "GET", pattern: "/analytics/cost", build: listCostAnalyticsHandler },
-	{ method: "GET", pattern: "/analytics/runs", build: listRunAnalyticsHandler },
-	{ method: "GET", pattern: "/analytics/behavior", build: listBehaviorAnalyticsHandler },
-	{ method: "GET", pattern: "/runs", build: listRunsHandler },
-	{ method: "POST", pattern: "/runs", build: createRunHandler },
-	{ method: "GET", pattern: "/runs/:id", build: getRunHandler },
-	{ method: "GET", pattern: "/runs/:id/events", build: streamRunEventsHandler },
-	{ method: "GET", pattern: "/runs/:id/session", build: wakeSessionHandler },
-	{ method: "POST", pattern: "/runs/:id/steer", build: steerRunHandler },
-	{ method: "POST", pattern: "/runs/:id/cancel", build: cancelRunHandler },
-	{ method: "GET", pattern: "/runs/:id/preview/login", build: previewLoginHandler },
-	{ method: "POST", pattern: "/runs/:id/preview/teardown", build: previewTeardownHandler },
-
-	{ method: "GET", pattern: "/preview/config", build: previewConfigHandler },
-
-	{ method: "GET", pattern: "/plan-runs", build: listPlanRunsHandler },
-	{ method: "POST", pattern: "/plan-runs", build: createPlanRunHandler },
-	{ method: "POST", pattern: "/plot-plan-runs", build: createPlotPlanRunHandler },
-	{ method: "GET", pattern: "/plan-runs/:id", build: getPlanRunHandler },
-	{ method: "POST", pattern: "/plan-runs/:id/cancel", build: cancelPlanRunHandler },
-	{ method: "POST", pattern: "/plan-runs/:id/resume", build: resumePlanRunHandler },
-	{ method: "GET", pattern: "/plan-runs/:id/events", build: streamPlanRunEventsHandler },
-
-	{ method: "POST", pattern: "/graph-runs", build: createGraphRunHandler },
-	{ method: "GET", pattern: "/graph-runs/:id", build: getGraphRunHandler },
-
-	{ method: "GET", pattern: "/conversations", build: listConversationsHandler },
-	{ method: "POST", pattern: "/conversations", build: createConversationHandler },
-	{ method: "GET", pattern: "/conversations/:id", build: getConversationHandler },
-	{
-		method: "POST",
-		pattern: "/conversations/:id/messages",
-		build: postConversationMessageHandler,
-	},
-	{
-		method: "POST",
-		pattern: "/conversations/:id/send-off",
-		build: sendOffConversationHandler,
-	},
-	{
-		method: "POST",
-		pattern: "/conversations/:id/re-wake",
-		build: rewakeConversationHandler,
-	},
-
-	{ method: "GET", pattern: "/plots", build: listPlotsHandler },
-	{ method: "POST", pattern: "/plots", build: createPlotHandler },
-	// Static path — must precede `/plots/:id` so the param route doesn't
-	// swallow `needs-attention` as an :id.
 	{
 		method: "GET",
-		pattern: "/plots/needs-attention/count",
-		build: needsAttentionCountHandler,
+		pattern: "/analytics/cost",
+		policy: "readOperator",
+		build: listCostAnalyticsHandler,
 	},
-	// Static-suffix path — must precede `/plots/:id` so the param route
-	// doesn't swallow `summary` as the rest of the id.
-	{ method: "GET", pattern: "/plots/:id/summary", build: getPlotSummaryHandler },
-	{ method: "GET", pattern: "/plots/:id", build: getPlotHandler },
-	{ method: "POST", pattern: "/plots/:id/intent", build: editPlotIntentHandler },
-	{ method: "POST", pattern: "/plots/:id/rename", build: renamePlotHandler },
-	{ method: "POST", pattern: "/plots/:id/sync", build: syncPlotHandler },
-	{ method: "POST", pattern: "/plots/:id/status", build: changePlotStatusHandler },
-	{ method: "POST", pattern: "/plots/:id/attachments", build: attachPlotHandler },
-	// Specific path — must precede `/plots/:id/attachments/:ref` so the
-	// DELETE-by-ref route doesn't swallow `<ref>/merge` as a ref.
+	{
+		method: "GET",
+		pattern: "/analytics/runs",
+		policy: "readPublic",
+		build: listRunAnalyticsHandler,
+	},
+	{
+		method: "GET",
+		pattern: "/analytics/behavior",
+		policy: "readOperator",
+		build: listBehaviorAnalyticsHandler,
+	},
+	{ method: "GET", pattern: "/runs", policy: "readPublic", build: listRunsHandler },
+	{ method: "POST", pattern: "/runs", policy: "dispatch", build: createRunHandler },
+	{ method: "GET", pattern: "/runs/:id", policy: "readPublic", build: getRunHandler },
+	{
+		method: "GET",
+		pattern: "/runs/:id/events",
+		policy: "readPublic",
+		build: streamRunEventsHandler,
+	},
+	// warren-3d0b: the in-pod steering poll for the K8s backend. Bearer-gated
+	// like every /runs route; the pod carries its per-run SCOPED token
+	// (warren-57fd). Destructive on read (it claims unread messages), so for a
+	// non-run caller it is operator-only (warren-b875).
+	{ method: "GET", pattern: "/runs/:id/inbox", policy: "readOperator", build: pollRunInboxHandler },
+	// warren-0d35: the in-pod finalize callback for the K8s backend — the pod
+	// fetches the reap intent, runs the workspace-dependent half in place, and
+	// POSTs the FinalizeResult back. Bearer-gated; the pod carries its per-run
+	// scoped token (warren-57fd).
+	{
+		method: "GET",
+		pattern: "/runs/:id/finalize-intent",
+		policy: "readOperator",
+		build: getRunFinalizeIntentHandler,
+	},
 	{
 		method: "POST",
-		pattern: "/plots/:id/attachments/:ref/merge",
-		build: mergePlotPrAttachmentHandler,
+		pattern: "/runs/:id/finalize-result",
+		policy: "dispatch",
+		build: postRunFinalizeResultHandler,
 	},
+	// warren-cd3b: the in-pod salvage intake — the pod POSTs the work it
+	// captured (rescue ref + git bundle) when the finalize branch push failed
+	// or no reap intent ever arrived, BEFORE its emptyDir dies with the pod.
 	{
-		method: "DELETE",
-		pattern: "/plots/:id/attachments/:ref",
-		build: detachPlotHandler,
+		method: "POST",
+		pattern: "/runs/:id/salvage",
+		policy: "dispatch",
+		build: postRunSalvageHandler,
+	},
+	{ method: "POST", pattern: "/runs/:id/steer", policy: "dispatch", build: steerRunHandler },
+	{ method: "POST", pattern: "/runs/:id/cancel", policy: "dispatch", build: cancelRunHandler },
+	// warren-e1b0: POST, not GET — the bearer rides the `Authorization`
+	// header like every other /runs route instead of a `?token=` query
+	// string that would land in history / Referer / proxy logs.
+	{
+		method: "POST",
+		pattern: "/runs/:id/preview/login",
+		policy: "dispatch",
+		build: previewLoginHandler,
 	},
 	{
 		method: "POST",
-		pattern: "/plots/:id/questions/:event_id/answer",
-		build: answerPlotQuestionHandler,
+		pattern: "/runs/:id/preview/teardown",
+		policy: "dispatch",
+		build: previewTeardownHandler,
+	},
+
+	{
+		method: "GET",
+		pattern: "/preview/config",
+		policy: "readOperator",
+		build: previewConfigHandler,
+	},
+
+	{ method: "GET", pattern: "/plan-runs", policy: "readPublic", build: listPlanRunsHandler },
+	{ method: "POST", pattern: "/plan-runs", policy: "dispatch", build: createPlanRunHandler },
+	{ method: "GET", pattern: "/plan-runs/:id", policy: "readPublic", build: getPlanRunHandler },
+	{
+		method: "POST",
+		pattern: "/plan-runs/:id/cancel",
+		policy: "dispatch",
+		build: cancelPlanRunHandler,
+	},
+	{
+		method: "GET",
+		pattern: "/plan-runs/:id/events",
+		policy: "readPublic",
+		build: streamPlanRunEventsHandler,
 	},
 ];
-
-/**
- * Matches `/runs/<id>/preview/login` (the auth-exempt signed-cookie
- * handshake from SPEC §11.L). Kept module-scoped so the request gate
- * doesn't compile a regex per request.
- */
-const PREVIEW_LOGIN_PATH_RE = /^\/runs\/[^/]+\/preview\/login\/?$/;
 
 export function buildApiRoutes(deps: ServerDeps): Route[] {
 	return ROUTE_TABLE.map((entry) => ({
 		method: entry.method,
 		pattern: entry.pattern,
+		policy: entry.policy,
 		handler: entry.build(deps),
 	}));
 }
@@ -407,20 +388,15 @@ export const API_PREFIXES: readonly string[] = [
 	"/agents",
 	"/alerts",
 	"/analytics",
-	"/burrows",
-	"/conversations",
 	"/projects",
 	"/runs",
-	"/workers",
 	"/healthz",
 	"/readyz",
 	"/version",
 	"/metrics",
 	"/preview",
 	"/plan-runs",
-	"/graph-runs",
-	"/plot-plan-runs",
-	"/plots",
+	"/whoami",
 ];
 
 /**
@@ -435,40 +411,59 @@ export function isApiPath(pathname: string): boolean {
 }
 
 /**
+ * API paths the auth gate skips entirely — derived from the routes whose
+ * declared policy is `anonymous` (warren-b875), so the exemption list is the
+ * policy table rather than a second hand-maintained copy of it. Only static
+ * patterns can appear here; a `:param` pattern would never match a real
+ * pathname by string equality (asserted in `index.test.ts`).
+ */
+const AUTH_EXEMPT_PATHS: ReadonlySet<string> = new Set(
+	ROUTE_TABLE.filter((e) => e.policy === "anonymous").map((e) => e.pattern),
+);
+
+/**
  * Auth predicate for the request gate (server.ts).
  *
  * Exempt:
- *   - `/healthz` — liveness probes can't carry a token and the response
- *     is non-sensitive (`{ok: true}`).
+ *   - Every `anonymous`-policy route: `/healthz` (liveness probes can't
+ *     carry a token and the response is non-sensitive, `{ok: true}`) and
+ *     `/version` (just the package version string, which the UI fetches
+ *     before the user logs in — keeping it exempt avoids a chicken-and-egg
+ *     on the login screen).
  *   - Every non-API path — the SPA shell (`/`), its static assets
  *     (`/assets/<hash>`), and React Router deep links must be reachable
  *     from a fresh browser. Otherwise the user can't load `Login.tsx`
  *     to enter their bearer token (chicken-and-egg, warren-d2a5).
  *
  * Auth-required:
- *   - Every API path other than `/healthz`. `/readyz` stays gated
- *     because its body reveals which checks failed (sensitive in a
- *     misconfigured deploy).
+ *   - Every other API path, and beyond the gate its declared `RoutePolicy`
+ *     decides whether the admitted actor may proceed. `/metrics` is
+ *     deliberately NOT exempt (warren-682a): behind a public Ingress the
+ *     scrape surface leaks operational shape (run counts, pod phases, queue
+ *     depth). In-cluster Prometheus scrapes it with the bearer via the
+ *     ServiceMonitor's `authorization` credentials
+ *     (deploy/k8s/servicemonitor.yaml). `/readyz` stays gated because its
+ *     body reveals which checks failed (sensitive in a misconfigured
+ *     deploy). `POST /runs/:id/preview/login` is gated too (warren-e1b0) —
+ *     it used to be exempt so a browser could hand the bearer over in a
+ *     `?token=` query string; the handshake now carries the bearer in the
+ *     `Authorization` header like every other `/runs/*` route, so the
+ *     exemption is gone.
  */
 export function isAuthExempt(pathname: string): boolean {
-	if (pathname === "/healthz") return true;
-	// `/metrics` is the Prometheus scrape surface (warren observability
-	// Phase 1). Fly's managed Prometheus scrapes it over the private
-	// network without a bearer token; the body is aggregate counts +
-	// counters only (no secrets), mirroring `/healthz`.
-	if (pathname === "/metrics") return true;
-	// `/version` is non-sensitive (just the package version string) and
-	// the UI fetches it before the user logs in to render in the sidebar
-	// header. Keeping it auth-exempt avoids a chicken-and-egg on the
-	// login screen.
-	if (pathname === "/version") return true;
-	// Preview login handshake (R-19 / SPEC §11.L): the browser arrives
-	// without an Authorization header and validates the bearer via
-	// `?token=<WARREN_API_TOKEN>`. The handler does its own constant-time
-	// compare, so the global gate must let the request through.
-	if (PREVIEW_LOGIN_PATH_RE.test(pathname)) return true;
+	if (AUTH_EXEMPT_PATHS.has(pathname)) return true;
 	return !isApiPath(pathname);
 }
 
+/**
+ * The declared policy of every API route (warren-b875) — the readable form
+ * of `ROUTE_TABLE` for tests and tooling that must not build handlers.
+ */
+export const API_ROUTE_POLICIES: readonly {
+	method: Route["method"];
+	pattern: string;
+	policy: RoutePolicy;
+}[] = ROUTE_TABLE.map((e) => ({ method: e.method, pattern: e.pattern, policy: e.policy }));
+
 export const API_ROUTE_PATTERNS: readonly { method: Route["method"]; pattern: string }[] =
-	ROUTE_TABLE.map((e) => ({ method: e.method, pattern: e.pattern }));
+	API_ROUTE_POLICIES;

@@ -1,4 +1,5 @@
 import { ValidationError } from "../../../core/errors.ts";
+import type { RunRow } from "../../../db/schema.ts";
 import { readProviderFrontmatter } from "../../../registry/index.ts";
 import {
 	buildCostAnalytics,
@@ -6,9 +7,91 @@ import {
 	hydrateRunsUsage,
 	hydrateRunUsage,
 } from "../../../runs/index.ts";
+import { isPublicOnly, pickFields } from "../../projection.ts";
 import { jsonResponse } from "../../response.ts";
-import type { RouteHandler, ServerDeps } from "../../types.ts";
+import type { Actor, RouteHandler, ServerDeps } from "../../types.ts";
 import { requireParam } from "../index.ts";
+
+/**
+ * The run columns a `readPublic`-only spectator sees (warren-946f /
+ * pl-b82d step 14). An allowlist, so a column added to `runs` tomorrow is
+ * absent from the public body until someone classifies it here — see
+ * `src/server/projection.ts` for why this is never a denylist.
+ *
+ * The prompt stays: "here's what we asked, here's what it did" is the
+ * interesting half of a public instance. Per-run `costUsd` and the token
+ * counts stay too — cost-per-merged-PR is the metric the instance exists
+ * to show, and it is os-eco's own spend on its own public repos.
+ */
+export const PUBLIC_RUN_FIELDS = [
+	"id",
+	"agentName",
+	"projectId",
+	"seedId",
+	"parentRunId",
+	"cloneKind",
+	"mode",
+	"state",
+	"failureReason",
+	"startedAt",
+	"endedAt",
+	"prompt",
+	"trigger",
+	"prUrl",
+	"targetBranch",
+	// warren-cd3b: the rescue ref is operator-recovery metadata (a branch name
+	// carrying the run id, which is already public) — safe for spectators.
+	"salvageRef",
+	"costUsd",
+	"tokensInput",
+	"tokensOutput",
+	"tokensCacheRead",
+	"tokensCacheWrite",
+	"previewState",
+	"previewPort",
+	"previewStartedAt",
+	"previewLastHitAt",
+	"mergeWaitStartedAt",
+] as const satisfies readonly (keyof RunRow)[];
+
+/**
+ * The complement of `PUBLIC_RUN_FIELDS`, spelled out so the classification
+ * is a decision on record rather than "whatever fell off the list", and so
+ * `lifecycle.projection.test.ts` can assert the two partition `RunRow`.
+ *
+ * - `renderedAgentJson` — the fully rendered system prompt. Prompt
+ *   engineering is the IP here, and it is pure noise to a spectator.
+ * - `burrowId` / `burrowRunId` / `workerId` — internal runtime handles.
+ *   They also render as empty "—" cards on the K8s instance today.
+ * - `previewFailureMessage` — free text carrying a subprocess stderr tail.
+ * - `salvagePath` — a host filesystem path (warren-cd3b); internal topology,
+ *   same posture as the runtime handles.
+ */
+export const REDACTED_RUN_FIELDS = [
+	"renderedAgentJson",
+	"burrowId",
+	"burrowRunId",
+	"workerId",
+	"previewFailureMessage",
+	"salvagePath",
+] as const satisfies readonly (keyof RunRow)[];
+
+/** A run row as a `readPublic`-only caller sees it. */
+export type PublicRun = Pick<RunRow, (typeof PUBLIC_RUN_FIELDS)[number]>;
+
+/**
+ * Narrow one run row for `actor`. The operator gets the row untouched, so
+ * the public body is provably the operator body minus fields — there is
+ * only one construction site and the two cannot drift.
+ *
+ * Exported (warren-c405) because `GET /plan-runs/:id` fans out `runs[]` too
+ * and must reuse THIS function rather than grow a second projection: the
+ * plan-run detail handler served raw `RunRow`s to spectators until scenario
+ * 39 caught it.
+ */
+export function projectRun<T extends RunRow>(run: T, actor: Actor | undefined): T | PublicRun {
+	return isPublicOnly(actor) ? pickFields(run, PUBLIC_RUN_FIELDS) : run;
+}
 
 function parseRunsSort(ctx: { url: URL }): { sort: "started" | "cost"; dir: "asc" | "desc" } {
 	const rawSort = ctx.url.searchParams.get("sort");
@@ -80,7 +163,7 @@ export function listRunsHandler(deps: ServerDeps): RouteHandler {
 					: await deps.repos.runs.listAll(listOpts);
 		// warren-ab18: surface in-events cost for terminal runs whose
 		// bridge died before the final checkpoint landed.
-		const runs = await hydrateRunsUsage(rows, deps.repos.events);
+		const hydrated = await hydrateRunsUsage(rows, deps.repos.events);
 		// warren-ee50 / pl-b0c0 step 1: aggregate the full filtered set so
 		// the Runs page can show all-time totals next to a paginated table.
 		const aggFilter = {
@@ -88,10 +171,15 @@ export function listRunsHandler(deps: ServerDeps): RouteHandler {
 			...(agent !== null ? { agentName: agent } : {}),
 		};
 		const agg = await deps.repos.runs.aggregate(aggFilter);
+		// warren-946f: `costTotalUsd` is an instance-wide all-time number.
+		// Unlabeled on a list endpoint it reads as a headline out of
+		// context, so it belongs in a deliberately framed ledger view
+		// rather than here; per-run `costUsd` survives the projection.
+		const publicOnly = isPublicOnly(ctx.actor);
 		return jsonResponse(200, {
-			runs,
+			runs: hydrated.map((run) => projectRun(run, ctx.actor)),
 			total: agg.total,
-			costTotalUsd: agg.costTotalUsd,
+			...(publicOnly ? {} : { costTotalUsd: agg.costTotalUsd }),
 			costPricedCount: agg.costPricedCount,
 			limit: page.limit,
 			offset: page.offset,
@@ -106,15 +194,17 @@ export function getRunHandler(deps: ServerDeps): RouteHandler {
 		// warren-ab18: same compute-on-read fallback as the list handler
 		// so the RunDetail page shows cost for ghost / reboot-orphaned runs.
 		const run = await hydrateRunUsage(row, deps.repos.events);
-		return jsonResponse(200, run);
+		return jsonResponse(200, projectRun(run, ctx.actor));
 	};
 }
 
 /**
  * `GET /analytics/cost?from=&to=&projectId=` (warren-cf63 / pl-b0c0 step 6).
  *
- * Window defaults to the last 30 days when neither bound is supplied so
- * a fresh install renders a useful chart without operator setup. Both
+ * Window defaults to the last 30 days whenever `from` is absent —
+ * including when `to` is supplied — and the from..to span is clamped to
+ * 90 days, so no anonymous request can drop the lower bound and scan
+ * the whole table (warren-30cc). Both
  * bounds and `projectId` are validated lightly — a malformed date is a
  * 400 because the lexicographic ISO8601 compare in `listForAnalytics`
  * would silently produce surprising results otherwise.
@@ -124,11 +214,12 @@ export function listCostAnalyticsHandler(deps: ServerDeps): RouteHandler {
 		const projectId = ctx.url.searchParams.get("projectId") ?? undefined;
 		const from = parseAnalyticsDateBound(ctx, "from");
 		const to = parseAnalyticsDateBound(ctx, "to");
-		const defaultFrom = resolveAnalyticsFrom(from, to);
-		const filter: { projectId?: string; from?: string; to?: string } = {};
+		const window = resolveAnalyticsWindow(from, to);
+		const filter: { projectId?: string; from?: string; to?: string } = {
+			from: window.from,
+			to: window.to,
+		};
 		if (projectId !== undefined) filter.projectId = projectId;
-		if (defaultFrom !== undefined) filter.from = defaultFrom;
-		if (to !== undefined) filter.to = to;
 		const rowsRaw = await deps.repos.runs.listForAnalytics(filter);
 		// Hydrate so terminal runs with bridge-died cost still count.
 		const rows = await hydrateRunsUsage(rowsRaw, deps.repos.events);
@@ -143,7 +234,6 @@ export function listCostAnalyticsHandler(deps: ServerDeps): RouteHandler {
 				runId: r.id,
 				projectId: r.projectId,
 				agentName: r.agentName,
-				plotId: r.plotId,
 				planId: planByRun.get(r.id) ?? null,
 				planRunId: null,
 				provider: provider ?? null,
@@ -156,8 +246,8 @@ export function listCostAnalyticsHandler(deps: ServerDeps): RouteHandler {
 		return jsonResponse(200, {
 			filter: {
 				projectId: projectId ?? null,
-				from: defaultFrom ?? null,
-				to: to ?? null,
+				from: window.from,
+				to: window.to,
 			},
 			...analytics,
 		});
@@ -177,19 +267,33 @@ export function parseAnalyticsDateBound(
 	return d.toISOString();
 }
 
+/** Default analytics window when the caller supplies no `from` (days). */
+export const ANALYTICS_DEFAULT_WINDOW_DAYS = 30;
+/** Hard ceiling on the from..to span so an anonymous caller can't widen the scan (warren-30cc). */
+export const ANALYTICS_MAX_WINDOW_DAYS = 90;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /**
- * Resolve the analytics window `from` bound, defaulting to the last 30
- * days when neither bound is supplied so a fresh install renders a
- * useful chart without operator setup. Shared by the cost + run
- * analytics handlers (warren-cf63 / warren-0692).
+ * Resolve the analytics window, defaulting `from` to the last 30 days
+ * whenever it is absent — including when `to` is supplied — so a fresh
+ * install renders a useful chart and no anonymous request can drop the
+ * lower bound entirely (warren-30cc). The total span is clamped to
+ * {@link ANALYTICS_MAX_WINDOW_DAYS} by pulling `from` forward, so the
+ * scan stays bounded no matter what the caller supplies. Shared by the
+ * cost + run analytics handlers (warren-cf63 / warren-0692).
  */
-export function resolveAnalyticsFrom(
+export function resolveAnalyticsWindow(
 	from: string | undefined,
 	to: string | undefined,
-): string | undefined {
-	if (from !== undefined) return from;
-	if (to !== undefined) return undefined;
-	return new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+): { from: string; to: string } {
+	const toMs = to !== undefined ? Date.parse(to) : Date.now();
+	let fromMs =
+		from !== undefined ? Date.parse(from) : toMs - ANALYTICS_DEFAULT_WINDOW_DAYS * DAY_MS;
+	if (toMs - fromMs > ANALYTICS_MAX_WINDOW_DAYS * DAY_MS) {
+		fromMs = toMs - ANALYTICS_MAX_WINDOW_DAYS * DAY_MS;
+	}
+	return { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString() };
 }
 
 export function extractProviderModel(rendered: unknown): { provider?: string; model?: string } {

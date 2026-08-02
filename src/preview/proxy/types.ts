@@ -5,10 +5,19 @@
  */
 
 import type { Repos } from "../../db/repos/index.ts";
-import type { PreviewProxyHandler } from "../../server/types.ts";
 import type { PreviewAuth } from "../cookie.ts";
 
-export type { PreviewProxyHandler };
+/**
+ * Host-match preview proxy preamble — the callable `createPreviewProxyHandler`
+ * returns. Runs BEFORE auth + route match in `serve`; returns a `Response` to
+ * short-circuit the request, or `null` to fall through to the regular pipeline.
+ *
+ * Declared here, in the preview domain that owns the behaviour, and re-exported
+ * by `src/server/types.ts` for the wiring that consumes it (warren-89a6). The
+ * dependency used to point the other way, which made a domain module import the
+ * HTTP surface.
+ */
+export type PreviewProxyHandler = (request: Request, url: URL) => Promise<Response | null>;
 
 interface PreviewProxyConfigBase {
 	/** Local-worker name. Defaults to the pool's `LOCAL_WORKER_NAME`

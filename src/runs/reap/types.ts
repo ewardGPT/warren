@@ -1,4 +1,3 @@
-import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { RunFailureReason, RunTerminalState } from "../../db/schema.ts";
 import type { TerminalNotificationEnvelope } from "../../notifications/signature.ts";
@@ -6,8 +5,10 @@ import type {
 	LaunchPreviewInput,
 	LaunchPreviewResult,
 	PreviewLaunchConfig,
+	PreviewSidecarResolver,
 } from "../../preview/launch/index.ts";
 import type { PreviewPortAllocator } from "../../preview/port-allocator.ts";
+import type { RuntimeProvider } from "../../runtime/contract.ts";
 import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
 import type { ServerPreviewConfig } from "../../warren-config/index.ts";
 import type { CompletionSignal } from "../completion-signal.ts";
@@ -32,31 +33,57 @@ export interface ReapFs {
 
 export interface ReapExec {
 	/** Run a command; resolves on exit-0, rejects with an `Error` whose
-	 * `message` carries stderr otherwise. Mirrors `child_process.execFile`. */
+	 * `message` carries stderr otherwise. Mirrors `child_process.execFile`.
+	 *
+	 * `env` (warren-035c) is merged OVER the inherited process environment at
+	 * the spawn — the commit sites pass `warrenCommitIdentityEnv()` so an
+	 * inherited `GIT_AUTHOR_*` / `GIT_COMMITTER_*` can't out-rank the pinned
+	 * bot identity. A key mapped to `undefined` is REMOVED from the child env
+	 * (warren-fa84) — how clone-apply scrubs repo-context `GIT_*` a parent
+	 * hook leaked. Omitted ⇒ plain inheritance, behavior unchanged. */
 	readonly run: (
 		cmd: string,
 		args: readonly string[],
-		opts: { cwd: string; timeoutMs?: number },
+		opts: { cwd: string; timeoutMs?: number; env?: Record<string, string | undefined> },
 	) => Promise<{ stdout: string; stderr: string }>;
 }
 
 export interface ReapRunInput {
 	readonly runId: string;
-	/** The burrow-observed terminal state to transition the warren row into. */
+	/** The provider-observed terminal state to transition the warren row into. */
 	readonly outcome: RunTerminalState;
 	readonly repos: Repos;
 	/**
-	 * Multi-worker burrow pool (warren-c0c9 / pl-9ba1 step 5). reap resolves
-	 * the owning worker via `pool.clientFor({burrowId: run.burrowId})` for
-	 * the workspace lookup + seeds-close mirror http calls. Propagates
-	 * `StickyWorkerUnreachableError` (503 via src/server/errors.ts) when the
-	 * pinned worker is `unreachable`.
+	 * Runtime-provider seam (K8s migration pl-829f step 13 / warren-1f56). The
+	 * workspace-dependent half of reap runs as `provider.finalize(handle, intent)`
+	 * followed by `provider.terminate(handle)`; workspace resolution runs through
+	 * `provider.workspaceInfo`. REQUIRED (warren-e24d): reap no longer builds a
+	 * fallback burrow-backed provider, so it holds no burrow client of its own —
+	 * the boot wiring (and tests) construct the provider and thread it here.
 	 */
-	readonly burrowClientPool: BurrowClientPool;
+	readonly runtimeProvider: RuntimeProvider;
+	/**
+	 * Preview sidecar seam (warren-e24d), used ONLY by the preview launch
+	 * sub-step — a LocalProvider-only capability. Built at boot from the runtime
+	 * provider (`createLocalSidecarsResolver`) and threaded here gated on
+	 * `runtimeProvider.capabilities.previewPorts`. Omitted (or absent capability)
+	 * ⇒ the preview launch is skipped exactly as for a backend without preview
+	 * ports; the pipeline surfaces `reap.preview_skipped_unsupported` for an
+	 * opted-in project.
+	 */
+	readonly previewSidecars?: PreviewSidecarResolver;
 	/** If supplied, every reap-emitted event is published here too. */
 	readonly broker?: RunEventBroker;
 	readonly fs?: ReapFs;
 	readonly exec?: ReapExec;
+	/**
+	 * Durable dir for the local salvage bundle capture (warren-cd3b), boot-wired
+	 * to `<dataDir>/salvage`. Consulted ONLY when the finalize branch push
+	 * failed and the rescue-ref push also fails — the bundle is the last
+	 * capture before the workspace is preserved-or-destroyed. Absent ⇒ the
+	 * bundle form is skipped (tests); the rescue push still runs.
+	 */
+	readonly salvageDir?: string;
 	readonly now?: () => Date;
 	readonly logger?: BridgeLogger;
 	/** Best-effort terminal notification; invoked after durable state transition. */
@@ -94,7 +121,7 @@ export interface ReapRunInput {
 	 */
 	readonly sleep?: (ms: number) => Promise<void>;
 	/**
-	 * Per-run preview environments (R-19 / SPEC §11.L, warren-f156). When
+	 * Per-run preview environments (R-19 / docs/design/preview-environments.md, warren-f156). When
 	 * the project has opted in via `.warren/defaults.json` and `outcome ===
 	 * "succeeded"`, reap launches `preview.command` as a long-lived burrow
 	 * sidecar in the same workspace (`preview_launch`) and — if `pr_open`
@@ -123,7 +150,7 @@ export interface ReapRunInput {
 	/**
 	 * Override the preview-launch mechanics (tests). Defaults to
 	 * `launchPreview`. Receives the resolved input shape, including the
-	 * port allocator and the worker-local burrow client, so tests can
+	 * port allocator and the resolved sidecars facade, so tests can
 	 * assert call arguments without touching real sidecars.
 	 */
 	readonly launchPreview?: (input: LaunchPreviewInput) => Promise<LaunchPreviewResult>;
@@ -156,9 +183,10 @@ export type ReapStep =
 	| "seeds_close"
 	| "plans_mirror"
 	| "seed_id_close"
+	| "clone_apply"
+	| "clone_apply_push"
 	| "seeds_commit"
-	| "plot_merge"
-	| "plot_commit"
+	| "seed_reset"
 	| "auto_plan_run"
 	| "branch_push"
 	| "pr_open"
@@ -196,55 +224,13 @@ export interface ReapRunResult {
 	readonly mulchAppended: number;
 	readonly seedsClosed: number;
 	readonly seedsCreated: number;
-	/**
-	 * True when reap successfully closed the dispatched run's seed (warren-0d2d).
-	 * Requires `run.seedId` to be non-null, `outcome === "succeeded"`,
-	 * `project.hasSeeds === true`, and `seedsCli` to be configured. False when
-	 * the step was skipped (any gate missing) or when `sd close` failed
-	 * (failure surfaces as `reap_failed` step=`seed_id_close`).
-	 */
-	readonly seedIdClosed: boolean;
-	/**
-	 * Plot event log lines appended to the project's `.plot/plot-*.events.jsonl`
-	 * files after merging the burrow workspace's deltas (warren-7e0f /
-	 * pl-2047 step 6). Idempotent re-runs report 0 — the merge dedups by
-	 * full-line content so a second sweep over the same workspace adds
-	 * nothing.
-	 */
-	readonly plotEventsAppended: number;
-	/**
-	 * Distinct `plot-*.json` files overwritten in the project's `.plot/` from
-	 * a newer workspace copy (warren-7e0f). Last-write-wins on `updated_at`
-	 * mirrors the mulch-merge primitive; ties with different contents emit
-	 * a `plot.conflict` event but leave the project copy untouched.
-	 */
-	readonly plotsUpdated: number;
-	/**
-	 * New agent-emitted `decision_made` / `question_posed` /
-	 * `artifact_produced` events mirrored into warren's event stream tagged
-	 * with `plot_id` (warren-7e0f). Idempotent — re-runs against an already
-	 * merged workspace re-mirror nothing because the underlying file merge
-	 * is content-dedup'd.
-	 */
-	readonly plotEventsMirrored: number;
-	/**
-	 * True when reap authored a `chore(warren): plot state` commit in the
-	 * workspace before `branch_push` so origin's workspace branch carries
-	 * the `.plot/` deltas (warren-343a, shape (a) commit-through-reap).
-	 * Set when host-side appender writes in `<project>/.plot/` (or merge
-	 * deltas from the burrow workspace) had not yet been committed by the
-	 * agent — reap stages them and authors a warren-identity commit so
-	 * the push isn't empty. False when nothing needed staging (agent had
-	 * already committed everything, project has no `.plot/`, or the merge
-	 * produced no on-disk delta) and false when the commit attempt failed
-	 * (the failure surfaces as a `reap_failed` step=`plot_commit` event).
-	 */
-	readonly plotCommitted: boolean;
+	// warren-df3e: the host-side seed-id close (warren-0d2d) is no longer a reap
+	// step — it observes `post_reap` on the observation bus
+	// (`./seed-close-lifecycle.ts`), so its outcome is no longer reported here.
 	/**
 	 * True when reap authored a `chore(warren): seeds state` commit in the
 	 * workspace before `branch_push` so origin's workspace branch carries
-	 * the `.seeds/` deltas (warren-7ecc). Mirrors `plotCommitted` (warren-
-	 * 343a, shape (a) commit-through-reap) but for the seeds tracker:
+	 * the `.seeds/` deltas (warren-7ecc). For the seeds tracker,
 	 * agents with narrowly-scoped write contracts (the planner, see
 	 * src/registry/builtins/planner.ts) are forbidden from running
 	 * `git commit`, so `sd plan submit` writes to `.seeds/issues.jsonl` +
@@ -276,7 +262,7 @@ export interface ReapRunResult {
 	 */
 	readonly prUrl: string | null;
 	/**
-	 * Terminal state of the preview launch (R-19 / SPEC §11.L,
+	 * Terminal state of the preview launch (R-19 / docs/design/preview-environments.md,
 	 * warren-f156). `null` when the sub-step was skipped (project didn't
 	 * opt in, outcome !== succeeded, worker !== local, type !== server) —
 	 * not when it failed. `live` / `failed` carry the matching
@@ -318,6 +304,16 @@ export interface ReapRunResult {
 	 * still covers crash-stranded burrows.
 	 */
 	readonly workspaceDestroyed: boolean;
+	/**
+	 * Salvage-before-destroy outcome (warren-cd3b): where the run's committed
+	 * work was captured when the finalize branch push failed. `salvageRescueRef`
+	 * is the `warren/rescue/<runId>` branch on origin; `salvagePath` is the
+	 * durable git-bundle file. Both null when no salvage ran (push fine, k8s
+	 * backend — the pod self-salvages) or when every capture failed (the
+	 * `reap.workspace_salvage_failed` event carries the notes).
+	 */
+	readonly salvageRescueRef: string | null;
+	readonly salvagePath: string | null;
 	readonly errors: readonly ReapStepError[];
 	/** True when the row was already terminal on entry — sub-steps were skipped. */
 	readonly alreadyTerminal: boolean;

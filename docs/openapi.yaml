@@ -3,11 +3,11 @@
 openapi: 3.1.0
 info:
   title: warren HTTP API
-  version: 0.9.11
+  version: 0.13.1
   description: >-
     Auto-generated from `src/server/handlers/index.ts`'s `ROUTE_TABLE`. Run `bun run gen:openapi` to
     refresh; CI fails if this schema drifts from the handler module. Request/response bodies are
-    intentionally left permissive in V1 — see SPEC §8.1 for the canonical handler contracts.
+    intentionally left permissive in V1 — see docs/http-api.md for the canonical handler contracts.
 tags:
   - name: agents
     description: '`/agents` routes.'
@@ -15,30 +15,20 @@ tags:
     description: '`/alerts` routes.'
   - name: analytics
     description: '`/analytics` routes.'
-  - name: burrows
-    description: '`/burrows` routes.'
-  - name: conversations
-    description: '`/conversations` routes.'
-  - name: graph-runs
-    description: '`/graph-runs` routes.'
   - name: meta
     description: Liveness, readiness, and version.
   - name: metrics
     description: '`/metrics` routes.'
   - name: plan-runs
     description: '`/plan-runs` routes.'
-  - name: plot-plan-runs
-    description: '`/plot-plan-runs` routes.'
-  - name: plots
-    description: '`/plots` routes.'
   - name: preview
     description: '`/preview` routes.'
   - name: projects
     description: '`/projects` routes.'
   - name: runs
     description: '`/runs` routes.'
-  - name: workers
-    description: '`/workers` routes.'
+  - name: whoami
+    description: '`/whoami` routes.'
 paths:
   /agents:
     get:
@@ -46,17 +36,6 @@ paths:
       tags:
         - agents
       summary: GET /agents
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-  /agents/refresh:
-    post:
-      operationId: refreshAgentsHandler
-      tags:
-        - agents
-      summary: POST /agents/refresh
       responses:
         '200':
           description: Successful response.
@@ -126,151 +105,6 @@ paths:
           description: Successful response.
         default:
           description: Error response (see `src/core/errors.ts`).
-  /burrows:
-    get:
-      operationId: listBurrowsHandler
-      tags:
-        - burrows
-      summary: GET /burrows
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-  /burrows/{id}:
-    get:
-      operationId: getBurrowHandler
-      tags:
-        - burrows
-      summary: GET /burrows/:id
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /conversations:
-    get:
-      operationId: listConversationsHandler
-      tags:
-        - conversations
-      summary: GET /conversations
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-    post:
-      operationId: createConversationHandler
-      tags:
-        - conversations
-      summary: POST /conversations
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-  /conversations/{id}:
-    get:
-      operationId: getConversationHandler
-      tags:
-        - conversations
-      summary: GET /conversations/:id
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /conversations/{id}/messages:
-    post:
-      operationId: postConversationMessageHandler
-      tags:
-        - conversations
-      summary: POST /conversations/:id/messages
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /conversations/{id}/re-wake:
-    post:
-      operationId: rewakeConversationHandler
-      tags:
-        - conversations
-      summary: POST /conversations/:id/re-wake
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /conversations/{id}/send-off:
-    post:
-      operationId: sendOffConversationHandler
-      tags:
-        - conversations
-      summary: POST /conversations/:id/send-off
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /graph-runs:
-    post:
-      operationId: createGraphRunHandler
-      tags:
-        - graph-runs
-      summary: POST /graph-runs
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-  /graph-runs/{id}:
-    get:
-      operationId: getGraphRunHandler
-      tags:
-        - graph-runs
-      summary: GET /graph-runs/:id
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
   /healthz:
     get:
       operationId: healthzHandler
@@ -365,260 +199,6 @@ paths:
           required: true
           schema:
             type: string
-  /plan-runs/{id}/resume:
-    post:
-      operationId: resumePlanRunHandler
-      tags:
-        - plan-runs
-      summary: POST /plan-runs/:id/resume
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plot-plan-runs:
-    post:
-      operationId: createPlotPlanRunHandler
-      tags:
-        - plot-plan-runs
-      summary: POST /plot-plan-runs
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-  /plots:
-    get:
-      operationId: listPlotsHandler
-      tags:
-        - plots
-      summary: GET /plots
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-    post:
-      operationId: createPlotHandler
-      tags:
-        - plots
-      summary: POST /plots
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-  /plots/needs-attention/count:
-    get:
-      operationId: needsAttentionCountHandler
-      tags:
-        - plots
-      summary: GET /plots/needs-attention/count
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      description: >-
-        Static path — must precede `/plots/:id` so the param route doesn't swallow `needs-attention`
-        as an :id.
-  /plots/{id}:
-    get:
-      operationId: getPlotHandler
-      tags:
-        - plots
-      summary: GET /plots/:id
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/attachments:
-    post:
-      operationId: attachPlotHandler
-      tags:
-        - plots
-      summary: POST /plots/:id/attachments
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/attachments/{ref}:
-    delete:
-      operationId: detachPlotHandler
-      tags:
-        - plots
-      summary: DELETE /plots/:id/attachments/:ref
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: ref
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/attachments/{ref}/merge:
-    post:
-      operationId: mergePlotPrAttachmentHandler
-      tags:
-        - plots
-      summary: POST /plots/:id/attachments/:ref/merge
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      description: >-
-        Specific path — must precede `/plots/:id/attachments/:ref` so the DELETE-by-ref route
-        doesn't swallow `<ref>/merge` as a ref.
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: ref
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/intent:
-    post:
-      operationId: editPlotIntentHandler
-      tags:
-        - plots
-      summary: POST /plots/:id/intent
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/questions/{event_id}/answer:
-    post:
-      operationId: answerPlotQuestionHandler
-      tags:
-        - plots
-      summary: POST /plots/:id/questions/:event_id/answer
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: event_id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/rename:
-    post:
-      operationId: renamePlotHandler
-      tags:
-        - plots
-      summary: POST /plots/:id/rename
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/status:
-    post:
-      operationId: changePlotStatusHandler
-      tags:
-        - plots
-      summary: POST /plots/:id/status
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/summary:
-    get:
-      operationId: getPlotSummaryHandler
-      tags:
-        - plots
-      summary: GET /plots/:id/summary
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      description: >-
-        Static-suffix path — must precede `/plots/:id` so the param route doesn't swallow `summary`
-        as the rest of the id.
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /plots/{id}/sync:
-    post:
-      operationId: syncPlotHandler
-      tags:
-        - plots
-      summary: POST /plots/:id/sync
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
   /preview/config:
     get:
       operationId: previewConfigHandler
@@ -657,23 +237,6 @@ paths:
       tags:
         - projects
       summary: DELETE /projects/:id
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-  /projects/{id}/agents/refresh:
-    post:
-      operationId: refreshProjectAgentsHandler
-      tags:
-        - projects
-      summary: POST /projects/:id/agents/refresh
       responses:
         '200':
           description: Successful response.
@@ -900,17 +463,80 @@ paths:
           required: true
           schema:
             type: string
-  /runs/{id}/preview/login:
+  /runs/{id}/finalize-intent:
     get:
-      operationId: previewLoginHandler
+      operationId: getRunFinalizeIntentHandler
       tags:
         - runs
-      summary: GET /runs/:id/preview/login
+      summary: GET /runs/:id/finalize-intent
       responses:
         '200':
           description: Successful response.
         default:
           description: Error response (see `src/core/errors.ts`).
+      description: >-
+        warren-0d35: the in-pod finalize callback for the K8s backend — the pod fetches the reap
+        intent, runs the workspace-dependent half in place, and POSTs the FinalizeResult back.
+        Bearer-gated; the pod carries its per-run scoped token (warren-57fd).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+  /runs/{id}/finalize-result:
+    post:
+      operationId: postRunFinalizeResultHandler
+      tags:
+        - runs
+      summary: POST /runs/:id/finalize-result
+      responses:
+        '200':
+          description: Successful response.
+        default:
+          description: Error response (see `src/core/errors.ts`).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+  /runs/{id}/inbox:
+    get:
+      operationId: pollRunInboxHandler
+      tags:
+        - runs
+      summary: GET /runs/:id/inbox
+      responses:
+        '200':
+          description: Successful response.
+        default:
+          description: Error response (see `src/core/errors.ts`).
+      description: >-
+        warren-3d0b: the in-pod steering poll for the K8s backend. Bearer-gated like every /runs
+        route; the pod carries its per-run SCOPED token (warren-57fd). Destructive on read (it
+        claims unread messages), so for a non-run caller it is operator-only (warren-b875).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+  /runs/{id}/preview/login:
+    post:
+      operationId: previewLoginHandler
+      tags:
+        - runs
+      summary: POST /runs/:id/preview/login
+      responses:
+        '200':
+          description: Successful response.
+        default:
+          description: Error response (see `src/core/errors.ts`).
+      description: >-
+        warren-e1b0: POST, not GET — the bearer rides the `Authorization` header like every other
+        /runs route instead of a `?token=` query string that would land in history / Referer / proxy
+        logs.
       parameters:
         - name: id
           in: path
@@ -934,17 +560,21 @@ paths:
           required: true
           schema:
             type: string
-  /runs/{id}/session:
-    get:
-      operationId: wakeSessionHandler
+  /runs/{id}/salvage:
+    post:
+      operationId: postRunSalvageHandler
       tags:
         - runs
-      summary: GET /runs/:id/session
+      summary: POST /runs/:id/salvage
       responses:
         '200':
           description: Successful response.
         default:
           description: Error response (see `src/core/errors.ts`).
+      description: >-
+        warren-cd3b: the in-pod salvage intake — the pod POSTs the work it captured (rescue ref +
+        git bundle) when the finalize branch push failed or no reap intent ever arrived, BEFORE its
+        emptyDir dies with the pod.
       parameters:
         - name: id
           in: path
@@ -979,31 +609,15 @@ paths:
           description: Successful response.
         default:
           description: Error response (see `src/core/errors.ts`).
-  /workers:
+  /whoami:
     get:
-      operationId: listWorkersHandler
+      operationId: whoamiHandler
       tags:
-        - workers
-      summary: GET /workers
+        - whoami
+      summary: GET /whoami
       responses:
         '200':
           description: Successful response.
         default:
           description: Error response (see `src/core/errors.ts`).
-  /workers/{name}/drain:
-    post:
-      operationId: drainWorkerHandler
-      tags:
-        - workers
-      summary: POST /workers/:name/drain
-      responses:
-        '200':
-          description: Successful response.
-        default:
-          description: Error response (see `src/core/errors.ts`).
-      parameters:
-        - name: name
-          in: path
-          required: true
-          schema:
-            type: string
+      description: 'warren-e195: `readPublic`, not `anonymous` — an exempt route gets no actor to name.'

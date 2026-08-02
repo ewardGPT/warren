@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `warren` / `wr` CLI entry (SPEC §8.2).
+ * `warren` / `wr` CLI entry.
  *
  * Five subcommands, all dispatching into pure functions in `./commands/`.
  * The dispatch is intentionally thin: commander handles argv parsing and
@@ -11,15 +11,15 @@
  */
 
 import { Command } from "commander";
-import { BurrowClientPool } from "../burrow-client/pool.ts";
 import { WarrenClient } from "../client/index.ts";
-import type { PlanRunState } from "../client/types.ts";
+import { PLAN_RUN_STATES, type PlanRunState } from "../core/wire.ts";
 import { openDatabase } from "../db/client.ts";
 import { parseDatabaseUrl } from "../db/url.ts";
 import { VERSION } from "../index.ts";
 import { loadProjectsConfigFromEnv } from "../projects/config.ts";
+import { resolvePublicAllowlist } from "../projects/public-allowlist.ts";
 import { seedBuiltinAgents } from "../registry/builtins/index.ts";
-import { requireCanopyRegistryConfigFromEnv } from "../registry/config.ts";
+import { resolveLocalRunBackend } from "../runtime/local/diagnostics/burrow.ts";
 import { runAddProject } from "./commands/add-project.ts";
 import { runConfigMigrate } from "./commands/config-migrate.ts";
 import { runMigrateToPostgres } from "./commands/db.ts";
@@ -27,7 +27,6 @@ import { runDoctor } from "./commands/doctor.ts";
 import { runInit } from "./commands/init.ts";
 import { runPlanCancel, runPlanRun } from "./commands/plan-run.ts";
 import { runPlanList, runPlanStatus } from "./commands/plan-status.ts";
-import { runRegisterAgent } from "./commands/register-agent.ts";
 import { runRun } from "./commands/run.ts";
 import { runServe } from "./commands/serve.ts";
 import { withCliDb } from "./context.ts";
@@ -48,28 +47,6 @@ export function buildProgram(context: CliContext): Command {
 		});
 
 	program
-		.command("register-agent")
-		.description("refresh canopy and register one agent into warren's cache")
-		.argument("<name>", "canopy prompt name (must be tagged 'agent')")
-		.action(async (name: string) => {
-			const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
-				// register-agent only makes sense against a configured library —
-				// built-ins are seeded automatically and can't be 'registered'
-				// from canopy. requireCanopyRegistryConfigFromEnv throws a
-				// ValidationError with a friendly hint when CANOPY_REPO_URL is
-				// unset; main's catch surfaces it.
-				const canopyConfig = requireCanopyRegistryConfigFromEnv(context.env);
-				const result = await runRegisterAgent(
-					context,
-					{ agents: repos.agents, canopyConfig },
-					{ name },
-				);
-				return result.exitCode;
-			});
-			process.exit(exitCode);
-		});
-
-	program
 		.command("add-project")
 		.description("clone a GitHub repo into the projects root and persist it")
 		.argument("<git-url>", "GitHub URL (https or git@)")
@@ -77,9 +54,24 @@ export function buildProgram(context: CliContext): Command {
 		.action(async (gitUrl: string, opts: { defaultBranch?: string }) => {
 			const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
 				const projectsConfig = loadProjectsConfigFromEnv(context.env);
+				// warren-0883: the CLI used to bypass the public-instance
+				// allowlist that `POST /projects` enforces. Resolve it here
+				// (public mode with a missing/empty list throws, exactly like
+				// server boot) and forward it into `addProject`, the single
+				// enforcement site both surfaces share. The CLI cannot import
+				// the server's `resolveAuthKind` (check:layers), so it reads
+				// the selector directly.
+				const publicAllowlist = resolvePublicAllowlist(
+					context.env.WARREN_AUTH?.trim() === "public",
+					context.env,
+				);
 				const result = await runAddProject(
 					context,
-					{ projects: repos.projects, projectsConfig },
+					{
+						projects: repos.projects,
+						projectsConfig,
+						...(publicAllowlist !== undefined ? { publicAllowlist } : {}),
+					},
 					{
 						gitUrl,
 						...(opts.defaultBranch !== undefined ? { defaultBranch: opts.defaultBranch } : {}),
@@ -116,20 +108,22 @@ export function buildProgram(context: CliContext): Command {
 					// a canopy library (warren-d3e9). Idempotent against existing
 					// rows.
 					await seedBuiltinAgents(repos.agents, undefined, context.now);
-					// warren-39c3 / warren-c0c9: build a single-worker pool from env
-					// so spawnRun can resolve placement and the bridge/reap/state-
-					// fetch paths can resolve per-burrow workers via `clientFor`.
-					// The pool registers a synthetic `local` row in `workers` and
-					// forwards the env-derived BurrowClient as its only entry,
-					// mirroring the zero-config bootServer path.
-					const burrowClientPool = await BurrowClientPool.fromEnv({
-						env: context.env,
-						repos,
-					});
+					// warren-11cc: resolve the run backend once (honoring WARREN_RUNTIME).
+					// The local backend lazily builds a single burrow client + preview
+					// seam; under k8s no burrow client is constructed. Direct burrow
+					// access is confined to `resolveLocalRunBackend`
+					// (src/runtime/local/diagnostics/burrow.ts).
+					const backend = resolveLocalRunBackend(context.env);
 					try {
 						const result = await runRun(
 							context,
-							{ repos, burrowClientPool },
+							{
+								repos,
+								runtimeProvider: backend.runtimeProvider,
+								...(backend.previewSidecars !== undefined
+									? { previewSidecars: backend.previewSidecars }
+									: {}),
+							},
 							{
 								agent,
 								project,
@@ -141,7 +135,7 @@ export function buildProgram(context: CliContext): Command {
 						);
 						return result.exitCode;
 					} finally {
-						await burrowClientPool.close().catch(() => undefined);
+						await backend.close();
 					}
 				});
 				process.exit(exitCode);
@@ -160,7 +154,11 @@ export function buildProgram(context: CliContext): Command {
 				process.exit(2);
 			}
 			const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
-				seedBuiltinAgents(repos.agents, undefined, context.now);
+				// Must await (warren-e376): --default-role validation reads the
+				// registry immediately after; an un-awaited seed lets the read
+				// race ahead on a fresh DB and reject built-in names like
+				// claude-code as "unknown agent" (acceptance scenario 17).
+				await seedBuiltinAgents(repos.agents, undefined, context.now);
 				const args =
 					opts.project !== undefined
 						? {
@@ -213,9 +211,10 @@ export function buildProgram(context: CliContext): Command {
 
 	program
 		.command("doctor")
-		.description("check warren's environment: env vars, burrow socket, canopy clone")
+		.description("check warren's environment: env vars, burrow socket")
 		.option("--no-auth", "skip the WARREN_API_TOKEN check (loopback dev mode)")
-		.action(async (opts: { auth?: boolean }) => {
+		.option("--verbose", "print raw probe/driver output (withheld from check messages) to stderr")
+		.action(async (opts: { auth?: boolean; verbose?: boolean }) => {
 			// commander turns `--no-auth` into `opts.auth === false`.
 			// Open the DB so the warren_config check can walk every
 			// registered project. A missing DB file is fine — withCliDb's
@@ -225,18 +224,11 @@ export function buildProgram(context: CliContext): Command {
 				const projects = (await repos.projects.listAll()).map((p) => ({
 					id: p.id,
 					localPath: p.localPath,
-					gitUrl: p.gitUrl,
-					hasSeeds: p.hasSeeds,
 				}));
 				const result = await runDoctor(
 					context,
-					{
-						projects,
-						db,
-						repos,
-						seedsCli: { sdBinary: context.env.WARREN_SD_BINARY ?? "sd", spawn: context.spawn },
-					},
-					{ noAuth: opts.auth === false },
+					{ projects, db },
+					{ noAuth: opts.auth === false, verbose: opts.verbose === true },
 				);
 				return result.exitCode;
 			});
@@ -313,7 +305,6 @@ export function buildProgram(context: CliContext): Command {
 		.option("--ref <git-ref>", "git ref to clone child workspaces from")
 		.option("--provider <name>", "per-run override of agent frontmatter.provider")
 		.option("--model <name>", "per-run override of agent frontmatter.model")
-		.option("--plot <id>", "associate the plan-run with a Plot (plt_xxx)")
 		.option("--no-follow", "dispatch and exit without tailing events")
 		.option("--output <mode>", "output mode: ndjson (default) or pretty", "ndjson")
 		.action(
@@ -326,7 +317,6 @@ export function buildProgram(context: CliContext): Command {
 					ref?: string;
 					provider?: string;
 					model?: string;
-					plot?: string;
 					follow: boolean;
 					output?: string;
 				},
@@ -345,7 +335,6 @@ export function buildProgram(context: CliContext): Command {
 						...(opts.ref !== undefined ? { ref: opts.ref } : {}),
 						...(opts.provider !== undefined ? { provider: opts.provider } : {}),
 						...(opts.model !== undefined ? { model: opts.model } : {}),
-						...(opts.plot !== undefined ? { plot: opts.plot } : {}),
 					},
 				);
 				process.exit(result.exitCode);
@@ -421,18 +410,15 @@ export function parsePlanRunOutput(value: string | undefined): PlanRunOutput {
 	return value === "pretty" ? "pretty" : "ndjson";
 }
 
-/** The set of recognised plan-run states for the `plan list --state` filter. */
-const PLAN_RUN_STATES: ReadonlySet<string> = new Set([
-	"queued",
-	"running",
-	"succeeded",
-	"failed",
-	"cancelled",
-]);
-
-/** Coerce a `--state` flag value to a {@link PlanRunState}, or undefined when unset/invalid. */
+/**
+ * Coerce a `--state` flag value to a {@link PlanRunState}, or undefined when
+ * unset/invalid. Membership is tested against the canonical tuple rather than
+ * a locally rebuilt `Set` — that copy was drift waiting to happen (warren-d371).
+ */
 export function parsePlanRunState(value: string | undefined): PlanRunState | undefined {
-	return value !== undefined && PLAN_RUN_STATES.has(value) ? (value as PlanRunState) : undefined;
+	return value !== undefined && (PLAN_RUN_STATES as readonly string[]).includes(value)
+		? (value as PlanRunState)
+		: undefined;
 }
 
 if (import.meta.main) {

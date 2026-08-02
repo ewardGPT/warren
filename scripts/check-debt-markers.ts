@@ -3,7 +3,7 @@
  * Debt-marker scanner (warren-7f2b, plan pl-7b06 step 8).
  *
  * Walks every TypeScript file under `src/` and `scripts/` (excluding
- * `src/ui/`, `__golden__/`, and `node_modules/`) and flags any
+ * `src/ui/dist/`, `__golden__/`, and `node_modules/`) and flags any
  * `TODO` / `FIXME` / `HACK` / `XXX` marker that is not paired with a
  * tracker reference on the same line.
  *
@@ -34,7 +34,7 @@ const ALLOWLIST_PATH = resolve(REPO_ROOT, "scripts/debt-marker-allowlist.json");
 const SCAN_ROOTS = ["src", "scripts"] as const;
 const EXTENSIONS = [".ts", ".tsx"] as const;
 const EXCLUDE_DIR_SEGMENTS = ["node_modules", "__golden__"] as const;
-const EXCLUDE_PATH_PREFIXES = ["src/ui/"] as const;
+const EXCLUDE_PATH_PREFIXES = ["src/ui/dist/"] as const;
 // The scanner and its test naturally contain the marker tokens they
 // hunt for. Exclude them to avoid self-reference false positives.
 const EXCLUDE_PATH_EXACT: ReadonlySet<string> = new Set([

@@ -39,22 +39,18 @@ import { formatError } from "../core/errors.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { ProjectRow } from "../db/schema.ts";
 import type { ScheduledSeed, WarrenExtensions } from "../seeds-cli/index.ts";
-import type {
-	CronTrigger,
-	GoalTrigger,
-	LoadedWarrenConfig,
-	LoopTrigger,
-} from "../warren-config/index.ts";
+import type { LoadedWarrenConfig } from "../warren-config/index.ts";
 import { runCiFixerPass, type TickCiFixerDeps } from "./ci-fixer-pass.ts";
+import type { CronRetryTracker } from "./cron-retry.ts";
 import {
 	type DispatchCronResult,
 	type DispatchScheduledResult,
 	type DispatchSpawnFn,
 	dispatchCronTrigger,
-	dispatchScheduledSeed,
 } from "./dispatch.ts";
-import { dispatchGoalTrigger, dispatchLoopTrigger } from "./goal-loop.ts";
-import { runTriageInboxPass, type TriageCollector } from "./triage-inbox.ts";
+import type { EnsureProjectCloneFn } from "./project-heal.ts";
+import { runScheduledSeedsPass } from "./scheduled-pass.ts";
+import type { TriageCollector } from "./triage-inbox.ts";
 
 export type {
 	TickCiFixerDeps,
@@ -91,6 +87,17 @@ export interface TickLogger {
 	error(obj: Record<string, unknown>, msg?: string): void;
 }
 
+/**
+ * Rate-limiter for repeated per-project scheduler notices (warren-1ec7);
+ * `ProjectHealTracker` satisfies it. `shouldNotify` returns true the first
+ * time a condition is seen and again only once its interval elapses;
+ * `clearNotice` resets a resolved condition. Absent ⇒ every notice logs.
+ */
+export interface SchedulerNoticeGate {
+	shouldNotify(key: string, nowMs: number): boolean;
+	clearNotice(key: string): void;
+}
+
 export interface TriageSchedulerDeps {
 	readonly collect: TriageCollector;
 }
@@ -102,10 +109,44 @@ export interface TickDeps {
 	readonly updateExtensions: UpdateSeedExtensionsFn;
 	readonly spawn: DispatchSpawnFn;
 	readonly ciFixer?: TickCiFixerDeps;
-	/** Optional daily/project triage collector; absent projects retain legacy behavior. */
+	/**
+	 * Per-trigger bounded-retry memory (warren-a0a2). Constructed once by
+	 * `bootScheduler` so it survives across ticks; the cron dispatcher caps
+	 * consecutive transient spawn failures per slot against it. Omitted in unit
+	 * tests that don't exercise the bound.
+	 */
+	readonly cronRetryTracker?: CronRetryTracker;
+	/**
+	 * GC seam for the scheduler's transient `never_started` rows (warren-a0a2),
+	 * wired to `repos.runs.deleteNeverStarted`. Threaded onto the cron
+	 * dispatcher so a failing slot doesn't flood the runs list.
+	 */
+	readonly deleteNeverStartedRun?: (runId: string) => Promise<void>;
+	/**
+	 * Self-heal seam (warren-1ec7). Called at the top of each project's tick;
+	 * on a missing on-disk clone it re-clones from the row's gitUrl instead of
+	 * letting `loadWarrenConfig` throw `project clone missing on disk` every
+	 * tick. `skip` ⇒ clone missing and backing off / re-clone failed, so skip
+	 * this tick. Omitted ⇒ old behavior (missing clone → `project_failed`).
+	 */
+	readonly ensureProjectClone?: EnsureProjectCloneFn;
+	/**
+	 * Rate-limiter for repeated per-project error notices (warren-1ec7:
+	 * `project_failed`, `sd_list_failed`). Omitted ⇒ every notice logs.
+	 */
+	readonly noticeGate?: SchedulerNoticeGate;
 	readonly triage?: TriageSchedulerDeps;
 	readonly now?: () => Date;
 	readonly logger?: TickLogger;
+}
+
+/**
+ * Gate a per-project notice through the optional rate-limiter. Returns true
+ * (always log) when no gate is wired — preserving the legacy every-tick
+ * logging that unit tests assert against.
+ */
+function shouldNotify(deps: Pick<TickDeps, "noticeGate">, key: string, nowMs: number): boolean {
+	return deps.noticeGate?.shouldNotify(key, nowMs) ?? true;
 }
 
 export interface RunTickResult {
@@ -125,6 +166,7 @@ export async function runTick(deps: TickDeps): Promise<RunTickResult> {
 	const scheduled: DispatchScheduledResult[] = [];
 	const projectErrors: { projectId: string; reason: string }[] = [];
 
+	const nowMs = now.getTime();
 	for (const project of await deps.repos.projects.listAll()) {
 		try {
 			await runProjectTick({
@@ -134,13 +176,21 @@ export async function runTick(deps: TickDeps): Promise<RunTickResult> {
 				cron,
 				scheduled,
 			});
+			// Reached the end cleanly — clear any lingering per-project error
+			// gate so a fresh failure logs immediately (warren-1ec7).
+			deps.noticeGate?.clearNotice(`project_failed:${project.id}`);
 		} catch (err) {
 			// pl-2f15 risk #9: project delete races with the tick can leave
 			// stale rows in flight. Catch per-project so one bad row can't
 			// derail the rest of the tick.
 			const reason = formatError(err);
 			projectErrors.push({ projectId: project.id, reason });
-			deps.logger?.error({ projectId: project.id, reason }, "scheduler.project_failed");
+			// warren-1ec7: gate the error log so a persistently-broken project
+			// (e.g. a clone the self-heal couldn't re-materialize) logs once per
+			// interval instead of flooding at error level every tick.
+			if (shouldNotify(deps, `project_failed:${project.id}`, nowMs)) {
+				deps.logger?.error({ projectId: project.id, reason }, "scheduler.project_failed");
+			}
 		}
 	}
 
@@ -155,9 +205,34 @@ interface RunProjectTickInput {
 	readonly scheduled: DispatchScheduledResult[];
 }
 
+/**
+ * warren-a0a2: the optional bounded-retry seams the cron dispatcher takes.
+ * Built once per project tick so the dispatch call site stays flat (keeps
+ * `runProjectTick` under the cognitive-complexity gate).
+ */
+function cronDispatchExtras(
+	deps: TickDeps,
+): Pick<Parameters<typeof dispatchCronTrigger>[0], "retryTracker" | "deleteNeverStartedRun"> {
+	return {
+		...(deps.cronRetryTracker !== undefined ? { retryTracker: deps.cronRetryTracker } : {}),
+		...(deps.deleteNeverStartedRun !== undefined
+			? { deleteNeverStartedRun: deps.deleteNeverStartedRun }
+			: {}),
+	};
+}
+
 async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 	const { deps, project, now, cron, scheduled } = input;
 	const nowIso = now.toISOString();
+
+	// warren-1ec7: self-heal a missing on-disk clone before anything reads it.
+	// `skip` means it's absent and either backing off or its re-clone failed;
+	// bail this tick rather than let `loadWarrenConfig` throw clone-missing.
+	if (deps.ensureProjectClone !== undefined) {
+		const heal = await deps.ensureProjectClone(project);
+		if (heal === "skip") return;
+	}
+
 	const config = await deps.loadWarrenConfig(project.id, project.localPath);
 
 	// Surface .warren/ parse errors at info-level — the GET /warren-config
@@ -170,9 +245,20 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 		);
 	}
 
-	await dispatchCronTriggers({ deps, project, config, now, cron });
-	await dispatchGoalTriggers({ deps, project, config, now });
-	await dispatchLoopTriggers({ deps, project, config, now });
+	const cronExtras = cronDispatchExtras(deps);
+	for (const trigger of config.triggers ?? []) {
+		const result = await dispatchCronTrigger({
+			projectId: project.id,
+			trigger,
+			defaults: config.defaults,
+			now,
+			repos: deps.repos,
+			spawn: deps.spawn,
+			...cronExtras,
+		});
+		cron.push(result);
+		logCronResult(deps.logger, project.id, trigger.id, result);
+	}
 
 	// warren-0b75: CI-fixer poll. Independent of the seeds shell-out below,
 	// so it runs before the `return` on an `sd list` failure can skip it.
@@ -187,155 +273,7 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 		});
 	}
 
-	if (deps.triage !== undefined) {
-		const triage = await runTriageInboxPass({
-			projectId: project.id,
-			projectPath: project.localPath,
-			gitUrl: project.gitUrl,
-			now,
-			collect: deps.triage.collect,
-		});
-		deps.logger?.info(
-			{
-				projectId: project.id,
-				added: triage.added,
-				updated: triage.updated,
-				archivedEmpty: triage.archivedEmpty,
-			},
-			"scheduler.triage_completed",
-		);
-	}
-
-	let seedsResult: Awaited<ReturnType<ListScheduledSeedsFn>>;
-	try {
-		seedsResult = await deps.listScheduledSeeds(project.localPath);
-	} catch (err) {
-		// pl-2f15 risk #4: shell-out failures must not double-dispatch on
-		// the next tick. We never wrote a warren-side row for these seeds,
-		// so retrying on the next tick is correct.
-		deps.logger?.warn(
-			{ projectId: project.id, reason: formatError(err) },
-			"scheduler.sd_list_failed",
-		);
-		return;
-	}
-
-	for (const err of seedsResult.errors) {
-		deps.logger?.warn(
-			{ projectId: project.id, seedId: err.seedId, reason: err.message },
-			"scheduler.scheduled_for_parse_error",
-		);
-	}
-
-	for (const seed of seedsResult.scheduled) {
-		const result = await dispatchScheduledSeed({
-			projectId: project.id,
-			seed,
-			defaults: config.defaults,
-			now,
-			spawn: deps.spawn,
-		});
-		scheduled.push(result);
-		logScheduledResult(deps.logger, project.id, result);
-
-		if (result.kind === "fired") {
-			// Risk #4: write-once semantics. We dispatched the seed; even if
-			// the merged extension write fails, the warren-side run row is
-			// authoritative. Failure stamps a system event on the run so the
-			// operator sees the lingering scheduledFor without tailing logs.
-			// pl-bb70 step 5: collapse the prior clearScheduledFor + (no-op
-			// spawn-side write) into one sd update that carries scheduledFor
-			// clear + lastScheduledRun pointer + the warren-namespaced common
-			// keys (role, trigger, lastRunId, lastRunAt).
-			const extensions: WarrenExtensions = {
-				role: result.role,
-				trigger: "scheduled",
-				lastRunId: result.runId,
-				lastRunAt: nowIso,
-				scheduledFor: null,
-				lastScheduledRun: result.runId,
-			};
-			try {
-				await deps.updateExtensions(project.localPath, result.seedId, extensions);
-			} catch (err) {
-				await recordClearFailure(deps, result.runId, result.seedId, formatError(err));
-			}
-		}
-	}
-}
-
-async function dispatchCronTriggers(input: {
-	readonly deps: TickDeps;
-	readonly project: ProjectRow;
-	readonly config: LoadedWarrenConfig;
-	readonly now: Date;
-	readonly cron: DispatchCronResult[];
-}): Promise<void> {
-	for (const trigger of (input.config.triggers ?? []).filter(
-		(candidate): candidate is CronTrigger => candidate.kind === "cron",
-	)) {
-		const result = await dispatchCronTrigger({
-			projectId: input.project.id,
-			trigger,
-			defaults: input.config.defaults,
-			now: input.now,
-			repos: input.deps.repos,
-			spawn: input.deps.spawn,
-		});
-		input.cron.push(result);
-		logCronResult(input.deps.logger, input.project.id, trigger.id, result);
-	}
-}
-
-async function dispatchGoalTriggers(input: {
-	readonly deps: TickDeps;
-	readonly project: ProjectRow;
-	readonly config: LoadedWarrenConfig;
-	readonly now: Date;
-}): Promise<void> {
-	for (const trigger of (input.config.triggers ?? []).filter(
-		(candidate): candidate is GoalTrigger => candidate.kind === "goal",
-	)) {
-		const result = await dispatchGoalTrigger({
-			projectId: input.project.id,
-			trigger,
-			now: input.now,
-			spawn: input.deps.spawn,
-			repos: input.deps.repos,
-		});
-		input.deps.logger?.info(
-			{ projectId: input.project.id, triggerId: trigger.id, kind: result.kind },
-			"scheduler.goal_dispatched",
-		);
-	}
-}
-
-async function dispatchLoopTriggers(input: {
-	readonly deps: TickDeps;
-	readonly project: ProjectRow;
-	readonly config: LoadedWarrenConfig;
-	readonly now: Date;
-}): Promise<void> {
-	for (const trigger of (input.config.triggers ?? []).filter(
-		(candidate): candidate is LoopTrigger => candidate.kind === "loop",
-	)) {
-		const iterationsRun = await input.deps.repos.triggers.getFireCount({
-			projectId: input.project.id,
-			triggerId: trigger.id,
-		});
-		const result = await dispatchLoopTrigger({
-			projectId: input.project.id,
-			trigger,
-			now: input.now,
-			iterationsRun,
-			spawn: input.deps.spawn,
-			repos: input.deps.repos,
-		});
-		input.deps.logger?.info(
-			{ projectId: input.project.id, triggerId: trigger.id, kind: result.kind },
-			"scheduler.loop_dispatched",
-		);
-	}
+	await runScheduledSeedsPass({ deps, project, config, now, nowIso, scheduled });
 }
 
 function logCronResult(
@@ -349,53 +287,23 @@ function logCronResult(
 			{ projectId, triggerId, runId: result.runId, nextFireAt: result.nextFireAt?.toISOString() },
 			"scheduler.cron_fired",
 		);
+	} else if (result.kind === "gave_up") {
+		// warren-a0a2: N consecutive transient failures consumed the slot.
+		// error-level — a persistently-unreachable runtime needs operator eyes,
+		// but the noise floor is now once-per-slot, not once-per-tick.
+		logger?.error(
+			{
+				projectId,
+				triggerId,
+				attempts: result.attempts,
+				reason: result.reason,
+				nextFireAt: result.nextFireAt?.toISOString(),
+			},
+			"scheduler.cron_gave_up",
+		);
 	} else if (result.kind === "error") {
 		logger?.warn({ projectId, triggerId, reason: result.reason }, "scheduler.cron_failed");
 	}
-}
-
-function logScheduledResult(
-	logger: TickLogger | undefined,
-	projectId: string,
-	result: DispatchScheduledResult,
-): void {
-	if (result.kind === "fired") {
-		logger?.info(
-			{ projectId, seedId: result.seedId, runId: result.runId },
-			"scheduler.scheduled_fired",
-		);
-	} else if (result.kind === "error") {
-		logger?.warn(
-			{ projectId, seedId: result.seedId, reason: result.reason },
-			"scheduler.scheduled_failed",
-		);
-	}
-}
-
-async function recordClearFailure(
-	deps: TickDeps,
-	runId: string,
-	seedId: string,
-	reason: string,
-): Promise<void> {
-	try {
-		const seq = ((await deps.repos.events.maxSeqForRun(runId)) ?? 0) + 1;
-		const now = deps.now?.() ?? new Date();
-		await deps.repos.events.append({
-			runId,
-			burrowEventSeq: seq,
-			ts: now.toISOString(),
-			kind: "trigger.cleared_extension_failed",
-			stream: "system",
-			payload: { seedId, reason },
-		});
-	} catch (err) {
-		deps.logger?.error(
-			{ runId, seedId, reason: formatError(err) },
-			"scheduler.system_event_failed",
-		);
-	}
-	deps.logger?.warn({ runId, seedId, reason }, "scheduler.clear_scheduled_for_failed");
 }
 
 /**

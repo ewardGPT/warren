@@ -8,12 +8,16 @@
  * the three sibling test files), which all import from `./checks.ts`,
  * keeps resolving unchanged.
  *
- *   - checks-sandbox.ts — bwrap bring-up, the canopy clone's existence
- *     + cleanliness, and burrow socket reachability (single + pool).
+ *   - checks-sandbox.ts — bwrap bring-up and the canopy clone's
+ *     existence + cleanliness. Burrow socket reachability lives in the
+ *     allowlisted `src/runtime/local/diagnostics/burrow.ts` module
+ *     (warren-11cc), out of this diagnostics surface.
  *   - checks-config.ts — per-project `.warren/` parsing (fatal +
  *     deprecation), resolved DB dialect, live `SELECT 1` reachability.
  *   - checks-preview.ts — preview port + live-count saturation and
  *     signed-cookie token strength.
+ *   - redact.ts — the body/log split that keeps raw driver text, token
+ *     lengths, and absolute paths out of every check message (warren-51de).
  *
  * Each check returns `{ name, ok, message?, hint? }`. Callers decide
  * how to render (newline-delimited JSON for doctor, one envelope for
@@ -30,6 +34,17 @@ export interface DiagnosticCheck {
 
 export type EnvLike = Readonly<Record<string, string | undefined>>;
 export type ExistsFn = (path: string) => boolean;
+
+/**
+ * Minimal logger seam for checks that must LOG a failure detail they
+ * refuse to put on the wire (warren-51de) — see `./redact.ts`. Pino and a
+ * console-shaped test stub both satisfy it structurally. Optional at every
+ * call site, so surfaces with no logger (the `warren doctor` CLI) simply
+ * drop the detail rather than leak it.
+ */
+export interface DiagnosticLogger {
+	warn(obj: object, msg?: string): void;
+}
 
 export {
 	type CheckWarrenConfigDeps,
@@ -49,12 +64,5 @@ export {
 	type PreviewLiveCountProbe,
 	type PreviewPortUsageProbe,
 } from "./checks-preview.ts";
-export {
-	BWRAP_PROBE_TIMEOUT_MS,
-	CANOPY_GIT_TIMEOUT_MS,
-	checkBurrowPoolReachable,
-	checkBurrowReachable,
-	checkBwrap,
-	checkCanopyClean,
-	checkCanopyClone,
-} from "./checks-sandbox.ts";
+export { BWRAP_PROBE_TIMEOUT_MS, checkBwrap } from "./checks-sandbox.ts";
+export { classifyDbFailure, type DbFailureReason, dbFailureMessage } from "./redact.ts";

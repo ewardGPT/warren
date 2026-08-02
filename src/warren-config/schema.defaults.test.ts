@@ -1,12 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { VALID_SERVER_PREVIEW } from "./schema.test-helpers.ts";
 import {
-	DEFAULT_AGENT_PAUSE_TIMEOUT_MS,
 	DEFAULT_CI_FIXER_COOLDOWN_MINUTES,
 	DEFAULT_CI_FIXER_LOG_TAIL_LINES,
 	DEFAULT_CI_FIXER_MAX_RETRIES,
 	DEFAULT_CI_FIXER_ROLE,
-	DEFAULT_CONVERSATION_IDLE_TIMEOUT_MS,
 	DefaultsConfigSchema,
 	interactiveRuntimeOverride,
 	KNOWN_RUNTIME_IDS,
@@ -34,6 +32,32 @@ describe("DefaultsConfigSchema", () => {
 	test("rejects extra fields so typos surface loudly", () => {
 		const parsed = DefaultsConfigSchema.safeParse({ defaultRoll: "claude-code" });
 		expect(parsed.success).toBe(false);
+	});
+
+	test("accepts an admission block with a positive maxConcurrentRuns (warren-b6f2)", () => {
+		const parsed = DefaultsConfigSchema.safeParse({ admission: { maxConcurrentRuns: 3 } });
+		expect(parsed.success).toBe(true);
+		if (parsed.success) expect(parsed.data.admission?.maxConcurrentRuns).toBe(3);
+	});
+
+	test("accepts an empty admission block (uses the provider default)", () => {
+		expect(DefaultsConfigSchema.safeParse({ admission: {} }).success).toBe(true);
+	});
+
+	test("rejects a non-positive / non-integer maxConcurrentRuns (warren-b6f2)", () => {
+		expect(DefaultsConfigSchema.safeParse({ admission: { maxConcurrentRuns: 0 } }).success).toBe(
+			false,
+		);
+		expect(DefaultsConfigSchema.safeParse({ admission: { maxConcurrentRuns: -1 } }).success).toBe(
+			false,
+		);
+		expect(DefaultsConfigSchema.safeParse({ admission: { maxConcurrentRuns: 2.5 } }).success).toBe(
+			false,
+		);
+	});
+
+	test("rejects unknown keys inside the admission block", () => {
+		expect(DefaultsConfigSchema.safeParse({ admission: { maxConcurrent: 3 } }).success).toBe(false);
 	});
 
 	test("rejects empty-string overrides", () => {
@@ -64,25 +88,18 @@ describe("DefaultsConfigSchema", () => {
 	});
 });
 
-describe("DefaultsConfigSchema agent block (warren-cd37)", () => {
-	test("DEFAULT_AGENT_PAUSE_TIMEOUT_MS is 30 minutes in milliseconds", () => {
-		expect(DEFAULT_AGENT_PAUSE_TIMEOUT_MS).toBe(1_800_000);
+describe("DefaultsConfigSchema agent block (warren-8f4c)", () => {
+	test("accepts an explicit skipGitHooks flag", () => {
+		const parsed = DefaultsConfigSchema.safeParse({ agent: { skipGitHooks: true } });
+		expect(parsed.success).toBe(true);
+		if (parsed.success) {
+			expect(parsed.data.agent?.skipGitHooks).toBe(true);
+		}
 	});
 
-	test("applies DEFAULT_AGENT_PAUSE_TIMEOUT_MS when agent block is present but field omitted", () => {
+	test("accepts an empty agent block", () => {
 		const parsed = DefaultsConfigSchema.safeParse({ agent: {} });
 		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.agent?.pauseTimeoutMs).toBe(DEFAULT_AGENT_PAUSE_TIMEOUT_MS);
-		}
-	});
-
-	test("accepts an explicit pauseTimeoutMs override", () => {
-		const parsed = DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: 60_000 } });
-		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.agent?.pauseTimeoutMs).toBe(60_000);
-		}
 	});
 
 	test("leaves agent undefined when the block is omitted entirely", () => {
@@ -93,103 +110,10 @@ describe("DefaultsConfigSchema agent block (warren-cd37)", () => {
 		}
 	});
 
-	test("rejects pauseTimeoutMs below 1s", () => {
-		expect(DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: 500 } }).success).toBe(false);
-		expect(DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: 0 } }).success).toBe(false);
-		expect(DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: -1 } }).success).toBe(false);
-	});
-
-	test("rejects pauseTimeoutMs above 24h", () => {
-		expect(DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: 86_400_001 } }).success).toBe(
-			false,
-		);
-	});
-
-	test("accepts the boundary values", () => {
-		expect(DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: 1_000 } }).success).toBe(true);
-		expect(DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: 86_400_000 } }).success).toBe(
-			true,
-		);
-	});
-
-	test("rejects non-integer pauseTimeoutMs", () => {
-		expect(DefaultsConfigSchema.safeParse({ agent: { pauseTimeoutMs: 1500.5 } }).success).toBe(
-			false,
-		);
-	});
-
 	test("rejects unknown fields inside agent (strict)", () => {
 		expect(
 			DefaultsConfigSchema.safeParse({
-				agent: { pauseTimeoutMs: 60_000, unknownField: true },
-			}).success,
-		).toBe(false);
-	});
-});
-
-describe("DefaultsConfigSchema conversation block (warren-005d)", () => {
-	test("DEFAULT_CONVERSATION_IDLE_TIMEOUT_MS is 20 minutes in milliseconds", () => {
-		expect(DEFAULT_CONVERSATION_IDLE_TIMEOUT_MS).toBe(1_200_000);
-	});
-
-	test("applies the default when the conversation block is present but field omitted", () => {
-		const parsed = DefaultsConfigSchema.safeParse({ conversation: {} });
-		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.conversation?.idleTimeoutMs).toBe(DEFAULT_CONVERSATION_IDLE_TIMEOUT_MS);
-		}
-	});
-
-	test("accepts an explicit idleTimeoutMs override", () => {
-		const parsed = DefaultsConfigSchema.safeParse({ conversation: { idleTimeoutMs: 60_000 } });
-		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.conversation?.idleTimeoutMs).toBe(60_000);
-		}
-	});
-
-	test("leaves conversation undefined when the block is omitted entirely", () => {
-		const parsed = DefaultsConfigSchema.safeParse({});
-		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.conversation).toBeUndefined();
-		}
-	});
-
-	test("rejects idleTimeoutMs below 1s", () => {
-		expect(DefaultsConfigSchema.safeParse({ conversation: { idleTimeoutMs: 500 } }).success).toBe(
-			false,
-		);
-		expect(DefaultsConfigSchema.safeParse({ conversation: { idleTimeoutMs: 0 } }).success).toBe(
-			false,
-		);
-	});
-
-	test("rejects idleTimeoutMs above 24h", () => {
-		expect(
-			DefaultsConfigSchema.safeParse({ conversation: { idleTimeoutMs: 86_400_001 } }).success,
-		).toBe(false);
-	});
-
-	test("accepts the boundary values", () => {
-		expect(DefaultsConfigSchema.safeParse({ conversation: { idleTimeoutMs: 1_000 } }).success).toBe(
-			true,
-		);
-		expect(
-			DefaultsConfigSchema.safeParse({ conversation: { idleTimeoutMs: 86_400_000 } }).success,
-		).toBe(true);
-	});
-
-	test("rejects non-integer idleTimeoutMs", () => {
-		expect(
-			DefaultsConfigSchema.safeParse({ conversation: { idleTimeoutMs: 1500.5 } }).success,
-		).toBe(false);
-	});
-
-	test("rejects unknown fields inside conversation (strict)", () => {
-		expect(
-			DefaultsConfigSchema.safeParse({
-				conversation: { idleTimeoutMs: 60_000, unknownField: true },
+				agent: { skipGitHooks: true, unknownField: true },
 			}).success,
 		).toBe(false);
 	});
@@ -240,83 +164,6 @@ describe("DefaultsConfigSchema interactiveAgents block (warren-b802)", () => {
 		expect(
 			DefaultsConfigSchema.safeParse({
 				interactiveAgents: { plannerRuntime: "pi", extra: true },
-			}).success,
-		).toBe(false);
-	});
-});
-
-describe("DefaultsConfigSchema plotSync block (warren-cd22)", () => {
-	test("accepts valid mergeStrategy values", () => {
-		for (const strategy of ["immediate", "auto", "manual"] as const) {
-			const parsed = DefaultsConfigSchema.safeParse({
-				plotSync: { mergeStrategy: strategy },
-			});
-			expect(parsed.success).toBe(true);
-			if (parsed.success) {
-				expect(parsed.data.plotSync?.mergeStrategy).toBe(strategy);
-			}
-		}
-	});
-
-	test("accepts a valid targetBranch", () => {
-		const parsed = DefaultsConfigSchema.safeParse({
-			plotSync: { targetBranch: "main" },
-		});
-		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.plotSync?.targetBranch).toBe("main");
-		}
-	});
-
-	test("accepts both fields together", () => {
-		const parsed = DefaultsConfigSchema.safeParse({
-			plotSync: { mergeStrategy: "immediate", targetBranch: "develop" },
-		});
-		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.plotSync?.mergeStrategy).toBe("immediate");
-			expect(parsed.data.plotSync?.targetBranch).toBe("develop");
-		}
-	});
-
-	test("accepts empty block (both fields optional)", () => {
-		const parsed = DefaultsConfigSchema.safeParse({ plotSync: {} });
-		expect(parsed.success).toBe(true);
-	});
-
-	test("leaves plotSync undefined when the block is omitted", () => {
-		const parsed = DefaultsConfigSchema.safeParse({});
-		expect(parsed.success).toBe(true);
-		if (parsed.success) {
-			expect(parsed.data.plotSync).toBeUndefined();
-		}
-	});
-
-	test("rejects unknown mergeStrategy values (typo protection)", () => {
-		expect(
-			DefaultsConfigSchema.safeParse({
-				plotSync: { mergeStrategy: "always" },
-			}).success,
-		).toBe(false);
-		expect(
-			DefaultsConfigSchema.safeParse({
-				plotSync: { mergeStrategy: "never" },
-			}).success,
-		).toBe(false);
-	});
-
-	test("rejects empty-string targetBranch", () => {
-		expect(
-			DefaultsConfigSchema.safeParse({
-				plotSync: { targetBranch: "" },
-			}).success,
-		).toBe(false);
-	});
-
-	test("rejects unknown fields inside plotSync (strict)", () => {
-		expect(
-			DefaultsConfigSchema.safeParse({
-				plotSync: { mergeStrategy: "auto", extra: true },
 			}).success,
 		).toBe(false);
 	});

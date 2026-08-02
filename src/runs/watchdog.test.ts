@@ -18,11 +18,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import type { RunMode } from "../db/schema.ts";
-import type { ReapRunInput, ReapRunResult } from "./reap/index.ts";
+import type { ReapRunInput } from "./reap/index.ts";
+import {
+	fakeReapResult,
+	makeAgentJson,
+	makeCancelProvider,
+	PROJECT_ID,
+} from "./watchdog.test-helpers.ts";
 import {
 	bootWatchdog,
 	computeIdleMs,
@@ -31,77 +36,7 @@ import {
 	tickWatchdog,
 	WATCHDOG_TIMED_OUT_KIND,
 } from "./watchdog.ts";
-
-const PROJECT_ID = "prj_xxxxxxxxxxxx";
-
-function makeAgentJson() {
-	return {
-		name: "claude-code",
-		version: 1,
-		sections: { system: "be helpful" },
-		resolvedFrom: [],
-		frontmatter: {},
-	};
-}
-
-function fakeReapResult(state: ReapRunResult["state"]): ReapRunResult {
-	return {
-		state,
-		failureReason: state === "failed" ? "timed_out" : null,
-		providerError: null,
-		completionSignal: null,
-		resumeFeedback: null,
-		mulchUpdated: 0,
-		mulchSkipped: 0,
-		mulchAppended: 0,
-		seedsClosed: 0,
-		seedsCreated: 0,
-		seedIdClosed: false,
-		plotEventsAppended: 0,
-		plotsUpdated: 0,
-		plotEventsMirrored: 0,
-		plotCommitted: false,
-		seedsCommitted: false,
-		branchPushed: false,
-		commitsAhead: null,
-		prUrl: null,
-		previewState: null,
-		previewPort: null,
-		previewUrl: null,
-		autoPlanRunCreated: false,
-		autoPlanRunId: null,
-		autoPlanRunPlanId: null,
-		workspaceDestroyed: true,
-		errors: [],
-		alreadyTerminal: false,
-	};
-}
-
-/** Minimal pool stub recording cancel calls. */
-function makeCancelPool(cancels: string[]): BurrowClientPool {
-	return {
-		clientFor: async () => ({
-			workerName: "local",
-			client: {
-				config: { transport: { kind: "unix", path: "/tmp/x.sock" }, token: undefined },
-				http: {
-					runs: {
-						cancel: async (id: string) => {
-							cancels.push(id);
-							return {} as never;
-						},
-					},
-				},
-			},
-		}),
-	} as unknown as BurrowClientPool;
-}
-
-const NEVER_POOL = {
-	clientFor: async () => {
-		throw new Error("clientFor should not be called");
-	},
-} as unknown as BurrowClientPool;
+import { DEFAULT_WATCHDOG_TERMINAL_RECONCILE_GRACE_MS } from "./watchdog-reconcile.ts";
 
 describe("computeIdleMs", () => {
 	let db: WarrenDb;
@@ -180,6 +115,18 @@ describe("loadWatchdogConfigFromEnv", () => {
 		expect(cfg.enabled).toBe(true);
 		expect(cfg.heartbeatTimeoutMs).toBe(DEFAULT_WATCHDOG_HEARTBEAT_TIMEOUT_MS);
 		expect(cfg.tickMs).toBe(30_000);
+		expect(cfg.terminalReconcileGraceMs).toBe(DEFAULT_WATCHDOG_TERMINAL_RECONCILE_GRACE_MS);
+	});
+
+	test("honours an explicit terminal-reconcile grace and allows pinning to 0 (warren-c433)", () => {
+		expect(
+			loadWatchdogConfigFromEnv({ WARREN_RUN_TERMINAL_RECONCILE_GRACE_MS: "30000" })
+				.terminalReconcileGraceMs,
+		).toBe(30_000);
+		expect(
+			loadWatchdogConfigFromEnv({ WARREN_RUN_TERMINAL_RECONCILE_GRACE_MS: "0" })
+				.terminalReconcileGraceMs,
+		).toBe(0);
 	});
 
 	test("honours an explicit timeout", () => {
@@ -269,7 +216,7 @@ describe("tickWatchdog", () => {
 
 		const result = await tickWatchdog({
 			repos,
-			burrowClientPool: makeCancelPool(cancels),
+			runtimeProvider: makeCancelProvider(cancels),
 			heartbeatTimeoutMs: 5 * 60_000,
 			now: () => new Date("2026-06-05T00:10:00Z"),
 			reap: async (input) => {
@@ -292,19 +239,18 @@ describe("tickWatchdog", () => {
 		expect((timedOut?.payloadJson as { burrowRunId?: string }).burrowRunId).toBe("run_b1");
 	});
 
-	test("never force-fails an idle conversation run (warren-c770)", async () => {
-		await seedRunning("2026-06-05T00:00:00Z", {
+	test("forwards the active runtimeProvider into the force-fail reap (warren-a7cb)", async () => {
+		const runId = await seedRunning("2026-06-05T00:00:00Z", {
 			burrowId: "bur_1",
 			burrowRunId: "run_b1",
-			mode: "conversation",
 		});
+		const provider = makeCancelProvider([]);
 		const reapCalls: ReapRunInput[] = [];
 
-		const result = await tickWatchdog({
+		await tickWatchdog({
 			repos,
-			burrowClientPool: NEVER_POOL,
+			runtimeProvider: provider,
 			heartbeatTimeoutMs: 5 * 60_000,
-			// 10min idle — well past budget; a batch run here would force-fail.
 			now: () => new Date("2026-06-05T00:10:00Z"),
 			reap: async (input) => {
 				reapCalls.push(input);
@@ -312,8 +258,11 @@ describe("tickWatchdog", () => {
 			},
 		});
 
-		expect(result.timedOut).toEqual([]);
-		expect(reapCalls).toEqual([]);
+		// The reap gets the SAME provider so its finalize + terminate run through the
+		// active backend (in-pod under WARREN_RUNTIME=k8s), not the default burrow.
+		expect(reapCalls).toHaveLength(1);
+		expect(reapCalls[0]?.runtimeProvider).toBe(provider);
+		expect(runId).toBeDefined();
 	});
 
 	test("leaves a run inside budget alone", async () => {
@@ -322,7 +271,7 @@ describe("tickWatchdog", () => {
 
 		const result = await tickWatchdog({
 			repos,
-			burrowClientPool: NEVER_POOL,
+			runtimeProvider: makeCancelProvider([]),
 			heartbeatTimeoutMs: 5 * 60_000,
 			now: () => new Date("2026-06-05T00:02:00Z"),
 			reap: async (input) => {
@@ -341,7 +290,7 @@ describe("tickWatchdog", () => {
 
 		const result = await tickWatchdog({
 			repos,
-			burrowClientPool: NEVER_POOL,
+			runtimeProvider: makeCancelProvider([]),
 			heartbeatTimeoutMs: 60_000,
 			now: () => new Date("2026-06-05T00:10:00Z"),
 			reap: async (input) => {
@@ -359,7 +308,7 @@ describe("tickWatchdog", () => {
 
 		const result = await tickWatchdog({
 			repos,
-			burrowClientPool: NEVER_POOL,
+			runtimeProvider: makeCancelProvider([]),
 			heartbeatTimeoutMs: 60_000,
 			now: () => new Date("2026-06-05T00:10:00Z"),
 			reap: async () => {
@@ -377,7 +326,8 @@ describe("bootWatchdog", () => {
 		let ticked = false;
 		const handle = bootWatchdog({
 			repos: { runs: { listByState: async () => [] } } as unknown as Repos,
-			burrowClientPool: NEVER_POOL,
+			runtimeProvider: makeCancelProvider([]),
+			reap: async () => fakeReapResult("failed"),
 			heartbeatTimeoutMs: 60_000,
 			tickMs: 1000,
 			disabled: true,
@@ -394,13 +344,14 @@ describe("bootWatchdog", () => {
 	test("runOnce ticks and tickCount increments", async () => {
 		const handle = bootWatchdog({
 			repos: { runs: { listByState: async () => [] } } as unknown as Repos,
-			burrowClientPool: NEVER_POOL,
+			runtimeProvider: makeCancelProvider([]),
+			reap: async () => fakeReapResult("failed"),
 			heartbeatTimeoutMs: 60_000,
 			tickMs: 1000,
 			disabled: true,
 		});
 		const result = await handle.runOnce();
-		expect(result).toEqual({ timedOut: [], errors: [] });
+		expect(result).toEqual({ timedOut: [], reconciled: [], errors: [] });
 		expect(handle.tickCount()).toBe(1);
 		await handle.stop();
 	});
@@ -419,7 +370,8 @@ describe("bootWatchdog", () => {
 					},
 				},
 			} as unknown as Repos,
-			burrowClientPool: NEVER_POOL,
+			runtimeProvider: makeCancelProvider([]),
+			reap: async () => fakeReapResult("failed"),
 			heartbeatTimeoutMs: 60_000,
 			tickMs: 1000,
 			disabled: true,

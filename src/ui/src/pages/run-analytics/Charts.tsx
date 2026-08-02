@@ -14,11 +14,12 @@
  * Charts render a muted "No data in this window." placeholder rather
  * than an empty axis frame when their slice of the payload is empty.
  */
-import type {
-	RunDayBucket,
-	RunFailureBucket,
-	RunGroupBucket,
-	SeedContextBucket,
+import {
+	RUN_ANALYTICS_NONE_KEY,
+	type RunDayBucket,
+	type RunFailureBucket,
+	type RunGroupBucket,
+	type SeedContextBucket,
 } from "@/api/client.ts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import {
@@ -36,6 +37,7 @@ import {
 	XAxis,
 	YAxis,
 } from "@/components/ui/chart.tsx";
+import { formatRunFailureReason } from "@/lib/labels.ts";
 import { formatTokens } from "./format.ts";
 
 /**
@@ -44,9 +46,7 @@ import { formatTokens } from "./format.ts";
  * coerce to a finite number before running it through `formatTokens`.
  */
 function tokenTooltip(label: string) {
-	return (
-		value: number | string | readonly (number | string)[] | undefined,
-	): [string, string] => {
+	return (value: number | string | readonly (number | string)[] | undefined): [string, string] => {
 		const n = typeof value === "number" ? value : Number(value);
 		return [formatTokens(Number.isFinite(n) ? n : 0), label];
 	};
@@ -101,9 +101,7 @@ function ChartFrame({
 			</CardHeader>
 			<CardContent>
 				{empty ? (
-					<p className="py-6 text-sm text-(--color-muted-foreground)">
-						No data in this window.
-					</p>
+					<p className="py-6 text-sm text-(--color-muted-foreground)">No data in this window.</p>
 				) : (
 					<ChartContainer>{children}</ChartContainer>
 				)}
@@ -177,7 +175,14 @@ export function AvgContextPerAgentChart({ byAgent }: { byAgent: RunGroupBucket[]
 		>
 			<BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -8 }}>
 				<CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
-				<XAxis dataKey="key" {...AXIS_PROPS} interval={0} angle={-20} textAnchor="end" height={50} />
+				<XAxis
+					dataKey="key"
+					{...AXIS_PROPS}
+					interval={0}
+					angle={-20}
+					textAnchor="end"
+					height={50}
+				/>
 				<YAxis tickFormatter={formatTokens} {...AXIS_PROPS} />
 				<Tooltip contentStyle={TOOLTIP_STYLE} formatter={tokenTooltip("avg context")} />
 				<Bar dataKey="avgContextTokens" fill="var(--color-info)" radius={[3, 3, 0, 0]} />
@@ -196,11 +201,7 @@ export function TopSeedsByContextChart({ topSeeds }: { topSeeds: SeedContextBuck
 			subtitle="Total context tokens across seed-originated runs"
 			empty={data.length === 0}
 		>
-			<BarChart
-				data={data}
-				layout="vertical"
-				margin={{ top: 8, right: 8, bottom: 0, left: 8 }}
-			>
+			<BarChart data={data} layout="vertical" margin={{ top: 8, right: 8, bottom: 0, left: 8 }}>
 				<CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" horizontal={false} />
 				<XAxis type="number" tickFormatter={formatTokens} {...AXIS_PROPS} />
 				<YAxis type="category" dataKey="key" width={90} {...AXIS_PROPS} />
@@ -212,25 +213,26 @@ export function TopSeedsByContextChart({ topSeeds }: { topSeeds: SeedContextBuck
 }
 
 export function FailureReasonChart({ byFailureReason }: { byFailureReason: RunFailureBucket[] }) {
+	// The slice name is what the legend, the slice label and the tooltip all
+	// render, so map it to prose before recharts ever sees it — the raw
+	// `finalize_failed` / `evicted` discriminators were reaching public
+	// visitors otherwise (warren-14fc / #641). Runs with no recorded reason
+	// come back under the analytics null key.
+	const data = byFailureReason.map((b) => ({
+		...b,
+		label: b.key === RUN_ANALYTICS_NONE_KEY ? "Unrecorded" : formatRunFailureReason(b.key),
+	}));
 	return (
 		<ChartFrame
 			title="Failure reasons"
 			subtitle="Failed runs grouped by recorded reason"
-			empty={byFailureReason.length === 0}
+			empty={data.length === 0}
 		>
 			<PieChart>
 				<Tooltip contentStyle={TOOLTIP_STYLE} />
 				<Legend wrapperStyle={{ fontSize: 11 }} />
-				<Pie
-					data={byFailureReason}
-					dataKey="runs"
-					nameKey="key"
-					cx="50%"
-					cy="50%"
-					outerRadius={80}
-					label
-				>
-					{byFailureReason.map((b, i) => (
+				<Pie data={data} dataKey="runs" nameKey="label" cx="50%" cy="50%" outerRadius={80} label>
+					{data.map((b, i) => (
 						<Cell key={b.key} fill={PIE_PALETTE[i % PIE_PALETTE.length]} />
 					))}
 				</Pie>

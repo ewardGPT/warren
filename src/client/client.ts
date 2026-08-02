@@ -2,41 +2,27 @@ import { pollUntilTerminal } from "./client-helpers.ts";
 import { type EnvLike, loadWarrenClientConfigFromEnv, type WarrenClientConfig } from "./config.ts";
 import { WarrenClientError, WarrenUnreachableError } from "./errors.ts";
 import { errorFromResponse, readNdjsonStream } from "./ndjson.ts";
-import * as plots from "./plots.ts";
 import {
 	type AgentRow,
 	type CancelPlanRunResponse,
-	type ChangePlotStatusInput,
-	type ChangePlotStatusResponse,
 	type CreatePlanRunInput,
 	type CreatePlanRunResponse,
-	type CreatePlotInput,
 	type CreateProjectInput,
 	type CreateRunInput,
 	type DispatchRunInput,
-	type EditPlotIntentInput,
 	isTerminalPlanRunState,
 	isTerminalRunState,
-	type ListAgentsQuery,
 	type ListAgentsResponse,
 	type ListPlanRunsFilter,
 	type ListPlanRunsResponse,
-	type ListPlotsFilter,
-	type ListPlotsResponse,
 	type ListProjectsResponse,
 	type ListReadyPlansResponse,
 	type ListRunsResponse,
 	type PlanRunDetailResponse,
 	type PlanRunRow,
-	type PlotEnvelope,
-	type PlotSummary,
-	type PlotSyncResponse,
 	type ProjectRow,
-	type RefreshAgentsResponse,
-	type RefreshProjectAgentsResult,
 	type RefreshProjectInput,
 	type RefreshProjectResponse,
-	type ResumePlanRunResponse,
 	type RunEvent,
 	type RunRow,
 	type SpawnRunResponse,
@@ -44,11 +30,11 @@ import {
 	type SteerRunResponse,
 	type StreamPlanRunEventsOptions,
 	type StreamRunEventsOptions,
+	type WhoamiResponse,
 } from "./types.ts";
 
 export const DEFAULT_PROBE_TIMEOUT_MS = 2_000;
 
-/** Default poll cadence for {@link WarrenClient.waitForRun}. */
 export { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS } from "./client-helpers.ts";
 
 export interface WaitForRunOptions {
@@ -132,6 +118,18 @@ export class WarrenClient {
 		});
 	}
 
+	/**
+	 * `GET /whoami` — the identity and capability set warren admitted this
+	 * client as (warren-e195). Useful before a mutation: a client whose
+	 * capabilities lack `dispatch` is reading a public instance and will be
+	 * refused with 403, so it can say so up front instead of on failure.
+	 * Unlike `probe`, this is a gated route — the default `WARREN_AUTH=token`
+	 * mode 401s a client configured without a token.
+	 */
+	async whoami(signal?: AbortSignal): Promise<WhoamiResponse> {
+		return this.request<WhoamiResponse>("/whoami", { ...(signal ? { signal } : {}) });
+	}
+
 	async getProject(projectId: string): Promise<ProjectRow> {
 		return this.request<ProjectRow>(`/projects/${encodeURIComponent(projectId)}`);
 	}
@@ -168,31 +166,12 @@ export class WarrenClient {
 		);
 	}
 
-	async refreshProjectAgents(projectId: string): Promise<RefreshProjectAgentsResult> {
-		return this.request<RefreshProjectAgentsResult>(
-			`/projects/${encodeURIComponent(projectId)}/agents/refresh`,
-			{ method: "POST" },
-		);
+	async listAgents(): Promise<ListAgentsResponse> {
+		return this.request<ListAgentsResponse>("/agents");
 	}
 
-	async listAgents(query: ListAgentsQuery = {}): Promise<ListAgentsResponse> {
-		const qs =
-			query.projectId !== undefined && query.projectId !== ""
-				? `?projectId=${encodeURIComponent(query.projectId)}`
-				: "";
-		return this.request<ListAgentsResponse>(`/agents${qs}`);
-	}
-
-	async getAgent(name: string, query: ListAgentsQuery = {}): Promise<AgentRow> {
-		const qs =
-			query.projectId !== undefined && query.projectId !== ""
-				? `?projectId=${encodeURIComponent(query.projectId)}`
-				: "";
-		return this.request<AgentRow>(`/agents/${encodeURIComponent(name)}${qs}`);
-	}
-
-	async refreshAgents(): Promise<RefreshAgentsResponse> {
-		return this.request<RefreshAgentsResponse>("/agents/refresh", { method: "POST" });
+	async getAgent(name: string): Promise<AgentRow> {
+		return this.request<AgentRow>(`/agents/${encodeURIComponent(name)}`);
 	}
 
 	async createRun(input: CreateRunInput): Promise<SpawnRunResponse> {
@@ -215,7 +194,6 @@ export class WarrenClient {
 		if (input.model !== undefined) body.modelOverride = input.model;
 		if (input.provider !== undefined) body.providerOverride = input.provider;
 		if (input.seedId !== undefined) body.seedId = input.seedId;
-		if (input.plotId !== undefined) body.plotId = input.plotId;
 		if (input.dispatcherHandle !== undefined) body.dispatcherHandle = input.dispatcherHandle;
 		if (input.continueFromRunId !== undefined) body.continueFromRunId = input.continueFromRunId;
 		if (input.cloneFromRunId !== undefined) body.cloneFromRunId = input.cloneFromRunId;
@@ -226,9 +204,6 @@ export class WarrenClient {
 	 * `POST /runs/:id/steer` — mid-run steering. Forwards an operator
 	 * message into the burrow inbox; valid only while the run is
 	 * non-terminal AND a burrow is attached (else `ValidationError`).
-	 * Batch runs get nudges here, but blocking-question `pause ↔ resume`
-	 * is driven server-side by Plot `question_answered` events
-	 * (`src/runs/pause.ts`) — no explicit "resume" needed after a steer.
 	 */
 	async steer(runId: string, input: SteerRunInput): Promise<SteerRunResponse> {
 		const body: Record<string, unknown> = { body: input.body };
@@ -309,40 +284,6 @@ export class WarrenClient {
 	}
 
 	/* --------------------------------------------------------------- */
-	/* Plots — warren-8ffc. Implementations live in `./plots.ts` as    */
-	/* free functions (warren-fcc8) so this class stays under budget;  */
-	/* see that module for per-method docs + the camelCase→snake_case  */
-	/* wire mapping.                                                    */
-	/* --------------------------------------------------------------- */
-
-	listPlots(filter: ListPlotsFilter = {}): Promise<ListPlotsResponse> {
-		return plots.listPlots(this, filter);
-	}
-
-	getPlot(plotId: string): Promise<PlotEnvelope> {
-		return plots.getPlot(this, plotId);
-	}
-
-	createPlot(input: CreatePlotInput): Promise<PlotSummary> {
-		return plots.createPlot(this, input);
-	}
-
-	editPlotIntent(plotId: string, input: EditPlotIntentInput = {}): Promise<PlotEnvelope> {
-		return plots.editPlotIntent(this, plotId, input);
-	}
-
-	changePlotStatus(
-		plotId: string,
-		input: ChangePlotStatusInput,
-	): Promise<ChangePlotStatusResponse> {
-		return plots.changePlotStatus(this, plotId, input);
-	}
-
-	syncPlot(plotId: string): Promise<PlotSyncResponse> {
-		return plots.syncPlot(this, plotId);
-	}
-
-	/* --------------------------------------------------------------- */
 	/* Plan-runs — warren-8ffc.                                        */
 	/* Wire envelope is camelCase, mirroring /runs.                    */
 	/* --------------------------------------------------------------- */
@@ -353,10 +294,6 @@ export class WarrenClient {
 	 * each on the previous PR merging. Re-dispatching the same
 	 * `planId` after children land resumes from the next open child
 	 * (idempotent resume contract).
-	 *
-	 * When the project has a `.plot/` directory and `plotId` is
-	 * supplied, warren emits a `plan_run_dispatched` event onto the
-	 * Plot and threads `PLOT_ID`/`PLOT_ACTOR` into every child run.
 	 */
 	async createPlanRun(input: CreatePlanRunInput): Promise<CreatePlanRunResponse> {
 		return this.request<CreatePlanRunResponse>("/plan-runs", {
@@ -396,14 +333,6 @@ export class WarrenClient {
 	async cancelPlanRun(planRunId: string): Promise<CancelPlanRunResponse> {
 		return this.request<CancelPlanRunResponse>(
 			`/plan-runs/${encodeURIComponent(planRunId)}/cancel`,
-			{ method: "POST" },
-		);
-	}
-
-	/** Resume a plan-run stopped by a child/parent PR merge timeout. */
-	async resumePlanRun(planRunId: string): Promise<ResumePlanRunResponse> {
-		return this.request<ResumePlanRunResponse>(
-			`/plan-runs/${encodeURIComponent(planRunId)}/resume`,
 			{ method: "POST" },
 		);
 	}

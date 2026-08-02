@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
+import type { EventRow } from "../../db/schema.ts";
 import { reapRun } from "./index.ts";
+import { mirrorPlans, mirrorSeeds } from "./seeds.ts";
 import {
 	type Ctx,
 	createRepos,
@@ -8,9 +9,9 @@ import {
 	fakeExec,
 	fakeFs,
 	makeBurrow,
-	makePool,
 	openDatabase,
 	RunEventBroker,
+	reapDeps,
 	setup,
 } from "./test-helpers.ts";
 
@@ -34,13 +35,13 @@ describe("reapRun seeds-close mirror", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(
+			...reapDeps(
 				fakeBurrowClient(makeBurrow(), {
 					seedsIssuesBody:
 						'{"id":"sd-1","status":"closed","updatedAt":"2026-05-08T22:00:00Z","title":"x"}\n' +
 						'{"id":"sd-2","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"y"}\n',
 				}),
-				ctx.repos,
+				{ fs: f.fs, exec: fakeExec().exec },
 			),
 			fs: f.fs,
 			exec: fakeExec().exec,
@@ -61,14 +62,14 @@ describe("reapRun seeds-close mirror", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(
+			...reapDeps(
 				fakeBurrowClient(makeBurrow(), {
 					seedsIssuesBody:
 						'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n' +
 						'{"id":"sd-new1","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"planned-a"}\n' +
 						'{"id":"sd-new2","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"planned-b"}\n',
 				}),
-				ctx.repos,
+				{ fs: f.fs, exec: fakeExec().exec },
 			),
 			fs: f.fs,
 			exec: fakeExec().exec,
@@ -90,12 +91,12 @@ describe("reapRun seeds-close mirror", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(
+			...reapDeps(
 				fakeBurrowClient(makeBurrow(), {
 					seedsIssuesBody:
 						'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"modified"}\n',
 				}),
-				ctx.repos,
+				{ fs: f.fs, exec: fakeExec().exec },
 			),
 			fs: f.fs,
 			exec: fakeExec().exec,
@@ -120,7 +121,7 @@ describe("reapRun seeds-close mirror", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			...reapDeps(fakeBurrowClient(makeBurrow()), { fs: f.fs, exec: fakeExec().exec }),
 			fs: f.fs,
 			exec: fakeExec().exec,
 		});
@@ -138,13 +139,13 @@ describe("reapRun seeds-close mirror", () => {
 			runId: ctx.runId,
 			outcome: "succeeded",
 			repos: ctx.repos,
-			burrowClientPool: await makePool(
+			...reapDeps(
 				fakeBurrowClient(makeBurrow(), {
 					filesRead: async () => {
 						throw new Error("boom");
 					},
 				}),
-				ctx.repos,
+				{ fs: f.fs, exec: fakeExec().exec },
 			),
 			fs: f.fs,
 			exec: fakeExec().exec,
@@ -157,6 +158,40 @@ describe("reapRun seeds-close mirror", () => {
 /* ----------------------------------------------------------------------- */
 /* Plans mirror (warren-d9a2)                                               */
 /* ----------------------------------------------------------------------- */
+
+/* warren-fbbf: merge primitives are pure string→clone merges (burrow read moved
+ * into `LocalProvider.finalize`); drive them off a `workspaceBody` string. */
+describe("mirrorSeeds/mirrorPlans (warren-fbbf pure merge)", () => {
+	const emit = async (): Promise<EventRow> => ({}) as unknown as EventRow;
+
+	test("workspaceBody null is a clean no-op for both", async () => {
+		const f = fakeFs({ "/p/.seeds/issues.jsonl": '{"id":"sd-1","status":"open"}\n' });
+		const s = await mirrorSeeds({ workspaceBody: null, projectPath: "/p", fs: f.fs, emit });
+		expect(s).toEqual({ closed: 0, created: 0 });
+		expect(await mirrorPlans({ workspaceBody: null, projectPath: "/p", fs: f.fs, emit })).toBe(0);
+		expect(f.files.get("/p/.seeds/issues.jsonl")).toBe('{"id":"sd-1","status":"open"}\n');
+	});
+
+	test("merges a closed workspace row into the clone via LWW", async () => {
+		const f = fakeFs({
+			"/p/.seeds/issues.jsonl":
+				'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z"}\n',
+		});
+		const body = '{"id":"sd-1","status":"closed","updatedAt":"2026-05-08T22:00:00Z"}\n';
+		const s = await mirrorSeeds({ workspaceBody: body, projectPath: "/p", fs: f.fs, emit });
+		expect(s).toEqual({ closed: 1, created: 0 });
+		expect(f.files.get("/p/.seeds/issues.jsonl")).toContain('"status":"closed"');
+	});
+
+	test("mirrorPlans appends only new plan ids (append-only)", async () => {
+		const f = fakeFs({ "/p/.seeds/plans.jsonl": '{"id":"pl-1"}\n' });
+		const body = '{"id":"pl-1"}\n{"id":"pl-2"}\n';
+		expect(await mirrorPlans({ workspaceBody: body, projectPath: "/p", fs: f.fs, emit })).toBe(1);
+		const merged = f.files.get("/p/.seeds/plans.jsonl") ?? "";
+		expect(merged).toContain("pl-1");
+		expect(merged).toContain("pl-2");
+	});
+});
 
 describe("mirrorPlans (warren-d9a2)", () => {
 	async function setupWithSeeds() {
@@ -181,7 +216,6 @@ describe("mirrorPlans (warren-d9a2)", () => {
 			burrowId: "bur_aaaaaaaaaaaa",
 			burrowRunId: "run_zzzzzzzzzzzz",
 		});
-		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
 		await repos.runs.markRunning(run.id);
 		return {
 			db,
@@ -208,11 +242,11 @@ describe("mirrorPlans (warren-d9a2)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(
+				...reapDeps(
 					fakeBurrowClient(makeBurrow(), {
 						seedsPlansBody: `${existingPlan}${newPlan}`,
 					}),
-					ctx.repos,
+					{ fs: f.fs, exec: e.exec },
 				),
 				fs: f.fs,
 				exec: e.exec,
@@ -242,10 +276,10 @@ describe("mirrorPlans (warren-d9a2)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(
-					fakeBurrowClient(makeBurrow(), { seedsPlansBody: existingPlan }),
-					ctx.repos,
-				),
+				...reapDeps(fakeBurrowClient(makeBurrow(), { seedsPlansBody: existingPlan }), {
+					fs: f.fs,
+					exec: e.exec,
+				}),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -272,10 +306,10 @@ describe("mirrorPlans (warren-d9a2)", () => {
 				runId: ctx.runId,
 				outcome: "succeeded",
 				repos: ctx.repos,
-				burrowClientPool: await makePool(
-					fakeBurrowClient(makeBurrow(), { seedsPlansBody: newPlan }),
-					ctx.repos,
-				),
+				...reapDeps(fakeBurrowClient(makeBurrow(), { seedsPlansBody: newPlan }), {
+					fs: f.fs,
+					exec: e.exec,
+				}),
 				fs: f.fs,
 				exec: e.exec,
 			});
@@ -284,183 +318,6 @@ describe("mirrorPlans (warren-d9a2)", () => {
 			expect(workspacePlans).toContain("pl-agent-created");
 		} finally {
 			await ctx.db.close();
-		}
-	});
-});
-
-/* ----------------------------------------------------------------------- */
-/* Host-side seed-id close (warren-0d2d)                                   */
-/* ----------------------------------------------------------------------- */
-
-/** Build a SeedsCliDeps stub whose `spawn` tracks calls and returns exit 0. */
-function fakeSeedsCli(opts: { exitCode?: number } = {}): {
-	seedsCli: SeedsCliDeps;
-	calls: Array<{ args: string[]; cwd: string }>;
-} {
-	const calls: Array<{ args: string[]; cwd: string }> = [];
-	const seedsCli: SeedsCliDeps = {
-		sdBinary: "sd",
-		spawn: async (args, spawnOpts) => {
-			calls.push({ args: args as string[], cwd: spawnOpts?.cwd ?? "" });
-			const exitCode = opts.exitCode ?? 0;
-			return { exitCode, stdout: "", stderr: exitCode !== 0 ? "error" : "" };
-		},
-	};
-	return { seedsCli, calls };
-}
-
-describe("closeRunSeedId (warren-0d2d)", () => {
-	/** Setup helper: project with hasSeeds=true + run with seedId. */
-	async function setupWithSeedId(seedId: string | null = "sd-target"): Promise<{
-		db: ReturnType<typeof openDatabase> extends Promise<infer T> ? T : never;
-		repos: Awaited<ReturnType<typeof setup>>["repos"];
-		runId: string;
-	}> {
-		const db = await openDatabase({ path: ":memory:" });
-		const repos = createRepos(db);
-		await repos.agents.upsert({
-			name: "refactor-bot",
-			renderedJson: { sections: { system: "x" } },
-		});
-		const project = await repos.projects.create({
-			gitUrl: "https://github.com/x/y.git",
-			localPath: "/data/projects/x/y",
-			defaultBranch: "main",
-			hasSeeds: true,
-		});
-		const run = await repos.runs.create({
-			agentName: "refactor-bot",
-			projectId: project.id,
-			prompt: "p",
-			renderedAgentJson: {},
-			trigger: "manual",
-			burrowId: "bur_aaaaaaaaaaaa",
-			burrowRunId: "run_zzzzzzzzzzzz",
-			...(seedId !== null ? { seedId } : {}),
-		});
-		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
-		await repos.runs.markRunning(run.id);
-		return { db, repos, runId: run.id };
-	}
-
-	test("closes the run seedId via sd cli when outcome=succeeded and run has a seedId", async () => {
-		const { db, repos, runId } = await setupWithSeedId("sd-target");
-		try {
-			const f = fakeFs({
-				"/data/projects/x/y/.seeds/issues.jsonl":
-					'{"id":"sd-target","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
-			});
-			const { seedsCli, calls } = fakeSeedsCli();
-
-			const result = await reapRun({
-				runId,
-				outcome: "succeeded",
-				repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), repos),
-				fs: f.fs,
-				exec: fakeExec().exec,
-				seedsCli,
-			});
-
-			expect(result.seedIdClosed).toBe(true);
-			const closeCall = calls.find((c) => c.args.includes("close") && c.args.includes("sd-target"));
-			expect(closeCall).toBeDefined();
-			expect(closeCall?.cwd).toBe("/data/projects/x/y");
-			const events = await repos.events.listByRun(runId);
-			expect(events.find((ev) => ev.kind === "seeds.seed_id_closed")).toBeDefined();
-		} finally {
-			await db.close();
-		}
-	});
-
-	test("skips close when run has no seedId", async () => {
-		const { db, repos, runId } = await setupWithSeedId(null);
-		try {
-			const f = fakeFs({ "/data/projects/x/y/.seeds/issues.jsonl": "" });
-			const { seedsCli, calls } = fakeSeedsCli();
-
-			const result = await reapRun({
-				runId,
-				outcome: "succeeded",
-				repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), repos),
-				fs: f.fs,
-				exec: fakeExec().exec,
-				seedsCli,
-			});
-
-			expect(result.seedIdClosed).toBe(false);
-			expect(calls.some((c) => c.args.includes("close"))).toBe(false);
-		} finally {
-			await db.close();
-		}
-	});
-
-	test("skips close when outcome is failed", async () => {
-		const { db, repos, runId } = await setupWithSeedId("sd-target");
-		try {
-			const f = fakeFs({ "/data/projects/x/y/.seeds/issues.jsonl": "" });
-			const { seedsCli, calls } = fakeSeedsCli();
-
-			const result = await reapRun({
-				runId,
-				outcome: "failed",
-				repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), repos),
-				fs: f.fs,
-				exec: fakeExec().exec,
-				seedsCli,
-			});
-
-			expect(result.seedIdClosed).toBe(false);
-			expect(calls.some((c) => c.args.includes("close"))).toBe(false);
-		} finally {
-			await db.close();
-		}
-	});
-
-	test("surfaces sd close failure as reap_failed step=seed_id_close (best-effort)", async () => {
-		const { db, repos, runId } = await setupWithSeedId("sd-target");
-		try {
-			const f = fakeFs({ "/data/projects/x/y/.seeds/issues.jsonl": "" });
-			const { seedsCli } = fakeSeedsCli({ exitCode: 1 });
-
-			const result = await reapRun({
-				runId,
-				outcome: "succeeded",
-				repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), repos),
-				fs: f.fs,
-				exec: fakeExec().exec,
-				seedsCli,
-			});
-
-			expect(result.seedIdClosed).toBe(false);
-			expect(result.errors.map((e) => e.step)).toContain("seed_id_close");
-			expect(result.state).toBe("succeeded");
-		} finally {
-			await db.close();
-		}
-	});
-
-	test("skips close when seedsCli is not provided", async () => {
-		const { db, repos, runId } = await setupWithSeedId("sd-target");
-		try {
-			const f = fakeFs({ "/data/projects/x/y/.seeds/issues.jsonl": "" });
-
-			const result = await reapRun({
-				runId,
-				outcome: "succeeded",
-				repos,
-				burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), repos),
-				fs: f.fs,
-				exec: fakeExec().exec,
-			});
-
-			expect(result.seedIdClosed).toBe(false);
-			expect(result.errors.map((e) => e.step)).not.toContain("seed_id_close");
-		} finally {
-			await db.close();
 		}
 	});
 });

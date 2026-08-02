@@ -8,13 +8,35 @@
  * runtime cycle.
  */
 
-import type { RunEvent } from "@os-eco/burrow-cli";
-import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
-import type { RunMode, RunTerminalState } from "../../db/schema.ts";
+import type { RunFailureReason, RunMode, RunTerminalState } from "../../db/schema.ts";
+import type { RuntimeProvider, TerminalReason } from "../../runtime/contract.ts";
 import type { RunEventBroker } from "../events.ts";
-import type { TokenBudgetConfig } from "../token-budget.ts";
-import type { ConversationTurnHandler } from "./conversation-turn.ts";
+
+/**
+ * Structural view of a stream event — the fields the bridge and its pure
+ * classifiers (`terminal-detect.ts`) read off each
+ * event. Deliberately provider-neutral (warren-1f56): satisfied by BOTH the
+ * seam's `NormalizedEvent` (the production source, off `provider.streamEvents`)
+ * and burrow's `RunEvent` (the test `source` override still feeds those), so the
+ * bridge consumes one type without importing `@os-eco/burrow-cli`. `ts` is
+ * `Date | string` because burrow's `RunEvent` carries a `Date` while
+ * `NormalizedEvent` already carries an ISO string; `toIsoString` normalizes both.
+ */
+export interface StreamEventView {
+	readonly seq: number;
+	readonly ts: Date | string;
+	readonly kind: string;
+	readonly stream: string | null;
+	/**
+	 * Parse-boundary provenance (warren-6646). `"agent"` marks an unattributed
+	 * line warren re-parsed off a transport the agent can write to; those never
+	 * carry terminal authority. Optional because burrow's `RunEvent` (still fed by
+	 * test `source` overrides) predates the tag — absent reads as warren-authored.
+	 */
+	readonly origin?: string;
+	readonly payload: unknown;
+}
 
 /**
  * Optional logger interface — pino-compatible subset, but typed loosely
@@ -33,7 +55,7 @@ export interface BridgeLogger {
 }
 
 /**
- * Session-cumulative cost + token snapshot (warren-a7dc, SPEC §pi). Pi
+ * Session-cumulative cost + token snapshot (warren-a7dc, docs/design/agent-composition.md). Pi
  * v0.74 reports cost in USD computed against the same models.json it
  * dispatched against; warren persists the raw number rather than
  * re-pricing tokens itself (plan alternative #5).
@@ -88,6 +110,15 @@ export type RunStateProbe = (
 ) => Promise<{
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
 	exitCode: number | null;
+	/**
+	 * Coarse terminal classification the seam surfaces (warren-1f56 / warren-9cce).
+	 * The production probe fills it from `provider.status().terminalReason`; its
+	 * only load-bearing value today is `"oom_killed"` — burrow stamps an OOM kill
+	 * onto the run row's `errorMessage`, which `status()` recovers and the poller
+	 * carries through to `failure_reason` (a signal warren previously dropped).
+	 * Absent on non-terminal / test probes; other reasons are covered by `state`.
+	 */
+	terminalReason?: TerminalReason;
 } | null>;
 
 /** Burrow run-state poll cadence (ms) — light load: 1 RPC/run/2s. */
@@ -103,38 +134,34 @@ export interface BridgeRunStreamInput {
 	/** Burrow's run id (column `runs.burrow_run_id`). */
 	readonly burrowRunId: string;
 	/**
-	 * Burrow's burrow id (column `runs.burrow_id`). The bridge uses this to
-	 * resolve the owning worker via `burrowClientPool.clientFor({burrowId})`
-	 * so the stream poll lands on the same worker that hosts the burrow.
+	 * The run's sandbox id (column `runs.burrow_id`). Carried opaquely into the
+	 * `RunHandle` the bridge hands the provider so `streamEvents` / `status` /
+	 * `cancel` land on the backend that hosts this run.
 	 */
 	readonly burrowId: string;
 	readonly repos: Repos;
 	readonly broker: RunEventBroker;
 	/**
-	 * Multi-worker burrow pool (warren-c0c9 / pl-9ba1 step 5). bridge resolves
-	 * the owning worker via `pool.clientFor({burrowId})` for the
-	 * `http.runs.stream` poll. Propagates `StickyWorkerUnreachableError`
-	 * (503 via src/server/errors.ts) when the pinned worker is `unreachable`.
+	 * Runtime-provider seam (K8s migration pl-829f step 13 / warren-1f56,
+	 * warren-1fce). The bridge's backend touchpoints route through it: the event
+	 * stream is `provider.streamEvents(handle, { sinceSeq })` (resume cursor), the
+	 * run-state poller reads `provider.status(handle)`, and the budget-cap graceful
+	 * stop is `provider.cancel(handle)`. Event persistence + warren seq
+	 * bookkeeping, poller cadence, and terminal-reconciliation decisions stay
+	 * DOMAIN (they run over the seam's output). Ignored when a test `source`
+	 * overrides the stream.
 	 */
-	readonly burrowClientPool: BurrowClientPool;
+	readonly runtimeProvider: RuntimeProvider;
 	readonly signal?: AbortSignal;
-	/**
-	 * Run mode (warren-df71). When `'conversation'`, the bridge treats a pi
-	 * `agent_end` as a TURN boundary rather than a run terminal: it persists
-	 * the turn's usage + assistant text and applies any `propose_intent`
-	 * patch, then KEEPS the run `running` (no break, no inline reap). Omitted
-	 * / any other value behaves exactly as before — non-conversation run
-	 * lifecycles are unchanged.
-	 */
+	/** Run mode. */
 	readonly mode?: RunMode;
 	/**
-	 * Conversation-turn side-effect seam (warren-df71). Consulted only when
-	 * `mode === 'conversation'` to persist assistant turns and apply
-	 * `propose_intent` patches. Omit for non-conversation runs.
+	 * Override the stream source (tests). Default: the run's
+	 * `provider.streamEvents(handle)` adapted to the abort signal. Typed against
+	 * the provider-neutral `StreamEventView` so both the seam's `NormalizedEvent`
+	 * (production) and burrow's `RunEvent` (existing test fixtures) satisfy it.
 	 */
-	readonly conversationTurn?: ConversationTurnHandler;
-	/** Override the stream source (tests). Default: `client.http.runs.stream`. */
-	readonly source?: (signal: AbortSignal) => AsyncIterable<RunEvent>;
+	readonly source?: (signal: AbortSignal) => AsyncIterable<StreamEventView>;
 	readonly logger?: BridgeLogger;
 	/**
 	 * Pi cost-stats consumer (warren-a7dc). Set when the bridged run uses
@@ -157,6 +184,14 @@ export interface BridgeRunStreamInput {
 	/** Override the post-terminal drain window (ms). Default 1000. */
 	readonly runStateDrainMs?: number;
 	/**
+	 * Override the bounded provider-stream teardown ceiling (ms) applied after the
+	 * poller aborts (warren-c433). Default `DEFAULT_STREAM_TEARDOWN_MS`. Only takes
+	 * effect on the default provider-stream wiring (a test `source` override owns
+	 * its own teardown); tests pin it small to prove a hung K8s log pump can't wedge
+	 * the bridge's path to terminal/reap.
+	 */
+	readonly streamTeardownMs?: number;
+	/**
 	 * Effective per-run spend cap in USD (warren-a63d). When set, the
 	 * bridge cancels the run once cumulative cost crosses it. Normally
 	 * resolved by the bridge itself from `runs.rendered_agent_json`
@@ -164,8 +199,6 @@ export interface BridgeRunStreamInput {
 	 * enforcement without seeding a run row.
 	 */
 	readonly costCapUsd?: number;
-	/** Effective token budget; resolved from frozen agent frontmatter when omitted. */
-	readonly tokenBudget?: TokenBudgetConfig;
 	/**
 	 * Override the graceful-cancel seam used when the spend cap trips
 	 * (warren-a63d, tests). Production defaults to a closure over the
@@ -188,7 +221,19 @@ export interface BridgeRunStreamResult {
 	 * as the signal to call `reapRun` with the inferred outcome. Absent
 	 * for bridges that ended via abort, error, or natural source close.
 	 */
-	readonly terminalDetected?: { readonly outcome: RunTerminalState };
+	readonly terminalDetected?: {
+		readonly outcome: RunTerminalState;
+		/**
+		 * Explicit `failure_reason` the domain should finalize with, overriding
+		 * reap's `inferFailureReason` (warren-9cce). Set only for the plan-mandated
+		 * OOM surfacing: when the run-state poller reconciles a burrow-terminal run
+		 * whose `provider.status().terminalReason === "oom_killed"`, it carries
+		 * `"oom_killed"` here so the registry's inline reap records it instead of
+		 * collapsing an OOM kill into an anonymous `crashed`/`no_model_response`.
+		 * Absent otherwise (the in-stream terminal path carries no coarse reason).
+		 */
+		readonly failureReason?: RunFailureReason;
+	};
 	/**
 	 * Set when burrow returned 404 / NotFoundError for the run's
 	 * `burrow_run_id` while polling the stream (warren-b1a9). Indicates a
@@ -205,4 +250,37 @@ export interface BridgeRunStreamResult {
 export interface BurrowTerminalSnapshot {
 	readonly state: RunTerminalState;
 	readonly exitCode: number | null;
+	/**
+	 * Domain `failure_reason` distilled from the probe's coarse `terminalReason`
+	 * (warren-9cce). Populated only for `"oom_killed"` today; the bridge forwards
+	 * it onto the synthesized `terminalDetected.failureReason`. Absent otherwise.
+	 */
+	readonly failureReason?: RunFailureReason;
+}
+
+/**
+ * The bridge registry. Per-run bridges are created when `POST /runs`
+ * lands and on warren startup via `recoverActiveRunStreams`; the
+ * registry tracks them so server shutdown can abort everyone in one
+ * pass. Concrete impl lives in `src/server/bridges.ts`.
+ *
+ * The interface lives here, with the bridge it registers, rather than in
+ * `src/server/types.ts` (warren-89a6). The plan-run dispatcher needs the
+ * type and is domain code, so declaring it on the HTTP surface made a
+ * domain module import the server. `src/server/types.ts` re-exports it,
+ * so the ~20 server-side consumers are unchanged.
+ */
+export interface BridgeRegistry {
+	/**
+	 * Start a bridge for the given run; idempotent against a running bridge.
+	 * `burrowId` is required so the bridge can resolve the owning worker via
+	 * `BurrowClient.clientFor` (warren-c0c9). `mode` (warren-df71) makes a
+	 * `'conversation'` run keep-alive across pi `agent_end` turn boundaries;
+	 * omit / `'batch'` retains the prior one-shot terminal behaviour.
+	 */
+	start(runId: string, burrowRunId: string, burrowId: string, mode?: RunMode): void;
+	/** Abort all in-flight bridges and await their drain. */
+	stopAll(): Promise<void>;
+	/** Test/diagnostic surface — number of currently-attached bridges. */
+	size(): number;
 }

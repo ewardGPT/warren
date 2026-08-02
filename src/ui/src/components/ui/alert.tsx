@@ -1,11 +1,5 @@
 import { cva, type VariantProps } from "class-variance-authority";
-import {
-	AlertCircle,
-	AlertTriangle,
-	CheckCircle2,
-	Info,
-	type LucideIcon,
-} from "lucide-react";
+import { AlertCircle, AlertTriangle, CheckCircle2, Info, type LucideIcon } from "lucide-react";
 import * as React from "react";
 import { cn } from "@/lib/utils.ts";
 
@@ -57,7 +51,10 @@ const alertVariants = cva(
 	},
 );
 
-const VARIANT_ICON: Record<NonNullable<VariantProps<typeof alertVariants>["variant"]>, LucideIcon> = {
+const VARIANT_ICON: Record<
+	NonNullable<VariantProps<typeof alertVariants>["variant"]>,
+	LucideIcon
+> = {
 	info: Info,
 	success: CheckCircle2,
 	warning: AlertTriangle,

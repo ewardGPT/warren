@@ -1,13 +1,6 @@
 import * as ToastPrimitive from "@radix-ui/react-toast";
 import { cva, type VariantProps } from "class-variance-authority";
-import {
-	AlertCircle,
-	AlertTriangle,
-	CheckCircle2,
-	Info,
-	type LucideIcon,
-	X,
-} from "lucide-react";
+import { AlertCircle, AlertTriangle, CheckCircle2, Info, type LucideIcon, X } from "lucide-react";
 import * as React from "react";
 import { cn } from "@/lib/utils.ts";
 
@@ -51,7 +44,10 @@ const toastVariants = cva(
 	},
 );
 
-const VARIANT_ICON: Record<NonNullable<VariantProps<typeof toastVariants>["variant"]>, LucideIcon> = {
+const VARIANT_ICON: Record<
+	NonNullable<VariantProps<typeof toastVariants>["variant"]>,
+	LucideIcon
+> = {
 	info: Info,
 	success: CheckCircle2,
 	warning: AlertTriangle,
@@ -81,14 +77,11 @@ let toastSeq = 0;
 export function ToastProvider({ children }: { children: React.ReactNode }) {
 	const [items, setItems] = React.useState<ToastItem[]>([]);
 
-	const toast = React.useCallback(
-		(input: Omit<ToastItem, "id"> & { id?: string }): string => {
-			const id = input.id ?? `t-${++toastSeq}`;
-			setItems((prev) => [...prev.filter((i) => i.id !== id), { ...input, id }]);
-			return id;
-		},
-		[],
-	);
+	const toast = React.useCallback((input: Omit<ToastItem, "id"> & { id?: string }): string => {
+		const id = input.id ?? `t-${++toastSeq}`;
+		setItems((prev) => [...prev.filter((i) => i.id !== id), { ...input, id }]);
+		return id;
+	}, []);
 	const dismiss = React.useCallback((id: string) => {
 		setItems((prev) => prev.filter((i) => i.id !== id));
 	}, []);
@@ -111,10 +104,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
 							}}
 							className={cn(toastVariants({ variant: v }))}
 						>
-							<Icon
-								aria-hidden="true"
-								className="mt-0.5 h-4 w-4 shrink-0 text-(--color-fg)"
-							/>
+							<Icon aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-(--color-fg)" />
 							<div className="min-w-0 flex-1 space-y-0.5">
 								{it.title ? (
 									<ToastPrimitive.Title className="font-medium leading-tight">

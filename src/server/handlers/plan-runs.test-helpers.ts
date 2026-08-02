@@ -1,14 +1,9 @@
-import { BurrowClient, BurrowClientPool } from "../../burrow-client/index.ts";
+import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
-import type {
-	ActivatePlanRunPlotInput,
-	AppendPlanRunDispatchedInput,
-	PlanRunPlotActivator,
-	PlanRunPlotAppender,
-} from "../../plan-runs/plot-appender.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "../../projects/clone.ts";
 import { RunEventBroker } from "../../runs/index.ts";
+import { resolveRuntimeProvider } from "../../runtime/registry.ts";
 import { createBridgeRegistry } from "../bridges.ts";
 import type { BridgeRegistry, Logger, ServeHandle, ServerDeps } from "../types.ts";
 
@@ -78,29 +73,25 @@ export function seedShowResult(
 	};
 }
 
-export async function poolFor(repos: Repos): Promise<BurrowClientPool> {
-	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
-	const pool = new BurrowClientPool({ repos });
+export async function poolFor(_repos: Repos): Promise<BurrowClient> {
 	const client = new BurrowClient({
 		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 		fetch: stubFetch(async () => jsonRes(404, { error: { code: "not_found", message: "stub" } })),
 	});
-	pool.register("local", client);
-	return pool;
+	return client;
 }
 
 export interface BuildDepsInput {
 	repos: Repos;
 	sdSpawn: SpawnFn;
 	bridges?: BridgeRegistry;
-	planRunPlotAppender?: PlanRunPlotAppender;
-	planRunPlotActivator?: PlanRunPlotActivator;
 	logger?: Logger;
-	plotResolver?: import("../../plots/index.ts").PlotResolver;
 	/** Wire the git `spawn` seam so the plan-run handler refreshes the clone (warren-6d60). */
 	spawn?: SpawnFn;
 	/** Stub the project refresher so tests assert the refresh without shelling out (warren-6d60). */
 	refreshProjectFn?: ServerDeps["refreshProjectFn"];
+	/** Event-stream concurrency caps (warren-25f6). Omitted ⇒ uncapped. */
+	streamLimiter?: ServerDeps["streamLimiter"];
 }
 
 export async function depsFor(input: BuildDepsInput): Promise<ServerDeps> {
@@ -108,57 +99,23 @@ export async function depsFor(input: BuildDepsInput): Promise<ServerDeps> {
 	const pool = await poolFor(input.repos);
 	return {
 		repos: input.repos,
-		burrowClientPool: pool,
+		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => pool }),
 		broker,
 		bridges:
 			input.bridges ??
 			createBridgeRegistry({
 				repos: input.repos,
 				broker,
-				burrowClientPool: pool,
+				runtimeProvider: resolveRuntimeProvider({ burrowClient: () => pool }),
 				bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 			}),
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
 		logger: input.logger ?? silentLogger,
 		uiDistDir: null,
 		seedsCli: { sdBinary: "sd", spawn: input.sdSpawn },
-		...(input.planRunPlotAppender !== undefined
-			? { planRunPlotAppender: input.planRunPlotAppender }
-			: {}),
-		...(input.planRunPlotActivator !== undefined
-			? { planRunPlotActivator: input.planRunPlotActivator }
-			: {}),
-		...(input.plotResolver !== undefined ? { plotResolver: input.plotResolver } : {}),
 		...(input.spawn !== undefined ? { spawn: input.spawn } : {}),
 		...(input.refreshProjectFn !== undefined ? { refreshProjectFn: input.refreshProjectFn } : {}),
-	};
-}
-
-export function makePlanRunAppender(
-	opts: { calls?: AppendPlanRunDispatchedInput[]; throws?: Error } = {},
-): PlanRunPlotAppender {
-	const calls = opts.calls ?? [];
-	return {
-		async appendPlanRunDispatched(input) {
-			calls.push(input);
-			if (opts.throws) throw opts.throws;
-		},
-	};
-}
-
-export function makePlanRunActivator(
-	opts: { calls?: ActivatePlanRunPlotInput[]; throws?: Error; currentStatus?: string } = {},
-): PlanRunPlotActivator {
-	const calls = opts.calls ?? [];
-	return {
-		async activatePlanRunPlot(input) {
-			calls.push(input);
-			if (opts.throws) throw opts.throws;
-			if (opts.currentStatus !== undefined && opts.currentStatus !== "ready") {
-				return { kind: "skipped", currentStatus: opts.currentStatus };
-			}
-			return { kind: "activated", previousStatus: "ready" };
-		},
+		...(input.streamLimiter !== undefined ? { streamLimiter: input.streamLimiter } : {}),
 	};
 }
 
@@ -192,8 +149,6 @@ export interface PlanRunFixture {
 	repos: Repos;
 	projectId: string;
 	seedyProjectId: string;
-	plottedProjectId: string;
-	barePlottedProjectId: string;
 }
 
 export async function setupPlanRunFixture(): Promise<PlanRunFixture> {
@@ -223,26 +178,10 @@ export async function setupPlanRunFixture(): Promise<PlanRunFixture> {
 		defaultBranch: "main",
 		hasSeeds: false,
 	});
-	const plotted = await repos.projects.create({
-		gitUrl: "https://github.com/x/plotted.git",
-		localPath: "/tmp/plotted",
-		defaultBranch: "main",
-		hasSeeds: true,
-		hasPlot: true,
-	});
-	const barePlotted = await repos.projects.create({
-		gitUrl: "https://github.com/x/bare-plotted.git",
-		localPath: "/tmp/bare-plotted",
-		defaultBranch: "main",
-		hasSeeds: false,
-		hasPlot: true,
-	});
 	return {
 		db,
 		repos,
 		projectId: bare.id,
 		seedyProjectId: seedy.id,
-		plottedProjectId: plotted.id,
-		barePlottedProjectId: barePlotted.id,
 	};
 }

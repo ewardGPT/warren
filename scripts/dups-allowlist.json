@@ -1,0 +1,70 @@
+{
+	"_comment": "Grandfathered clones for the scoped jscpd run (warren-032a, .jscpd.scoped.json). The scoped run reads src/cli, src/client, src/ui/src/api and src/server/handlers at 40 tokens with a 0% threshold, so ANY clone across those surfaces fails unless it is listed here. Entries are file PAIRS, not line ranges, so ordinary edits do not churn the list; `a` and `b` are repo-relative POSIX and order does not matter. Every entry states why the copy is tolerated. Ratchet only goes down — delete an entry when the clone is gone (a stale entry fails the gate on purpose), and add one only with a reason.",
+	"allowlist": [
+		{
+			"a": "src/cli/commands/config-migrate.ts",
+			"b": "src/cli/commands/init.ts",
+			"why": "`resolveTargetDir` plus the --project/--cwd resolution around it. Both commands write .warren/config.yaml and resolve the target directory the same way. A real extraction candidate, left alone because it is outside warren-032a's scope."
+		},
+		{
+			"a": "src/cli/commands/plan-run.ts",
+			"b": "src/cli/commands/plan-status.ts",
+			"why": "The `client.probe()` reachability check and its `warren: <error>` stderr tail. Every remote CLI command ends this way; the shared part is the exit convention, not logic."
+		},
+		{
+			"a": "src/cli/main.ts",
+			"b": "src/cli/main.ts",
+			"why": "Commander `.option()` / `.action()` wiring repeated once per subcommand. Per-command declaration is the shape the library asks for; collapsing it hides which flags a command takes."
+		},
+		{
+			"a": "src/client/client.ts",
+			"b": "src/ui/src/api/client.ts",
+			"why": "The run-events querystring builder, duplicated because the SDK client and the UI client are two API clients over one API. Collapsing them is a separate piece of work."
+		},
+		{
+			"a": "src/client/ndjson.ts",
+			"b": "src/ui/src/api/client.ts",
+			"why": "The NDJSON stream parser, implemented twice — src/client/ndjson.ts even documents that it mirrors the UI copy. The UI cannot import the SDK module until src/ui/tsconfig.app.json includes it, which is the first step of the two-client collapse, so the fix is a follow-up rather than part of warren-032a."
+		},
+		{
+			"a": "src/client/types.plan-runs.ts",
+			"b": "src/ui/src/api/types.ts",
+			"why": "Plan-run wire rows. src/ui is a separate composite TS project that cannot import the SDK types (mx-2e4a1a), so the wire vocabulary is mirrored; `bun run check:wire-types` is what keeps the two copies from drifting."
+		},
+		{
+			"a": "src/client/types.ts",
+			"b": "src/ui/src/api/types.ts",
+			"why": "Same mirrored wire vocabulary as the plan-run rows above, guarded by check:wire-types."
+		},
+		{
+			"a": "src/server/handlers/alerts.ts",
+			"b": "src/server/handlers/projects.ts",
+			"why": "The `spawnRun` argument object. Both routes dispatch a run, so they pass the same optional-spread deps; the dispatch logic itself lives once in src/runs/spawn/dispatch.ts."
+		},
+		{
+			"a": "src/server/handlers/plan-runs.ts",
+			"b": "src/server/handlers/runs/events.ts",
+			"why": "The NDJSON response wrapper shared by the run and plan-run event streams (abort controller, `asNdjsonStream`, `ndjsonResponse`). Both already call the same three helpers; only the call site repeats."
+		},
+		{
+			"a": "src/server/handlers/projects.ts",
+			"b": "src/server/handlers/projects.ts",
+			"why": "The project-lookup-then-load-warren-config preamble, repeated by the warren-config, triggers and trigger-run routes. Same thin-surface argument as the :id preamble above."
+		},
+		{
+			"a": "src/server/handlers/runs/analytics.ts",
+			"b": "src/server/handlers/runs/lifecycle.ts",
+			"why": "Analytics window parsing and the run-row projection. mx-24e25f records that the analytics handler deliberately mirrors the list-runs handler so the two payloads keep the same recognisable shape."
+		},
+		{
+			"a": "src/server/handlers/runs/analytics.ts",
+			"b": "src/ui/src/api/types.ts",
+			"why": "The analytics response interface, mirrored into the UI types for the same composite-project reason as the other wire types."
+		},
+		{
+			"a": "src/ui/src/api/client.ts",
+			"b": "src/ui/src/api/client.ts",
+			"why": "Per-endpoint URLSearchParams filter builders and the error-envelope parse. Grandfathered by warren-032a, which is what first pointed a zero-threshold jscpd run at src/ui; the fix belongs with the two-client collapse, not with a gate change."
+		}
+	]
+}

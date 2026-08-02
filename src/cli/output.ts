@@ -7,7 +7,12 @@
  * tests pass capture-buffers and synthetic env tables.
  */
 
-import type { SpawnFn as ProjectsSpawnFn, SpawnOptions, SpawnResult } from "../projects/clone.ts";
+import {
+	defaultSpawn,
+	type SpawnFn as ProjectsSpawnFn,
+	type SpawnOptions,
+	type SpawnResult,
+} from "../projects/clone.ts";
 
 export interface WriteSink {
 	write(chunk: string): void;
@@ -49,30 +54,10 @@ export const PROCESS_STDIO: Stdio = {
 };
 
 /**
- * Default `Bun.spawn` adaptor matching the SpawnFn shape the registry +
- * projects modules expect. One of three identical copies, alongside
- * `defaultSpawn` in src/server/main/utils.ts and src/server/handlers/index.ts;
- * the duplication is deliberate so neither surface imports the other.
+ * The production `Bun.spawn` adaptor, re-exported so CLI commands keep
+ * importing their seams from one module.
  */
-export const defaultSpawn: CliSpawn = async (cmd, opts) => {
-	const proc = Bun.spawn({
-		cmd: [...cmd],
-		cwd: opts.cwd,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const timer =
-		opts.timeoutMs !== undefined && opts.timeoutMs > 0
-			? setTimeout(() => proc.kill(), opts.timeoutMs)
-			: null;
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
-	if (timer !== null) clearTimeout(timer);
-	return { stdout, stderr, exitCode: exitCode ?? 0 };
-};
+export { defaultSpawn };
 
 /** Print one JSON object per line ('\n' terminator) to a sink. */
 export function writeJsonLine(sink: WriteSink, value: unknown): void {

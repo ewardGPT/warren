@@ -11,10 +11,11 @@
 
 import { PREVIEW_MAX_LIVE_WARN_RATIO } from "../preview/eviction/index.ts";
 import { type PortUsage, PREVIEW_PORT_USAGE_WARN_RATIO } from "../preview/port-allocator.ts";
-import type { DiagnosticCheck, EnvLike } from "./checks.ts";
+import type { DiagnosticCheck, DiagnosticLogger, EnvLike } from "./checks.ts";
+import { dbFailureMessage } from "./redact.ts";
 
 /**
- * Preview port allocator saturation (R-19 / SPEC §11.L, warren-2277). Fails
+ * Preview port allocator saturation (R-19 / docs/design/preview-environments.md, warren-2277). Fails
  * when ≥ `warnRatio` of the configured port range is in use by `starting`
  * or `live` runs — operators can either raise `WARREN_PREVIEW_PORT_RANGE`
  * or tighten idle-TTL / max-lifetime so the eviction worker reclaims
@@ -28,6 +29,7 @@ export interface PreviewPortUsageProbe {
 export async function checkPreviewPortAllocator(deps: {
 	readonly probe: PreviewPortUsageProbe;
 	readonly warnRatio?: number;
+	readonly log?: DiagnosticLogger;
 }): Promise<DiagnosticCheck> {
 	const warnRatio = deps.warnRatio ?? PREVIEW_PORT_USAGE_WARN_RATIO;
 	let usage: PortUsage;
@@ -37,7 +39,7 @@ export async function checkPreviewPortAllocator(deps: {
 		return {
 			name: "preview_port_allocator",
 			ok: false,
-			message: err instanceof Error ? err.message : String(err),
+			message: dbFailureMessage("preview_port_allocator", err, deps.log),
 			hint: "verify WARREN_DB_URL is reachable and the runs table has the preview columns (migration 0009)",
 		};
 	}
@@ -55,7 +57,7 @@ export async function checkPreviewPortAllocator(deps: {
 }
 
 /**
- * Live-preview saturation against the global cap (R-19 / SPEC §11.L,
+ * Live-preview saturation against the global cap (R-19 / docs/design/preview-environments.md,
  * warren-ea6b). Fails when the count of `starting`/`live` previews is at
  * or above `warnRatio` of `WARREN_PREVIEW_MAX_LIVE`. Operators tighten
  * `WARREN_PREVIEW_IDLE_TTL` / `WARREN_PREVIEW_MAX_LIFETIME` so the
@@ -71,6 +73,7 @@ export async function checkPreviewMaxLive(deps: {
 	readonly probe: PreviewLiveCountProbe;
 	readonly maxLive: number;
 	readonly warnRatio?: number;
+	readonly log?: DiagnosticLogger;
 }): Promise<DiagnosticCheck> {
 	const warnRatio = deps.warnRatio ?? PREVIEW_MAX_LIVE_WARN_RATIO;
 	let live: number;
@@ -80,7 +83,7 @@ export async function checkPreviewMaxLive(deps: {
 		return {
 			name: "preview_max_live",
 			ok: false,
-			message: err instanceof Error ? err.message : String(err),
+			message: dbFailureMessage("preview_max_live", err, deps.log),
 			hint: "verify WARREN_DB_URL is reachable and the runs table has the preview columns (migration 0009)",
 		};
 	}
@@ -98,14 +101,19 @@ export async function checkPreviewMaxLive(deps: {
 }
 
 /**
- * Preview signed-cookie auth strength check (R-19 / SPEC §11.L,
+ * Preview signed-cookie auth strength check (R-19 / docs/design/preview-environments.md,
  * warren-8a10). When `WARREN_PREVIEW_HOST` is set, the proxy preamble
  * is gated by an HMAC derived from `WARREN_API_TOKEN`. A weak token
  * ("changeme", "warren-token", a tutorial copy-paste) leaves a
  * private-code preview accessible to anyone who can guess the token —
- * the SPEC's risk #2 mitigation. Warns when the token matches a
+ * the preview-environment contract's risk #2 mitigation. Warns when the token matches a
  * placeholder or is shorter than `MIN_TOKEN_LENGTH`. No-ops when
  * `WARREN_PREVIEW_HOST` is absent (the proxy surface is off).
+ *
+ * The messages report only whether each value is CONFIGURED, never the
+ * token's length or the host's value (warren-51de): `/readyz` renders them
+ * verbatim, and a token length is a real search-space reduction for anyone
+ * who can read the payload.
  */
 export const PREVIEW_TOKEN_PLACEHOLDERS: readonly string[] = [
 	"changeme",
@@ -148,9 +156,13 @@ export function checkPreviewAuthStrength(deps: { readonly env: EnvLike }): Diagn
 		return {
 			name: "preview_auth_strength",
 			ok: false,
-			message: `WARREN_API_TOKEN is ${token.length} chars; preview surface needs ≥${PREVIEW_MIN_TOKEN_LENGTH}`,
+			message: "WARREN_API_TOKEN is shorter than the preview surface minimum",
 			hint: "rotate WARREN_API_TOKEN to a strong random value (e.g. `openssl rand -hex 32`)",
 		};
 	}
-	return { name: "preview_auth_strength", ok: true, message: `host=${host}` };
+	return {
+		name: "preview_auth_strength",
+		ok: true,
+		message: "WARREN_PREVIEW_HOST and WARREN_API_TOKEN configured",
+	};
 }

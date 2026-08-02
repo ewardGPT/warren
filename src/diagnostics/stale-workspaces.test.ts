@@ -1,24 +1,28 @@
 import { describe, expect, test } from "bun:test";
-import type { BurrowRow, RunRow } from "../db/schema.ts";
+import type { RunRow, RunState } from "../db/schema.ts";
 import { checkStaleBurrowWorkspaces } from "./stale-workspaces.ts";
 
 const NOW = new Date("2026-05-29T12:00:00.000Z");
-
-function burrow(id: string, addedAt: string): BurrowRow {
-	return { id, workerId: "local", addedAt };
-}
 
 function terminalRun(burrowId: string, endedAt: string): RunRow {
 	return { burrowId, endedAt, state: "succeeded" } as unknown as RunRow;
 }
 
+function activeRun(burrowId: string): RunRow {
+	return { burrowId, endedAt: null, state: "running" } as unknown as RunRow;
+}
+
+/** Route a listByState mock: active states → active rows, else terminal rows. */
+function probe(active: RunRow[], terminal: RunRow[]) {
+	return {
+		listByState: async (states: RunState[]) => (states.includes("running") ? active : terminal),
+	};
+}
+
 describe("checkStaleBurrowWorkspaces", () => {
 	test("ok when nothing is stranded", async () => {
 		const result = await checkStaleBurrowWorkspaces({
-			probe: {
-				listAll: async () => [burrow("bur_a", NOW.toISOString())],
-				listByState: async () => [],
-			},
+			probe: probe([], []),
 			ttlMs: 60 * 60_000,
 			now: NOW,
 		});
@@ -28,10 +32,7 @@ describe("checkStaleBurrowWorkspaces", () => {
 
 	test("warns with a recovery hint when burrows are stranded", async () => {
 		const result = await checkStaleBurrowWorkspaces({
-			probe: {
-				listAll: async () => [burrow("bur_old", "2026-05-29T09:00:00.000Z")],
-				listByState: async () => [],
-			},
+			probe: probe([], [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")]),
 			ttlMs: 60 * 60_000,
 			now: NOW,
 		});
@@ -40,13 +41,9 @@ describe("checkStaleBurrowWorkspaces", () => {
 		expect(result.hint).toContain("workspace GC");
 	});
 
-	test("a recent terminal run keeps a long-lived burrow live", async () => {
+	test("a recent terminal run keeps a burrow live", async () => {
 		const result = await checkStaleBurrowWorkspaces({
-			probe: {
-				listAll: async () => [burrow("bur_x", "2026-01-01T00:00:00.000Z")],
-				listByState: async (states) =>
-					states.includes("succeeded") ? [terminalRun("bur_x", "2026-05-29T11:50:00.000Z")] : [],
-			},
+			probe: probe([], [terminalRun("bur_x", "2026-05-29T11:50:00.000Z")]),
 			ttlMs: 60 * 60_000,
 			now: NOW,
 		});
@@ -55,31 +52,31 @@ describe("checkStaleBurrowWorkspaces", () => {
 
 	test("an active run is never stranded", async () => {
 		const result = await checkStaleBurrowWorkspaces({
-			probe: {
-				listAll: async () => [burrow("bur_live", "2026-05-01T00:00:00.000Z")],
-				listByState: async (states) =>
-					states.includes("running")
-						? [{ burrowId: "bur_live", state: "running" } as unknown as RunRow]
-						: [],
-			},
+			probe: probe([activeRun("bur_live")], [terminalRun("bur_live", "2026-05-01T00:00:00.000Z")]),
 			ttlMs: 60 * 60_000,
 			now: NOW,
 		});
 		expect(result.ok).toBe(true);
 	});
 
-	test("fails loudly when the probe throws", async () => {
+	test("fails with a reason code and logs the raw driver text (warren-51de)", async () => {
+		const logged: object[] = [];
 		const result = await checkStaleBurrowWorkspaces({
 			probe: {
-				listAll: async () => {
-					throw new Error("db down");
+				listByState: async () => {
+					throw new Error("connection to server at 10.0.0.4 port 5432 failed: ECONNREFUSED");
 				},
-				listByState: async () => [],
 			},
 			ttlMs: 60 * 60_000,
 			now: NOW,
+			log: { warn: (obj) => logged.push(obj) },
 		});
 		expect(result.ok).toBe(false);
-		expect(result.message).toBe("db down");
+		expect(result.message).toBe("probe failed (reason=unreachable)");
+		expect(result.message).not.toContain("5432");
+		expect(logged[0]).toMatchObject({
+			check: "stale_burrow_workspaces",
+			reason: "unreachable",
+		});
 	});
 });
