@@ -30,6 +30,7 @@ export interface UpsertTriggerInput extends TriggerKey {
 	lastFiredAt?: string | null;
 	nextFireAt?: string | null;
 	lastRunId?: string | null;
+	fireCount?: number;
 }
 
 export interface RecordFireInput extends TriggerKey {
@@ -66,6 +67,7 @@ export class TriggersRepo {
 				if (input.lastFiredAt !== undefined) patch.lastFiredAt = input.lastFiredAt;
 				if (input.nextFireAt !== undefined) patch.nextFireAt = input.nextFireAt;
 				if (input.lastRunId !== undefined) patch.lastRunId = input.lastRunId;
+				if (input.fireCount !== undefined) patch.fireCount = input.fireCount;
 				if (Object.keys(patch).length === 0) return existing;
 				await tx.runWrite(txDb.update(triggers).set(patch).where(eq(triggers.id, id)));
 				return { ...existing, ...patch };
@@ -77,6 +79,7 @@ export class TriggersRepo {
 				lastFiredAt: input.lastFiredAt ?? null,
 				nextFireAt: input.nextFireAt ?? null,
 				lastRunId: input.lastRunId ?? null,
+				fireCount: input.fireCount ?? 0,
 			};
 			await tx.runWrite(txDb.insert(triggers).values(row));
 			return row;
@@ -91,13 +94,21 @@ export class TriggersRepo {
 	 * points at the past).
 	 */
 	async recordFire(input: RecordFireInput): Promise<TriggerRow> {
+		const existing = await this.get({ projectId: input.projectId, triggerId: input.triggerId });
+		const fireCount = (existing?.fireCount ?? 0) + 1;
 		return this.upsert({
 			projectId: input.projectId,
 			triggerId: input.triggerId,
 			lastFiredAt: input.firedAt.toISOString(),
 			nextFireAt: input.nextFireAt ? input.nextFireAt.toISOString() : null,
 			lastRunId: input.runId,
+			fireCount,
 		});
+	}
+
+	async getFireCount(key: TriggerKey): Promise<number> {
+		const row = await this.get(key);
+		return row?.fireCount ?? 0;
 	}
 
 	async get(key: TriggerKey): Promise<TriggerRow | null> {

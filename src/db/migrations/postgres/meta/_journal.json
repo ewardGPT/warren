@@ -162,6 +162,13 @@
 			"when": 1785639749981,
 			"tag": "0022_married_loners",
 			"breakpoints": true
+		},
+		{
+			"idx": 23,
+			"version": "7",
+			"when": 1785650114001,
+			"tag": "0023_dusty_ironclad",
+			"breakpoints": true
 		}
 	]
 }

@@ -41,8 +41,11 @@
 
 import { z } from "zod";
 import { parseDurationMs } from "../preview/duration.ts";
+import { CortexConfigSchema } from "./cortex-config.ts";
 import { CiFixerConfigSchema, HealerConfigSchema } from "./feature-loop-config.ts";
+import { GoalTriggerSchema, LoopTriggerSchema } from "./trigger-loop-config.ts";
 
+export type { CortexConfig } from "./cortex-config.ts";
 // warren-3db0: re-exported so the historical import sites (and
 // `warren-config/index.ts`) keep resolving these from `./schema.ts`
 // after the extraction into `feature-loop-config.ts`.
@@ -59,6 +62,7 @@ export {
 	type HealerConfig,
 	HealerConfigSchema,
 } from "./feature-loop-config.ts";
+export type { GoalTrigger, LoopTrigger } from "./trigger-loop-config.ts";
 
 const TriggerIdSchema = z
 	.string()
@@ -348,8 +352,11 @@ const CronTriggerSchema = z
 	})
 	.strict();
 
-export const TriggerSchema = z.discriminatedUnion("kind", [CronTriggerSchema]);
-
+export const TriggerSchema = z.discriminatedUnion("kind", [
+	CronTriggerSchema,
+	GoalTriggerSchema,
+	LoopTriggerSchema,
+]);
 export const TriggersConfigSchema = z.array(TriggerSchema).superRefine((list, ctx) => {
 	const seen = new Set<string>();
 	list.forEach((entry, index) => {
@@ -398,6 +405,8 @@ export const DefaultsConfigSchema = z
 		ciFixer: CiFixerConfigSchema.optional(),
 		// warren-3db0: opt-in closed-loop healer; missing block → intake skips it.
 		healer: HealerConfigSchema.optional(),
+		// Agent Cortex: optional URL/role overrides when `cortex.yaml` is present.
+		cortex: CortexConfigSchema.optional(),
 		qualityGate: z.string().min(1, "qualityGate must be non-empty if provided").optional(),
 	})
 	.strict();

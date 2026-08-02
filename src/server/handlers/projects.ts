@@ -229,7 +229,9 @@ export function getProjectTriggersHandler(deps: ServerDeps): RouteHandler {
 		const now = deps.now?.() ?? new Date();
 		const summaries = await buildTriggerSummaries({
 			projectId: project.id,
-			triggers: loaded.triggers ?? [],
+			triggers: (loaded.triggers ?? []).filter(
+				(trigger): trigger is CronTrigger => trigger.kind === "cron",
+			),
 			repo: deps.repos.triggers,
 			now,
 		});
@@ -254,7 +256,9 @@ export function runProjectTriggerHandler(deps: ServerDeps): RouteHandler {
 				? await deps.warrenConfigs.get(project.id, project.localPath)
 				: await loadWarrenConfig({ projectPath: project.localPath });
 
-		const trigger = (loaded.triggers ?? []).find((t): t is CronTrigger => t.id === triggerId);
+		const trigger = (loaded.triggers ?? []).find(
+			(t): t is CronTrigger => t.kind === "cron" && t.id === triggerId,
+		);
 		if (trigger === undefined) {
 			throw new NotFoundError(
 				`trigger '${triggerId}' not found in .warren/triggers.yaml for project ${project.id}`,

@@ -265,10 +265,9 @@ export const events = sqliteTable(
  * composite string `<projectId>:<triggerId>` so the scheduler tick can write
  * back last/next fire timestamps without juggling a separate generated id —
  * the trigger's authoring identity in YAML is what survives across restarts.
- *
- * The trigger definition itself stays in .warren/triggers.yaml (R-02); only
- * mutable scheduler bookkeeping lives here. last_run_id points at the most
- * recent dispatched run (ON DELETE SET NULL so deleting a run row doesn't
+ * Trigger definitions stay in .warren/triggers.yaml (R-02); only mutable
+ * Scheduler bookkeeping lives here. last_run_id points at the most recent dispatched run
+ * (ON DELETE SET NULL so deleting a run row doesn't
  * orphan the trigger). project_id is the cascade root — deleting the project
  * drops its triggers, mirroring the .warren/ clone going away with it.
  */
@@ -283,6 +282,7 @@ export const triggers = sqliteTable(
 		lastFiredAt: text("last_fired_at"),
 		nextFireAt: text("next_fire_at"),
 		lastRunId: text("last_run_id").references(() => runs.id, { onDelete: "set null" }),
+		fireCount: integer("fire_count").notNull().default(0),
 	},
 	(t) => [index(INDEX_NAMES.triggersProject).on(t.projectId)],
 );

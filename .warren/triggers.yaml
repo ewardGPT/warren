@@ -5,17 +5,19 @@
 # implemented; the `kind:` discriminator leaves room for future
 # webhook-style triggers without a breaking schema rev.
 #
-# Required fields: id, kind, cron, role.
+# Required fields: id, kind, role. Cron and loop triggers also require cron.
 # Optional fields: seed, timezone (default UTC), prompt.
 #
 # Field rules (TriggersConfigSchema in src/warren-config/schema.ts):
 #   id        kebab/snake-case (lowercase, digits, dots, dashes, _). Unique.
-#   kind      'cron'
-#   cron      5 or 6 whitespace-separated fields (croner-compatible)
+#   kind      'cron', 'goal', or 'loop'
+#   cron      5 or 6 whitespace-separated fields (croner-compatible) for cron/loop
 #   seed      seed id the agent reads + writes (e.g. warren-xxxx)
 #   role      registered agent name (kebab/snake-case)
 #   timezone  IANA tz name, e.g. America/Los_Angeles
 #   prompt    pre-filled into the agent; multi-line ok via `|`
+#   stopPrompt / maxRuns  goal stop condition and bounded attempts
+#   maxIterations         loop safety cap
 #
 # Example (uncomment to enable):
 #
@@ -32,6 +34,7 @@
   kind: cron
   cron: '0 2 * * *'
   role: nightwatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Scan this repo for quality issues. Follow your procedure exactly.
@@ -42,6 +45,7 @@
   kind: cron
   cron: '0 5 * * 0,3'
   role: bugwatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Triage open bug seeds and plan fixes. Follow your procedure exactly.
@@ -57,6 +61,7 @@
   kind: cron
   cron: '10 3 * * *'
   role: gatewatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Audit the last 36 hours of merged history for gate-integrity
@@ -72,6 +77,7 @@
   kind: cron
   cron: '40 3 * * *'
   role: ratchetwatch
+  maxCostUsd: 2
   timezone: America/Los_Angeles
   prompt: |
     Measure ratchet slack (coverage floors, grandfather lists, bundle
@@ -87,6 +93,7 @@
   kind: cron
   cron: '0 5 * * 0'
   role: warden-digest
+  maxCostUsd: 1
   timezone: America/Los_Angeles
   prompt: |
     Re-wake the Audit Warden conversation if its anchoring run has idled,
@@ -98,6 +105,7 @@
   kind: cron
   cron: '0 4 * * 0'
   role: tastewatch
+  maxCostUsd: 1
   timezone: America/Los_Angeles
   prompt: |
     Produce the weekly taste digest: stratified sample of the week's

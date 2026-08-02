@@ -39,7 +39,12 @@ import { formatError } from "../core/errors.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { ProjectRow } from "../db/schema.ts";
 import type { ScheduledSeed, WarrenExtensions } from "../seeds-cli/index.ts";
-import type { LoadedWarrenConfig } from "../warren-config/index.ts";
+import type {
+	CronTrigger,
+	GoalTrigger,
+	LoadedWarrenConfig,
+	LoopTrigger,
+} from "../warren-config/index.ts";
 import { runCiFixerPass, type TickCiFixerDeps } from "./ci-fixer-pass.ts";
 import {
 	type DispatchCronResult,
@@ -48,6 +53,7 @@ import {
 	dispatchCronTrigger,
 	dispatchScheduledSeed,
 } from "./dispatch.ts";
+import { dispatchGoalTrigger, dispatchLoopTrigger } from "./goal-loop.ts";
 
 export type {
 	TickCiFixerDeps,
@@ -157,18 +163,9 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 		);
 	}
 
-	for (const trigger of config.triggers ?? []) {
-		const result = await dispatchCronTrigger({
-			projectId: project.id,
-			trigger,
-			defaults: config.defaults,
-			now,
-			repos: deps.repos,
-			spawn: deps.spawn,
-		});
-		cron.push(result);
-		logCronResult(deps.logger, project.id, trigger.id, result);
-	}
+	await dispatchCronTriggers({ deps, project, config, now, cron });
+	await dispatchGoalTriggers({ deps, project, config, now });
+	await dispatchLoopTriggers({ deps, project, config, now });
 
 	// warren-0b75: CI-fixer poll. Independent of the seeds shell-out below,
 	// so it runs before the `return` on an `sd list` failure can skip it.
@@ -238,6 +235,87 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 				await recordClearFailure(deps, result.runId, result.seedId, formatError(err));
 			}
 		}
+	}
+}
+
+async function dispatchCronTriggers(input: {
+	readonly deps: TickDeps;
+	readonly project: ProjectRow;
+	readonly config: LoadedWarrenConfig;
+	readonly now: Date;
+	readonly cron: DispatchCronResult[];
+}): Promise<void> {
+	for (const trigger of (input.config.triggers ?? []).filter(
+		(candidate): candidate is CronTrigger => candidate.kind === "cron",
+	)) {
+		const result = await dispatchCronTrigger({
+			projectId: input.project.id,
+			trigger,
+			defaults: input.config.defaults,
+			now: input.now,
+			repos: input.deps.repos,
+			spawn: input.deps.spawn,
+		});
+		input.cron.push(result);
+		logCronResult(input.deps.logger, input.project.id, trigger.id, result);
+	}
+}
+
+async function dispatchGoalTriggers(input: {
+	readonly deps: TickDeps;
+	readonly project: ProjectRow;
+	readonly config: LoadedWarrenConfig;
+	readonly now: Date;
+}): Promise<void> {
+	for (const trigger of (input.config.triggers ?? []).filter(
+		(candidate): candidate is GoalTrigger => candidate.kind === "goal",
+	)) {
+		const result = await dispatchGoalTrigger({
+			projectId: input.project.id,
+			trigger,
+			now: input.now,
+			spawn: input.deps.spawn,
+		});
+		input.deps.logger?.info(
+			{ projectId: input.project.id, triggerId: trigger.id, kind: result.kind },
+			"scheduler.goal_dispatched",
+		);
+	}
+}
+
+async function dispatchLoopTriggers(input: {
+	readonly deps: TickDeps;
+	readonly project: ProjectRow;
+	readonly config: LoadedWarrenConfig;
+	readonly now: Date;
+}): Promise<void> {
+	for (const trigger of (input.config.triggers ?? []).filter(
+		(candidate): candidate is LoopTrigger => candidate.kind === "loop",
+	)) {
+		const iterationsRun = await input.deps.repos.triggers.getFireCount({
+			projectId: input.project.id,
+			triggerId: trigger.id,
+		});
+		const result = await dispatchLoopTrigger({
+			projectId: input.project.id,
+			trigger,
+			now: input.now,
+			iterationsRun,
+			spawn: input.deps.spawn,
+		});
+		if (result.kind === "spawned") {
+			await input.deps.repos.triggers.recordFire({
+				projectId: input.project.id,
+				triggerId: trigger.id,
+				firedAt: input.now,
+				nextFireAt: null,
+				runId: result.runId,
+			});
+		}
+		input.deps.logger?.info(
+			{ projectId: input.project.id, triggerId: trigger.id, kind: result.kind },
+			"scheduler.loop_dispatched",
+		);
 	}
 }
 
