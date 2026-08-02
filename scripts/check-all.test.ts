@@ -38,6 +38,7 @@ describe("check-all", () => {
 			"check:bundle-size": "x",
 			"gen:docs:check": "x",
 			"gen:openapi:check": "x",
+			"check:client-contract": "x",
 		});
 		expect(gates).toEqual(CANONICAL_ORDER);
 	});

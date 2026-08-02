@@ -68,7 +68,7 @@ export interface ChatProps {
 	/**
 	 * Deliver the user turn through the owning conversation route.
 	 */
-	readonly sendMessage: (message: string) => Promise<void>;
+	readonly sendMessage?: (message: string) => Promise<void>;
 	/** Optional className passthrough for the outer wrapper. */
 	readonly className?: string;
 }
@@ -105,11 +105,14 @@ export function Chat({
 		e.preventDefault();
 		const trimmed = draft.trim();
 		if (trimmed.length === 0 || sending || disabled) return;
+		if (!sendMessage) return;
 		setSending(true);
 		setSendError(null);
 		try {
-			await sendMessage(trimmed);
-			setDraft("");
+			if (sendMessage) {
+				await sendMessage(trimmed);
+				setDraft("");
+			}
 		} catch (err) {
 			setSendError(formatError(err));
 		} finally {
