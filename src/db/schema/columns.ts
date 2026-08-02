@@ -304,6 +304,7 @@ export interface GraphRunScopeJson {
 	readonly checkerAgent?: string;
 	readonly checkerModel?: string;
 	readonly stopCheckModel?: string;
+	readonly synthesizePrompt?: string;
 }
 
 /** Finding payload stored in graph_run_children.finding_json. */

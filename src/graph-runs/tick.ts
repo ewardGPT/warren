@@ -15,6 +15,7 @@ import {
 	type GraphRunEventKind,
 	type StopCheckFn,
 } from "./coordinator.ts";
+import { readRunOutputFromEvents } from "./run-output.ts";
 
 export interface GraphRunTickLogger {
 	info(obj: Record<string, unknown>, msg?: string): void;
@@ -110,23 +111,8 @@ function buildDefaultReadRunOutput(
 ): (runId: string) => Promise<string> {
 	return async (runId: string) => {
 		const rows = await events.listTail(runId, 200);
-		return rows
-			.map((row) => extractText(row.payloadJson))
-			.filter((text): text is string => text !== null)
-			.join("\n")
-			.slice(-12_000);
+		return readRunOutputFromEvents(rows);
 	};
-}
-
-function extractText(value: unknown): string | null {
-	if (typeof value === "string") return value;
-	if (value === null || typeof value !== "object") return null;
-	const record = value as Record<string, unknown>;
-	for (const key of ["text", "content", "output", "message"]) {
-		const candidate = record[key];
-		if (typeof candidate === "string") return candidate;
-	}
-	return null;
 }
 
 export type GraphRunCoordinatorTimerHandle = object;

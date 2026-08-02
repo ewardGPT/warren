@@ -26,9 +26,11 @@ const LOOP: LoopTrigger = {
 
 describe("dispatchGoalTrigger", () => {
 	let db: WarrenDb;
+	let repos: Repos;
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
+		repos = createRepos(db);
 		await db.drizzle
 			.insert(agents)
 			.values({
@@ -38,6 +40,12 @@ describe("dispatchGoalTrigger", () => {
 				lastRefreshed: "2026-05-10T00:00:00.000Z",
 			})
 			.run();
+		await repos.projects.create({
+			id: "p1",
+			gitUrl: "https://github.com/example/project.git",
+			localPath: "/tmp/project",
+			defaultBranch: "main",
+		});
 	});
 
 	afterEach(async () => {
@@ -86,6 +94,47 @@ describe("dispatchGoalTrigger", () => {
 		});
 		expect(result.kind).toBe("spawn_failed");
 		if (result.kind === "spawn_failed") expect(result.reason).toContain("burrow down");
+	});
+
+	test("runs an independent stop check and persists completion", async () => {
+		const previous = await repos.runs.create({
+			agentName: "claude-code",
+			projectId: "p1",
+			prompt: "work",
+			renderedAgentJson: { sections: {} },
+			trigger: "goal",
+			seedId: "ubuntu-abc",
+		});
+		await repos.runs.claimById(previous.id);
+		await repos.events.append({
+			runId: previous.id,
+			burrowEventSeq: 1,
+			ts: new Date().toISOString(),
+			kind: "text",
+			stream: "system",
+			payload: { text: "all done" },
+		});
+		await repos.runs.finalize(previous.id, "succeeded");
+		await repos.triggers.upsert({
+			projectId: "p1",
+			triggerId: GOAL.id,
+			lastRunId: previous.id,
+			fireCount: 1,
+		});
+		const result = await dispatchGoalTrigger({
+			projectId: "p1",
+			trigger: GOAL,
+			now: new Date(),
+			repos,
+			checkStop: async (_prompt, output) => output.includes("all done"),
+			spawn: async () => {
+				throw new Error("must not spawn after completion");
+			},
+		});
+		expect(result).toEqual({ kind: "completed" });
+		expect(
+			(await repos.triggers.get({ projectId: "p1", triggerId: GOAL.id }))?.completedAt,
+		).not.toBeNull();
 	});
 });
 

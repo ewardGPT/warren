@@ -12,8 +12,8 @@
 
 defaultRole: sapling
 defaultBranch: main
-defaultProvider: opencode-go
-defaultModel: opencode-go/glm-5.2
+defaultProvider: openai
+defaultModel: deepseek-chat
 
 # ── Optional knobs (uncomment to set) ───────────────────────────────────
 

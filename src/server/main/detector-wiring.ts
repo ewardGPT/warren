@@ -34,6 +34,12 @@
 import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import type { Repos } from "../../db/repos/index.ts";
+import {
+	bootGraphRunCoordinator,
+	createGraphRunSpawn,
+	type GraphRunCoordinatorHandle,
+	loadGraphRunCoordinatorConfigFromEnv,
+} from "../../graph-runs/index.ts";
 import { createPrMergeChecker } from "../../plan-runs/index.ts";
 import type { SpawnFn } from "../../projects/clone.ts";
 import type { ProjectsConfig } from "../../projects/config.ts";
@@ -58,7 +64,7 @@ import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
 import type { WarrenConfigCache } from "../../warren-config/index.ts";
 import type { EnvLike } from "../config.ts";
 import type { BridgeRegistry, Logger } from "../types.ts";
-import { bridgeLoggerFromPino, pauseLoggerFromPino } from "./logging.ts";
+import { bridgeLoggerFromPino, pauseLoggerFromPino, planRunLoggerFromPino } from "./logging.ts";
 import { parseIntEnv, parseTrueEnv } from "./utils.ts";
 
 export interface PauseDetectorWiringInput {
@@ -262,6 +268,8 @@ export interface BackgroundDetectorHandles {
 	readonly conversationIdleDetector: ConversationIdleDetectorHandle;
 	/** Periodic operational-stats log line (warren-b2dd / pl-f700 step 6). */
 	readonly opsStatsWorker: OpsStatsWorkerHandle;
+	/** Graph-run coordinator (graph-engineering pilot). */
+	readonly graphRunCoordinator: GraphRunCoordinatorHandle;
 }
 
 /**
@@ -324,5 +332,78 @@ export function bootBackgroundDetectors(
 		logger: input.logger,
 		env: input.env,
 	});
-	return { pauseDetector, watchdog, mergePoller, conversationIdleDetector, opsStatsWorker };
+	const graphRunCoordinator = bootGraphRunCoordinatorFromEnv({
+		env: input.env,
+		repos: input.repos,
+		burrowClientPool: input.burrowClientPool,
+		bridges: input.bridges,
+		warrenConfigs: input.warrenConfigs,
+		projectsConfig: input.projectsConfig,
+		projectSpawn: input.projectSpawn,
+		seedsCli: input.seedsCli,
+		...(input.runBranchPrefixDefault !== undefined
+			? { runBranchPrefixDefault: input.runBranchPrefixDefault }
+			: {}),
+		logger: input.logger,
+		...now,
+	});
+	return {
+		pauseDetector,
+		watchdog,
+		mergePoller,
+		conversationIdleDetector,
+		opsStatsWorker,
+		graphRunCoordinator,
+	};
+}
+
+export interface GraphRunCoordinatorWiringInput {
+	readonly env: EnvLike;
+	readonly repos: Repos;
+	readonly burrowClientPool: BurrowClientPool;
+	readonly bridges: BridgeRegistry;
+	readonly warrenConfigs: WarrenConfigCache;
+	readonly projectsConfig: ProjectsConfig;
+	readonly projectSpawn: SpawnFn;
+	readonly seedsCli: SeedsCliDeps;
+	readonly runBranchPrefixDefault?: string;
+	readonly logger: Logger;
+	readonly now?: () => Date;
+}
+
+/**
+ * Boot the GraphRun coordinator tick loop. Opt-in via
+ * WARREN_GRAPH_RUN_DISABLED (default off until explicitly enabled by
+ * leaving the flag unset/false — same posture as plan-run coordinator).
+ */
+export function bootGraphRunCoordinatorFromEnv(
+	input: GraphRunCoordinatorWiringInput,
+): GraphRunCoordinatorHandle {
+	const config = loadGraphRunCoordinatorConfigFromEnv(input.env);
+	const coordinator = bootGraphRunCoordinator({
+		repos: input.repos,
+		spawn: createGraphRunSpawn({
+			repos: input.repos,
+			burrowClientPool: input.burrowClientPool,
+			bridges: input.bridges,
+			warrenConfigs: input.warrenConfigs,
+			projectsConfig: input.projectsConfig,
+			projectSpawn: input.projectSpawn,
+			seedsCli: input.seedsCli,
+			...(input.runBranchPrefixDefault !== undefined
+				? { runBranchPrefixDefault: input.runBranchPrefixDefault }
+				: {}),
+			...(input.now !== undefined ? { now: input.now } : {}),
+		}),
+		tickMs: config.tickMs,
+		disabled: config.disabled,
+		logger: planRunLoggerFromPino(input.logger),
+		...(input.now !== undefined ? { now: input.now } : {}),
+	});
+	if (config.disabled) {
+		input.logger.info({}, "graph-run coordinator disabled via WARREN_GRAPH_RUN_DISABLED");
+	} else {
+		input.logger.info({ tickMs: config.tickMs }, "graph-run coordinator running");
+	}
+	return coordinator;
 }

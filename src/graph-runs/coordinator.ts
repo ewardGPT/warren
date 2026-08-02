@@ -120,7 +120,14 @@ async function advanceFanOut(
 		for (const child of toDispatch) {
 			const prompt = buildFanOutPrompt(input.graphRun, child.filePath ?? "");
 			try {
-				const spawnResult = await input.spawn({ graphRun: input.graphRun, child, prompt });
+				const spawnResult = await input.spawn({
+					graphRun: input.graphRun,
+					child,
+					prompt,
+					...(input.graphRun.scopeJson.makerModel !== undefined
+						? { model: input.graphRun.scopeJson.makerModel }
+						: {}),
+				});
 				await input.repos.graphRuns.updateChild({
 					id: child.id,
 					patch: { runId: spawnResult.runId, state: "dispatched" },
@@ -244,7 +251,7 @@ async function syncVerifyChildren(
 		if (child.state !== "dispatched" || child.runId === null) continue;
 		const run = await input.repos.runs.get(child.runId);
 		if (run === null || !isRunTerminal(run.state)) continue;
-		if (run.state !== "succeeded") {
+		if (!isGraphRunChildSuccess(run)) {
 			await input.repos.graphRuns.updateChild({ id: child.id, patch: { state: "failed" } });
 			continue;
 		}
@@ -303,7 +310,7 @@ async function advanceSynthesize(
 			.filter((c) => c.state === "succeeded" && c.findingJson !== null)
 			.map((c) => c.findingJson)
 			.filter((f): f is GraphRunFindingJson => f !== null);
-		const prompt = buildSynthesizePrompt(findings);
+		const prompt = buildSynthesizePrompt(input.graphRun, findings);
 		try {
 			const spawnResult = await input.spawn({ graphRun: input.graphRun, child, prompt });
 			await input.repos.graphRuns.updateChild({
@@ -327,7 +334,7 @@ async function advanceSynthesize(
 		if (run === null || !isRunTerminal(run.state)) {
 			return { kind: "waiting_for_runs" };
 		}
-		if (run.state !== "succeeded") {
+		if (!isGraphRunChildSuccess(run)) {
 			return failGraphRun(input, `synthesize_run_${run.state}`);
 		}
 		await input.repos.graphRuns.updateChild({ id: child.id, patch: { state: "succeeded" } });
@@ -462,7 +469,14 @@ function buildStopCheckPrompt(finding: GraphRunFindingJson | null): string {
 	return `Confirm that the independent verifier's verdict is justified for finding ${JSON.stringify(finding)}. Answer true only when the verdict is supported by the artifact.`;
 }
 
-function buildSynthesizePrompt(findings: readonly GraphRunFindingJson[]): string {
+function buildSynthesizePrompt(
+	graphRun: GraphRunRow,
+	findings: readonly GraphRunFindingJson[],
+): string {
+	const custom = graphRun.scopeJson.synthesizePrompt?.trim();
+	if (custom !== undefined && custom.length > 0) {
+		return `${custom}\n\nVerified findings JSON:\n${JSON.stringify(findings)}`;
+	}
 	return `Read verified findings below. Produce a verified-finding report and mint fix seeds for confirmed hits only.\nFindings: ${JSON.stringify(findings)}`;
 }
 

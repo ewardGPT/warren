@@ -72,6 +72,12 @@ describe("parseFindings", () => {
 		const findings = parseFindings('noise\n[{"file":"a.ts","claim":"missing auth"}]\ntrailer');
 		expect(findings).toEqual([{ file: "a.ts", claim: "missing auth" }]);
 	});
+
+	test("parses JSON embedded in sapling markdown response", () => {
+		const body =
+			'Audit done.\n\n```json\n[{"file":"src/runs.ts","claim":"no auth on POST"}]\n```\n';
+		expect(parseFindings(body)).toEqual([{ file: "src/runs.ts", claim: "no auth on POST" }]);
+	});
 });
 
 describe("isGraphRunChildSuccess", () => {
@@ -240,6 +246,65 @@ describe("advanceGraphRun", () => {
 			now: () => NOW,
 		});
 		expect(result.kind).toBe("graph_run_succeeded");
+	});
+
+	test("fan_out with findings advances to verifying when verify enabled", async () => {
+		const outputs = new Map<string, string>();
+		const spawn: CoordinatorSpawnFn = async ({ graphRun, child, prompt }) => {
+			const run = await h.repos.runs.create({
+				agentName: graphRun.agentName,
+				projectId: graphRun.projectId,
+				prompt,
+				renderedAgentJson: { sections: {} },
+				trigger: "graph-run",
+				now: NOW,
+			});
+			outputs.set(run.id, '[{"file":"a.ts","claim":"missing auth"}]');
+			await h.repos.runs.markRunning(run.id, NOW);
+			await h.repos.runs.finalize(run.id, "succeeded", NOW);
+			void child;
+			return { runId: run.id };
+		};
+
+		const { graphRun } = await h.repos.graphRuns.create({
+			projectId: h.projectId,
+			template: "security-sweep",
+			scopeJson: { glob: "*.ts" },
+			verifyEnabled: true,
+			synthesizeEnabled: false,
+			children: [{ seq: 1, phase: "fan_out", filePath: "a.ts" }],
+			now: NOW,
+		});
+
+		await advanceGraphRun({
+			graphRun,
+			repos: h.repos,
+			spawn,
+			checkStop: h.checkStop,
+			emit: h.emit,
+			readRunOutput: async (runId) => outputs.get(runId) ?? "",
+			now: () => NOW,
+		});
+
+		const result = await advanceGraphRun({
+			graphRun: await h.repos.graphRuns.require(graphRun.id),
+			repos: h.repos,
+			spawn,
+			checkStop: h.checkStop,
+			emit: h.emit,
+			readRunOutput: async (runId) => outputs.get(runId) ?? "",
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("advanced");
+		if (result.kind === "advanced") {
+			expect(result.from).toBe("fan_out");
+			expect(result.to).toBe("verifying");
+		}
+		const row = await h.repos.graphRuns.require(graphRun.id);
+		expect(row.state).toBe("verifying");
+		const verifyChildren = await h.repos.graphRuns.listChildrenByPhase(graphRun.id, "verify");
+		expect(verifyChildren).toHaveLength(1);
+		expect(verifyChildren[0]?.findingJson).toEqual({ file: "a.ts", claim: "missing auth" });
 	});
 
 	test("verify phase uses checkStop and advances to synthesize", async () => {

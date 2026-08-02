@@ -16,6 +16,7 @@ async function resolveScopeFiles(localPath: string, scope: GraphRunScopeJson): P
 	const glob = new Glob(scope.glob);
 	const files: string[] = [];
 	for await (const rel of glob.scan({ cwd: localPath, onlyFiles: true })) {
+		if (rel.endsWith(".test.ts") || rel.endsWith(".test.tsx")) continue;
 		files.push(rel);
 	}
 	files.sort();
@@ -23,14 +24,14 @@ async function resolveScopeFiles(localPath: string, scope: GraphRunScopeJson): P
 	return files.slice(0, max);
 }
 
-function parseScope(body: Record<string, unknown>): GraphRunScopeJson | undefined {
+function parseScopeOverride(body: Record<string, unknown>): Partial<GraphRunScopeJson> | undefined {
 	const scope = body.scope;
 	if (scope === undefined) return undefined;
 	if (scope === null || typeof scope !== "object" || Array.isArray(scope)) {
-		throw new ValidationError("scope must be an object with glob (and optional max, seedId)");
+		throw new ValidationError("scope must be an object with optional glob, max, seedId");
 	}
 	const record = scope as Record<string, unknown>;
-	const glob = requireString(record, "glob");
+	const glob = optionalString(record, "glob");
 	const maxRaw = record.max;
 	let max: number | undefined;
 	if (maxRaw !== undefined) {
@@ -42,7 +43,7 @@ function parseScope(body: Record<string, unknown>): GraphRunScopeJson | undefine
 	}
 	const seedId = optionalString(record, "seedId");
 	return {
-		glob,
+		...(glob !== undefined ? { glob } : {}),
 		...(max !== undefined ? { max } : {}),
 		...(seedId !== undefined ? { seedId } : {}),
 	};
@@ -70,7 +71,7 @@ export function createGraphRunHandler(deps: ServerDeps): RouteHandler {
 		const project = await deps.repos.projects.require(projectId);
 		const loaded = await loadGraphTemplate(project.localPath, templateName);
 		const agent = optionalString(body, "agent") ?? loaded.defaults.agent ?? "sapling";
-		const bodyScope = parseScope(body);
+		const bodyScope = parseScopeOverride(body);
 
 		const verifyEnabled = parseBodyBoolean(body, "verify", loaded.defaults.verify);
 		const synthesizeEnabled = parseBodyBoolean(body, "synthesize", loaded.defaults.synthesize);
@@ -78,6 +79,9 @@ export function createGraphRunHandler(deps: ServerDeps): RouteHandler {
 			...loaded.scope,
 			...(bodyScope ?? {}),
 			max: bodyScope?.max ?? loaded.scope.max ?? loaded.defaults.maxFanOut,
+			...(loaded.synthesizePrompt !== undefined
+				? { synthesizePrompt: loaded.synthesizePrompt }
+				: {}),
 		};
 
 		await deps.repos.agents.resolve(agent, { projectId });
