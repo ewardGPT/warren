@@ -75,7 +75,7 @@ export async function checkCrossRepoPlanTargets(input: {
 			message: "no seed-bearing projects registered",
 		};
 	}
-	const registered = projects.filter((project) => project.gitUrl !== undefined);
+	const registered = input.projects.filter((project) => project.gitUrl !== undefined);
 	const context: CrossRepoContext = {
 		seedsCli: input.seedsCli,
 		repos:
