@@ -110,13 +110,15 @@
 
 - id: weekly-seed-drain
   kind: cron
-  cron: '0 9 * * 1'
+  cron: '0 2 * * *'
   role: sapling
   timezone: America/Los_Angeles
   prompt: |
-    Run ml prime. Then sd ready.
-    Complete the highest-priority unblocked open task in this repo,
-    preferring ready-for-agent seeds that carry an approved plan (the
-    plan steps are the brief - execute them exactly).
+    Run ml prime. Then sd ready --format json.
+    Work ONLY seeds labelled ready-for-agent (prefer those with an
+    approved plan - the plan steps are the brief, execute them exactly).
+    If no ready-for-agent seed exists, report "drain <date>: nothing
+    ready" and exit - do NOT pick unlabelled or needs-triage seeds.
     Run the quality gate (bun run check:all) before committing.
     ml record learnings in the appropriate domain.
+
