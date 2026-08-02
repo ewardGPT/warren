@@ -7,7 +7,7 @@ This page enumerates every HTTP route registered by warren's `Bun.serve` router.
 
 To refresh: `bun run gen:docs`. To check (CI mode): `bun run gen:docs:check`.
 
-Total routes: **61**.
+Total routes: **64**.
 
 ## /agents
 
@@ -48,6 +48,13 @@ Total routes: **61**.
 | `POST` | `/conversations/:id/messages` | `postConversationMessageHandler` |  |
 | `POST` | `/conversations/:id/send-off` | `sendOffConversationHandler` |  |
 | `POST` | `/conversations/:id/re-wake` | `rewakeConversationHandler` |  |
+
+## /graph-runs
+
+| Method | Pattern | Handler | Notes |
+| --- | --- | --- | --- |
+| `POST` | `/graph-runs` | `createGraphRunHandler` |  |
+| `GET` | `/graph-runs/:id` | `getGraphRunHandler` |  |
 
 ## /healthz
 
@@ -132,6 +139,7 @@ Total routes: **61**.
 | `POST` | `/runs` | `createRunHandler` |  |
 | `GET` | `/runs/:id` | `getRunHandler` |  |
 | `GET` | `/runs/:id/events` | `streamRunEventsHandler` |  |
+| `GET` | `/runs/:id/session` | `wakeSessionHandler` |  |
 | `POST` | `/runs/:id/steer` | `steerRunHandler` |  |
 | `POST` | `/runs/:id/cancel` | `cancelRunHandler` |  |
 | `GET` | `/runs/:id/preview/login` | `previewLoginHandler` |  |

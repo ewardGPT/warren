@@ -934,6 +934,23 @@ paths:
           required: true
           schema:
             type: string
+  /runs/{id}/session:
+    get:
+      operationId: wakeSessionHandler
+      tags:
+        - runs
+      summary: GET /runs/:id/session
+      responses:
+        '200':
+          description: Successful response.
+        default:
+          description: Error response (see `src/core/errors.ts`).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
   /runs/{id}/steer:
     post:
       operationId: steerRunHandler

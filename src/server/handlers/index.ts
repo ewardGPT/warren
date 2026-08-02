@@ -102,6 +102,7 @@ import {
 	previewTeardownHandler,
 	steerRunHandler,
 	streamRunEventsHandler,
+	wakeSessionHandler,
 } from "./runs/index.ts";
 import { drainWorkerHandler, listWorkersHandler } from "./workers.ts";
 
@@ -303,6 +304,7 @@ const ROUTE_TABLE: readonly RouteEntry[] = [
 	{ method: "POST", pattern: "/runs", build: createRunHandler },
 	{ method: "GET", pattern: "/runs/:id", build: getRunHandler },
 	{ method: "GET", pattern: "/runs/:id/events", build: streamRunEventsHandler },
+	{ method: "GET", pattern: "/runs/:id/session", build: wakeSessionHandler },
 	{ method: "POST", pattern: "/runs/:id/steer", build: steerRunHandler },
 	{ method: "POST", pattern: "/runs/:id/cancel", build: cancelRunHandler },
 	{ method: "GET", pattern: "/runs/:id/preview/login", build: previewLoginHandler },

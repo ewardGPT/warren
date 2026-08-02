@@ -23,3 +23,4 @@ export {
 	previewLoginHandler,
 	previewTeardownHandler,
 } from "./preview.ts";
+export { wakeSessionHandler } from "./session.ts";
