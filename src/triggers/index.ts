@@ -62,3 +62,16 @@ export {
 	type TickLogger,
 	type UpdateSeedExtensionsFn,
 } from "./tick.ts";
+export {
+	DEFAULT_TRIAGE_INBOX_PATH,
+	emptyTriageInbox,
+	loadTriageInbox,
+	mergeTriageFindings,
+	saveTriageInbox,
+	type TriageFinding,
+	type TriageFindingStatus,
+	type TriageInboxFs,
+	type TriageInboxState,
+	type TriageMergeResult,
+	type TriageSource,
+} from "./triage-inbox.ts";
