@@ -2223,6 +2223,22 @@ shape, no new agent contract.
 
 ### 11.P PlanRun: serial plan execution (pl-a258, 2026-05-18)
 
+#### Cross-repo coordination contract (pl-fb43)
+
+The project named by `POST /plan-runs` is the coordination project. A child
+seed may set `extensions.repo` to a registered project slug or git remote.
+Warren resolves that value before dispatch and clones the child into the
+target project's Burrow workspace. Parent plan ownership, serial ordering,
+PR merge gating, and plan-run history remain in the coordination project.
+An unresolved target is rejected; it must never silently fall back to the
+coordination checkout. This is a Warren-side convention and requires no
+seeds-core schema change.
+
+The reference planner role is Sapling-backed (`runtime: sapling`,
+`auto_plan_run_agent: sapling`) and runs inside Burrow. Pi is not selected for
+this workflow. See `docs/cross-repo-planner.md` and the examples under
+`docs/examples/`.
+
 PlanRun is a dispatch mode, not a fifth bundled feature. The substrate
 is the existing single-run primitive — `spawnRun`, the events bus, the
 runs/projects/agents repos — composed by a second tick loop that takes

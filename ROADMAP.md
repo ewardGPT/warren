@@ -1646,6 +1646,17 @@ R-09 is repromoted and R-12 through R-18 are slotted in.
 ---
 
 ## R-20 — Colonies (project groups)
+
+### Cross-repo plan-run foundation (pl-fb43)
+
+The first cross-repo slice is deliberately smaller than colonies: one
+coordination project owns a seeds plan while each child may name its
+execution project with `extensions.repo`. Warren resolves the target before
+dispatch, runs the child in that project's Burrow workspace with Sapling,
+and keeps serial PR merge gating in the coordination project. The planner
+role and structured `repo` step template live in
+`docs/cross-repo-planner.md`; this is a Warren-side convention and does not
+change seeds core.
 Status: [proposed]
 Depends on: —
 Unlocks: cross-project scheduling policy, aggregate run analytics, colony-level
