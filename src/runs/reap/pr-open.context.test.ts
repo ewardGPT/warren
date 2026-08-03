@@ -83,6 +83,27 @@ describe("gatherPrContext K8s clone fetch (warren-ab66)", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	test("uses the persisted seed id before scanning the prompt", async () => {
+		const exec: ReapExec = {
+			run: async (cmd, args) => {
+				if (cmd === "sd") {
+					expect(args).toEqual(["show", "warren-right", "--format", "json"]);
+					return { stdout: JSON.stringify({ issue: { id: "warren-right", title: "right seed" } }), stderr: "" };
+				}
+				throw new Error(`unexpected command: ${cmd}`);
+			},
+		};
+		const ctx = await gatherPrContext({
+			workspacePath: null,
+			projectPath: "/tmp/project",
+			baseBranch: "main",
+			seedId: "warren-right",
+			prompt: "warren-wrong appears first",
+			exec,
+		});
+		expect(ctx.seed).toEqual({ id: "warren-right", title: "right seed" });
+	});
+
 	test("rebuilds commits + diff-stat from the pushed branch and cleans up the temp ref", async () => {
 		const ctx = await gatherPrContext({
 			workspacePath: null,

@@ -53,6 +53,8 @@ export interface TryOpenPrInput {
 		id: string;
 		agentName: string;
 		prompt: string;
+		/** Authoritative seed attribution; prompt parsing is legacy fallback only. */
+		seedId?: string | null;
 		startedAt: string | null;
 		endedAt: string | null;
 		costUsd: number | null;
@@ -141,6 +143,8 @@ export interface GatherPrContextInput {
 	readonly projectPath: string;
 	readonly baseBranch: string;
 	readonly prompt: string;
+	/** Authoritative seed id from the persisted run row, when available. */
+	readonly seedId?: string | null;
 	readonly exec: ReapExec;
 	/** K8s fallback source for the commit/diff-stat sections (warren-ab66). */
 	readonly cloneFetch?: CloneFetchConfig;
@@ -177,7 +181,7 @@ const CLONE_FETCH_REF_PREFIX = "refs/warren/pr-open/";
 export async function gatherPrContext(input: GatherPrContextInput): Promise<PrContext> {
 	const [stats, seed] = await Promise.all([
 		gatherCommitStats(input),
-		resolveSeed(input.prompt, input.projectPath, input.exec),
+		resolveSeed(input.seedId, input.prompt, input.projectPath, input.exec),
 	]);
 	return { commits: stats.commits, diffStat: stats.diffStat, seed };
 }
@@ -300,10 +304,13 @@ async function collectDiffStat(range: GitRange): Promise<string> {
 // the prefix-with-dashes regex would otherwise eat ordinary words.
 const SEED_ID_RE = /\b([a-z][a-z-]*-[a-f0-9]{4,})\b/;
 
-async function resolveSeed(prompt: string, cwd: string, exec: ReapExec): Promise<PrSeed | null> {
-	const m = SEED_ID_RE.exec(prompt);
-	if (m === null) return null;
-	const id = m[1];
+async function resolveSeed(
+	seedId: string | null | undefined,
+	prompt: string,
+	cwd: string,
+	exec: ReapExec,
+): Promise<PrSeed | null> {
+	const id = seedId ?? SEED_ID_RE.exec(prompt)?.[1];
 	if (id === undefined) return null;
 	try {
 		const out = await exec.run("sd", ["show", id, "--format", "json"], {
@@ -366,6 +373,7 @@ export async function runPrOpen(input: RunPrOpenInput): Promise<string | null> {
 			projectPath: input.project.localPath,
 			baseBranch: input.project.defaultBranch,
 			prompt: input.run.prompt,
+			...(input.run.seedId !== undefined ? { seedId: input.run.seedId } : {}),
 			exec: input.exec,
 			emit: input.emit,
 			// warren-ab66: under K8s (no host workspace) rebuild the commit/diff-stat
