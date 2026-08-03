@@ -177,16 +177,48 @@ export function parsePrTemplate(content: string): ParsedPrTemplate {
 	return { overrides, warnings };
 }
 
+/** GitHub's PR-body length cap (validation_error "body too long"). */
+const BODY_MAX_LENGTH = 65_536;
+
 /**
  * Compose the PR body from the registered fragments, applying any
  * project overrides. Empty body for a fragment (whitespace-only
  * override) is treated as "remove from output" — matches canopy's
  * section-merging semantics (mx-1c92f3 in canopy).
+ *
+ * Bodies that exceed GitHub's cap are clamped to it by truncating the
+ * commit list (the usual bloat source) with an "and N more" line,
+ * keeping as many commit lines as fit. If even zero commits overflow
+ * (enormous diffStat / prompt), fall back to a hard slice of the body.
  */
 export function composeBody(ctx: PrFragmentContext, overrides: PrTemplateOverrides = {}): string {
+	const totalCommits = ctx.commits?.length ?? 0;
+	const body = composeFragments(ctx, overrides, totalCommits);
+	if (body.length <= BODY_MAX_LENGTH) return body;
+
+	// Largest commit count whose body fits — keep as many lines as fit.
+	let lo = 0;
+	let hi = totalCommits;
+	while (lo < hi) {
+		const mid = Math.ceil((lo + hi) / 2);
+		if (composeFragments(ctx, overrides, mid).length <= BODY_MAX_LENGTH) {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	const clamped = composeFragments(ctx, overrides, lo);
+	return clamped.length <= BODY_MAX_LENGTH ? clamped : clamped.slice(0, BODY_MAX_LENGTH);
+}
+
+function composeFragments(
+	ctx: PrFragmentContext,
+	overrides: PrTemplateOverrides,
+	commitLimit: number | undefined,
+): string {
 	const out: string[] = [];
 	for (const name of PR_BODY_FRAGMENT_NAMES) {
-		const rendered = renderFragment(name, ctx, overrides);
+		const rendered = renderFragment(name, ctx, overrides, commitLimit);
 		if (rendered === null) continue;
 		out.push(rendered);
 	}
@@ -219,6 +251,7 @@ function renderFragment(
 	name: PrFragmentName,
 	ctx: PrFragmentContext,
 	overrides: PrTemplateOverrides,
+	commitLimit: number | undefined,
 ): string | null {
 	const override = overrides[name];
 	if (override !== undefined) {
@@ -226,10 +259,14 @@ function renderFragment(
 		if (trimmed === "") return null;
 		return trimmed;
 	}
-	return defaultRender(name, ctx);
+	return defaultRender(name, ctx, commitLimit);
 }
 
-function defaultRender(name: PrFragmentName, ctx: PrFragmentContext): string | null {
+function defaultRender(
+	name: PrFragmentName,
+	ctx: PrFragmentContext,
+	commitLimit: number | undefined,
+): string | null {
 	switch (name) {
 		case "title":
 			return null; // handled by composeTitle
@@ -243,7 +280,7 @@ function defaultRender(name: PrFragmentName, ctx: PrFragmentContext): string | n
 			return ctx.previewOptedIn === true ? defaultPreview() : null;
 		case "commits":
 			return ctx.commits !== undefined && ctx.commits.length > 0
-				? defaultCommits(ctx.commits)
+				? defaultCommits(ctx.commits, commitLimit)
 				: null;
 		case "files_changed":
 			return ctx.diffStat !== undefined && ctx.diffStat.trim() !== ""
@@ -289,10 +326,15 @@ function defaultPreview(): string {
 	return `## Preview\n\n${PREVIEW_FRAGMENT_START}\nPreview launching…\n${PREVIEW_FRAGMENT_END}`;
 }
 
-function defaultCommits(commits: readonly PrCommit[]): string {
+function defaultCommits(commits: readonly PrCommit[], limit?: number): string {
+	const shown = limit === undefined ? commits : commits.slice(0, limit);
+	const hidden = commits.length - shown.length;
 	const lines = [`## Commits (${commits.length})`, ""];
-	for (const c of commits) {
+	for (const c of shown) {
 		lines.push(`- ${shortSha(c.sha)} ${c.subject}`);
+	}
+	if (hidden > 0) {
+		lines.push(`- … and ${hidden} more.`);
 	}
 	return lines.join("\n");
 }
