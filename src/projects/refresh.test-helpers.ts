@@ -6,6 +6,7 @@ export const CFG: ProjectsConfig = { root: "/data/projects", gitBinary: "git" };
 export interface Recorded {
 	cmd: readonly string[];
 	cwd: string;
+	env?: Record<string, string | undefined>;
 }
 
 export function recorder(handler: (cmd: readonly string[]) => SpawnResult): {
@@ -14,7 +15,7 @@ export function recorder(handler: (cmd: readonly string[]) => SpawnResult): {
 } {
 	const calls: Recorded[] = [];
 	const spawn: SpawnFn = async (cmd, opts) => {
-		calls.push({ cmd, cwd: opts.cwd });
+		calls.push({ cmd, cwd: opts.cwd, ...(opts.env !== undefined ? { env: opts.env } : {}) });
 		return handler(cmd);
 	};
 	return { spawn, calls };
