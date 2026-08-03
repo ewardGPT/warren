@@ -42,7 +42,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// persisted event log is the safety net; the provider message is
 	// surfaced on the `reap.provider_error` event.
 	const providerError = await detectTerminalProviderError(input.repos, run.id);
-	const providerErrorMessage = providerError?.message ?? null;
+	const providerErrorDiagnostic = providerError?.diagnostic ?? null;
+	const providerErrorMessage = providerErrorDiagnostic?.message ?? null;
 	const failedFromProviderError = providerError !== null && input.outcome !== "cancelled";
 	// The success pipeline gates PR-open / seed-close / preview / auto-dispatch
 	// on `outcome === "succeeded"`, so thread the overridden outcome in so a
@@ -177,7 +178,12 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state.droppedCommit || failedFromProviderError || finalizeFailed ? "failed" : input.outcome;
 
 	if (failedFromProviderError) {
-		await emit("reap.provider_error", { message: providerErrorMessage });
+		await emit("reap.provider_error", {
+			message: providerErrorMessage,
+			provider: providerErrorDiagnostic?.provider ?? null,
+			status: providerErrorDiagnostic?.status ?? null,
+			body: providerErrorDiagnostic?.body ?? null,
+		});
 	}
 
 	let failureReason: RunFailureReason | null = null;
@@ -284,6 +290,14 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state: finalState,
 		failureReason,
 		providerError: failedFromProviderError ? providerErrorMessage : null,
+		providerErrorDiagnostic:
+			failedFromProviderError && providerErrorDiagnostic !== null
+				? {
+						provider: providerErrorDiagnostic.provider,
+						status: providerErrorDiagnostic.status,
+						body: providerErrorDiagnostic.body,
+					}
+				: null,
 		completionSignal: null,
 		resumeFeedback: null,
 		mulch: {
@@ -376,6 +390,14 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			state: finalState,
 			failureReason,
 			providerError: failedFromProviderError ? providerErrorMessage : null,
+			providerErrorDiagnostic:
+				failedFromProviderError && providerErrorDiagnostic !== null
+					? {
+							provider: providerErrorDiagnostic.provider,
+							status: providerErrorDiagnostic.status,
+							body: providerErrorDiagnostic.body,
+						}
+					: null,
 			mulchUpdated: state.mulchUpdated,
 			mulchSkipped: state.mulchSkipped,
 			mulchAppended: state.mulchAppended,
@@ -400,6 +422,14 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state: finalState,
 		failureReason,
 		providerError: failedFromProviderError ? providerErrorMessage : null,
+		providerErrorDiagnostic:
+			failedFromProviderError && providerErrorDiagnostic !== null
+				? {
+						provider: providerErrorDiagnostic.provider,
+						status: providerErrorDiagnostic.status,
+						body: providerErrorDiagnostic.body,
+					}
+				: null,
 		completionSignal: null,
 		resumeFeedback: null,
 		mulchUpdated: state.mulchUpdated,
