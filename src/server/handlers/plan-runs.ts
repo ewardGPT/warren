@@ -84,6 +84,19 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 		const modelOverride = optionalString(body, "modelOverride");
 		const dispatcherHandle = optionalString(body, "dispatcherHandle");
 
+		// warren-b3be: a promptTemplate without the {seed_id} placeholder would
+		// make the coordinator dispatch every child the same prompt (no seed
+		// reference). Refuse it up front rather than silently degrading.
+		if (promptTemplate !== undefined && !promptTemplate.includes("{seed_id}")) {
+			throw new ValidationError(
+				"promptTemplate must contain the {seed_id} placeholder so each child targets its seed",
+				{
+					recoveryHint:
+						'add {seed_id} to the template, e.g. "work on sd {seed_id}" (default when omitted)',
+				},
+			);
+		}
+
 		// (1) project lookup — NotFoundError → 404.
 		const project = await deps.repos.projects.require(projectId);
 
