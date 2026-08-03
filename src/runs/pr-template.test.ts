@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { PrCommit } from "./pr.ts";
 import {
 	composeBody,
 	composeTitle,
@@ -158,6 +159,29 @@ describe("composeBody", () => {
 		// Spot-check that the registry exposes the documented body order.
 		expect(PR_BODY_FRAGMENT_NAMES[0]).toBe("summary");
 		expect(PR_BODY_FRAGMENT_NAMES[PR_BODY_FRAGMENT_NAMES.length - 1]).toBe("trailer");
+	});
+
+	test("clamps an oversized body to the cap by dropping commits", () => {
+		// Enough wide commits to blow past GitHub's 65_536-char body cap.
+		const commits: readonly PrCommit[] = Array.from({ length: 5000 }, (_, i) => ({
+			sha: `deadbeef${i.toString(16).padStart(2, "0")}`,
+			subject: `commit number ${i} with a long-enough subject to inflate the rendered line beyond the cap`,
+		}));
+		const body = composeBody({ ...BASE_CTX, commits });
+		expect(body.length).toBeLessThanOrEqual(65_536);
+		expect(body).toContain("and ");
+		expect(body).toContain(" more");
+		// The commit list header still reflects the true total.
+		expect(body).toContain("## Commits (5000)");
+	});
+
+	test("oversized body that cannot fit even with zero commits is hard-sliced", () => {
+		const ctx: PrFragmentContext = {
+			...BASE_CTX,
+			prompt: "x".repeat(80_000),
+		};
+		const body = composeBody(ctx);
+		expect(body.length).toBeLessThanOrEqual(65_536);
 	});
 });
 
