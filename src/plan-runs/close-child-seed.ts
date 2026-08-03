@@ -18,6 +18,15 @@
  * a warren-identity commit (`--no-verify`) and push it straight to the
  * default branch. An already-closed seed leaves the tree clean and yields a
  * `noop`, so the operation is idempotent.
+ *
+ * **Concurrent-writer recovery (warren-f6b5).** The close commit is a
+ * read-modify-write against the shared `.seeds/issues.jsonl` on the default
+ * branch. If the push is refused as non-fast-forward — another warren
+ * process pinned a tick extension/`sd update` onto default between our
+ * worktree snapshot and push — we re-fetch origin, re-apply the idempotent
+ * `sd close` against the fresh head, and retry the push once. A second
+ * rejection propagates as a failure; `sd close` merging by `id` keeps the
+ * recovery convergent instead of overwriting the conflicting lines.
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -59,6 +68,20 @@ export type CloseMergedChildSeedResult =
 	| { readonly kind: "noop" };
 
 const SEEDS_ISSUES_PATHSPEC = join(".seeds", "issues.jsonl");
+
+/**
+ * True when a `git push` rejection is a non-fast-forward (the remote head
+ * moved after our snapshot) rather than an auth/transport/other error. Only
+ * this cause is safe to recover from by merging our idempotent close onto
+ * the fresh head and retrying.
+ */
+function isNonFastForwardPush(stderr: string): boolean {
+	return (
+		stderr.includes("non-fast-forward") ||
+		stderr.includes("[rejected]") ||
+		stderr.includes("fetch first")
+	);
+}
 
 async function runGit(
 	input: CloseMergedChildSeedInput,
@@ -106,16 +129,54 @@ async function addWorktree(
  * Close a merged plan-run child's seed on the project's default branch.
  * Idempotent: an already-closed seed returns `{ kind: "noop" }` without
  * authoring a commit.
+ *
+ * A fresh worktree is spun off `origin/<defaultBranch>` (re-fetched first)
+ * and `sd close` runs there. The commit is pushed to default; a
+ * non-fast-forward rejection re-fetches origin, re-applies the idempotent
+ * close against the moved head, and retries once (warren-f6b5).
  */
 export async function closeMergedChildSeed(
 	input: CloseMergedChildSeedInput,
 ): Promise<CloseMergedChildSeedResult> {
+	await runGit(input, ["fetch", "--prune", "origin"], input.projectPath, {
+		...gitRepoContextScrubEnv(),
+		...githubCredentialGitEnv(input.githubToken),
+	});
+
+	const first = await closeAndPushWorktree(input, "first");
+	if (first.kind === "closed" || first.kind === "noop") return first;
+
+	// Non-fast-forward only — a concurrent writer moved default between our
+	// snapshot and push. Re-fetch and merge our idempotent close onto the new
+	// head, then retry once. Anything else propagates untouched.
+	if (!isNonFastForwardPush(first.error)) {
+		throw new Error(first.error);
+	}
+	const retry = await closeAndPushWorktree(input, "retry");
+	if (retry.kind === "closed" || retry.kind === "noop") return retry;
+	throw new Error(retry.error);
+}
+
+type RunKind = "first" | "retry";
+
+type CloseRun =
+	| { readonly kind: "closed"; readonly branch: string }
+	| { readonly kind: "noop" }
+	| { readonly kind: "error"; readonly error: string };
+
+/** One spin of the worktree → `sd close` → commit → push attempt. */
+async function closeAndPushWorktree(
+	input: CloseMergedChildSeedInput,
+	kind: RunKind,
+): Promise<CloseRun> {
 	const scrub = gitRepoContextScrubEnv();
 	// Credential env for the network-touching calls only (fetch + push).
 	const cred = githubCredentialGitEnv(input.githubToken);
 
-	// Best-effort fetch so the worktree reflects the just-merged default branch.
-	await runGit(input, ["fetch", "--prune", "origin"], input.projectPath, { ...scrub, ...cred });
+	// The retry re-fetches origin so the worktree reflects the moved head.
+	if (kind === "retry") {
+		await runGit(input, ["fetch", "--prune", "origin"], input.projectPath, { ...scrub, ...cred });
+	}
 
 	const bytes = new Uint8Array(4);
 	crypto.getRandomValues(bytes);
@@ -158,7 +219,10 @@ export async function closeMergedChildSeed(
 			{ ...scrub, ...warrenCommitIdentityEnv() },
 		);
 		if (commit.exitCode !== 0) {
-			throw new Error(`git commit failed (exit ${commit.exitCode}): ${commit.stderr}`);
+			return {
+				kind: "error",
+				error: `git commit failed (exit ${commit.exitCode}): ${commit.stderr}`,
+			};
 		}
 
 		const push = await runGit(
@@ -168,7 +232,10 @@ export async function closeMergedChildSeed(
 			{ ...scrub, ...cred },
 		);
 		if (push.exitCode !== 0) {
-			throw new Error(`git push failed (exit ${push.exitCode}): ${push.stderr}`);
+			return {
+				kind: "error",
+				error: `git push failed (exit ${push.exitCode}): ${push.stderr}`,
+			};
 		}
 
 		return { kind: "closed", branch: input.defaultBranch };
