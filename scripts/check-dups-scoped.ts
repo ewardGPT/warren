@@ -3,12 +3,12 @@
  * Scoped copy-paste guard (warren-032a, plan pl-b82d step 31).
  *
  * The repo-wide jscpd run (`.jscpd.json`) is a PERCENTAGE budget: 100 tokens
- * minimum, 3% of duplicated lines allowed. It reported the three `defaultSpawn`
- * copies for as long as they existed and still exited 0, because 26 clones came
- * to 0.94% of the tree. A percentage budget over a growing codebase can only
- * get easier to pass, so it never sees an individual clone — that is why a
- * three-copy cross-layer duplicate survived long enough to grow a comment
- * justifying itself.
+ * minimum, ratcheted down to 1.3% duplicated lines. It reported the three
+ * `defaultSpawn` copies for as long as they existed and still exited 0, because
+ * 26 clones came to 0.94% of the tree. A percentage budget over a growing
+ * codebase can only get easier to pass, so it never sees an individual clone —
+ * that is why a three-copy cross-layer duplicate survived long enough to grow a
+ * comment justifying itself.
  *
  * This gate is the other half: a SECOND jscpd run (`.jscpd.scoped.json`) over
  * the four surfaces where a cross-layer copy actually hurts —
