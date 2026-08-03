@@ -88,7 +88,10 @@ describe("gatherPrContext K8s clone fetch (warren-ab66)", () => {
 			run: async (cmd, args) => {
 				if (cmd === "sd") {
 					expect(args).toEqual(["show", "warren-right", "--format", "json"]);
-					return { stdout: JSON.stringify({ issue: { id: "warren-right", title: "right seed" } }), stderr: "" };
+					return {
+						stdout: JSON.stringify({ issue: { id: "warren-right", title: "right seed" } }),
+						stderr: "",
+					};
 				}
 				throw new Error(`unexpected command: ${cmd}`);
 			},
