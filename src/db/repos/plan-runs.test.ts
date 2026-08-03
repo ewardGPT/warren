@@ -5,7 +5,11 @@ import type { SqliteDrizzleDb } from "../client.ts";
 import { isPostgresTestEnabled, withDb } from "../testing.ts";
 import { AgentsRepo } from "./agents.ts";
 import { DrizzleAdapter } from "./drizzle-adapter.ts";
-import { assertPlanRunTransition, PlanRunsRepo } from "./plan-runs.ts";
+import {
+	assertPlanRunChildTransition,
+	assertPlanRunTransition,
+	PlanRunsRepo,
+} from "./plan-runs.ts";
 import { ProjectsRepo } from "./projects.ts";
 import { RunsRepo } from "./runs.ts";
 
@@ -29,6 +33,22 @@ describe("assertPlanRunTransition", () => {
 		expect(() => assertPlanRunTransition("succeeded", "running")).toThrow(StateTransitionError);
 		expect(() => assertPlanRunTransition("cancelled", "running")).toThrow(StateTransitionError);
 		expect(() => assertPlanRunTransition("failed", "running")).not.toThrow();
+	});
+});
+
+describe("assertPlanRunChildTransition", () => {
+	test("allows the coordinator lifecycle", () => {
+		expect(() => assertPlanRunChildTransition("pending", "dispatched")).not.toThrow();
+		expect(() => assertPlanRunChildTransition("dispatched", "running")).not.toThrow();
+		expect(() => assertPlanRunChildTransition("running", "pr_open")).not.toThrow();
+		expect(() => assertPlanRunChildTransition("pr_open", "merged")).not.toThrow();
+		expect(() => assertPlanRunChildTransition("pending", "skipped")).not.toThrow();
+	});
+
+	test("rejects rewinds from terminal states", () => {
+		expect(() => assertPlanRunChildTransition("merged", "pending")).toThrow(StateTransitionError);
+		expect(() => assertPlanRunChildTransition("failed", "running")).toThrow(StateTransitionError);
+		expect(() => assertPlanRunChildTransition("pending", "merged")).not.toThrow();
 	});
 });
 
@@ -185,6 +205,9 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			try {
 				const { planRun } = await repo.create(seed({ agentName, projectId }));
 				for (const seq of [1, 2, 3]) {
+					await repo.updateChild({ planRunId: planRun.id, seq, patch: { state: "dispatched" } });
+					await repo.updateChild({ planRunId: planRun.id, seq, patch: { state: "running" } });
+					await repo.updateChild({ planRunId: planRun.id, seq, patch: { state: "pr_open" } });
 					await repo.updateChild({
 						planRunId: planRun.id,
 						seq,
@@ -222,14 +245,28 @@ function suite(dialect: "sqlite" | "postgres"): void {
 				const merged = await repo.updateChild({
 					planRunId: planRun.id,
 					seq: 1,
+					patch: { state: "running" },
+					now: new Date("2026-05-17T00:09:00.000Z"),
+				});
+				const prOpen = await repo.updateChild({
+					planRunId: planRun.id,
+					seq: 1,
+					patch: { state: "pr_open" },
+					now: new Date("2026-05-17T00:09:00.000Z"),
+				});
+				const mergedFinal = await repo.updateChild({
+					planRunId: planRun.id,
+					seq: 1,
 					patch: { state: "merged", prMergedAt: "2026-05-17T00:09:00.000Z" },
 					now: new Date("2026-05-17T00:09:00.000Z"),
 				});
-				expect(merged.state).toBe("merged");
-				expect(merged.prMergedAt).toBe("2026-05-17T00:09:00.000Z");
+				expect(merged.state).toBe("running");
+				expect(prOpen.state).toBe("pr_open");
+				expect(mergedFinal.state).toBe("merged");
+				expect(mergedFinal.prMergedAt).toBe("2026-05-17T00:09:00.000Z");
 				// runId + startedAt preserved.
-				expect(merged.runId).toBe(run.id);
-				expect(merged.startedAt).toBe("2026-05-17T00:01:00.000Z");
+				expect(mergedFinal.runId).toBe(run.id);
+				expect(mergedFinal.startedAt).toBe("2026-05-17T00:01:00.000Z");
 			} finally {
 				await handle.close();
 			}

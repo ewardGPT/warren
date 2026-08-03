@@ -25,6 +25,8 @@
  */
 
 import { z } from "zod";
+import { ValidationError } from "../core/errors.ts";
+import { KNOWN_RUNTIME_IDS } from "../warren-config/schema.ts";
 import { AgentSchemaError } from "./errors.ts";
 
 export const REQUIRED_AGENT_SECTIONS = ["system"] as const;
@@ -271,6 +273,12 @@ export function readRuntimeId(agent: AgentDefinition, configOverride?: string): 
 	// Pi was the former execution runtime. Keep legacy agent definitions
 	// dispatchable, but route them through the supported Sapling/Burrow path.
 	if (configured === "pi" || configured === "pi-chat") return DEFAULT_RUNTIME_ID;
+	if (!(KNOWN_RUNTIME_IDS as readonly string[]).includes(configured)) {
+		throw new ValidationError(
+			`agent "${agent.name}" resolved unknown runtime "${configured}"; expected one of ${KNOWN_RUNTIME_IDS.join(", ")}`,
+			{ recoveryHint: "set runtime to sapling, claude-code, or pi (legacy compatibility)" },
+		);
+	}
 	return configured;
 }
 
@@ -368,6 +376,18 @@ export function validateAgentDefinition(def: AgentDefinition): void {
 	// warren-8dee: reject a malformed tools policy here (parse-time + cross-tier
 	// composer) so an unenforceable read-only declaration surfaces loudly.
 	readToolsFrontmatter(def.frontmatter, def.name);
+	const runtime = def.frontmatter.runtime;
+	if (runtime !== undefined) {
+		if (typeof runtime !== "string") {
+			throw new AgentSchemaError(`agent "${def.name}" frontmatter.runtime must be a string`);
+		}
+		if (runtime !== "pi-chat" && !(KNOWN_RUNTIME_IDS as readonly string[]).includes(runtime)) {
+			throw new AgentSchemaError(
+				`agent "${def.name}" frontmatter.runtime "${runtime}" is unknown; expected one of ${KNOWN_RUNTIME_IDS.join(", ")}`,
+				{ recoveryHint: "set runtime to sapling, claude-code, or pi" },
+			);
+		}
+	}
 }
 
 /**

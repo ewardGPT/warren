@@ -13,6 +13,7 @@
 import { and, eq } from "drizzle-orm";
 import { NotFoundError, StateTransitionError, ValidationError } from "../../core/errors.ts";
 import { generateId } from "../../core/ids.ts";
+import { PREVIEW_STATES } from "../../core/wire.ts";
 import type { SqliteDrizzleDb } from "../client.ts";
 import type {
 	CloneKind,
@@ -42,6 +43,27 @@ const ALLOWED_TRANSITIONS: Record<RunState, readonly RunState[]> = {
 	failed: [],
 	cancelled: [],
 };
+
+const ALLOWED_PREVIEW_TRANSITIONS: Record<PreviewState, readonly PreviewState[]> = {
+	starting: ["starting", "live", "failed", "torn-down"],
+	live: ["starting", "live", "failed", "torn-down"],
+	failed: ["starting", "live", "failed", "torn-down"],
+	"torn-down": [],
+};
+
+export function assertPreviewTransition(from: PreviewState | null, to: PreviewState | null): void {
+	if (from === to) return;
+	if (to === null) return;
+	if (from === null) {
+		return;
+	}
+	if (!(PREVIEW_STATES as readonly PreviewState[]).includes(from)) {
+		throw new StateTransitionError(`unknown preview state: ${from}`);
+	}
+	if (!ALLOWED_PREVIEW_TRANSITIONS[from].includes(to)) {
+		throw new StateTransitionError(`invalid preview transition: ${from} → ${to}`);
+	}
+}
 
 export function assertRunTransition(from: RunState, to: RunState): void {
 	if (!ALLOWED_TRANSITIONS[from].includes(to)) {
@@ -368,6 +390,9 @@ export class RunsRepo {
 			throw new ValidationError("attachPreview requires at least one preview field");
 		}
 		const current = await this.require(id);
+		if (input.previewState !== undefined && input.previewState !== current.previewState) {
+			assertPreviewTransition(current.previewState, input.previewState);
+		}
 		const patch: Partial<RunRow> = {};
 		for (const k of keys) {
 			if (input[k] !== undefined) {
