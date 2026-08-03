@@ -6,7 +6,7 @@ import { AgentsRepo } from "./agents.ts";
 import { DrizzleAdapter } from "./drizzle-adapter.ts";
 import { EventsRepo } from "./events.ts";
 import { ProjectsRepo } from "./projects.ts";
-import { assertRunTransition, RunsRepo } from "./runs.ts";
+import { assertPreviewTransition, assertRunTransition, RunsRepo } from "./runs.ts";
 
 describe("assertRunTransition", () => {
 	test("queued → running is allowed", () => {
@@ -30,6 +30,23 @@ describe("assertRunTransition", () => {
 
 	test("queued → succeeded is rejected", () => {
 		expect(() => assertRunTransition("queued", "succeeded")).toThrow(StateTransitionError);
+	});
+});
+
+describe("assertPreviewTransition", () => {
+	test("allows launch, readiness, failure, and teardown", () => {
+		expect(() => assertPreviewTransition(null, "starting")).not.toThrow();
+		expect(() => assertPreviewTransition(null, "failed")).not.toThrow();
+		expect(() => assertPreviewTransition("starting", "live")).not.toThrow();
+		expect(() => assertPreviewTransition("live", "failed")).not.toThrow();
+		expect(() => assertPreviewTransition("live", "torn-down")).not.toThrow();
+	});
+
+	test("rejects resurrection but permits operational retries", () => {
+		expect(() => assertPreviewTransition("torn-down", "live")).toThrow(StateTransitionError);
+		expect(() => assertPreviewTransition(null, "torn-down")).not.toThrow();
+		expect(() => assertPreviewTransition("starting", "torn-down")).not.toThrow();
+		expect(() => assertPreviewTransition("live", "starting")).not.toThrow();
 	});
 });
 

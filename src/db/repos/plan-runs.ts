@@ -27,6 +27,7 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { NotFoundError, StateTransitionError, ValidationError } from "../../core/errors.ts";
 import { generateId } from "../../core/ids.ts";
+import { PLAN_RUN_CHILD_STATES } from "../../core/wire.ts";
 import type { SqliteDrizzleDb } from "../client.ts";
 import type { PlanRunChildRow, PlanRunChildState, PlanRunRow, PlanRunState } from "../schema.ts";
 import type { DrizzleAdapter } from "./drizzle-adapter.ts";
@@ -38,6 +39,25 @@ const ALLOWED_TRANSITIONS: Record<PlanRunState, readonly PlanRunState[]> = {
 	failed: ["running"],
 	cancelled: [],
 };
+
+const ALLOWED_CHILD_TRANSITIONS: Record<PlanRunChildState, readonly PlanRunChildState[]> = {
+	pending: ["dispatched", "running", "pr_open", "merged", "failed", "skipped"],
+	dispatched: ["running", "pr_open", "merged", "failed", "skipped"],
+	running: ["pr_open", "merged", "failed", "skipped"],
+	pr_open: ["merged", "failed", "skipped"],
+	merged: [],
+	failed: [],
+	skipped: [],
+};
+
+export function assertPlanRunChildTransition(from: PlanRunChildState, to: PlanRunChildState): void {
+	if (!(PLAN_RUN_CHILD_STATES as readonly PlanRunChildState[]).includes(from)) {
+		throw new StateTransitionError(`unknown plan_run_child state: ${from}`);
+	}
+	if (!ALLOWED_CHILD_TRANSITIONS[from].includes(to)) {
+		throw new StateTransitionError(`invalid plan_run_child transition: ${from} → ${to}`);
+	}
+}
 
 export function assertPlanRunTransition(from: PlanRunState, to: PlanRunState): void {
 	if (!ALLOWED_TRANSITIONS[from].includes(to)) {
@@ -340,6 +360,9 @@ export class PlanRunsRepo {
 		const patch: Partial<PlanRunChildRow> = {
 			updatedAt: (input.now ?? new Date()).toISOString(),
 		};
+		if (input.patch.state !== undefined && input.patch.state !== current.state) {
+			assertPlanRunChildTransition(current.state, input.patch.state);
+		}
 		for (const k of CHILD_PATCH_KEYS) {
 			if (input.patch[k] !== undefined) {
 				(patch as Record<string, unknown>)[k] = input.patch[k];
