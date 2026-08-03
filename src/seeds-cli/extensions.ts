@@ -24,6 +24,7 @@
 import { formatError } from "../core/errors.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import { SeedsCliError } from "./errors.ts";
+import { withSeedsWriteLock } from "./lock.ts";
 import {
 	type ParseScheduledSeedsResult,
 	parseScheduledSeeds,
@@ -92,15 +93,19 @@ export async function closeSeed(
 	projectPath: string,
 	seedId: string,
 ): Promise<void> {
-	const result = await deps.spawn([deps.sdBinary, "close", seedId], {
-		cwd: projectPath,
-		timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
+	// Serialized per project so a concurrently-firing `sd close` / `sd update`
+	// never interleaves a read-modify-write on .seeds/issues.jsonl (warren-f6b5).
+	await withSeedsWriteLock(projectPath, async () => {
+		const result = await deps.spawn([deps.sdBinary, "close", seedId], {
+			cwd: projectPath,
+			timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
+		});
+		if (result.exitCode !== 0) {
+			throw new SeedsCliError(
+				`sd close ${seedId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
+			);
+		}
 	});
-	if (result.exitCode !== 0) {
-		throw new SeedsCliError(
-			`sd close ${seedId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
-		);
-	}
 }
 
 /**
@@ -149,13 +154,15 @@ export async function updateExtensions(
 		);
 	}
 	const payload = JSON.stringify(parsed.data);
-	const result = await deps.spawn([deps.sdBinary, "update", seedId, "--extensions", payload], {
-		cwd: projectPath,
-		timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
+	await withSeedsWriteLock(projectPath, async () => {
+		const result = await deps.spawn([deps.sdBinary, "update", seedId, "--extensions", payload], {
+			cwd: projectPath,
+			timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
+		});
+		if (result.exitCode !== 0) {
+			throw new SeedsCliError(
+				`sd update ${seedId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
+			);
+		}
 	});
-	if (result.exitCode !== 0) {
-		throw new SeedsCliError(
-			`sd update ${seedId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
-		);
-	}
 }
