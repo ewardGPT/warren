@@ -4,6 +4,7 @@ import { AgentsRepo } from "../../db/repos/agents.ts";
 import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import { parseRenderedAgent, type RenderResponse } from "../schema.ts";
 import {
+	BUGWATCH_BUILTIN,
 	BUILTIN_AGENT_NAMES,
 	BUILTIN_AGENTS,
 	CLAUDE_CODE_BUILTIN,
@@ -70,6 +71,15 @@ describe("BUILTIN_AGENTS", () => {
 			expect(system).toContain("Do not declare the task complete");
 			expect(system).toContain("red gate");
 		}
+	});
+});
+
+describe("BUGWATCH_BUILTIN", () => {
+	test("treats seed blockers as advisory while keeping closed seeds excluded", () => {
+		const system = BUGWATCH_BUILTIN.sections.system ?? "";
+		expect(system).toMatch(/Blockers are advisory/i);
+		expect(system).toMatch(/Do not skip a seed because it has unresolved/);
+		expect(system).toMatch(/closed/i);
 	});
 });
 

@@ -13,7 +13,9 @@
  * fixes for existing filed bugs — complementary inputs, no overlap.
  *
  * Conservative by design: skips bugs that already have plans, are
- * in_progress, are blocked, or lack enough detail to plan confidently.
+ * in_progress, or lack enough detail to plan confidently. Dependency
+ * blockers are advisory: bugwatch can plan the work while preserving the
+ * dependency metadata for operators and downstream dispatch.
  * Caps output to at most 3 plans per run to keep plan-run volume
  * manageable.
  *
@@ -36,7 +38,10 @@ Run \`sd list --status open --type bug --format json\` to get the full bug queue
 
 1. **No existing plan.** The seed has no \`plan_id\` field (nobody has planned it yet).
 2. **Not in progress.** Status is \`open\`, not \`in_progress\`.
-3. **Not blocked.** The seed has no \`blockedBy\` entries, or all blockers are closed.
+3. **Blockers are advisory.** Do not skip a seed because it has unresolved
+   \`blockedBy\` entries; preserve that metadata in the resulting plan so
+   operators can see the dependency while the work remains actionable.
+   Closed seeds remain excluded by the open-queue filter.
 4. **Sufficient detail.** The description names at least one file or module, or the title is specific enough that you can locate the relevant code. Skip vague reports like "something is slow" with no pointers.
 5. **Small scope.** The fix should touch at most 3 files and require no public API changes, no dependency changes, and no architectural restructuring. If the bug is bigger than that, skip it — it needs a human to scope.
 
