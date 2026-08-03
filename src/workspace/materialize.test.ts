@@ -166,6 +166,7 @@ describe("materializeProjectWorkspace", () => {
 			const result = await materializeProjectWorkspace({
 				workspacePath: ws,
 				branch: "main",
+				createBranch: false,
 				projectRoot: outside,
 				originUrl: repo,
 				hostEnv: isolatedEnv(home),
@@ -173,6 +174,38 @@ describe("materializeProjectWorkspace", () => {
 			expect(result.source.kind).toBe("clone");
 			expect(result.source.originUrl).toBe(repo);
 			expect(await Bun.file(join(ws, "README.md")).exists()).toBe(true);
+		} finally {
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("fresh clone carves the per-run branch off baseBranch, not off a nonexistent remote branch (warren-3fa1)", async () => {
+		// Regression: the fresh-clone materializer used to `git clone --branch
+		// <runBranch>`, which fails because the per-run branch doesn't exist on the
+		// remote. It must clone baseBranch and carve the run branch off it instead —
+		// the clone-side analogue of `git worktree add -b <branch> <baseBranch>`.
+		const outside = mkdtempSync(join(tmpdir(), "warren-outside-run-"));
+		try {
+			const ws = join(outside, "ws");
+			const result = await materializeProjectWorkspace({
+				workspacePath: ws,
+				branch: "warren/run_x",
+				baseBranch: "main",
+				projectRoot: outside,
+				originUrl: repo,
+				hostEnv: isolatedEnv(home),
+			});
+			expect(result.source.kind).toBe("clone");
+			expect(result.source.branch).toBe("warren/run_x");
+			// baseBranch content is present...
+			expect(await Bun.file(join(ws, "README.md")).exists()).toBe(true);
+			// ...and the run branch is checked out locally, carved off main.
+			const branch = await fixtureGitOrThrow(ws, ["branch", "--show-current"]);
+			expect(branch.stdout.trim()).toBe("warren/run_x");
+			// Since we cloned a local-path origin, old HEAD of the run branch === main's tip.
+			const runHead = await fixtureGitOrThrow(ws, ["rev-parse", "warren/run_x"]);
+			const mainHead = await fixtureGitOrThrow(ws, ["rev-parse", "main"]);
+			expect(runHead.stdout.trim()).toBe(mainHead.stdout.trim());
 		} finally {
 			rmSync(outside, { recursive: true, force: true });
 		}
@@ -320,6 +353,7 @@ describe("removeMaterializedWorkspace", () => {
 			const result = await materializeProjectWorkspace({
 				workspacePath: ws,
 				branch: "main",
+				createBranch: false,
 				projectRoot: outside,
 				originUrl: repo,
 				hostEnv: isolatedEnv(home),

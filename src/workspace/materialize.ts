@@ -255,11 +255,32 @@ async function materializeViaClone(
 		});
 	}
 	try {
-		await cloneRepo({
-			originUrl: options.originUrl,
-			targetPath: options.workspacePath,
-			branch: options.branch,
-		});
+		if (options.createBranch ?? true) {
+			// The per-run branch does not exist on the remote, so `git clone --branch
+			// <branch>` fails. Clone the base ref instead, then carve the run branch off
+			// it — the clone-side analogue of `git worktree add -b <branch> <baseBranch>`
+			// (warren-3fa1).
+			const base = options.baseBranch ?? "main";
+			await cloneRepo({
+				originUrl: options.originUrl,
+				targetPath: options.workspacePath,
+				branch: base,
+			});
+			const checkout = await runGit(["checkout", "-b", options.branch], {
+				cwd: options.workspacePath,
+			});
+			if (checkout.exitCode !== 0) {
+				throw new WorkspaceMaterializationError(
+					`git checkout -b ${options.branch} failed (exit ${checkout.exitCode}): ${checkout.stderr.trim()}`,
+				);
+			}
+		} else {
+			await cloneRepo({
+				originUrl: options.originUrl,
+				targetPath: options.workspacePath,
+				branch: options.branch,
+			});
+		}
 	} catch (err) {
 		throw wrapMaterializationError(
 			`failed to clone ${options.originUrl} into ${options.workspacePath}`,
