@@ -215,6 +215,12 @@ export interface ReapRunResult {
 	 * message (also emitted on the `reap.provider_error` event).
 	 */
 	readonly providerError: string | null;
+	/** Sanitized upstream metadata when the provider supplied structured diagnostics. */
+	readonly providerErrorDiagnostic: {
+		readonly provider: string | null;
+		readonly status: number | null;
+		readonly body: string | null;
+	} | null;
 	/** Last valid structured completion signal recovered from persisted output. */
 	readonly completionSignal: CompletionSignal | null;
 	/** Resume prompt emitted for failed runs; null for successful runs. */

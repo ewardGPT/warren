@@ -21,7 +21,13 @@ describe("classifyTerminalProviderError (warren-edc3)", () => {
 				message: { stopReason: "error", errorMessage: CREDIT_MESSAGE },
 			}),
 		];
-		expect(classifyTerminalProviderError(events)).toEqual({ message: CREDIT_MESSAGE });
+		expect(classifyTerminalProviderError(events)).toMatchObject({
+			diagnostic: {
+				provider: null,
+				status: null,
+				body: "Your credit balance is too low to access the Anthropic API",
+			},
+		});
 	});
 
 	test("agent_end with top-level stopReason=error + errorMessage -> terminal provider error", () => {
@@ -31,7 +37,9 @@ describe("classifyTerminalProviderError (warren-edc3)", () => {
 		const events = [
 			envEvent({ type: "agent_end", stopReason: "error", errorMessage: "overloaded_error" }),
 		];
-		expect(classifyTerminalProviderError(events)).toEqual({ message: "overloaded_error" });
+		expect(classifyTerminalProviderError(events)).toMatchObject({
+			diagnostic: { body: "overloaded_error" },
+		});
 	});
 
 	test("success turn_end (stopReason=stop) -> no provider error", () => {
@@ -54,7 +62,9 @@ describe("classifyTerminalProviderError (warren-edc3)", () => {
 			}),
 			envEvent({ type: "agent_end", messages: [{ role: "assistant", content: [] }] }),
 		];
-		expect(classifyTerminalProviderError(events)).toEqual({ message: CREDIT_MESSAGE });
+		expect(classifyTerminalProviderError(events)).toMatchObject({
+			diagnostic: { body: "Your credit balance is too low to access the Anthropic API" },
+		});
 	});
 
 	test("a later successful turn clears an earlier error turn (retried-then-succeeded)", () => {
@@ -116,7 +126,9 @@ describe("classifyTerminalProviderError (warren-edc3)", () => {
 		const events = [
 			envEvent({ type: "turn_end", stopReason: "error", errorMessage: CREDIT_MESSAGE }),
 		];
-		expect(classifyTerminalProviderError(events)).toEqual({ message: CREDIT_MESSAGE });
+		expect(classifyTerminalProviderError(events)).toMatchObject({
+			diagnostic: { body: "Your credit balance is too low to access the Anthropic API" },
+		});
 	});
 
 	test("first-turn 400 (0 tokens, no prior output) is detected", () => {
@@ -130,6 +142,40 @@ describe("classifyTerminalProviderError (warren-edc3)", () => {
 				message: { stopReason: "error", errorMessage: CREDIT_MESSAGE },
 			}),
 		];
-		expect(classifyTerminalProviderError(events)).toEqual({ message: CREDIT_MESSAGE });
+		expect(classifyTerminalProviderError(events)).toMatchObject({
+			diagnostic: { body: "Your credit balance is too low to access the Anthropic API" },
+		});
+	});
+
+	test("extracts provider, status, body, and redacts secrets from structured errors", () => {
+		const message = JSON.stringify({
+			status: 429,
+			provider: "openai",
+			body: { message: "rate limited", api_key: "sk-secret" },
+		});
+		const result = classifyTerminalProviderError([
+			envEvent({ type: "agent_end", stopReason: "error", errorMessage: message }),
+		]);
+		expect(result).toMatchObject({
+			diagnostic: {
+				provider: "openai",
+				status: 429,
+				body: '{"message":"rate limited","api_key":"[redacted]"}',
+			},
+		});
+		expect(result?.diagnostic.message).not.toContain("sk-secret");
+	});
+
+	test("keeps malformed JSON and plain text safe", () => {
+		const result = classifyTerminalProviderError([
+			envEvent({
+				type: "agent_end",
+				stopReason: "error",
+				errorMessage: "provider unavailable token=secret",
+			}),
+		]);
+		expect(result).toMatchObject({
+			diagnostic: { provider: null, status: null, body: "provider unavailable token=[redacted]" },
+		});
 	});
 });

@@ -24,6 +24,7 @@ export function fakeReapResult(state: ReapRunResult["state"]): ReapRunResult {
 		state,
 		failureReason: state === "failed" ? "timed_out" : null,
 		providerError: null,
+		providerErrorDiagnostic: null,
 		completionSignal: null,
 		resumeFeedback: null,
 		mulchUpdated: 0,
