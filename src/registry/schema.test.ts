@@ -7,6 +7,7 @@ import {
 	readProviderFrontmatter,
 	readRuntimeId,
 	readToolsFrontmatter,
+	validateAgentDefinition,
 	withMaxCostUsdOverride,
 	withProviderOverrides,
 } from "./schema.ts";
@@ -143,6 +144,35 @@ describe("readRuntimeId", () => {
 	test("ignores empty / undefined config override", () => {
 		expect(readRuntimeId(INTERACTIVE, undefined)).toBe("sapling");
 		expect(readRuntimeId(INTERACTIVE, "")).toBe("sapling");
+	});
+
+	test("rejects unknown runtime overrides before dispatch", () => {
+		expect(() => readRuntimeId(NAME_MATCH, "planner")).toThrow(/unknown runtime.*planner/i);
+	});
+});
+
+describe("validateAgentDefinition runtime", () => {
+	test("rejects an unknown declared runtime at registration/refresh", () => {
+		const invalid = {
+			name: "broken-runtime",
+			version: 1,
+			sections: { system: "hi" },
+			resolvedFrom: ["test"],
+			frontmatter: { runtime: "planner" },
+		} satisfies AgentDefinition;
+		expect(() => validateAgentDefinition(invalid)).toThrow(/planner.*unknown/i);
+	});
+
+	test("keeps legacy pi-chat declarations compatible", () => {
+		const legacy = {
+			name: "legacy-pi-chat",
+			version: 1,
+			sections: { system: "hi" },
+			resolvedFrom: ["test"],
+			frontmatter: { runtime: "pi-chat" },
+		} satisfies AgentDefinition;
+		expect(() => validateAgentDefinition(legacy)).not.toThrow();
+		expect(readRuntimeId(legacy)).toBe("sapling");
 	});
 });
 
