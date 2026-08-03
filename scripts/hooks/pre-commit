@@ -17,4 +17,4 @@ bun run check:all
 
 # Secret scan — mirrors the gitleaks step in .github/workflows/ci.yml so
 # the local gate matches CI (git-mode scan; empty diff = no-op success).
-gitleaks git --pre-commit --redact --staged --no-banner
+gitleaks protect --staged --redact --no-banner

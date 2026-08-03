@@ -42,3 +42,4 @@ deploy/k8s/overlays/gke-live/
 # plan. Thinking-in-progress lives here so it has a home outside the tracker
 # and outside git history; promote anything durable into docs or `sd plan`.
 local-planning/
+/.local/
