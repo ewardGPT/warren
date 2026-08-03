@@ -58,6 +58,11 @@ describe("reapRun provider-error safety net (warren-edc3)", () => {
 		expect(result.state).toBe("failed");
 		expect(result.failureReason).toBe("provider_error");
 		expect(result.providerError).toBe(message);
+		expect(result.providerErrorDiagnostic).toEqual({
+			provider: null,
+			status: null,
+			body: "Your credit balance is too low to access the Anthropic API",
+		});
 		// No bookkeeping-only PR ships for a provider-error run.
 		expect(result.prUrl).toBeNull();
 		const events = await ctx.repos.events.listByRun(ctx.runId);

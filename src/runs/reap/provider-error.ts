@@ -37,9 +37,84 @@ export interface ProviderErrorEventInput {
 	readonly payload: unknown;
 }
 
-/** A detected terminal provider error + the provider's message. */
-export interface ProviderErrorSignal {
+/** A detected terminal provider error with safe upstream diagnostics. */
+export interface ProviderErrorDiagnostic {
 	readonly message: string;
+	readonly provider: string | null;
+	readonly status: number | null;
+	readonly body: string | null;
+}
+
+export interface ProviderErrorSignal {
+	readonly diagnostic: ProviderErrorDiagnostic;
+}
+
+const MAX_DIAGNOSTIC_LENGTH = 4_000;
+
+function redactDiagnosticText(value: string): string {
+	return value
+		.replace(/(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+		.replace(/("(?:api[_-]?key|token|secret|password)"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
+		.replace(/(api[_-]?key|token|secret|password)(\s*[=:]\s*)[^\s,;]+/gi, "$1$2[redacted]")
+		.slice(0, MAX_DIAGNOSTIC_LENGTH);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+function firstString(record: Record<string, unknown>, keys: readonly string[]): string | null {
+	for (const key of keys) {
+		if (typeof record[key] === "string" && record[key].trim() !== "") {
+			return redactDiagnosticText(record[key] as string);
+		}
+	}
+	return null;
+}
+
+function firstStatus(record: Record<string, unknown>): number | null {
+	for (const key of ["status", "statusCode", "status_code", "httpStatus", "http_status"]) {
+		const value = record[key];
+		if (typeof value === "number" && Number.isInteger(value)) return value;
+		if (typeof value === "string" && /^\d{3}$/.test(value)) return Number(value);
+	}
+	return null;
+}
+
+function diagnosticFromMessage(
+	message: string,
+	envelope: Record<string, unknown>,
+): ProviderErrorDiagnostic {
+	const safeMessage = redactDiagnosticText(message);
+	let parsed: Record<string, unknown> | null = null;
+	try {
+		parsed = asRecord(JSON.parse(message));
+	} catch {
+		// Plain-text provider errors are valid and remain useful as-is.
+	}
+	const root = parsed ?? envelope;
+	const nestedError = asRecord(root.error);
+	const nestedResponse = asRecord(root.response);
+	const provider =
+		firstString(root, ["provider", "providerName", "provider_name"]) ??
+		(nestedError ? firstString(nestedError, ["provider", "providerName", "provider_name"]) : null);
+	const status =
+		firstStatus(root) ??
+		(nestedError ? firstStatus(nestedError) : null) ??
+		(nestedResponse ? firstStatus(nestedResponse) : null);
+	const bodyValue = root.body ?? root.error_body ?? nestedResponse?.body ?? nestedError?.message;
+	let body: string | null = null;
+	if (typeof bodyValue === "string") body = redactDiagnosticText(bodyValue);
+	else if (bodyValue !== undefined) {
+		try {
+			body = redactDiagnosticText(JSON.stringify(bodyValue));
+		} catch {
+			body = null;
+		}
+	}
+	return { message: safeMessage, provider, status, body: body ?? safeMessage };
 }
 
 /**
@@ -85,7 +160,7 @@ function readErrorMessage(env: Record<string, unknown>): unknown {
  *                carrying only `messages`); leaves the running verdict untouched.
  */
 type EnvelopeVerdict =
-	| { readonly kind: "error"; readonly message: string }
+	| { readonly kind: "error"; readonly diagnostic: ProviderErrorDiagnostic }
 	| { readonly kind: "clear" }
 	| { readonly kind: "ignore" };
 
@@ -96,7 +171,7 @@ function classifyEnvelope(env: Record<string, unknown>): EnvelopeVerdict {
 	if (stopReason === undefined) return { kind: "ignore" };
 	const errorMessage = readErrorMessage(env);
 	if (stopReason === "error" && typeof errorMessage === "string" && errorMessage.length > 0) {
-		return { kind: "error", message: errorMessage };
+		return { kind: "error", diagnostic: diagnosticFromMessage(errorMessage, env) };
 	}
 	return { kind: "clear" };
 }
@@ -138,7 +213,7 @@ export function classifyTerminalProviderError(
 		if (payload === null || typeof payload !== "object") continue;
 		const verdict = classifyEnvelope(payload as Record<string, unknown>);
 		if (verdict.kind === "ignore") continue;
-		terminal = verdict.kind === "error" ? { message: verdict.message } : null;
+		terminal = verdict.kind === "error" ? { diagnostic: verdict.diagnostic } : null;
 	}
 	return terminal;
 }
