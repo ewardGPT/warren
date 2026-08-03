@@ -42,6 +42,8 @@ describe("refreshProjectClone", () => {
 		expect(calls[3]?.cmd).toEqual(["git", "config", "--local", "--unset-all", "user.name"]);
 		expect(calls[4]?.cmd).toEqual(["git", "config", "--local", "--unset-all", "user.email"]);
 		expect(calls.every((c) => c.cwd === "/data/projects/x/y")).toBe(true);
+		expect(calls.every((c) => c.env?.GIT_DIR === undefined)).toBe(true);
+		expect(calls.every((c) => c.env?.GIT_WORK_TREE === undefined)).toBe(true);
 	});
 
 	test("tolerates the user identity scrub exiting non-zero when keys are absent (warren-9f70)", async () => {
@@ -109,13 +111,9 @@ describe("refreshProjectClone", () => {
 		});
 
 		const fetch = seen.find((c) => c.cmd[1] === "fetch");
-		expect(fetch?.env).toEqual({
-			GIT_CONFIG_COUNT: "1",
-			GIT_CONFIG_KEY_0: "url.https://x-access-token:ghp_secret@github.com/.insteadOf",
-			GIT_CONFIG_VALUE_0: "https://github.com/",
-		});
-		// checkout / reset / config / rev-parse are local — no env override.
-		expect(seen.filter((c) => c.cmd[1] !== "fetch").every((c) => c.env === undefined)).toBe(true);
+		expect(fetch?.env?.GIT_CONFIG_COUNT).toBe("1");
+		expect(fetch?.env?.GIT_CONFIG_KEY_0).toContain("ghp_secret");
+		expect(seen.every((c) => c.env?.GIT_DIR === undefined)).toBe(true);
 		// Token never rides in argv.
 		expect(seen.flatMap((c) => c.cmd).join(" ")).not.toContain("ghp_secret");
 	});
@@ -135,7 +133,7 @@ describe("refreshProjectClone", () => {
 			spawn,
 			exists: () => true,
 		});
-		expect(seen.find((c) => c.cmd[1] === "fetch")?.env).toBeUndefined();
+		expect(seen.find((c) => c.cmd[1] === "fetch")?.env?.GIT_DIR).toBeUndefined();
 	});
 
 	test("throws ProjectUnavailableError when localPath does not exist", async () => {

@@ -32,9 +32,9 @@
 			"why": "Plan-run wire rows. src/ui is a separate composite TS project that cannot import the SDK types (mx-2e4a1a), so the wire vocabulary is mirrored; `bun run check:wire-types` is what keeps the two copies from drifting."
 		},
 		{
-			"a": "src/client/types.ts",
-			"b": "src/ui/src/api/types.ts",
-			"why": "Same mirrored wire vocabulary as the plan-run rows above, guarded by check:wire-types."
+			"a": "src/cli/commands/add-project.ts",
+			"b": "src/cli/commands/init.ts",
+			"why": "The seven-line success-envelope tail is intentionally repeated: add-project reports a persisted project row while init reports scaffolded files, and extracting a shared writer would erase the distinct response schemas."
 		},
 		{
 			"a": "src/server/handlers/alerts.ts",
@@ -55,11 +55,6 @@
 			"a": "src/server/handlers/runs/analytics.ts",
 			"b": "src/server/handlers/runs/lifecycle.ts",
 			"why": "Analytics window parsing and the run-row projection. mx-24e25f records that the analytics handler deliberately mirrors the list-runs handler so the two payloads keep the same recognisable shape."
-		},
-		{
-			"a": "src/server/handlers/runs/analytics.ts",
-			"b": "src/ui/src/api/types.ts",
-			"why": "The analytics response interface, mirrored into the UI types for the same composite-project reason as the other wire types."
 		},
 		{
 			"a": "src/ui/src/api/client.ts",

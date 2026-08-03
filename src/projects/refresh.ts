@@ -24,6 +24,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { gitRepoContextScrubEnv } from "../bot-identity.ts";
 import { githubCredentialGitEnv } from "../workspace/git/credential-env.ts";
 import { detectProjectFeatures, type ProjectFeatureFlags } from "./capabilities.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "./clone.ts";
@@ -98,6 +99,14 @@ export async function refreshProjectClone(
 	const { config, localPath, ref, spawn } = input;
 	const timeoutMs = input.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
 	const exists = input.exists ?? existsSync;
+	// A refresh runs after Warren's own commit/reap work. Hooks can export
+	// repository-context variables such as GIT_DIR into a child process; never
+	// let those variables redirect a project refresh away from its cwd.
+	const safeSpawn: SpawnFn = async (cmd, opts) =>
+		spawn(cmd, {
+			...opts,
+			env: { ...gitRepoContextScrubEnv(), ...(opts.env ?? {}) },
+		});
 
 	if (!exists(localPath)) {
 		// A registered project whose on-disk clone vanished is a data-integrity
@@ -112,7 +121,7 @@ export async function refreshProjectClone(
 	const credEnv = githubCredentialGitEnv(input.token);
 	const netEnv = Object.keys(credEnv).length > 0 ? { env: credEnv } : {};
 
-	await runGit(spawn, [config.gitBinary, "fetch", "--prune", "origin"], {
+	await runGit(safeSpawn, [config.gitBinary, "fetch", "--prune", "origin"], {
 		cwd: localPath,
 		timeoutMs,
 		...netEnv,
@@ -124,7 +133,7 @@ export async function refreshProjectClone(
 	// branch we happened to already be on — which on a fresh clone
 	// is the default branch, but on a prior run might be something
 	// else entirely.
-	await runGit(spawn, [config.gitBinary, "checkout", "--force", ref], {
+	await runGit(safeSpawn, [config.gitBinary, "checkout", "--force", ref], {
 		cwd: localPath,
 		timeoutMs,
 	});
@@ -134,12 +143,12 @@ export async function refreshProjectClone(
 	// remote. If `ref` is a SHA or tag, `origin/<ref>` won't resolve;
 	// fall back to a plain `reset --hard <ref>` in that case.
 	const resetToRemote = await trySpawn(
-		spawn,
+		safeSpawn,
 		[config.gitBinary, "reset", "--hard", `origin/${ref}`],
 		{ cwd: localPath, timeoutMs },
 	);
 	if (resetToRemote.exitCode !== 0) {
-		await runGit(spawn, [config.gitBinary, "reset", "--hard", ref], {
+		await runGit(safeSpawn, [config.gitBinary, "reset", "--hard", ref], {
 			cwd: localPath,
 			timeoutMs,
 		});
@@ -152,7 +161,7 @@ export async function refreshProjectClone(
 	// identity into the agent's commits. Best-effort: `--unset-all`
 	// exits 5 when the key is absent, which is the normal case.
 	for (const key of ["user.name", "user.email"] as const) {
-		await trySpawn(spawn, [config.gitBinary, "config", "--local", "--unset-all", key], {
+		await trySpawn(safeSpawn, [config.gitBinary, "config", "--local", "--unset-all", key], {
 			cwd: localPath,
 			timeoutMs,
 		});
@@ -171,13 +180,13 @@ export async function refreshProjectClone(
 		await tryArmGitHooks({
 			config,
 			localPath,
-			spawn,
+			spawn: safeSpawn,
 			timeoutMs,
 			readFileFn: input.readFileFn,
 		});
 	}
 
-	const headSha = await readHead(spawn, config.gitBinary, localPath, timeoutMs);
+	const headSha = await readHead(safeSpawn, config.gitBinary, localPath, timeoutMs);
 	const features = detectProjectFeatures(localPath, exists);
 	return { headSha, ref, features };
 }
