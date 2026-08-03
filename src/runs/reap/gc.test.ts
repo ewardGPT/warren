@@ -104,6 +104,7 @@ interface Harness {
 	activeRuns: RunRow[];
 	terminalRuns: RunRow[];
 	destroyed: string[];
+	forgotten: string[][];
 }
 
 function tickInput(
@@ -115,6 +116,9 @@ function tickInput(
 		repos: {
 			runs: {
 				listByState: async (states) => (states.includes("running") ? h.activeRuns : h.terminalRuns),
+				clearBurrowId: async (ids) => {
+					h.forgotten.push([...ids]);
+				},
 			},
 		},
 		config: { ttlMs: 60 * 60_000, tickMs: 1000, disabled: false, ...config },
@@ -127,36 +131,71 @@ function tickInput(
 	};
 }
 
+function blankHarness(): Harness {
+	return { activeRuns: [], terminalRuns: [], destroyed: [], forgotten: [] };
+}
+
 describe("runWorkspaceGcTick", () => {
 	test("destroys stranded burrows", async () => {
-		const h: Harness = {
-			activeRuns: [],
-			terminalRuns: [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")],
-			destroyed: [],
-		};
+		const h: Harness = blankHarness();
+		h.terminalRuns = [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")];
 		const result = await runWorkspaceGcTick(tickInput(h));
 		expect(result).toEqual({ scanned: 1, stranded: 1, destroyed: 1, failed: 0 });
 		expect(h.destroyed).toEqual(["bur_old"]);
 	});
 
+	test("detaches the swept runs so the burrow is not re-stranded", async () => {
+		const h: Harness = blankHarness();
+		h.terminalRuns = [
+			terminalRun("bur_old", "2026-05-29T09:00:00.000Z"),
+			{ ...terminalRun("bur_old", "2026-05-29T09:00:00.000Z"), id: "run_b" },
+		];
+		const result = await runWorkspaceGcTick(tickInput(h));
+		expect(result).toEqual({ scanned: 1, stranded: 1, destroyed: 1, failed: 0 });
+		// Both runs anchored to the swept burrow are detached.
+		expect(h.forgotten).toEqual([expect.arrayContaining(["run_b"])]);
+	});
+
+	test("already-gone burrows are counted as destroyed and detached", async () => {
+		const h: Harness = blankHarness();
+		h.terminalRuns = [terminalRun("bur_gone", "2026-05-29T09:00:00.000Z")];
+		const result = await runWorkspaceGcTick(
+			tickInput(h, {
+				destroyWorkspace: async () => ({ status: "already-gone" }),
+			}),
+		);
+		expect(result).toEqual({ scanned: 1, stranded: 1, destroyed: 1, failed: 0 });
+		expect(h.forgotten).toHaveLength(1);
+		expect(h.forgotten[0]).toStrictEqual<Array<string | undefined>>([undefined]);
+	});
+
 	test("never touches a burrow with a live run", async () => {
-		const h: Harness = {
-			activeRuns: [activeRun("bur_live")],
-			terminalRuns: [terminalRun("bur_live", "2026-05-29T00:00:00.000Z")],
-			destroyed: [],
-		};
+		const h: Harness = blankHarness();
+		h.activeRuns = [activeRun("bur_live")];
+		h.terminalRuns = [terminalRun("bur_live", "2026-05-29T00:00:00.000Z")];
 		const result = await runWorkspaceGcTick(tickInput(h));
 		expect(result.scanned).toBe(0);
 		expect(result.destroyed).toBe(0);
 		expect(h.destroyed).toEqual([]);
+		expect(h.forgotten).toEqual([]);
+	});
+
+	test("a failed destroy is retried and never detached", async () => {
+		const h: Harness = blankHarness();
+		h.terminalRuns = [terminalRun("bur_flaky", "2026-05-29T09:00:00.000Z")];
+		const result = await runWorkspaceGcTick(
+			tickInput(h, {
+				destroyWorkspace: async () => ({ status: "failed", error: "worker unreachable" }),
+			}),
+		);
+		expect(result).toEqual({ scanned: 1, stranded: 1, destroyed: 0, failed: 1 });
+		// Not forgotten — next tick must re-derive it and retry.
+		expect(h.forgotten).toEqual([]);
 	});
 
 	test("counts a destroy failure", async () => {
-		const h: Harness = {
-			activeRuns: [],
-			terminalRuns: [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")],
-			destroyed: [],
-		};
+		const h: Harness = blankHarness();
+		h.terminalRuns = [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")];
 		const result = await runWorkspaceGcTick(
 			tickInput(h, {
 				destroyWorkspace: async () => ({ status: "failed", error: "worker unreachable" }),
@@ -166,11 +205,8 @@ describe("runWorkspaceGcTick", () => {
 	});
 
 	test("treats a 404 from burrow as already-gone: counts as destroyed", async () => {
-		const h: Harness = {
-			activeRuns: [],
-			terminalRuns: [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")],
-			destroyed: [],
-		};
+		const h: Harness = blankHarness();
+		h.terminalRuns = [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")];
 		const logs: string[] = [];
 		const result = await runWorkspaceGcTick(
 			tickInput(h, {
@@ -188,6 +224,36 @@ describe("runWorkspaceGcTick", () => {
 		expect(result).toEqual({ scanned: 1, stranded: 1, destroyed: 1, failed: 0 });
 		// Logged at info, not warn — it's not an error.
 		expect(logs.some((m) => m.includes("already_gone") || m.includes("bur_old"))).toBe(true);
+	});
+
+	test("keeps retrying a destroy while the workspace stays reachable", async () => {
+		const h: Harness = blankHarness();
+		h.terminalRuns = [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")];
+		let attempts = 0;
+		const input = tickInput(h, {
+			destroyWorkspace: async () => {
+				attempts += 1;
+				return { status: "failed", error: "worker unreachable" };
+			},
+		});
+		await runWorkspaceGcTick(input);
+		await runWorkspaceGcTick(input);
+		expect(attempts).toBe(2);
+		expect(h.forgotten).toEqual([]);
+	});
+
+	test("already-gone burrow is not re-stranded on the next sweep", async () => {
+		const h: Harness = blankHarness();
+		h.terminalRuns = [terminalRun("bur_gone", "2026-05-29T09:00:00.000Z")];
+		const input = tickInput(h, {
+			destroyWorkspace: async () => ({ status: "already-gone" }),
+		});
+		const first = await runWorkspaceGcTick(input);
+		expect(first.destroyed).toBe(1);
+		// After detachment, the terminal run no longer anchors the burrow.
+		h.terminalRuns = [];
+		const second = await runWorkspaceGcTick(input);
+		expect(second).toEqual({ scanned: 0, stranded: 0, destroyed: 0, failed: 0 });
 	});
 });
 
@@ -229,6 +295,7 @@ describe("startWorkspaceGcWorker", () => {
 			activeRuns: [],
 			terminalRuns: [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")],
 			destroyed: [],
+			forgotten: [],
 		};
 		const worker = startWorkspaceGcWorker({
 			...tickInput(h),
@@ -242,7 +309,7 @@ describe("startWorkspaceGcWorker", () => {
 	});
 
 	test("disabled config never schedules an interval", async () => {
-		const h: Harness = { activeRuns: [], terminalRuns: [], destroyed: [] };
+		const h: Harness = { activeRuns: [], terminalRuns: [], destroyed: [], forgotten: [] };
 		let scheduled = false;
 		const worker = startWorkspaceGcWorker({
 			...tickInput(h, {}, { disabled: true }),
@@ -261,6 +328,7 @@ describe("startWorkspaceGcWorker", () => {
 			activeRuns: [],
 			terminalRuns: [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")],
 			destroyed: [],
+			forgotten: [],
 		};
 		let release: () => void = () => {};
 		const gate = new Promise<void>((r) => {

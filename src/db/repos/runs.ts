@@ -10,7 +10,7 @@
  * the burrow IDs are written back once we have them.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { NotFoundError, StateTransitionError, ValidationError } from "../../core/errors.ts";
 import { generateId } from "../../core/ids.ts";
 import { PREVIEW_STATES } from "../../core/wire.ts";
@@ -291,6 +291,16 @@ export class RunsRepo {
 	 * second (`POST /burrows/:id/runs`), so each ID lands on a different turn.
 	 * Both fields are optional, but at least one must be set.
 	 */
+	async clearBurrowId(ids: readonly string[]): Promise<void> {
+		if (ids.length === 0) return;
+		await this.adapter.runWrite(
+			this.db
+				.update(this.runs)
+				.set({ burrowId: null })
+				.where(inArray(this.runs.id, ids as readonly string[])),
+		);
+	}
+
 	async attachBurrow(id: string, input: AttachBurrowInput): Promise<RunRow> {
 		if (
 			input.burrowId === undefined &&
