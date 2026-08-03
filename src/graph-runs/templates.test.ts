@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import { parseGraphTemplate } from "./templates.ts";
 
 describe("parseGraphTemplate", () => {
@@ -21,7 +22,8 @@ describe("parseGraphTemplate", () => {
 describe("loadGraphTemplate", () => {
 	test("loads warren security-sweep.yaml from disk", async () => {
 		const { loadGraphTemplate } = await import("./templates.ts");
-		const tpl = await loadGraphTemplate("/home/ubuntu/warren", "security-sweep");
+		const projRoot = join(import.meta.dir, "..", "..");
+		const tpl = await loadGraphTemplate(projRoot, "security-sweep");
 		expect(tpl.name).toBe("security-sweep");
 		expect(tpl.scope.glob).toContain("handlers");
 	});
