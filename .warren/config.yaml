@@ -1,7 +1,10 @@
 # .warren/config.yaml — per-project warren defaults.
 defaultRole: sapling
 defaultBranch: main
-defaultProvider: deepseek
-defaultModel: deepseek-reasoner
+# Sapling runs through Burrow's OpenAI-compatible backend. Keep the project
+# default aligned with the backend names Burrow accepts; Pi/OpenRouter is not
+# an implementation path for Warren Seeds.
+defaultProvider: openai
+defaultModel: deepseek-chat
 runBranchPrefix: warren
 qualityGate: bun run check:all
