@@ -155,6 +155,63 @@ describe("POST /plan-runs", () => {
 		expect(body.error.code).toBe("plan_has_no_open_children");
 	});
 
+	test("rejects a promptTemplate that lacks {seed_id}: 400 + recovery hint (warren-b3be)", async () => {
+		const sdSpawn = makeSdSpawn([], []);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-x",
+				agent: "claude-code",
+				promptTemplate: "fix whatever is failing",
+			}),
+		});
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { error: { code: string; hint?: string } };
+		expect(body.error.code).toBe("validation_error");
+		expect(body.error.hint).toContain("{seed_id}");
+	});
+
+	test("accepts a promptTemplate that contains {seed_id} (warren-b3be)", async () => {
+		const calls: SdCall[] = [];
+		const sdSpawn = makeSdSpawn(calls, [
+			{
+				match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+				result: planShowResult("pl-tpl", "active", ["wa-a"]),
+			},
+			{
+				match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+				result: seedShowResult("wa-a", "open"),
+			},
+		]);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-tpl",
+				agent: "claude-code",
+				promptTemplate: "implement {seed_id}",
+			}),
+		});
+		expect(res.status).toBe(201);
+	});
+
 	test("refreshes the project clone before walking the plan (warren-6d60)", async () => {
 		const order: string[] = [];
 		const calls: SdCall[] = [];
