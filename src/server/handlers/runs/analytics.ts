@@ -12,6 +12,7 @@
  * `filter` echo.
  */
 
+import type { RunAnalyticsTokensSection } from "../../../core/api-wire.ts";
 import type { EventsRepo } from "../../../db/repos/events.ts";
 import type { RunRow } from "../../../db/schema.ts";
 import {
@@ -19,14 +20,11 @@ import {
 	buildInsights,
 	buildRunMetrics,
 	buildSteeringSignals,
-	type DimensionTokenSeries,
 	hydrateRunsUsage,
 	type RunGroupBucket,
 	type RunMetrics,
 	type RunMetricsRow,
 	type RunTotals,
-	type TokenBreakdown,
-	type TokenDayBucket,
 	type ToolEventRow,
 } from "../../../runs/index.ts";
 import { isPublicOnly, pickFields } from "../../projection.ts";
@@ -44,20 +42,6 @@ import {
  * and daily time series — into a single nested object so the UI can render
  * token charts without picking fields off multiple top-level keys.
  */
-export interface RunAnalyticsTokensSection {
-	/** Aggregate token breakdown across all runs in the window. */
-	readonly totals: TokenBreakdown;
-	/** Per-model aggregate token totals, sorted by total tokens desc. */
-	readonly byModel: readonly { readonly key: string; readonly tokens: TokenBreakdown }[];
-	/** Per-provider aggregate token totals, sorted by total tokens desc. */
-	readonly byProvider: readonly { readonly key: string; readonly tokens: TokenBreakdown }[];
-	/** Overall daily token series, one bucket per calendar day (YYYY-MM-DD). */
-	readonly timeSeries: readonly TokenDayBucket[];
-	/** Per-model daily token series, top-5 + OTHER_KEY fold + NONE_KEY. */
-	readonly byModelTimeSeries: readonly DimensionTokenSeries[];
-	/** Per-provider daily token series, top-5 + OTHER_KEY fold + NONE_KEY. */
-	readonly byProviderTimeSeries: readonly DimensionTokenSeries[];
-}
 
 /** Resolved `?from`/`?to`/`?projectId` analytics window. */
 interface AnalyticsWindow {
