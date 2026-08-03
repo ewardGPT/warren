@@ -32,11 +32,6 @@
 			"why": "Plan-run wire rows. src/ui is a separate composite TS project that cannot import the SDK types (mx-2e4a1a), so the wire vocabulary is mirrored; `bun run check:wire-types` is what keeps the two copies from drifting."
 		},
 		{
-			"a": "src/cli/commands/add-project.ts",
-			"b": "src/cli/commands/init.ts",
-			"why": "The seven-line success-envelope tail is intentionally repeated: add-project reports a persisted project row while init reports scaffolded files, and extracting a shared writer would erase the distinct response schemas."
-		},
-		{
 			"a": "src/server/handlers/alerts.ts",
 			"b": "src/server/handlers/projects.ts",
 			"why": "The `spawnRun` argument object. Both routes dispatch a run, so they pass the same optional-spread deps; the dispatch logic itself lives once in src/runs/spawn/dispatch.ts."

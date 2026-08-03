@@ -12,7 +12,6 @@
 // Only the RESPONSE ENVELOPES below are UI-local, and only because the
 // server's row types are drizzle-inferred — importing them would drag
 // drizzle and `bun:sqlite` into the browser bundle.
-
 export {
 	type AgentRow,
 	type AgentSource,
@@ -33,7 +32,6 @@ export {
 } from "../../../core/wire.ts";
 
 import type {
-	CloneKind,
 	EventStream,
 	PlanRunChildState,
 	PlanRunState,
@@ -73,115 +71,18 @@ export interface RefreshProjectResponse {
 	ref: string;
 }
 
-export interface RunRow {
-	id: string;
-	agentName: string;
-	/**
-	 * Null when the project was deleted after the run was created
-	 * (warren-5f19). The FK is `ON DELETE SET NULL`, so run history
-	 * survives a project delete as orphan rows.
-	 */
-	projectId: string | null;
-	/**
-	 * Internal runtime handles, named for burrow but populated by
-	 * whichever runtime dispatched the run (warren-0965): burrow
-	 * sandbox/run ids under the burrow runtime, the pod name and pod UID
-	 * under `WARREN_RUNTIME=k8s` — NOT null there. OPTIONAL on the wire:
-	 * the public projection drops both (warren-946f), so consumers must
-	 * test presence, not `!== null` (warren-f53e).
-	 */
-	burrowId?: string | null;
-	burrowRunId?: string | null;
-	/**
-	 * Back-link to the seeds issue this run was dispatched against
-	 * (pl-bb70 step 3 / warren-805a). Null encodes "no seed" — manual
-	 * prompts from POST /runs without `seedId`, or legacy rows written
-	 * before the column existed. Surfaced as a MetaCard on RunDetail so
-	 * operators can navigate from a run back to its issue (pl-bb70 step
-	 * 6 / warren-c845). R-04 will turn this into a proper hyperlink
-	 * when the issues page lands.
-	 */
-	seedId: string | null;
-	/**
-	 * Continuation back-link (warren-4b11). Set when this run was spawned as
-	 * a "re-run with follow-up" of a prior terminal run: its workspace was
-	 * seeded from the parent's pushed branch instead of the project default
-	 * branch. Null for root runs. The Runs list renders a `↪ from run_xxx`
-	 * chain indicator and RunDetail links back to the parent.
-	 */
-	parentRunId: string | null;
-	/**
-	 * Chain-kind discriminator (warren-e96f) for a run carrying a
-	 * `parentRunId`: `'continue'` (warren-4b11 — workspace seeded from the
-	 * parent's pushed branch) vs `'replicate'` (warren-e96f — fresh
-	 * re-dispatch of the parent's exact agent/model/project/prompt against
-	 * the project default base). Null for root runs.
-	 */
-	cloneKind: CloneKind | null;
-	/**
-	 * Run mode discriminator (pl-0344 step 1 / warren-67b6). Pinned at row
-	 * creation; warren-side only (burrow doesn't know about run mode).
-	 * `batch` is the only member today.
-	 */
-	mode: RunMode;
-	renderedAgentJson: unknown;
-	state: RunState;
-	failureReason: RunFailureReason | null;
-	startedAt: string | null;
-	endedAt: string | null;
-	prompt: string;
-	trigger: string;
-	/**
-	 * URL of the PR reap opened (warren-f6af). Null when reap's `pr_open`
-	 * sub-step was skipped (auto-open disabled, no commits, push failed,
-	 * branch == defaultBranch) or the GitHub call errored.
-	 */
-	prUrl: string | null;
-	/** Existing branch reap pushes the workspace back to (#419). Null when unset. */
-	targetBranch: string | null;
-	/**
-	 * Salvage-before-destroy (warren-cd3b): where a finalize_failed run's
-	 * committed work was captured — `salvageRef` is the `warren/rescue/<runId>`
-	 * branch on origin, `salvagePath` the durable git-bundle file. Both null
-	 * when nothing was captured (or needed).
-	 */
-	salvageRef: string | null;
-	salvagePath: string | null;
-	/**
-	 * Per-run cost in USD (warren-a7dc). Currently populated only for runs
-	 * dispatched against the `pi` runtime — the bridge snapshots
-	 * `get_session_stats` at run-start + run-end and persists the delta.
-	 * Null for non-pi runtimes and for pi runs whose stats RPC failed.
-	 */
-	costUsd: number | null;
-	/** Input tokens consumed (warren-a7dc); see `costUsd` for nullability. */
-	tokensInput: number | null;
-	/** Output tokens produced (warren-a7dc); see `costUsd` for nullability. */
-	tokensOutput: number | null;
-	/** Cache-read tokens (warren-a7dc); see `costUsd` for nullability. */
-	tokensCacheRead: number | null;
-	/** Cache-write tokens (warren-a7dc); see `costUsd` for nullability. */
-	tokensCacheWrite: number | null;
-	/**
-	 * Per-run preview environment columns (R-19 / docs/design/preview-environments.md). All null on
-	 * runs whose project hasn't opted into previews; populated by reap's
-	 * `preview_launch` sub-step, the readiness probe, the host reverse
-	 * proxy (`previewLastHitAt`), and the eviction worker / manual
-	 * teardown route.
-	 */
-	previewState: PreviewState | null;
-	previewPort: number | null;
-	previewStartedAt: string | null;
-	previewLastHitAt: string | null;
-	/**
-	 * OPTIONAL on the wire: free text carrying a subprocess stderr tail, so
-	 * the public projection drops it (warren-946f / warren-f53e).
-	 */
-	previewFailureMessage?: string | null;
-}
+export type { RunRow } from "../../../core/api-wire.ts";
+
+import type { RunRow } from "../../../core/api-wire.ts";
+
+// Public projections may omit these fields; the canonical declaration lives
+// in core/api-wire.ts and remains optional at this boundary.
+// burrowId?: string | null
+// burrowRunId?: string | null
+// previewFailureMessage?: string | null
 
 /**
- * Wire envelope of `POST /runs/:id/preview/teardown` (R-19 / docs/design/preview-environments.md,
+ * Wire envelope of `POST /runs/:id/preview/teardown` (R-19 / SPEC §11.L,
  * warren-d725). The handler is idempotent and always 200s with a CAS-
  * outcome discriminator: `tornDown: true` only when the call flipped a
  * `starting`/`live` row.
@@ -200,7 +101,7 @@ export interface PreviewTeardownResponse {
 }
 
 /**
- * Wire envelope of `POST /runs/:id/preview/login` (R-19 / docs/design/preview-environments.md,
+ * Wire envelope of `POST /runs/:id/preview/login` (R-19 / SPEC §11.L,
  * warren-e1b0). The credential-bearing half of the handshake is the
  * `Set-Cookie` header the browser stores implicitly; `url` is the
  * mode-correct preview target the caller navigates to afterwards.
@@ -364,7 +265,7 @@ export interface WhoamiResponse {
 }
 
 /**
- * Wire envelope of `GET /preview/config` (R-19 / docs/design/preview-environments.md path addendum,
+ * Wire envelope of `GET /preview/config` (R-19 / SPEC §11.L path addendum,
  * warren-016d). Deployment-wide preview routing mode + optional host. The
  * UI uses this to render the canonical preview URL in `PreviewCard` so
  * path-mode and subdomain-mode deploys both show a copyable string that
@@ -642,51 +543,9 @@ export interface CancelPlanRunResponse {
  * means no token data for the window (not null — the server always zeroes
  * empty windows rather than omitting the field).
  */
-export interface TokenBreakdown {
-	readonly input: number;
-	readonly output: number;
-	readonly cacheRead: number;
-	readonly cacheWrite: number;
-	readonly total: number;
-}
-
-/** One calendar-day's token counts in an overall time-series. `date` is YYYY-MM-DD. */
-export interface TokenDayBucket {
-	readonly date: string;
-	readonly input: number;
-	readonly output: number;
-	readonly cacheRead: number;
-	readonly cacheWrite: number;
-	readonly total: number;
-}
-
-/**
- * One key's (model or provider) daily token series in a per-dimension
- * breakdown. `key` may be the `__none__` or `__other__` sentinel — see
- * `RUN_ANALYTICS_NONE_KEY` / `RUN_ANALYTICS_OTHER_KEY` in client.ts.
- */
-export interface DimensionTokenSeries {
-	readonly key: string;
-	readonly series: readonly TokenDayBucket[];
-}
-
-/**
- * The `tokens` section of `GET /analytics/runs` (warren-1244 / pl-d1a2
- * step 2). Carries aggregate totals, per-model/per-provider roll-ups,
- * and three time-series (overall + by-model + by-provider) all within
- * the same filter window applied to the rest of the response.
- */
-export interface RunAnalyticsTokensSection {
-	/** Aggregate token totals across the entire filter window. */
-	readonly totals: TokenBreakdown;
-	/** Per-model aggregate totals, sorted by total tokens desc. */
-	readonly byModel: readonly { readonly key: string; readonly tokens: TokenBreakdown }[];
-	/** Per-provider aggregate totals, sorted by total tokens desc. */
-	readonly byProvider: readonly { readonly key: string; readonly tokens: TokenBreakdown }[];
-	/** Overall daily token time-series (one bucket per calendar day). */
-	readonly timeSeries: readonly TokenDayBucket[];
-	/** Per-model daily series, top-5 by total + OTHER_KEY fold + NONE_KEY. */
-	readonly byModelTimeSeries: readonly DimensionTokenSeries[];
-	/** Per-provider daily series, top-5 by total + OTHER_KEY fold + NONE_KEY. */
-	readonly byProviderTimeSeries: readonly DimensionTokenSeries[];
-}
+export type {
+	DimensionTokenSeries,
+	RunAnalyticsTokensSection,
+	TokenBreakdown,
+	TokenDayBucket,
+} from "../../../core/api-wire.ts";

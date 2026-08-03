@@ -85,6 +85,7 @@ export type InboxPriority = (typeof INBOX_PRIORITIES)[number];
 export const INBOX_STATES = ["unread", "delivered", "failed"] as const;
 export type InboxState = (typeof INBOX_STATES)[number];
 
+/** Canonical public run row shape shared by the SDK and browser UI. */
 /**
  * Chain-kind discriminator for a run that carries a `parent_run_id`
  * (warren-e96f). Both kinds share the parent back-link column but differ in

@@ -33,6 +33,6 @@
 	// server, the SDK and this UI all import so the enums can never drift.
 	// A composite project must list every file it compiles, so naming it here
 	// is what makes `import "../../../core/wire.ts"` resolve under `tsc -b`.
-	"include": ["src", "../core/wire.ts"],
+	"include": ["src", "../core/wire.ts", "../core/api-wire.ts"],
 	"exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }

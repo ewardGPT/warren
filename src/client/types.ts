@@ -7,18 +7,17 @@
 /* redeclare one of these names — `check:wire-types` (warren-d371) fails    */
 /* the build if you do.                                                     */
 /* ----------------------------------------------------------------------- */
-import type {
-	AgentRow,
-	CloneKind,
-	EventStream,
-	InboxPriority,
-	InboxState,
-	PreviewState,
-	RunFailureReason,
-	RunMode,
-	RunState,
-} from "../core/wire.ts";
 
+import type { RunRow } from "../core/api-wire.ts";
+import type { AgentRow, EventStream, InboxPriority, InboxState } from "../core/wire.ts";
+
+export type {
+	DimensionTokenSeries,
+	RunAnalyticsTokensSection,
+	RunRow,
+	TokenBreakdown,
+	TokenDayBucket,
+} from "../core/api-wire.ts";
 export {
 	type AgentRow,
 	type AgentSource,
@@ -66,46 +65,6 @@ export interface ProjectRow {
 	lastFetchedAt: string | null;
 	lastHeadSha: string | null;
 	hasSeeds: boolean;
-}
-
-export interface RunRow {
-	id: string;
-	agentName: string;
-	projectId: string | null;
-	burrowId: string | null;
-	burrowRunId: string | null;
-	seedId: string | null;
-	/** Chain back-link (warren-4b11 / warren-e96f); null for root runs. */
-	parentRunId: string | null;
-	cloneKind: CloneKind | null;
-	mode: RunMode;
-	renderedAgentJson: unknown;
-	state: RunState;
-	failureReason: RunFailureReason | null;
-	startedAt: string | null;
-	endedAt: string | null;
-	prompt: string;
-	trigger: string;
-	prUrl: string | null;
-	targetBranch: string | null;
-	/**
-	 * Salvage-before-destroy (warren-cd3b): where a finalize_failed run's
-	 * committed work was captured. `salvageRef` is the `warren/rescue/<runId>`
-	 * branch on origin; `salvagePath` is the durable git-bundle file. Both null
-	 * when no salvage was captured (or none was needed).
-	 */
-	salvageRef: string | null;
-	salvagePath: string | null;
-	costUsd: number | null;
-	tokensInput: number | null;
-	tokensOutput: number | null;
-	tokensCacheRead: number | null;
-	tokensCacheWrite: number | null;
-	previewState: PreviewState | null;
-	previewPort: number | null;
-	previewStartedAt: string | null;
-	previewLastHitAt: string | null;
-	previewFailureMessage: string | null;
 }
 
 export interface RunEvent {
