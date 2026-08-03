@@ -22,6 +22,14 @@
  * run is never touched, and every destroy is best-effort so one
  * unreachable worker can't stall the sweep.
  *
+ * A confirmed destroy (including `already-gone` / 404, where the burrow no
+ * longer exists) detaches the swept run rows from `burrow_id`, so the burrow
+ * is not re-derived as stranded and re-destroyed on the next sweep (warren-9b77).
+ * This is what lets `readyz`'s `stale_burrow_workspaces` recover: once the GC
+ * reclaims a workspace, the diagnostic no longer sees a terminal run anchored
+ * to that burrow. Detachment is best-effort and never blames a failed update
+ * on a successful destroy.
+ *
  * The same `findStrandedBurrows` predicate backs the `warren doctor` /
  * `/readyz` stale-workspace diagnostic (`src/diagnostics/checks.ts`) so the
  * report and the reaper agree on what "stranded" means.
@@ -209,6 +217,8 @@ export interface WorkspaceGcLogger {
 export interface WorkspaceGcReposLike {
 	readonly runs: {
 		listByState(state: RunState[]): Promise<RunRow[]>;
+		/** Detach a set of runs from their burrow so the swept burrow is forgotten. */
+		clearBurrowId(ids: readonly string[]): Promise<void>;
 	};
 }
 
@@ -257,6 +267,16 @@ export async function runWorkspaceGcTick(
 		now,
 	});
 
+	// Run ids anchored to each terminal burrow, so a confirmed destroy can detach
+	// the runs and stop the burrow being re-derived as stranded on every sweep.
+	const runsByBurrow = new Map<string, string[]>();
+	for (const r of terminalRuns) {
+		if (r.burrowId === null) continue;
+		const bucket = runsByBurrow.get(r.burrowId);
+		if (bucket === undefined) runsByBurrow.set(r.burrowId, [r.id]);
+		else bucket.push(r.id);
+	}
+
 	// Scanned = distinct burrow ids that carry a terminal run and no live run
 	// (the candidate universe the predicate walks).
 	let scanned = 0;
@@ -268,8 +288,12 @@ export async function runWorkspaceGcTick(
 	let failed = 0;
 	for (const candidate of stranded) {
 		const ok = await destroyOne(input, candidate);
-		if (ok) destroyed += 1;
-		else failed += 1;
+		if (ok) {
+			destroyed += 1;
+			await forgetBurrow(input, runsByBurrow, candidate.burrowId);
+		} else {
+			failed += 1;
+		}
 	}
 
 	if (stranded.length > 0) {
@@ -311,6 +335,30 @@ async function destroyOne(
 		"workspace_gc.destroy_failed",
 	);
 	return false;
+}
+
+/**
+ * Best-effort detach of a reclaimed burrow's runs so the sweep doesn't
+ * re-derive the (already-gone or just-destroyed) workspace as stranded on
+ * the next tick. Never propagates — the destroy already succeeded.
+ */
+async function forgetBurrow(
+	input: WorkspaceGcTickInput,
+	runsByBurrow: ReadonlyMap<string, readonly string[]>,
+	burrowId: string,
+): Promise<void> {
+	const runIds = runsByBurrow.get(burrowId);
+	if (runIds === undefined) return;
+	await input.repos.runs.clearBurrowId([...runIds]).catch((err) => {
+		input.logger?.warn(
+			{
+				burrowId,
+				err: err instanceof Error ? err.message : String(err),
+			},
+			"workspace_gc.forget_failed",
+		);
+		// Sweep already succeeded at destroying; forgetting is best-effort.
+	});
 }
 
 /* ----------------------------------------------------------------------- */
