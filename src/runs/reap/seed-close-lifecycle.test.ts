@@ -164,6 +164,25 @@ describe("createSeedCloseLifecycleExtension", () => {
 		expect(calls.some((c) => c.args.includes("close"))).toBe(false);
 	});
 
+	test("skips when the pushed branch carries no changes (commitsAhead 0)", async () => {
+		const { repos, runId, projectId } = await setup();
+		const { seedsCli, calls } = fakeSeedsCli();
+		const { logger } = recordingLogger();
+		await fire(repos, seedsCli, logger, { runId, projectId, commitsAhead: 0 });
+		expect(calls.some((c) => c.args.includes("close"))).toBe(false);
+	});
+
+	test("closes the seed on a pushed branch with actual changes (commitsAhead > 0)", async () => {
+		const { repos, runId, projectId } = await setup();
+		const { seedsCli, calls } = fakeSeedsCli();
+		const { logger } = recordingLogger();
+		await fire(repos, seedsCli, logger, { runId, projectId, commitsAhead: 5 });
+		const closeCall = calls.find((c) => c.args.includes("close") && c.args.includes("sd-target"));
+		expect(closeCall).toBeDefined();
+		const events = await repos.events.listByRun(runId);
+		expect(events.find((ev) => ev.kind === "seeds.seed_id_closed")).toBeDefined();
+	});
+
 	test("skips when the project has no seeds", async () => {
 		const { repos, runId, projectId } = await setup({ hasSeeds: false });
 		const { seedsCli, calls } = fakeSeedsCli();

@@ -69,8 +69,18 @@ export function createSeedCloseLifecycleExtension(
 				const { payload } = envelope;
 				// Capability, not conditional (rule 7): this hook IS "close the run's
 				// seed after a clean, pushed reap" — the same gate the old pipeline step
-				// used. `outcome` already accounts for reap's flips-to-failed.
-				if (payload.outcome !== "succeeded" || !payload.branchPushed) return;
+				// used. `outcome` already accounts for reap's flips-to-failed. We further
+				// gate on an actual branch change (commitsAhead > 0): a pushed but
+				// zero-commit reap (warren-89b0 no-changes run) leaves nothing on the
+				// branch to consume, so the seed must stay open for explicit agent-close
+				// evidence (that evidence always fires and is preserved here).
+				if (
+					payload.outcome !== "succeeded" ||
+					!payload.branchPushed ||
+					payload.commitsAhead === null ||
+					payload.commitsAhead <= 0
+				)
+					return;
 				await closeSeedForReap(input, now, payload.runId, payload.projectId);
 			},
 		},
