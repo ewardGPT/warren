@@ -55,4 +55,19 @@ describe("spawnRun: agent git identity env (warren-4e36)", () => {
 		expect(env?.GIT_COMMITTER_NAME).toBeUndefined();
 		expect(env?.GIT_COMMITTER_EMAIL).toBeUndefined();
 	});
+
+	test("K8s dispatch rejects an unconfigured identity before provider create", async () => {
+		const { client, calls } = makeBurrowClient();
+		await expect(
+			spawnRun({
+				repos,
+				runtimeProvider: makeProvider(client),
+				agentName: "refactor-bot",
+				projectId: "prj_xxxxxxxxxxxx",
+				prompt: "fix it",
+				serverEnv: { WARREN_RUNTIME: "k8s" },
+			}),
+		).rejects.toThrow("K8s dispatch requires WARREN_GIT_AUTHOR_NAME");
+		expect(calls).toHaveLength(0);
+	});
 });

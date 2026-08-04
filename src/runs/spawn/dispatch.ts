@@ -400,7 +400,14 @@ function composeRunEnv(
 function injectGitIdentityEnv(env: Record<string, string>, serverEnv: EnvLike): void {
 	const name = serverEnv.WARREN_GIT_AUTHOR_NAME?.trim();
 	const email = serverEnv.WARREN_GIT_AUTHOR_EMAIL?.trim();
-	if (name === undefined || name === "" || email === undefined || email === "") return;
+	if (name === undefined || name === "" || email === undefined || email === "") {
+		if (serverEnv.WARREN_RUNTIME?.trim().toLowerCase() === "k8s") {
+			throw new ValidationError(
+				"K8s dispatch requires WARREN_GIT_AUTHOR_NAME and WARREN_GIT_AUTHOR_EMAIL; set both to a dedicated agent identity",
+			);
+		}
+		return;
+	}
 	env.GIT_AUTHOR_NAME = name;
 	env.GIT_AUTHOR_EMAIL = email;
 	env.GIT_COMMITTER_NAME = name;

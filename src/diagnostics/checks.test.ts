@@ -1,7 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import type { SpawnFn } from "../projects/clone.ts";
 import { captureSpawnCalls } from "./checks.test-helpers.ts";
-import { checkBwrap } from "./checks.ts";
+import { checkBwrap, checkGitIdentity } from "./checks.ts";
+
+describe("checkGitIdentity", () => {
+	test("passes when both identity variables are configured", () => {
+		const result = checkGitIdentity({
+			WARREN_GIT_AUTHOR_NAME: "warren-run-bot",
+			WARREN_GIT_AUTHOR_EMAIL: "123+warren-run-bot@users.noreply.github.com",
+		});
+		expect(result).toEqual({
+			name: "git_identity",
+			ok: true,
+			message: "dedicated agent commit identity configured",
+		});
+	});
+
+	test("fails clearly when the pair is missing or half-set", () => {
+		expect(checkGitIdentity({}).message).toContain("are not configured");
+		expect(checkGitIdentity({ WARREN_GIT_AUTHOR_NAME: "warren" }).message).toContain(
+			"must be set together",
+		);
+	});
+});
 
 describe("checkBwrap", () => {
 	test("ok when the functional sandbox probe exits 0 (warren-daef)", async () => {

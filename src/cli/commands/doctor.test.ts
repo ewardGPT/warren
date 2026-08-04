@@ -153,6 +153,7 @@ describe("runDoctor", () => {
 		const names = result.checks.map((c) => c.name);
 		expect(names).toEqual([
 			"WARREN_API_TOKEN",
+			"git_identity",
 			"warren_db",
 			"db_reachable",
 			"projects_root",

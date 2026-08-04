@@ -36,6 +36,36 @@ export type EnvLike = Readonly<Record<string, string | undefined>>;
 export type ExistsFn = (path: string) => boolean;
 
 /**
+ * Verify the dedicated identity that agent pods use for git commits.
+ * Supervisor-backed local runs warn during startup; K8s has no supervisor,
+ * so this shared check is the operator-visible signal for both doctor and
+ * readyz (warren-e7b7).
+ */
+export function checkGitIdentity(env: EnvLike = process.env): DiagnosticCheck {
+	const name = env.WARREN_GIT_AUTHOR_NAME?.trim();
+	const email = env.WARREN_GIT_AUTHOR_EMAIL?.trim();
+	if (name !== undefined && name !== "" && email !== undefined && email !== "") {
+		return {
+			name: "git_identity",
+			ok: true,
+			message: "dedicated agent commit identity configured",
+		};
+	}
+	const halfSet = (name !== undefined && name !== "") !== (email !== undefined && email !== "");
+	return {
+		name: "git_identity",
+		// Advisory for readiness: local deployments may still use a host git
+		// identity. K8s dispatch has a separate hard guard because pods have no
+		// supervisor fallback.
+		ok: true,
+		message: halfSet
+			? "warning: WARREN_GIT_AUTHOR_NAME and WARREN_GIT_AUTHOR_EMAIL must be set together"
+			: "warning: WARREN_GIT_AUTHOR_NAME and WARREN_GIT_AUTHOR_EMAIL are not configured",
+		hint: "Set both variables to a dedicated bot identity before dispatching agents",
+	};
+}
+
+/**
  * Minimal logger seam for checks that must LOG a failure detail they
  * refuse to put on the wire (warren-51de) — see `./redact.ts`. Pino and a
  * console-shaped test stub both satisfy it structurally. Optional at every

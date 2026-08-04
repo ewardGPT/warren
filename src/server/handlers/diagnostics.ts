@@ -9,6 +9,7 @@
 import {
 	checkBwrap,
 	checkDatabaseReachable,
+	checkGitIdentity,
 	checkPreviewAuthStrength,
 	checkPreviewMaxLive,
 	checkPreviewPortAllocator,
@@ -45,6 +46,7 @@ export function readyzHandler(deps: ServerDeps): RouteHandler {
 				log: deps.logger,
 			}),
 		);
+		checks.push(checkGitIdentity(process.env));
 		// The burrow socket, bwrap, and stale-burrow-workspace probes only make
 		// sense for the local backend, where warren co-tenants a burrow daemon.
 		// Under `WARREN_RUNTIME=k8s` there is no burrow at all (agents run in pods),
