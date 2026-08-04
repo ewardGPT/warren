@@ -131,7 +131,7 @@ describe("PLANNER_BUILTIN", () => {
 		expect(PLANNER_BUILTIN.frontmatter.tags).toContain("interactive");
 	});
 
-	test("system prompt allows .plot/ and .seeds/ writes only, forbids source + dispatch", () => {
+	test("system prompt writes scope to .seeds/ only, forbids source + dispatch", () => {
 		// Warren's burrow_config only forwards [sandbox].network onto
 		// POST /burrows (src/runs/burrow_config.ts), so the path-scoped
 		// write contract is enforced in the prompt for now. These string
@@ -141,7 +141,6 @@ describe("PLANNER_BUILTIN", () => {
 		expect(system).toMatch(/must NOT/);
 		expect(system).toMatch(/source files/);
 		expect(system).toMatch(/Dispatch agent runs/);
-		expect(system).toMatch(/\.plot\//);
 		expect(system).toMatch(/\.seeds\//);
 	});
 
@@ -161,7 +160,7 @@ describe("PLANNER_BUILTIN", () => {
 	});
 
 	test("refuses to invent Plot intent and defers to brainstorm + formalize", () => {
-		// The interactive run primitive (warren-1117) loads Plot context
+		// The interactive run primitive (warren-1117) loads the finalized intent
 		// into the prompt. If intent is empty, planner must bounce the user
 		// to the brainstorm/formalize flow (warren-3de8 / warren-d22e)
 		// rather than fabricate goals.
