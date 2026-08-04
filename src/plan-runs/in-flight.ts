@@ -53,7 +53,48 @@ async function fireCloseChildSeed(input: HandleInFlightInput): Promise<void> {
 
 export type HandleInFlightDecision =
 	| { readonly kind: "merged" }
+	| { readonly kind: "retry" }
 	| { readonly kind: "result"; readonly result: AdvanceResult };
+
+/** Marker retained on the child so a second provider error is terminal. */
+export const PROVIDER_ERROR_RETRY_MARKER = "provider_error_retry_attempted";
+
+/**
+ * Requeue one provider-error child with a fresh run. Provider errors are
+ * commonly transient (quota/upstream pool faults), but an unbounded retry
+ * would loop a plan forever. The marker is persisted on the child and is
+ * intentionally retained through the replacement run for exhaustion logic.
+ */
+async function retryProviderError(
+	input: HandleInFlightInput,
+	run: RunRow,
+): Promise<HandleInFlightDecision> {
+	const { repos, planRun, child, emit, now } = input;
+	if (child.failureReason === PROVIDER_ERROR_RETRY_MARKER) {
+		return await failChild(input, run, "child_provider_error");
+	}
+	const retriedAt = now().toISOString();
+	await repos.planRuns.updateChild({
+		planRunId: planRun.id,
+		seq: child.seq,
+		patch: {
+			state: "pending",
+			runId: null,
+			startedAt: null,
+			endedAt: retriedAt,
+			failureReason: PROVIDER_ERROR_RETRY_MARKER,
+		},
+		now: now(),
+	});
+	await emit(run.id, "plan_run.child_retry", {
+		planRunId: planRun.id,
+		seq: child.seq,
+		seedId: child.seedId,
+		reason: "child_provider_error",
+		retryAttempt: 1,
+	});
+	return { kind: "retry" };
+}
 
 /**
  * Mark the in-flight child + its plan failed and emit `plan_run.failed`.
@@ -328,6 +369,9 @@ export async function handleInFlight(input: HandleInFlightInput): Promise<Handle
 		return await handleNonTerminalRun(input, run);
 	}
 	if (run.state === "failed" || run.state === "cancelled") {
+		if (run.state === "failed" && run.failureReason === "provider_error") {
+			return await retryProviderError(input, run);
+		}
 		return await failChild(input, run, `child_${run.failureReason ?? run.state}`);
 	}
 	// run.state === 'succeeded': advance to pr_open, then poll the PR.

@@ -88,6 +88,7 @@ export const PLAN_RUN_EVENT_KINDS = [
 	"plan_run.failed",
 	"plan_run.succeeded",
 	"plan_run.waiting_for_pr_reopen",
+	"plan_run.child_retry",
 ] as const;
 export type PlanRunEventKind = (typeof PLAN_RUN_EVENT_KINDS)[number];
 
@@ -190,6 +191,9 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 			});
 			if (decision.kind === "merged") {
 				mergedChildSeq = inFlight.seq;
+				continue;
+			}
+			if (decision.kind === "retry") {
 				continue;
 			}
 			if (decision.kind === "result") {

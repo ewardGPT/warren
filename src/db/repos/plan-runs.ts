@@ -42,8 +42,10 @@ const ALLOWED_TRANSITIONS: Record<PlanRunState, readonly PlanRunState[]> = {
 
 const ALLOWED_CHILD_TRANSITIONS: Record<PlanRunChildState, readonly PlanRunChildState[]> = {
 	pending: ["dispatched", "running", "pr_open", "merged", "failed", "skipped"],
-	dispatched: ["running", "pr_open", "merged", "failed", "skipped"],
-	running: ["pr_open", "merged", "failed", "skipped"],
+	// A provider error is retryable once at the coordinator layer. Requeueing
+	// the same child preserves its sequence while replacing the failed run.
+	dispatched: ["pending", "running", "pr_open", "merged", "failed", "skipped"],
+	running: ["pending", "pr_open", "merged", "failed", "skipped"],
 	pr_open: ["merged", "failed", "skipped"],
 	merged: [],
 	failed: [],
