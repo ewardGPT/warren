@@ -58,6 +58,8 @@
 		"check:bundle-size": "bun run scripts/check-bundle-size.ts --build",
 		"gen:docs": "bun run scripts/generate-docs.ts",
 		"gen:docs:check": "bun run scripts/generate-docs.ts --check",
+		"gen:cli-reference": "bun run scripts/generate-cli-reference.ts",
+		"gen:cli-reference:check": "bun run scripts/generate-cli-reference.ts --check",
 		"gen:openapi": "bun run scripts/generate-openapi.ts",
 		"gen:openapi:check": "bun run scripts/generate-openapi.ts --check",
 		"check:ci-parity": "bun scripts/check-ci-parity.ts",

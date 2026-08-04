@@ -19,6 +19,7 @@ Two paths lead out of here. Take the first to run warren against your own repos.
 - [`../AGENTS.md`](../AGENTS.md) — the same ground for a coding agent: repo map, quality gates, and the rules an agent must obey here.
 - [`labels.md`](labels.md) — the GitHub label taxonomy that triage and the issue templates depend on.
 - [`http-api.md`](http-api.md) — every HTTP route with its auth posture. `bun run gen:docs` writes this file from `ROUTE_TABLE`.
+- [`cli-reference.md`](cli-reference.md) — generated command, argument, and option reference. `bun run gen:cli-reference` writes this file from the Commander tree in `src/cli/main.ts`.
 - [`openapi.yaml`](openapi.yaml) — the same surface as an OpenAPI 3.1 schema. `bun run gen:openapi` writes it from the same route table.
 - [`CONSTITUTION.md`](CONSTITUTION.md) — the articles that govern warren-authored code, commits, and bot identity.
 - [`../ROADMAP.md`](../ROADMAP.md) — what is in flight now, what comes next, and what warren will not do.
