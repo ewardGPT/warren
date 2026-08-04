@@ -164,6 +164,29 @@ describe("createSeedCloseLifecycleExtension", () => {
 		expect(calls.some((c) => c.args.includes("close"))).toBe(false);
 	});
 
+	test("skips when commitsAhead is 0 (noChanges / warren-f3bb shape)", async () => {
+		const { repos, runId, projectId } = await setup();
+		const { seedsCli, calls } = fakeSeedsCli();
+		const { logger } = recordingLogger();
+		await fire(repos, seedsCli, logger, { runId, projectId, commitsAhead: 0 });
+		expect(calls.some((c) => c.args.includes("close"))).toBe(false);
+		const events = await repos.events.listByRun(runId);
+		expect(events.find((ev) => ev.kind === "seeds.seed_id_closed")).toBeUndefined();
+	});
+
+	test("closes the run seed when commitsAhead > 0 on a changed branch", async () => {
+		const { repos, runId, projectId } = await setup();
+		const { seedsCli, calls } = fakeSeedsCli();
+		const { logger } = recordingLogger();
+		await fire(repos, seedsCli, logger, { runId, projectId, commitsAhead: 1 });
+
+		const closeCall = calls.find((c) => c.args.includes("close") && c.args.includes("sd-target"));
+		expect(closeCall).toBeDefined();
+		expect(closeCall?.cwd).toBe("/data/projects/x/y");
+		const events = await repos.events.listByRun(runId);
+		expect(events.find((ev) => ev.kind === "seeds.seed_id_closed")).toBeDefined();
+	});
+
 	test("skips when the project has no seeds", async () => {
 		const { repos, runId, projectId } = await setup({ hasSeeds: false });
 		const { seedsCli, calls } = fakeSeedsCli();
