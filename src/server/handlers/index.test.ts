@@ -72,6 +72,7 @@ describe("ROUTE_TABLE policy classification", () => {
 		"GET /agents",
 		"GET /agents/:name",
 		"GET /projects",
+		"GET /projects/:id",
 		"GET /analytics/runs",
 		"GET /runs",
 		"GET /runs/:id",

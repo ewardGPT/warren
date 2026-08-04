@@ -82,6 +82,15 @@ export function listProjectsHandler(deps: ServerDeps): RouteHandler {
 	};
 }
 
+/** `GET /projects/:id` — return one project using the same actor projection as the list. */
+export function getProjectHandler(deps: ServerDeps): RouteHandler {
+	return async (ctx) => {
+		const id = requireParam(ctx, "id");
+		const project = await deps.repos.projects.require(id);
+		return jsonResponse(200, projectProject(project, ctx.actor));
+	};
+}
+
 export function createProjectHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const body = await readJsonBody(ctx);
