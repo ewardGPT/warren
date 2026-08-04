@@ -67,8 +67,8 @@ export interface AgentDefinition {
  *              decides how to interpret it.
  *   runtime  — burrow runtime id this canopy agent dispatches onto
  *              (e.g. "claude-code", "sapling", "pi"). When unset,
- *              warren falls back to `DEFAULT_RUNTIME_ID` ("pi") —
- *              the multi-provider runtime is the preferred default
+ *              warren falls back to `DEFAULT_RUNTIME_ID` ("sapling") —
+ *              the supported coding runtime is the preferred default
  *              (warren-16f8). claude-code stays available but is now
  *              opt-in: pin it via this field. Built-in agents that
  *              want a non-pi runtime (claude-code / sapling) declare
@@ -245,12 +245,10 @@ function assignToolFlag(
 
 /**
  * Default burrow runtime id warren dispatches onto when an agent pins
- * none (warren-16f8). Pi is the multi-provider runtime — cost streams
- * in-band, the unified provider matrix works, and it's what most
- * dogfood runs use — so it's the preferred default; claude-code is
- * opt-in via `frontmatter.runtime`.
+ * none. Sapling is the supported coding runtime for default local runs;
+ * Pi remains available only when explicitly selected.
  */
-export const DEFAULT_RUNTIME_ID = "pi";
+export const DEFAULT_RUNTIME_ID = "sapling";
 
 /**
  * Resolve the burrow runtime id this canopy agent should dispatch onto.
@@ -262,8 +260,8 @@ export const DEFAULT_RUNTIME_ID = "pi";
  *      specific runtime (claude-code / sapling) or compose a system
  *      prompt onto an existing runtime (planner,
  *      warren-ebca)
- *   3. `DEFAULT_RUNTIME_ID` ("pi") — the preferred default when
- *      nothing pins a runtime; claude-code is opt-in
+ *   3. `DEFAULT_RUNTIME_ID` ("sapling") — the preferred default when
+ *      nothing pins a runtime; Pi is explicit-only
  */
 export function readRuntimeId(agent: AgentDefinition, configOverride?: string): AcceptedRuntimeId {
 	if (typeof configOverride === "string" && configOverride.length > 0) {

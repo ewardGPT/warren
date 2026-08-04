@@ -13,7 +13,8 @@
  * fixes for existing filed bugs — complementary inputs, no overlap.
  *
  * Conservative by design: skips bugs that already have plans, are
- * in_progress, are blocked, or lack enough detail to plan confidently.
+ * in_progress, or lack enough detail to plan confidently. Dependency edges
+ * are advisory and do not prevent triage of otherwise actionable bugs.
  * Caps output to at most 3 plans per run to keep plan-run volume
  * manageable.
  *
@@ -36,7 +37,8 @@ Run \`sd list --status open --type bug --format json\` to get the full bug queue
 
 1. **No existing plan.** The seed has no \`plan_id\` field (nobody has planned it yet).
 2. **Not in progress.** Status is \`open\`, not \`in_progress\`.
-3. **Not blocked.** The seed has no \`blockedBy\` entries, or all blockers are closed.
+3. **Actionable.** Dependency metadata is advisory; do not exclude a bug only
+   because it has \`blockedBy\` entries. Preserve the metadata in any plan context.
 4. **Sufficient detail.** The description names at least one file or module, or the title is specific enough that you can locate the relevant code. Skip vague reports like "something is slow" with no pointers.
 5. **Small scope.** The fix should touch at most 3 files and require no public API changes, no dependency changes, and no architectural restructuring. If the bug is bigger than that, skip it — it needs a human to scope.
 
@@ -100,9 +102,9 @@ export const BUGWATCH_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		runtime: "pi",
+		runtime: "sapling",
 		auto_plan_run: true,
-		auto_plan_run_agent: "pi",
+		auto_plan_run_agent: "sapling",
 		// Sonnet tier (model-tiers.ts): bounded triage (≤3 well-specified
 		// bugs per run).
 		...MODEL_TIERS.sonnet,

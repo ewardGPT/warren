@@ -155,11 +155,8 @@ describe("PLANNER_BUILTIN", () => {
 		expect(system).toMatch(/0-BASED/);
 	});
 
-	test("declares runtime = 'pi' so dispatch composes on the real runtime", () => {
-		// warren-ebca: see BRAINSTORM_BUILTIN's matching test — planner is
-		// the other system-prompt-only canopy agent whose name does not
-		// match any burrow runtime.
-		expect(PLANNER_BUILTIN.frontmatter.runtime).toBe("pi");
+	test("declares runtime = 'sapling' for Burrow-backed dispatch", () => {
+		expect(PLANNER_BUILTIN.frontmatter.runtime).toBe("sapling");
 	});
 
 	test("refuses to invent Plot intent and defers to brainstorm + formalize", () => {
@@ -186,8 +183,8 @@ describe("PR_FIXER_BUILTIN", () => {
 		expect(PR_FIXER_BUILTIN.frontmatter.auto_plan_run).toBeUndefined();
 	});
 
-	test("declares runtime = 'pi' so dispatch composes on the real runtime", () => {
-		expect(PR_FIXER_BUILTIN.frontmatter.runtime).toBe("pi");
+	test("declares runtime = 'sapling' for Burrow-backed dispatch", () => {
+		expect(PR_FIXER_BUILTIN.frontmatter.runtime).toBe("sapling");
 	});
 
 	test("system prompt frames the quality gate as terminal and forbids a new PR", () => {
@@ -320,10 +317,10 @@ describe("seedBuiltinAgents", () => {
 		const result = await seedBuiltinAgents(repo);
 		expect(result.seeded).toContain("planner");
 
-		// The stored version should now have the updated frontmatter with 'runtime' set to 'pi'.
+		// The stored version should now have the updated frontmatter with 'runtime' set to 'sapling'.
 		const stored = await repo.get("planner");
 		expect(stored).not.toBeNull();
 		const rendered = stored?.renderedJson as { frontmatter: { runtime: string } };
-		expect(rendered.frontmatter.runtime).toBe("pi");
+		expect(rendered.frontmatter.runtime).toBe("sapling");
 	});
 });

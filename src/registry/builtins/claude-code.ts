@@ -40,7 +40,7 @@ export const CLAUDE_CODE_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		// claude-code is opt-in since the default runtime flipped to pi
+		// claude-code is opt-in; Sapling is the default runtime.
 		// (warren-16f8); pin it explicitly so this built-in keeps
 		// dispatching onto the claude-code burrow runtime.
 		runtime: "claude-code",

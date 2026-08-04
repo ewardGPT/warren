@@ -79,11 +79,9 @@ export const PLANNER_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent", "interactive"],
-		// warren-ebca: planner is a system-prompt-only canopy agent; it
-		// dispatches onto the pi burrow runtime rather than registering
-		// its own. Without this, burrow looks up "planner" in
-		// BUILT_IN_RUNTIMES and the run fails before agent boot.
-		runtime: "pi",
+		// Planner is a system-prompt-only canopy agent; it dispatches onto
+		// Burrow's Sapling runtime rather than registering its own runtime.
+		runtime: "sapling",
 		// Opus tier (model-tiers.ts): the plan planner emits caps the
 		// quality of every downstream step.
 		...MODEL_TIERS.opus,

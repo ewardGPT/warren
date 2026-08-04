@@ -45,7 +45,7 @@ export const PI_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
-		// pi is the default runtime (warren-16f8); declared explicitly
+		// Pi is explicit-only; Sapling is the default runtime.
 		// here for parity with the other harness built-ins even though
 		// readRuntimeId would fall back to it anyway.
 		runtime: "pi",
