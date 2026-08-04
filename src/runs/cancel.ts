@@ -188,11 +188,16 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
 	// needs it for the inline-reap decision and the HTTP response's
 	// `burrowRun.state`.
 	const status = await input.runtimeProvider.status(handle);
-	const burrowState = status.phase;
+	// K8s deletes the pod as the cancel operation. A subsequent status read can
+	// therefore observe the provider's neutral `lost` snapshot instead of a
+	// terminal `cancelled` phase. The operator's cancel intent wins this race;
+	// never turn our own deletion into an infrastructure failure.
+	const lostAfterCancel = !status.exists && status.terminalReason === "lost";
+	const burrowState: RunState = lostAfterCancel ? "cancelled" : status.phase;
 
 	await emitCancelEvent(input, run.id, {
 		reason: input.reason,
-		mode: "forwarded",
+		mode: lostAfterCancel ? "lost_after_cancel" : "forwarded",
 		burrowRunId,
 		burrowRunState: burrowState,
 	});
