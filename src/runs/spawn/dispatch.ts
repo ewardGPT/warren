@@ -38,6 +38,7 @@
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
 import { refreshProject } from "../../projects/manage.ts";
 import {
+	readProviderFrontmatter,
 	readRuntimeId,
 	withMaxCostUsdOverride,
 	withProviderOverrides,
@@ -71,6 +72,23 @@ import type { SpawnRunInput, SpawnRunResult } from "./types.ts";
  * imports burrow-client's `LOCAL_WORKER_NAME`.
  */
 const WORKER_PLACEMENT_LABEL = "local";
+
+/**
+ * Reject the provider/model mismatch that would otherwise create a doomed
+ * run. OpenRouter model ids are namespaced (for example
+ * `moonshotai/kimi-k3`), while a bare model id such as `claude-opus-4-8`
+ * belongs to the Anthropic provider. Other providers may expose aliases, so
+ * this guard stays deliberately narrow (warren-bad5).
+ */
+export function validateProviderModelCompatibility(provider: string, model: string): void {
+	const normalizedProvider = provider.trim().toLowerCase();
+	const normalizedModel = model.trim();
+	if (normalizedProvider === "openrouter" && !normalizedModel.includes("/")) {
+		throw new ValidationError(
+			`modelOverride "${model}" is incompatible with provider "${provider}"; OpenRouter models must use a namespaced id such as provider/model`,
+		);
+	}
+}
 
 export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	if (input.prompt.trim() === "") {
@@ -144,6 +162,10 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		}),
 		input.maxCostUsdOverride,
 	);
+	const resolvedProviderModel = readProviderFrontmatter(agent.frontmatter);
+	if (resolvedProviderModel.provider !== undefined && resolvedProviderModel.model !== undefined) {
+		validateProviderModelCompatibility(resolvedProviderModel.provider, resolvedProviderModel.model);
+	}
 
 	// Build the seed payload BEFORE creating the warren row so a malformed
 	// expertise_seed / pi_skills / pi_prompts section surfaces as a clean

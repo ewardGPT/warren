@@ -27,6 +27,7 @@ import type {
 	RuntimeCapabilities,
 	RuntimeProvider,
 } from "../../runtime/contract.ts";
+import { validateProviderModelCompatibility } from "./dispatch.ts";
 import { spawnRun } from "./index.ts";
 import { setupRepos } from "./test-helpers.ts";
 
@@ -200,5 +201,24 @@ describe("spawnRun: provider-neutral dispatch (k8s-shaped backend)", () => {
 		const payload = ev?.payloadJson as { message?: string; burrowId?: string };
 		expect(payload?.message).toContain("pod admission rejected");
 		expect(payload?.burrowId).toBeUndefined();
+	});
+
+	test("rejects a bare model override for OpenRouter before creating a run", async () => {
+		const { provider, specs } = makeRecordingProvider();
+		await expect(
+			spawnRun({
+				repos,
+				runtimeProvider: provider,
+				agentName: "refactor-bot",
+				projectId: "prj_xxxxxxxxxxxx",
+				prompt: "do the thing",
+				providerOverride: "openrouter",
+				modelOverride: "claude-opus-4-8",
+			}),
+		).rejects.toThrow("incompatible with provider");
+		expect(specs).toHaveLength(0);
+		expect(() =>
+			validateProviderModelCompatibility("openrouter", "moonshotai/kimi-k3"),
+		).not.toThrow();
 	});
 });
