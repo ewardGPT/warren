@@ -232,6 +232,11 @@ export interface ReapCompletedPayload {
 	mulch?: { updated?: number; skipped?: number; appended?: number };
 	seeds?: { closed?: number; committed?: boolean };
 	errors?: { step: string; message: string; path?: string }[];
+	pushProtection?: {
+		unblockUrl: string | null;
+		locations: readonly string[];
+		message: string;
+	} | null;
 }
 
 export interface ApiErrorEnvelope {

@@ -35,6 +35,7 @@ import { dispatchAutoPlanRuns, hasAutoPlanRunFrontmatter, parsePlanIds } from ".
 import { applyK8sCloneDeltas } from "./clone-apply.ts";
 import { runPrOpen } from "./pr-open.ts";
 import { runPreviewAnnotate, runPreviewLaunch } from "./preview.ts";
+import { classifyPushProtection, type PushProtectionDetail } from "./push-protection.ts";
 import { seededArtifactResetPaths } from "./seed-reset.ts";
 import type { ReapExec, ReapFs, ReapRunInput, ReapStep } from "./types.ts";
 import { classifyEmptyPush } from "./util.ts";
@@ -61,6 +62,8 @@ export interface ReapPipelineState {
 	 * `finalize_failed` in reap.
 	 */
 	finalizeUnposted: NonNullable<FinalizeResult["unposted"]> | null;
+	/** GitHub push-protection diagnostics from the failed branch push. */
+	pushProtection: PushProtectionDetail | null;
 	/** warren-e9e1 (leg 2): K8s finalize's mirror deltas applied to the clone; local=false. */
 	cloneDeltasApplied: boolean;
 	/**
@@ -93,6 +96,7 @@ export function createPipelineState(): ReapPipelineState {
 		noChanges: false,
 		finalizeFailed: false,
 		finalizeUnposted: null,
+		pushProtection: null,
 		cloneDeltasApplied: false,
 		mirrorDurabilityFailed: false,
 		prUrl: null,
@@ -253,6 +257,8 @@ function applyFinalizeToState(state: ReapPipelineState, r: FinalizeResult): void
 	state.commitsAhead = r.commitsAhead;
 	// warren-495d: push failed/timed out (commits left unpushed).
 	state.finalizeFailed = r.stages.some((s) => s.stage === "branch_push" && s.status === "failed");
+	const branchPush = r.stages.find((s) => s.stage === "branch_push" && s.status === "failed");
+	state.pushProtection = classifyPushProtection(branchPush?.error);
 	// warren-5ea1: a warren-synthesized result (pod never posted) carries its cause.
 	state.finalizeUnposted = r.unposted ?? null;
 }

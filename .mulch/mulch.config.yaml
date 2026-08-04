@@ -47,6 +47,8 @@ domains:
   types: {}
   seeds-tracker: {}
   security: {}
+  patterns: {}
+  task-log: {}
 governance:
   max_entries: 100
   warn_entries: 150

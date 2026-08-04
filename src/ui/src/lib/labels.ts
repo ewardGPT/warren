@@ -65,6 +65,7 @@ const RUN_FAILURE_REASON_LABELS: Readonly<Record<string, string>> = {
 	provider_error: "Provider error",
 	oom_killed: "Out of memory",
 	evicted: "Evicted",
+	push_rejected_policy: "Push rejected by repository policy",
 } satisfies Record<RunFailureReason, string>;
 
 /** Prose for a run's `failureReason`. */

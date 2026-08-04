@@ -29,6 +29,7 @@ import { useEventStream } from "@/hooks/useEventStream.ts";
 import { formatError } from "@/lib/format-error.ts";
 import { formatTimestamp, relativeTime } from "@/lib/utils.ts";
 import type { NewRunRouteState } from "@/pages/NewRun.tsx";
+import { PushProtectionNotice } from "./push-protection-notice.tsx";
 
 /**
  * Event kinds whose arrival means the warren run row may have advanced
@@ -118,6 +119,7 @@ export function RunDetailPage() {
 
 	return (
 		<div className="space-y-6">
+			{reap?.pushProtection ? <PushProtectionNotice detail={reap.pushProtection} /> : null}
 			<header className="flex flex-wrap items-start justify-between gap-3">
 				<div>
 					<div className="flex items-center gap-3">

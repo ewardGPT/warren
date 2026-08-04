@@ -39,6 +39,7 @@ describe("run vocabulary", () => {
 	test("failure reasons include the two the copies had lost", () => {
 		expect(RUN_FAILURE_REASONS).toContain("finalize_failed");
 		expect(RUN_FAILURE_REASONS).toContain("evicted");
+		expect(RUN_FAILURE_REASONS).toContain("push_rejected_policy");
 	});
 
 	/**

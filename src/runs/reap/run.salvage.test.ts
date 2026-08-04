@@ -64,7 +64,7 @@ describe("reapRun salvage-before-destroy (warren-cd3b)", () => {
 		});
 
 		expect(result.state).toBe("failed");
-		expect(result.failureReason).toBe("finalize_failed");
+		expect(result.failureReason).toBe("push_rejected_policy");
 		expect(result.salvageRescueRef).toBe(`warren/rescue/${ctx.runId}`);
 		expect(result.salvagePath).toBeNull();
 		// The run row carries the recovery location for operators.
@@ -72,6 +72,13 @@ describe("reapRun salvage-before-destroy (warren-cd3b)", () => {
 		expect(row.salvageRef).toBe(`warren/rescue/${ctx.runId}`);
 		// The event stream surfaces it.
 		const events = await ctx.repos.events.listByRun(ctx.runId);
+		const completed = events.find((ev) => ev.kind === "reap.completed");
+		expect(completed?.payloadJson).toMatchObject({
+			pushProtection: {
+				locations: [],
+				unblockUrl: null,
+			},
+		});
 		const salvaged = events.find((ev) => ev.kind === "reap.workspace_salvaged");
 		expect(salvaged?.payloadJson).toMatchObject({ rescueRef: `warren/rescue/${ctx.runId}` });
 		// The work is safe, so the warren-495d preserve-skip is LIFTED.

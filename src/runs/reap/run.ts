@@ -198,7 +198,12 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		// reached a terminal phase / vanished / timed out without posting
 		// anything, so the workspace died with it and salvage is the only
 		// recovery path.
-		failureReason = state.finalizeUnposted !== null ? "finalize_unposted" : "finalize_failed";
+		failureReason =
+			state.finalizeUnposted !== null
+				? "finalize_unposted"
+				: state.pushProtection !== null
+					? "push_rejected_policy"
+					: "finalize_failed";
 	} else if (effectiveOutcome === "failed") {
 		failureReason =
 			input.failureReason ?? (await inferFailureReason(input.repos, run.id, stateOnEntry));
@@ -329,6 +334,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			planId: state.autoPlanRunPlanId,
 		},
 		errors,
+		pushProtection: state.pushProtection,
 	});
 
 	// Final sub-step (warren-0d89): destroy the burrow workspace now that
@@ -389,6 +395,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			event: "reap.completed",
 			state: finalState,
 			failureReason,
+			pushProtection: state.pushProtection,
 			providerError: failedFromProviderError ? providerErrorMessage : null,
 			providerErrorDiagnostic:
 				failedFromProviderError && providerErrorDiagnostic !== null

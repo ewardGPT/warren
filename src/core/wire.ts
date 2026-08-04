@@ -216,6 +216,10 @@ export type CloneKind = (typeof CLONE_KINDS)[number];
  *     budget). K8s-only; distinct from `oom_killed` (a container cgroup kill)
  *     and `crashed` (an agent fault) because an eviction is an infra-capacity
  *     signal. Surfaced via the run-state probe's `terminalReason`.
+ *   - `push_rejected_policy` means GitHub rejected the finalize branch push
+ *     under a repository rule, most notably secret scanning/push protection.
+ *     The terminal `reap.completed` event carries the unblock URL and parsed
+ *     scanning locations when GitHub included them.
  *
  * Null on succeeded/cancelled rows.
  */
@@ -233,6 +237,7 @@ export const RUN_FAILURE_REASONS = [
 	"provider_error",
 	"oom_killed",
 	"evicted",
+	"push_rejected_policy",
 ] as const;
 export type RunFailureReason = (typeof RUN_FAILURE_REASONS)[number];
 
