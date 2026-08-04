@@ -25,9 +25,11 @@
  * payload's `runId` / `projectId`: the run row (its `seedId`), the project row
  * (its `localPath` clone + `hasSeeds`), and the boot-wired seeds CLI. It gates on
  * the payload's `outcome === "succeeded"` (already folded past dropped-commit /
- * finalize-failed / provider-error flips by reap) and `branchPushed`, matching
- * the old pipeline gate. Its `sd close` mutates the clone; a `seeds.seed_id_closed`
- * event is appended to the run's stream for observability, best-effort.
+ * finalize-failed / provider-error flips by reap), `branchPushed`, and
+ * `commitsAhead > 0` (warren-0395): the warren-f3bb noChanges shape is
+ * `branchPushed: true, commitsAhead: 0`, and must NOT auto-close the seed. Its
+ * `sd close` mutates the clone; a `seeds.seed_id_closed` event is appended to the
+ * run's stream for observability, best-effort.
  */
 
 import type { Repos } from "../../db/repos/index.ts";
@@ -70,7 +72,9 @@ export function createSeedCloseLifecycleExtension(
 				// Capability, not conditional (rule 7): this hook IS "close the run's
 				// seed after a clean, pushed reap" — the same gate the old pipeline step
 				// used. `outcome` already accounts for reap's flips-to-failed.
-				if (payload.outcome !== "succeeded" || !payload.branchPushed) return;
+				if (payload.outcome !== "succeeded") return;
+				if (!payload.branchPushed) return;
+				if ((payload.commitsAhead ?? 0) <= 0) return;
 				await closeSeedForReap(input, now, payload.runId, payload.projectId);
 			},
 		},
