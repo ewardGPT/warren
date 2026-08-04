@@ -107,7 +107,29 @@ function suite(dialect: "sqlite" | "postgres"): void {
 				await handle.close();
 			}
 		});
-
+		test("detachBurrowWorkspace clears all rows for a reclaimed workspace", async () => {
+			const { handle, repo, agentName, projectId } = await open();
+			try {
+				const first = await spawn(repo, agentName, projectId, {
+					burrowId: "bur_reclaimed",
+					burrowRunId: "run_provider_a",
+				});
+				const second = await spawn(repo, agentName, projectId, {
+					burrowId: "bur_reclaimed",
+					burrowRunId: "run_provider_b",
+				});
+				const untouched = await spawn(repo, agentName, projectId, {
+					burrowId: "bur_other",
+					burrowRunId: "run_provider_c",
+				});
+				expect(await repo.detachBurrowWorkspace("bur_reclaimed")).toBe(2);
+				expect((await repo.require(first.id)).burrowId).toBeNull();
+				expect((await repo.require(second.id)).burrowRunId).toBeNull();
+				expect((await repo.require(untouched.id)).burrowId).toBe("bur_other");
+			} finally {
+				await handle.close();
+			}
+		});
 		test("create leaves cost + token columns null", async () => {
 			const { handle, repo, agentName, projectId } = await open();
 			try {

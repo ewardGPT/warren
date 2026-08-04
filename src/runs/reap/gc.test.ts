@@ -189,6 +189,40 @@ describe("runWorkspaceGcTick", () => {
 		// Logged at info, not warn — it's not an error.
 		expect(logs.some((m) => m.includes("already_gone") || m.includes("bur_old"))).toBe(true);
 	});
+
+	test("marks destroyed workspaces so the next sweep cannot rediscover them", async () => {
+		const h: Harness = {
+			activeRuns: [],
+			terminalRuns: [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")],
+			destroyed: [],
+		};
+		const marked: string[] = [];
+		const result = await runWorkspaceGcTick(
+			tickInput(h, {
+				markWorkspaceDestroyed: async (id) => {
+					marked.push(id);
+				},
+			}),
+		);
+		expect(result.destroyed).toBe(1);
+		expect(marked).toEqual(["bur_old"]);
+	});
+
+	test("counts reclamation bookkeeping failures instead of hiding them", async () => {
+		const h: Harness = {
+			activeRuns: [],
+			terminalRuns: [terminalRun("bur_old", "2026-05-29T09:00:00.000Z")],
+			destroyed: [],
+		};
+		const result = await runWorkspaceGcTick(
+			tickInput(h, {
+				markWorkspaceDestroyed: async () => {
+					throw new Error("runs database unavailable");
+				},
+			}),
+		);
+		expect(result).toMatchObject({ destroyed: 0, failed: 1 });
+	});
 });
 
 describe("loadWorkspaceGcConfigFromEnv", () => {

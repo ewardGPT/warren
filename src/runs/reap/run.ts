@@ -337,6 +337,10 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		// salvage lands, destroy proceeds: the work is durable elsewhere.
 		branchPushFailed: workspacePreserved || salvageFailed,
 		terminate,
+		markWorkspaceDestroyed:
+			run.burrowId !== null
+				? () => input.repos.runs.detachBurrowWorkspace(run.burrowId as string).then(() => undefined)
+				: undefined,
 		emit,
 		fail: (step, err) => fail(step, err),
 	});

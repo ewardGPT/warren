@@ -62,6 +62,37 @@ describe("runWorkspaceDestroy", () => {
 		expect(h.failures).toEqual([]);
 	});
 
+	test("marks the workspace reclaimed after teardown succeeds", async () => {
+		const h = harness();
+		let marked = 0;
+		const destroyed = await runWorkspaceDestroy({
+			run: run(),
+			previewLaunchState: null,
+			terminate: async () => fakeTeardown(),
+			markWorkspaceDestroyed: async () => {
+				marked += 1;
+			},
+			...deps(h),
+		});
+		expect(destroyed).toBe(true);
+		expect(marked).toBe(1);
+	});
+
+	test("reports a bookkeeping failure when reclamation cannot be marked", async () => {
+		const h = harness();
+		const destroyed = await runWorkspaceDestroy({
+			run: run(),
+			previewLaunchState: null,
+			terminate: async () => fakeTeardown(),
+			markWorkspaceDestroyed: async () => {
+				throw new Error("runs database unavailable");
+			},
+			...deps(h),
+		});
+		expect(destroyed).toBe(false);
+		expect(h.failures[0]?.message).toContain("runs database unavailable");
+	});
+
 	test("reports archived:false when the teardown carries no archive", async () => {
 		const h = harness();
 		await runWorkspaceDestroy({

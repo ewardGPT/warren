@@ -325,6 +325,19 @@ export class RunsRepo {
 		return { ...current, ...patch };
 	}
 
+	/** Clear the provider workspace association after workspace destruction. */
+	async detachBurrowWorkspace(burrowId: string): Promise<number> {
+		const rows = await this.adapter.pickAll(
+			this.db.select().from(this.runs).where(eq(this.runs.burrowId, burrowId)),
+		);
+		const update = this.db
+			.update(this.runs)
+			.set({ burrowId: null, burrowRunId: null })
+			.where(eq(this.runs.burrowId, burrowId));
+		await this.adapter.runWrite(update);
+		return rows.length;
+	}
+
 	async markRunning(id: string, now: Date = new Date()): Promise<RunRow> {
 		const current = await this.require(id);
 		assertRunTransition(current.state, "running");
@@ -473,7 +486,7 @@ export class RunsRepo {
 			const txDb = tx.drizzle as SqliteDrizzleDb;
 			const runs = tx.schema.runs;
 			const row = await tx.pickOne(txDb.select().from(runs).where(eq(runs.id, id)));
-			if (!row || row.state !== "queued") return null;
+			if (row?.state !== "queued") return null;
 			const startedAt = now.toISOString();
 			await tx.runWrite(
 				txDb

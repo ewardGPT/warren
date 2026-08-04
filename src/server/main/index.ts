@@ -366,6 +366,8 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	const workspaceGcWorker = startWorkspaceGcWorker({
 		repos,
 		destroyWorkspace: workspaceDestroyer ?? (async () => ({ status: "already-gone" as const })),
+		markWorkspaceDestroyed: (burrowId) =>
+			repos.runs.detachBurrowWorkspace(burrowId).then(() => undefined),
 		config: resolvedWorkspaceGcConfig,
 		logger: workspaceGcLoggerFromPino(logger),
 		...(opts.now !== undefined ? { now: opts.now } : {}),

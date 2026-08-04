@@ -41,6 +41,8 @@ export interface RunWorkspaceDestroyInput {
 	 * propagates errors.
 	 */
 	readonly terminate: (() => Promise<TeardownResult>) | null;
+	/** Persist that the provider workspace no longer exists. */
+	readonly markWorkspaceDestroyed?: () => Promise<void>;
 	readonly emit: (kind: string, payload: unknown) => Promise<unknown>;
 	readonly fail: (step: "workspace_destroy", err: unknown) => Promise<void>;
 }
@@ -94,6 +96,9 @@ export async function runWorkspaceDestroy(input: RunWorkspaceDestroyInput): Prom
 
 	try {
 		const result = await terminate();
+		if (input.markWorkspaceDestroyed !== undefined) {
+			await input.markWorkspaceDestroyed();
+		}
 		await input.emit("reap.workspace_destroyed", {
 			burrowId: run.burrowId,
 			archived: result.archived,

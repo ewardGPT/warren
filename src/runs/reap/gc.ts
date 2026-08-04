@@ -209,6 +209,7 @@ export interface WorkspaceGcLogger {
 export interface WorkspaceGcReposLike {
 	readonly runs: {
 		listByState(state: RunState[]): Promise<RunRow[]>;
+		detachBurrowWorkspace?(burrowId: string): Promise<number>;
 	};
 }
 
@@ -221,6 +222,8 @@ export interface WorkspaceGcTickInput {
 	 * wiring, so under K8s the sweep is never started.
 	 */
 	readonly destroyWorkspace: WorkspaceDestroyer;
+	/** Persist that a reclaimed workspace must no longer be a GC candidate. */
+	readonly markWorkspaceDestroyed?: (burrowId: string) => Promise<void>;
 	readonly config: WorkspaceGcConfig;
 	readonly now?: () => Date;
 	readonly logger?: WorkspaceGcLogger;
@@ -288,6 +291,7 @@ async function destroyOne(
 ): Promise<boolean> {
 	const outcome = await input.destroyWorkspace(candidate.burrowId);
 	if (outcome.status === "destroyed") {
+		if (!(await markWorkspaceDestroyed(input, candidate.burrowId))) return false;
 		input.logger?.info(
 			{
 				burrowId: candidate.burrowId,
@@ -301,6 +305,7 @@ async function destroyOne(
 		return true;
 	}
 	if (outcome.status === "already-gone") {
+		if (!(await markWorkspaceDestroyed(input, candidate.burrowId))) return false;
 		// The workspace is already gone on the backend's side — count it as
 		// reclaimed so we don't churn on it every sweep.
 		input.logger?.info({ burrowId: candidate.burrowId }, "workspace_gc.already_gone");
@@ -311,6 +316,24 @@ async function destroyOne(
 		"workspace_gc.destroy_failed",
 	);
 	return false;
+}
+
+async function markWorkspaceDestroyed(
+	input: WorkspaceGcTickInput,
+	burrowId: string,
+): Promise<boolean> {
+	try {
+		if (input.markWorkspaceDestroyed !== undefined) {
+			await input.markWorkspaceDestroyed(burrowId);
+		}
+		return true;
+	} catch (err) {
+		input.logger?.error(
+			{ burrowId, err: err instanceof Error ? err.message : String(err) },
+			"workspace_gc.mark_destroyed_failed",
+		);
+		return false;
+	}
 }
 
 /* ----------------------------------------------------------------------- */
