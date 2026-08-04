@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { planRunsApi, projectsApi } from "@/api/client.ts";
-import type { CapabilityName, PlanRunRow, PlanRunState, RunRow } from "@/api/types.ts";
+import type { CapabilityName, PlanRunListItem, PlanRunRow, PlanRunState } from "@/api/types.ts";
 import { OperatorOnly, useOperatorHint } from "@/components/OperatorOnly.tsx";
 import { PlanRunStateBadge } from "@/components/PlanRunStateBadge.tsx";
 import { Alert } from "@/components/ui/alert.tsx";
@@ -24,7 +24,7 @@ import {
 import { useCapabilities } from "@/hooks/use-capabilities.ts";
 import { type Comparator, compareStrings, useClientSort } from "@/hooks/use-client-sort.ts";
 import { formatError } from "@/lib/format-error.ts";
-import { formatChildStateCounts } from "@/lib/labels.ts";
+import { formatChildStateCountsFromCounts } from "@/lib/labels.ts";
 import { relativeTime } from "@/lib/utils.ts";
 import { formatCostUsd } from "./RunDetail.tsx";
 import { ReadyPlansView } from "./ready-plans.tsx";
@@ -46,7 +46,7 @@ const TABS: { label: string; value: PlanRunsTab }[] = [
 ];
 
 const STATE_FILTERS: { label: string; value: "all" | PlanRunState }[] = [
-	{ label: "Active", value: "all" },
+	{ label: "All", value: "all" },
 	{ label: "Queued", value: "queued" },
 	{ label: "Running", value: "running" },
 	{ label: "Succeeded", value: "succeeded" },
@@ -222,11 +222,7 @@ export function PlanRunsPage() {
 									{sorted.map((pr) => (
 										<PlanRunListRow
 											key={pr.id}
-											planRunId={pr.id}
-											planId={pr.planId}
-											state={pr.state}
-											startedAt={pr.startedAt}
-											agentName={pr.agentName}
+											planRun={pr}
 											projectLabel={projectIndex.get(pr.projectId) ?? pr.projectId}
 										/>
 									))}
@@ -240,90 +236,49 @@ export function PlanRunsPage() {
 	);
 }
 
-/**
- * Per-row component so each plan run can fetch its own child-state counts
- * without one big GET. Detail endpoint is cheap (single tx) and the list
- * page polls every 5s — the cost is bounded and keeps the list endpoint
- * narrow (rows only, no children fan-out, mirrors `GET /runs` shape).
- */
 function PlanRunListRow({
-	planRunId,
-	planId,
-	state,
-	startedAt,
-	agentName,
+	planRun,
 	projectLabel,
 }: {
-	planRunId: string;
-	planId: string;
-	state: PlanRunState;
-	startedAt: string | null;
-	agentName: string;
+	planRun: PlanRunListItem;
 	projectLabel: string;
 }) {
-	const detail = useQuery({
-		queryKey: ["plan-runs", planRunId],
-		queryFn: ({ signal }) => planRunsApi.get(planRunId, signal),
-		refetchInterval: 5000,
-	});
-	const counts = formatChildStateCounts(detail.data?.children ?? []);
-	const cost = summarizeCost(detail.data?.runs ?? []);
+	const counts = formatChildStateCountsFromCounts(
+		planRun.summary.childCounts,
+		planRun.summary.childTotal,
+	);
 	return (
 		<TableRow>
 			<TableCell>
-				<PlanRunStateBadge state={state} />
+				<PlanRunStateBadge state={planRun.state} />
 			</TableCell>
 			<TableCell>
 				<Link
-					to={`/plan-runs/${encodeURIComponent(planRunId)}`}
+					to={`/plan-runs/${encodeURIComponent(planRun.id)}`}
 					className="font-mono text-xs underline-offset-2 hover:underline"
 				>
-					{planRunId}
+					{planRun.id}
 				</Link>
 			</TableCell>
-			<TableCell className="whitespace-nowrap font-mono text-xs">{planId}</TableCell>
+			<TableCell className="whitespace-nowrap font-mono text-xs">{planRun.planId}</TableCell>
 			<TableCell className="whitespace-nowrap font-mono text-xs">{projectLabel}</TableCell>
-			<TableCell className="whitespace-nowrap">{agentName}</TableCell>
+			<TableCell className="whitespace-nowrap">{planRun.agentName}</TableCell>
 			<TableCell className="text-xs text-(--color-muted-foreground)" title={counts.title}>
 				{counts.text}
 			</TableCell>
 			<TableCell
 				className="whitespace-nowrap font-mono text-xs text-(--color-muted-foreground)"
 				title={
-					cost.priced === 0
+					planRun.summary.costPricedCount === 0
 						? "No child runs have a recorded cost yet"
-						: `${cost.priced} of ${cost.total} child runs have a recorded cost`
+						: `${planRun.summary.costPricedCount} of ${planRun.summary.childTotal} child runs have a recorded cost`
 				}
 			>
-				{cost.priced === 0 ? "—" : formatCostUsd(cost.sum)}
+				{planRun.summary.costPricedCount === 0 ? "—" : formatCostUsd(planRun.summary.costTotalUsd)}
 			</TableCell>
 			<TableCell className="whitespace-nowrap text-(--color-muted-foreground)">
-				{relativeTime(startedAt)}
+				{relativeTime(planRun.startedAt)}
 			</TableCell>
 		</TableRow>
 	);
-}
-
-/**
- * Aggregate cost across a plan-run's child runs (warren-2235 / pl-b0c0
- * step 5). Mirrors RunsRepo.aggregate's NULL-aware rollup: `sum` adds
- * non-null `costUsd` only, `priced` counts those rows, `total` is the
- * full child-run count. Ghost runs whose cost was never recorded land
- * in `total - priced` — the tooltip surfaces the gap so a low total
- * isn't mistaken for cheap.
- */
-function summarizeCost(runs: RunRow[]): {
-	sum: number;
-	priced: number;
-	total: number;
-} {
-	let sum = 0;
-	let priced = 0;
-	for (const r of runs) {
-		if (r.costUsd !== null) {
-			sum += r.costUsd;
-			priced += 1;
-		}
-	}
-	return { sum, priced, total: runs.length };
 }

@@ -32,7 +32,7 @@ describe("GET /plan-runs", () => {
 		await db.close();
 	});
 
-	test("returns active plan_runs when no filter is set", async () => {
+	test("returns recent plan-run history when no filter is set", async () => {
 		await repos.planRuns.create({
 			planId: "pl-active",
 			projectId: seedyProjectId,
@@ -45,7 +45,7 @@ describe("GET /plan-runs", () => {
 			agentName: "claude-code",
 			children: [{ seq: 1, seedId: "wa-b" }],
 		});
-		// Drive the second through to running → succeeded so listActive omits it.
+		// Drive the second through to running → succeeded; the default is history.
 		await repos.planRuns.transitionTo(done.planRun.id, "running", {
 			startedAt: new Date().toISOString(),
 		});
@@ -62,8 +62,11 @@ describe("GET /plan-runs", () => {
 
 		const res = await fetch(`${tcpUrl(handle)}/plan-runs`);
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as { planRuns: { planId: string }[] };
-		expect(body.planRuns.map((p) => p.planId)).toEqual(["pl-active"]);
+		const body = (await res.json()) as {
+			planRuns: { planId: string; summary: { childTotal: number } }[];
+		};
+		expect(body.planRuns.map((p) => p.planId)).toEqual(["pl-active", "pl-done"]);
+		expect(body.planRuns.every((p) => p.summary.childTotal === 1)).toBe(true);
 	});
 
 	test("filters by project + state", async () => {

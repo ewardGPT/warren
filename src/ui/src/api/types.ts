@@ -483,6 +483,17 @@ export interface PlanRunRow {
 	endedAt: string | null;
 }
 
+export interface PlanRunSummary {
+	childCounts: Record<PlanRunChildState, number>;
+	childTotal: number;
+	costTotalUsd: number;
+	costPricedCount: number;
+}
+
+export interface PlanRunListItem extends PlanRunRow {
+	summary: PlanRunSummary;
+}
+
 export interface PlanRunChildRow {
 	planRunId: string;
 	seq: number;
@@ -513,6 +524,10 @@ export interface CreatePlanRunInput {
 export interface CreatePlanRunResponse {
 	planRun: PlanRunRow;
 	children: PlanRunChildRow[];
+}
+
+export interface ListPlanRunsResponse {
+	planRuns: PlanRunListItem[];
 }
 
 /**

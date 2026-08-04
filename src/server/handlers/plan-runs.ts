@@ -10,6 +10,7 @@
  */
 
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
+import type { PlanRunRow } from "../../db/schema.ts";
 import { PlanHasNoOpenChildrenError, ProjectLacksSeedsError } from "../../plan-runs/errors.ts";
 import { cancelRun } from "../../runs/index.ts";
 import { showPlan, showSeed } from "../../seeds-cli/index.ts";
@@ -195,34 +196,34 @@ export function listPlanRunsHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const projectId = ctx.url.searchParams.get("project");
 		const state = parsePlanRunStateFilter(ctx.url.searchParams.get("state"));
+		let rows: PlanRunRow[];
 		if (projectId !== null) {
-			const rows = await deps.repos.planRuns.listByProjectAndState(
+			rows = await deps.repos.planRuns.listByProjectAndState(
 				projectId,
 				state !== undefined ? state : undefined,
 			);
-			return jsonResponse(200, {
-				planRuns: rows.map((row) => projectPlanRun(row, ctx.actor)),
-			});
-		}
-		// No project filter — return active PlanRuns when no state requested,
-		// or the operator's chosen state across every project.
-		if (state !== undefined) {
+		} else if (state !== undefined) {
+			// No project filter — a state-only view walks projects sequentially.
 			// listByProjectAndState requires a project; for a state-only view
 			// we walk projects sequentially. Volume is tiny relative to runs
 			// (one plan-run per dispatched plan, not per child).
 			const projects = await deps.repos.projects.listAll();
-			const all = (
+			rows = (
 				await Promise.all(
 					projects.map((p) => deps.repos.planRuns.listByProjectAndState(p.id, state)),
 				)
 			).flat();
-			return jsonResponse(200, {
-				planRuns: all.map((row) => projectPlanRun(row, ctx.actor)),
-			});
+		} else {
+			// The unfiltered default is recent history, not active-only. The
+			// UI's default pill is explicitly labelled All.
+			rows = await deps.repos.planRuns.listAll();
 		}
-		const active = await deps.repos.planRuns.listActive();
+		const summaries = await deps.repos.planRuns.summarize(rows.map((row) => row.id));
 		return jsonResponse(200, {
-			planRuns: active.map((row) => projectPlanRun(row, ctx.actor)),
+			planRuns: rows.map((row) => ({
+				...projectPlanRun(row, ctx.actor),
+				summary: summaries.get(row.id),
+			})),
 		});
 	};
 }

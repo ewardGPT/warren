@@ -11,9 +11,9 @@ import type {
 	CreatePlanRunInput,
 	CreatePlanRunResponse,
 	CreateRunInput,
+	ListPlanRunsResponse,
 	ListRunsResponse,
 	PlanRunDetailResponse,
-	PlanRunRow,
 	PlanRunState,
 	PreviewConfigResponse,
 	PreviewLoginResponse,
@@ -329,7 +329,7 @@ export const planRunsApi = {
 		if (filter.project) params.set("project", filter.project);
 		if (filter.state) params.set("state", filter.state);
 		const qs = params.toString();
-		return request<{ planRuns: PlanRunRow[] }>(`/plan-runs${qs.length > 0 ? `?${qs}` : ""}`, {
+		return request<ListPlanRunsResponse>(`/plan-runs${qs.length > 0 ? `?${qs}` : ""}`, {
 			...(signal ? { signal } : {}),
 		});
 	},

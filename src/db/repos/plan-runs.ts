@@ -24,7 +24,7 @@
  * (planRunId, seq) pair (require-style read first).
  */
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, eq, inArray, sql } from "drizzle-orm";
 import { NotFoundError, StateTransitionError, ValidationError } from "../../core/errors.ts";
 import { generateId } from "../../core/ids.ts";
 import { PLAN_RUN_CHILD_STATES } from "../../core/wire.ts";
@@ -98,6 +98,13 @@ export interface CreatePlanRunInput {
 export interface CreatePlanRunResult {
 	planRun: PlanRunRow;
 	children: PlanRunChildRow[];
+}
+
+export interface PlanRunSummary {
+	childCounts: Record<PlanRunChildState, number>;
+	childTotal: number;
+	costTotalUsd: number;
+	costPricedCount: number;
 }
 
 export interface TransitionPlanRunOptions {
@@ -272,6 +279,13 @@ export class PlanRunsRepo {
 		);
 	}
 
+	/** All plan runs for the history view, ordered oldest-first for stable paging. */
+	async listAll(): Promise<PlanRunRow[]> {
+		return this.adapter.pickAll(
+			this.db.select().from(this.planRuns).orderBy(asc(this.planRuns.createdAt)),
+		);
+	}
+
 	/**
 	 * Distinct set of `plan_id`s that already have at least one `plan_run`
 	 * row for the given project — the dedup primitive behind the
@@ -305,6 +319,54 @@ export class PlanRunsRepo {
 				.where(inArray(this.planRuns.state, ["queued", "running"]))
 				.orderBy(asc(this.planRuns.createdAt)),
 		);
+	}
+
+	/** Aggregate list-page child progress and cost in one grouped query. */
+	async summarize(ids: readonly string[]): Promise<Map<string, PlanRunSummary>> {
+		const summaries = new Map<string, PlanRunSummary>();
+		for (const id of ids) {
+			summaries.set(id, {
+				childCounts: {
+					pending: 0,
+					dispatched: 0,
+					running: 0,
+					pr_open: 0,
+					merged: 0,
+					failed: 0,
+					skipped: 0,
+				},
+				childTotal: 0,
+				costTotalUsd: 0,
+				costPricedCount: 0,
+			});
+		}
+		if (ids.length === 0) return summaries;
+
+		const runs = this.adapter.schema.runs;
+		const rows = await this.adapter.pickAll(
+			this.db
+				.select({
+					planRunId: this.planRunChildren.planRunId,
+					state: this.planRunChildren.state,
+					childCount: count(this.planRunChildren.seq),
+					costTotalUsd: sql<number | null>`sum(${runs.costUsd})`,
+					costPricedCount: sql<number>`count(${runs.costUsd})`,
+				})
+				.from(this.planRunChildren)
+				.leftJoin(runs, eq(this.planRunChildren.runId, runs.id))
+				.where(inArray(this.planRunChildren.planRunId, ids as string[]))
+				.groupBy(this.planRunChildren.planRunId, this.planRunChildren.state),
+		);
+		for (const row of rows) {
+			const summary = summaries.get(row.planRunId);
+			if (!summary) continue;
+			const childCount = Number(row.childCount);
+			summary.childCounts[row.state] = childCount;
+			summary.childTotal += childCount;
+			summary.costTotalUsd += row.costTotalUsd ?? 0;
+			summary.costPricedCount += Number(row.costPricedCount);
+		}
+		return summaries;
 	}
 
 	/**

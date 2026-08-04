@@ -137,6 +137,33 @@ export interface ChildStateSummary {
 	title: string;
 }
 
+export type ChildStateCounts = Readonly<Record<PlanRunChildState, number>>;
+type ChildBucketCounts = Readonly<Record<ChildBucket, number>>;
+
+function formatChildStateCountMap(counts: ChildBucketCounts, total: number): ChildStateSummary {
+	const phrase = (b: ChildBucket): string => `${counts[b]} ${CHILD_BUCKET_LABELS[b]}`;
+	const nonEmpty = CHILD_BUCKET_ORDER.filter((b) => counts[b] > 0);
+	if (nonEmpty.length === 0) return { text: "—", title: "No child seeds yet" };
+	return {
+		text: nonEmpty.map(phrase).join(" · "),
+		title: `${total} child seed${total === 1 ? "" : "s"}: ${CHILD_BUCKET_ORDER.map(phrase).join(", ")}`,
+	};
+}
+
+export function formatChildStateCountsFromCounts(
+	counts: ChildStateCounts,
+	total: number,
+): ChildStateSummary {
+	const buckets: Record<ChildBucket, number> = {
+		pending: counts.pending,
+		inflight: counts.dispatched + counts.running + counts.pr_open,
+		merged: counts.merged,
+		skipped: counts.skipped,
+		failed: counts.failed,
+	};
+	return formatChildStateCountMap(buckets, total);
+}
+
 /** Roll a plan-run's children up into a readable count line plus tooltip. */
 export function formatChildStateCounts(
 	children: readonly { state: PlanRunChildState }[],
@@ -150,13 +177,5 @@ export function formatChildStateCounts(
 	};
 	for (const c of children) counts[bucketFor(c.state)] += 1;
 
-	const phrase = (b: ChildBucket): string => `${counts[b]} ${CHILD_BUCKET_LABELS[b]}`;
-	const nonEmpty = CHILD_BUCKET_ORDER.filter((b) => counts[b] > 0);
-	if (nonEmpty.length === 0) {
-		return { text: "—", title: "No child seeds yet" };
-	}
-	return {
-		text: nonEmpty.map(phrase).join(" · "),
-		title: `${children.length} child seed${children.length === 1 ? "" : "s"}: ${CHILD_BUCKET_ORDER.map(phrase).join(", ")}`,
-	};
+	return formatChildStateCountMap(counts, children.length);
 }
