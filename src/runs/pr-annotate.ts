@@ -28,6 +28,7 @@
  */
 
 import { PREVIEW_FRAGMENT_END, PREVIEW_FRAGMENT_START } from "./pr.ts";
+import { readJson, readText, truncate } from "./pr-checks.ts";
 
 const GITHUB_API_BASE = "https://api.github.com";
 const USER_AGENT = "warren-reap-pr-annotate";
@@ -205,24 +206,4 @@ function buildHeaders(token: string): Record<string, string> {
 		"user-agent": USER_AGENT,
 		"x-github-api-version": "2022-11-28",
 	};
-}
-
-async function readJson(res: Response): Promise<unknown> {
-	try {
-		return await res.json();
-	} catch {
-		return null;
-	}
-}
-
-async function readText(res: Response): Promise<string> {
-	try {
-		return await res.text();
-	} catch {
-		return "";
-	}
-}
-
-function truncate(input: string, max: number): string {
-	return input.length <= max ? input : `${input.slice(0, max)}…`;
 }
