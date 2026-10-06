@@ -36,7 +36,9 @@ describe("resolveAnalyticsWindow", () => {
 
 	test("defaults to to now when only from is supplied", () => {
 		const before = Date.now();
-		const from = "2026-07-01T00:00:00.000Z";
+		// A fixed from within the 90-day cap rots as the wall clock crosses
+		// the clamp boundary — derive the bound from now instead.
+		const from = new Date(Date.now() - 10 * DAY_MS).toISOString();
 		const w = resolveAnalyticsWindow(from, undefined);
 		expect(w.from).toBe(from);
 		expect(Date.parse(w.to)).toBeGreaterThanOrEqual(before);

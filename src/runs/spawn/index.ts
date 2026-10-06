@@ -12,5 +12,6 @@
  * posture) lives at the top of `./dispatch.ts`.
  */
 
-export { composeDispatchPrompt, spawnRun } from "./dispatch.ts";
+export { composeDispatchPrompt } from "./compose-prompt.ts";
+export { spawnRun } from "./dispatch.ts";
 export type { SpawnRunInput, SpawnRunResult } from "./types.ts";

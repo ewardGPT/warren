@@ -52,6 +52,8 @@ import { buildSeedFiles } from "../seed.ts";
 import { validateTargetBranch } from "../target-branch.ts";
 import { readCachedAgent, readProjectDefaults, resolveOverride } from "./agent-cache.ts";
 import { type EnvLike, injectWarrenCallbackEnv } from "./callback-env.ts";
+import { composeDispatchPrompt } from "./compose-prompt.ts";
+import { buildMulchPriorBlock } from "./mulch-priors.ts";
 import {
 	bindRunLogger,
 	logDispatched,
@@ -139,6 +141,22 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 				})
 			: null;
 	const projectAfterRefresh = refreshed?.project ?? project;
+
+	// ubuntu-2bb5: seed-relevant mulch priors. The prompt carries the known
+	// failure dead ends for this seed's paths, so the run does not spend
+	// tokens rediscovering them. Best-effort — an empty block leaves the
+	// prompt untouched.
+	const mulchPriors = await buildMulchPriorBlock({
+		projectPath: projectAfterRefresh.localPath,
+		prompt: input.prompt,
+		...(input.seedId !== undefined ? { seedId: input.seedId } : {}),
+	});
+	if (mulchPriors.count > 0) {
+		input.logger?.info(
+			{ seedId: input.seedId, priors: mulchPriors.count, chars: mulchPriors.block.length },
+			"spawn.mulch_priors",
+		);
+	}
 
 	// warren-618b: fold per-project provider/model defaults onto the agent
 	// frontmatter, operator per-run override winning. Order: operator
@@ -258,7 +276,7 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			? { projectResources: projectDefaults.resources }
 			: {}),
 		runtimeId,
-		prompt: composeDispatchPrompt(agent.sections.system, input.prompt),
+		prompt: composeDispatchPrompt(agent.sections.system, input.prompt, mulchPriors.block),
 		metadata: composeBurrowMetadata(input.metadata, agent.frontmatter),
 		mode: input.mode ?? "batch",
 		network: burrowConfig.network ?? "none",
@@ -434,23 +452,6 @@ function injectGitIdentityEnv(env: Record<string, string>, serverEnv: EnvLike): 
 	env.GIT_AUTHOR_EMAIL = email;
 	env.GIT_COMMITTER_NAME = name;
 	env.GIT_COMMITTER_EMAIL = email;
-}
-
-/**
- * Prefix the user's run prompt with the agent's `system` section so the
- * canopy-defined operating contract (workspace map, rituals, expectations)
- * actually reaches claude. Burrow's claude-code runtime feeds the dispatch
- * prompt to the agent as a single user turn — it never reads
- * `.warren/agent.json` itself, so without this prepend the canopy `system`
- * body is dead text on disk.
- *
- * `runs.prompt` (warren-side) keeps the user-typed input verbatim; only
- * the body sent on POST /burrows/:id/runs is composed.
- */
-export function composeDispatchPrompt(systemBody: string | undefined, userPrompt: string): string {
-	const trimmed = (systemBody ?? "").trim();
-	if (trimmed === "") return userPrompt;
-	return `${trimmed}\n\n---\n\n${userPrompt}`;
 }
 
 /**
