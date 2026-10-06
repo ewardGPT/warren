@@ -47,10 +47,12 @@ import type { RunSpec, RuntimeProvider } from "../../runtime/contract.ts";
 import { interactiveRuntimeOverride } from "../../warren-config/schema.ts";
 import { composeRunBranch, resolveRunBranchPrefix } from "../branch.ts";
 import { parseBurrowConfig } from "../burrow-config.ts";
+import { resolveCostCapUsd } from "../cost-cap.ts";
 import { lifecycleBus } from "../lifecycle-bus.ts";
 import { buildSeedFiles } from "../seed.ts";
 import { validateTargetBranch } from "../target-branch.ts";
 import { readCachedAgent, readProjectDefaults, resolveOverride } from "./agent-cache.ts";
+import { classifyBudgetClass } from "./budget-class.ts";
 import { type EnvLike, injectWarrenCallbackEnv } from "./callback-env.ts";
 import { composeDispatchPrompt } from "./compose-prompt.ts";
 import { buildMulchPriorBlock } from "./mulch-priors.ts";
@@ -158,6 +160,18 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		);
 	}
 
+	// ubuntu-d8c3: budget-class triage. A per-class USD ceiling applies only
+	// when the run otherwise has no cap — operator and trigger overrides
+	// always win, and the class never lowers an explicit frontmatter cap.
+	const budgetClass = classifyBudgetClass({
+		seedText: mulchPriors.seedText,
+		prompt: input.prompt,
+	});
+	const triageCapUsd =
+		input.maxCostUsdOverride === undefined && resolveCostCapUsd(baseAgent) === null
+			? budgetClass.maxCostUsd
+			: null;
+
 	// warren-618b: fold per-project provider/model defaults onto the agent
 	// frontmatter, operator per-run override winning. Order: operator
 	// override > .warren/defaults.json > agent frontmatter, all riding the
@@ -178,8 +192,14 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			...(effectiveProvider !== undefined ? { providerOverride: effectiveProvider } : {}),
 			...(effectiveModel !== undefined ? { modelOverride: effectiveModel } : {}),
 		}),
-		input.maxCostUsdOverride,
+		triageCapUsd ?? input.maxCostUsdOverride,
 	);
+	if (triageCapUsd !== null) {
+		input.logger?.info(
+			{ seedId: input.seedId, level: budgetClass.level, maxCostUsd: triageCapUsd },
+			"spawn.budget_class",
+		);
+	}
 	const resolvedProviderModel = readProviderFrontmatter(agent.frontmatter);
 	if (resolvedProviderModel.provider !== undefined && resolvedProviderModel.model !== undefined) {
 		validateProviderModelCompatibility(resolvedProviderModel.provider, resolvedProviderModel.model);

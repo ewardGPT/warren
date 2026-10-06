@@ -176,7 +176,7 @@ describe("buildMulchPriorBlock", () => {
 				throw new Error("ENOENT");
 			},
 		});
-		expect(result).toEqual({ block: "", count: 0 });
+		expect(result).toEqual({ block: "", count: 0, seedText: "fix src/runs/reap" });
 	});
 
 	test("selects records that match the operator prompt", async () => {

@@ -75,6 +75,8 @@ describe("reapRun: run.scorecard event (ubuntu-c929)", () => {
 		expect(scorecard?.costUsd).toBeNull();
 		expect(scorecard?.salvageRef).toBeNull();
 		expect(scorecard?.seedsClosed).toBe(0);
+		// Forcing is off by default — no continuation is spawned.
+		expect(await repos.runs.listAll()).toHaveLength(1);
 		await db.close();
 	});
 });

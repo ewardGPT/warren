@@ -31,6 +31,7 @@ import {
 	listAll,
 	listByAgent,
 	listByIds,
+	listByParentRunId as listByParentRunIdQuery,
 	listByProject,
 	listByState,
 	listForAnalytics,
@@ -189,6 +190,11 @@ export class RunsRepo {
 		const row = await this.get(id);
 		if (!row) throw new NotFoundError(`run not found: ${id}`);
 		return row;
+	}
+
+	/** Children of one run (continuation/replicate chain; ubuntu-d8c3 lineage cap). */
+	listByParentRunId(parentRunId: string): Promise<RunRow[]> {
+		return listByParentRunIdQuery(this.adapter, parentRunId);
 	}
 
 	/**
