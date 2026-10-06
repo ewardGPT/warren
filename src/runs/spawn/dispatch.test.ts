@@ -459,4 +459,20 @@ describe("composeDispatchPrompt", () => {
 		expect(composeDispatchPrompt("   \n\t", "task")).toBe("task");
 		expect(composeDispatchPrompt(undefined, "task")).toBe("task");
 	});
+
+	test("inserts a prior block between the system body and the user prompt", () => {
+		expect(composeDispatchPrompt("be a refactor agent", "fix it", "## priors")).toBe(
+			"be a refactor agent\n\n---\n\n## priors\n\n---\n\nfix it",
+		);
+	});
+
+	test("uses the prior block as the first section when the system body is empty", () => {
+		expect(composeDispatchPrompt("", "fix it", "## priors")).toBe("## priors\n\n---\n\nfix it");
+	});
+
+	test("ignores a blank prior block", () => {
+		expect(composeDispatchPrompt("be a refactor agent", "fix it", "  \n")).toBe(
+			"be a refactor agent\n\n---\n\nfix it",
+		);
+	});
 });
