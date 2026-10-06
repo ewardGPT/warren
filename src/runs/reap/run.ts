@@ -6,6 +6,7 @@ import { runWorkspaceDestroy } from "./destroy.ts";
 import { createPipelineState, runReapPipeline } from "./pipeline.ts";
 import { detectTerminalProviderError } from "./provider-error.ts";
 import { salvageWorkspace, type WorkspaceSalvageOutcome } from "./salvage.ts";
+import { buildRunScorecard } from "./scorecard.ts";
 import { inferFailureReason, isTerminal, transitionToTerminal } from "./state.ts";
 import type { ReapRunInput, ReapRunResult, ReapStep, ReapStepError } from "./types.ts";
 import { buildAlreadyTerminalResult, createSeqAllocator, defaultExec, defaultFs } from "./util.ts";
@@ -336,6 +337,37 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		errors,
 		pushProtection: state.pushProtection,
 	});
+
+	// ubuntu-c929: verified run scorecard — a deterministic, machine-readable
+	// terminal summary emitted as one event. No model-judged fields; budget
+	// triage, goal-loop forcing, and winner selection consume it instead of
+	// re-deriving the same facts. Emitted only when the workspace pipeline
+	// actually ran — a never-started or orphaned reap has no work facts to
+	// score. Best-effort: a failure here emits a warning and never changes
+	// the reap result.
+	if (stateOnEntry !== "queued" && resolved !== null && project !== null) {
+		try {
+			const scorecard = await buildRunScorecard({
+				outcome: finalState,
+				failureReason,
+				state,
+				run,
+				salvageRef: salvage?.rescueRef ?? null,
+				salvageBundlePath: salvage?.bundlePath ?? null,
+				providerError: failedFromProviderError,
+				events: await input.repos.events.listByRun(run.id),
+				workspacePath,
+				baseBranch,
+				exec,
+			});
+			await emit("run.scorecard", scorecard);
+		} catch (err) {
+			log.error(
+				{ event: "run.scorecard", err: err instanceof Error ? err.message : String(err) },
+				"run.scorecard emit failed",
+			);
+		}
+	}
 
 	// Final sub-step (warren-0d89): destroy the burrow workspace now that
 	// every result has been extracted and the branch pushed. Best-effort —

@@ -57,13 +57,15 @@ describe("reapRun", () => {
 			'"content":"new"',
 		);
 		// Reap runs `git push` then `git rev-list --count <base>..HEAD`
-		// (warren-f3bb).
-		expect(e.calls).toHaveLength(2);
+		// (warren-f3bb), then the scorecard's diff read (ubuntu-c929).
+		expect(e.calls).toHaveLength(3);
 		expect(e.calls[0]?.cmd).toBe("git");
 		expect(e.calls[0]?.args).toEqual(["push", "origin", "HEAD:agent/refactor-bot/run-1"]);
 		expect(e.calls[0]?.cwd).toBe("/data/burrow/ws");
 		expect(e.calls[1]?.cmd).toBe("git");
 		expect(e.calls[1]?.args).toEqual(["rev-list", "--count", "main..HEAD"]);
+		expect(e.calls[2]?.cmd).toBe("git");
+		expect(e.calls[2]?.args).toEqual(["diff", "--numstat", "main..HEAD"]);
 	});
 
 	test("emits reap.empty_push when push lands zero commits (warren-f3bb)", async () => {
