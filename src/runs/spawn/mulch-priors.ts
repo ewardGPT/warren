@@ -335,9 +335,9 @@ export interface BuildMulchPriorBlockInput {
 export interface MulchPriorBlockResult {
 	readonly block: string;
 	readonly count: number;
+	/** The resolved seed text the selection ran on (issues record or prompt). */
+	readonly seedText: string;
 }
-
-const EMPTY_RESULT: MulchPriorBlockResult = { block: "", count: 0 };
 
 /**
  * Build the prior block for one spawn. Never throws: every failure path
@@ -364,12 +364,12 @@ export async function buildMulchPriorBlock(
 		const names = (await readdirFn(dir)).filter((name) => name.endsWith(".jsonl")).sort();
 		contents = await Promise.all(names.map((name) => readFileFn(join(dir, name))));
 	} catch {
-		return EMPTY_RESULT;
+		return { block: "", count: 0, seedText };
 	}
 	const selected = selectFailurePriors(
 		seedText,
 		parseFailurePriors(contents),
 		input.limit ?? MULCH_PRIOR_LIMIT,
 	);
-	return { block: formatPriorBlock(selected), count: selected.length };
+	return { block: formatPriorBlock(selected), count: selected.length, seedText };
 }

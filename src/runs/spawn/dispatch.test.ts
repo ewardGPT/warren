@@ -105,7 +105,9 @@ describe("spawnRun: end-to-end", () => {
 			body: {
 				agentId: "sapling",
 				prompt: "be a refactor agent\n\n---\n\nfix the flaky test",
-				metadata: { frontmatter: {} },
+				// ubuntu-d8c3: the budget-class triage folds its USD ceiling
+				// onto the agent frontmatter when no explicit cap exists.
+				metadata: { frontmatter: { maxCostUsd: 1 } },
 			},
 		});
 

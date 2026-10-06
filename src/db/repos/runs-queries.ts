@@ -36,6 +36,20 @@ function orderByClause(
 	return [dir === "asc" ? asc(col) : desc(col), asc(runs.id)];
 }
 
+/**
+ * Child runs sharing one parent (continuation/replicate chains,
+ * warren-4b11 / warren-e96f). Feeds the forced-continuation lineage cap
+ * (ubuntu-d8c3). Plain text id, no FK.
+ */
+export async function listByParentRunId(
+	adapter: DrizzleAdapter,
+	parentRunId: string,
+): Promise<RunRow[]> {
+	const db = adapter.drizzle as SqliteDrizzleDb;
+	const runs: RunsTable = adapter.schema.runs;
+	return adapter.pickAll(db.select().from(runs).where(eq(runs.parentRunId, parentRunId)));
+}
+
 export async function listAll(
 	adapter: DrizzleAdapter,
 	options: {

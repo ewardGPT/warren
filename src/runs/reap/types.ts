@@ -84,6 +84,14 @@ export interface ReapRunInput {
 	 * bundle form is skipped (tests); the rescue push still runs.
 	 */
 	readonly salvageDir?: string;
+	/**
+	 * ubuntu-d8c3: forced-continuation switch. When enabled, an
+	 * evidence-empty terminal (succeeded with no changes, or failed with a
+	 * dropped commit) spawns ONE continuation seeded from the parent's
+	 * branch, capped per lineage and only while budget remains. Off by
+	 * default — `WARREN_FORCE_CONTINUE=1` flips it per deployment.
+	 */
+	readonly forceContinuation?: { readonly enabled: boolean };
 	readonly now?: () => Date;
 	readonly logger?: BridgeLogger;
 	/** Best-effort terminal notification; invoked after durable state transition. */
