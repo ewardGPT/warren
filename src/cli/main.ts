@@ -21,6 +21,7 @@ import { resolvePublicAllowlist } from "../projects/public-allowlist.ts";
 import { seedBuiltinAgents } from "../registry/builtins/index.ts";
 import { resolveLocalRunBackend } from "../runtime/local/diagnostics/burrow.ts";
 import { runAddProject } from "./commands/add-project.ts";
+import { runBestOf } from "./commands/best-of.ts";
 import { runConfigMigrate } from "./commands/config-migrate.ts";
 import { runMigrateToPostgres } from "./commands/db.ts";
 import { runDoctor } from "./commands/doctor.ts";
@@ -131,6 +132,60 @@ export function buildProgram(context: CliContext): Command {
 								...(opts.trigger !== undefined ? { trigger: opts.trigger } : {}),
 								...(opts.provider !== undefined ? { providerOverride: opts.provider } : {}),
 								...(opts.model !== undefined ? { modelOverride: opts.model } : {}),
+							},
+						);
+						return result.exitCode;
+					} finally {
+						await backend.close();
+					}
+				});
+				process.exit(exitCode);
+			},
+		);
+
+	program
+		.command("best-of")
+		.description("contest N competing replicates of one prompt, ranked by verified scorecards")
+		.argument("<agent>", "registered agent name")
+		.argument("<project>", "project id (prj_xxx)")
+		.requiredOption("-p, --prompt <text>", "prompt text every replicate receives")
+		.option("-r, --replicates <n>", "number of competing replicates (2..5)", "2")
+		.option("--seed <id>", "seed id attached to every replicate")
+		.option("--tiers <list>", "comma-separated model overrides, cycled per replicate")
+		.action(
+			async (
+				agent: string,
+				project: string,
+				opts: {
+					prompt: string;
+					replicates?: string;
+					seed?: string;
+					tiers?: string;
+				},
+			) => {
+				const replicates = Number(opts.replicates);
+				if (!Number.isInteger(replicates) || replicates < 2 || replicates > 5) {
+					context.stdio.stderr.write("warren: --replicates must be an integer from 2 to 5\n");
+					process.exit(2);
+				}
+				const tiers = opts.tiers
+					?.split(",")
+					.map((tier) => tier.trim())
+					.filter((tier) => tier !== "");
+				const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
+					await seedBuiltinAgents(repos.agents, undefined, context.now);
+					const backend = resolveLocalRunBackend(context.env);
+					try {
+						const result = await runBestOf(
+							context,
+							{ repos, runtimeProvider: backend.runtimeProvider },
+							{
+								agent,
+								project,
+								prompt: opts.prompt,
+								...(opts.seed !== undefined ? { seedId: opts.seed } : {}),
+								replicates,
+								...(tiers !== undefined && tiers.length > 0 ? { tiers } : {}),
 							},
 						);
 						return result.exitCode;
