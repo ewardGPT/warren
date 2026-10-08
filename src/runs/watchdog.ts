@@ -53,6 +53,7 @@ import { RuntimeRunNotFoundError } from "../runtime/errors.ts";
 import type { RunEventBroker } from "./events.ts";
 import type { AutoOpenPrConfig } from "./pr.ts";
 import type { ReapRunInput, ReapRunResult } from "./reap/index.ts";
+import { maybeStallPrune, type StallPruneConfig, type StallTrackerState } from "./stall-prune.ts";
 import { type BridgeLogger, bindBridgeLogger } from "./stream/index.ts";
 import {
 	DEFAULT_WATCHDOG_TERMINAL_RECONCILE_GRACE_MS,
@@ -112,6 +113,8 @@ export interface WatchdogTickDeps {
 	readonly broker?: RunEventBroker;
 	/** Forwarded to reap so a timed-out run still gets the configured PR/branch handling. */
 	readonly autoOpenPr?: AutoOpenPrConfig;
+	/** ubuntu-7579: stall-prune switch; defaults to `WARREN_STALL_PRUNE=1`. */
+	readonly stallPrune?: StallPruneConfig;
 	readonly now?: () => Date;
 	readonly logger?: BridgeLogger;
 	/**
@@ -164,6 +167,7 @@ export async function tickWatchdog(deps: WatchdogTickDeps): Promise<WatchdogTick
 	const timedOut: { runId: string; idleMs: number }[] = [];
 	const reconciled: { runId: string; idleMs: number; outcome: RunTerminalState }[] = [];
 	const errors: { runId: string; reason: string }[] = [];
+	const stallStates = new Map<string, StallTrackerState>();
 	const graceMs = deps.terminalReconcileGraceMs ?? 0;
 
 	let running: RunRow[];
@@ -184,6 +188,7 @@ export async function tickWatchdog(deps: WatchdogTickDeps): Promise<WatchdogTick
 			else if (action.kind === "reconciled") {
 				reconciled.push({ runId: run.id, idleMs: action.idleMs, outcome: action.outcome });
 			}
+			await maybeStallPrune(deps, run, stallStates, now());
 		} catch (err) {
 			errors.push({ runId: run.id, reason: formatError(err) });
 			bindBridgeLogger(deps.logger, { run_id: run.id }).error(

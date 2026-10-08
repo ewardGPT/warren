@@ -91,6 +91,20 @@ export function decideForcedContinuation(input: ForceDecisionInput): ForceDecisi
 }
 
 /**
+ * True when the run or any ancestor carries the forced-continuation trigger
+ * (ubuntu-d8c3). Consumers such as stall pruning must not touch such a
+ * lineage as if it were a fresh run.
+ */
+export async function isForcedContinuationLineage(repos: Repos, run: RunRow): Promise<boolean> {
+	let current: RunRow | null = run;
+	for (let hops = 0; current !== null && hops < LINEAGE_MAX_HOPS; hops += 1) {
+		if (current.trigger === FORCE_CONTINUE_TRIGGER) return true;
+		current = current.parentRunId !== null ? await repos.runs.get(current.parentRunId) : null;
+	}
+	return false;
+}
+
+/**
  * Count forced-continuation runs across the run's ancestry. Siblings from
  * the same parent count against the cap, and a run that IS a forced
  * continuation counts itself, so a lineage can never farm unlimited
