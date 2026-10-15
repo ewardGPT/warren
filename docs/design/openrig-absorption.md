@@ -337,14 +337,29 @@ diff, artifacts) is host filesystem and host git work.
 So the provider hands each box's `LocalProvider` ssh-backed `fs` and `exec` seams
 (`remote-seams.ts`). Reap itself does not change.
 
-**What the lane does not do yet.** The CLI places work and leaves warren's
-lifecycle alone. `fleet dispatch` and `fleet pump` call the provider directly,
-so warren writes no run row, nothing reaps the result, and no pull request
-follows.
+**What the lane does not do yet.** The CLI fleet verbs place work and leave
+warren's lifecycle alone. `fleet dispatch` and `fleet pump` call the provider
+directly, so warren writes no run row, nothing reaps the result, and no pull
+request follows.
 
-The provider carries the seams reap needs, so the missing half is the domain
-half. Until it lands, an operator drives the pump by hand and the box keeps the
-workspace for inspection.
+The domain verb does not have that gap. `warren run` opens the database itself
+and resolves its backend from `WARREN_RUNTIME`, so it walks the whole lifecycle
+on the fleet lane.
+
+Proven live. `WARREN_RUNTIME=fleet warren run pi <project> -p <prompt>` spawns the
+run, writes its row, streams the box's events, and reaches reap.
+
+Reap then runs **on the box**. The remote seams carry it, and the failing step
+names that box:
+
+```
+run.reaped state=failed errors=[{step: branch_push,
+  message: git on ubuntu@100.111.105.36 failed:
+  fatal: could not read Username for 'https://github.com'}]
+```
+
+So the last gap is credentials, not architecture. A box can clone a public repo
+and cannot push to a private one, because it holds no GitHub credential.
 
 The kernel queue stays out of this on purpose. A qitem is work addressed to a
 session, and a burrow run has no session. All three kernels report an empty queue
