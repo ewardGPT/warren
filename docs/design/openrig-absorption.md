@@ -124,6 +124,34 @@ carries idempotency keys.
 - tmux becomes a host requirement for persistent seats only. Batch runs keep the
 burrow and k8s paths.
 
+## Agentic boxes
+
+A host that runs its own kernel can hold its own seats, and any other host on the
+tailnet can watch them. `scripts/agentic-box.sh` turns a Debian or Ubuntu box into
+one: it creates the non-root `openrig` user with key-only SSH and a read-only sudo
+rule, installs Node 22 and `rig`, and runs the kernel as a systemd unit.
+
+Three choices in that script are deliberate.
+
+1. The unit execs the daemon entry directly. `rig daemon start` detaches and
+   unrefs its child, which systemd then cannot supervise.
+2. The kernel uses the daemon's default bind: loopback plus the tailnet, never
+   the public address. The posture profile checks exactly this, and the kernel
+   holds the fleet's work queue.
+3. The script refuses two changes it cannot make safely on its own: it leaves
+   `PermitRootLogin` alone when root has an authorized_keys file, and it leaves
+   password authentication alone when that is still on. Each one can
+   lock people out of a box that nobody can reach by hand.
+
+The registry holds two entries per box, `--transport http` for work and
+`--transport ssh` for posture, because the posture profile needs a shell.
+
+Verified on the EC2 box `headroom-aws` (t3.xlarge, us-east-1a): the kernel
+answers on its tailnet address, `rig host doctor --posture product-factory-vps`
+reports the daemon healthy and bound to loopback and the tailnet, and a terminal
+seat launched there is visible and drivable from the workstation: a `rig send`
+ran a command whose output came back through `rig capture`.
+
 ## Alternatives rejected
 
 | Alternative | Why not |
