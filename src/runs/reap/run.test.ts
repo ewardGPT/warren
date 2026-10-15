@@ -56,19 +56,14 @@ describe("reapRun", () => {
 		expect(f.files.get("/data/projects/x/y/.mulch/expertise/build.jsonl")).toContain(
 			'"content":"new"',
 		);
-		// Reap runs `git push`, then `git rev-list --count <base>..HEAD`
-		// (warren-f3bb), then the scorecard's `git diff --numstat` against the
-		// base (ubuntu-c929) — the last read happens while the workspace is
-		// still live, before the teardown.
-		expect(e.calls).toHaveLength(3);
+		// Reap runs `git push` then `git rev-list --count <base>..HEAD`
+		// (warren-f3bb).
+		expect(e.calls).toHaveLength(2);
 		expect(e.calls[0]?.cmd).toBe("git");
 		expect(e.calls[0]?.args).toEqual(["push", "origin", "HEAD:agent/refactor-bot/run-1"]);
 		expect(e.calls[0]?.cwd).toBe("/data/burrow/ws");
 		expect(e.calls[1]?.cmd).toBe("git");
 		expect(e.calls[1]?.args).toEqual(["rev-list", "--count", "main..HEAD"]);
-		expect(e.calls[2]?.cmd).toBe("git");
-		expect(e.calls[2]?.args).toEqual(["diff", "--numstat", "main..HEAD"]);
-		expect(e.calls[2]?.cwd).toBe("/data/burrow/ws");
 	});
 
 	test("emits reap.empty_push when push lands zero commits (warren-f3bb)", async () => {
@@ -367,9 +362,8 @@ describe("reapRun", () => {
 
 		expect(result.state).toBe("succeeded");
 		expect(result.branchPushed).toBe(true);
-		// The provider's exec did the workspace git: push, then rev-list, then the
-		// scorecard's diff.
-		expect(e.calls.map((call) => call.args[0])).toEqual(["push", "rev-list", "diff"]);
+		// The provider's exec did the workspace git: the push, then rev-list.
+		expect(e.calls.map((call) => call.args[0])).toEqual(["push", "rev-list"]);
 	});
 
 	test("never-started (queued) run skips workspace pipeline and emits reap.never_started_skip (warren-5e53)", async () => {

@@ -15,7 +15,6 @@ import type { AutoOpenPrConfig, OpenPullRequestInput, OpenPullRequestResult } fr
 import type { AnnotatePrPreviewInput, AnnotatePrPreviewResult } from "../pr-annotate.ts";
 import type { PrTemplateOverrides } from "../pr-template.ts";
 import type { BridgeLogger } from "../stream/index.ts";
-import type { RunScorecard } from "./scorecard.ts";
 
 /* ----------------------------------------------------------------------- */
 /* Public surface                                                           */
@@ -308,12 +307,6 @@ export interface ReapRunResult {
 	readonly errors: readonly ReapStepError[];
 	/** True when the row was already terminal on entry — sub-steps were skipped. */
 	readonly alreadyTerminal: boolean;
-	/**
-	 * The deterministic scorecard (ubuntu-c929). Null only when reap skipped
-	 * the run because the row was already terminal — a skipped reap observed
-	 * nothing, and an all-null scorecard would read as a run that did nothing.
-	 */
-	readonly scorecard: RunScorecard | null;
 }
 
 /* ----------------------------------------------------------------------- */

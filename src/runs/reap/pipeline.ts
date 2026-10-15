@@ -70,8 +70,6 @@ export interface ReapPipelineState {
 	 */
 	mirrorDurabilityFailed: boolean;
 	prUrl: string | null;
-	/** ubuntu-c929: the branch finalize pushed, for the scorecard's check-runs read. */
-	prBranch: string | null;
 	previewLaunchState: "live" | "failed" | null;
 	previewLaunchPort: number | null;
 	previewUrl: string | null;
@@ -98,7 +96,6 @@ export function createPipelineState(): ReapPipelineState {
 		cloneDeltasApplied: false,
 		mirrorDurabilityFailed: false,
 		prUrl: null,
-		prBranch: null,
 		previewLaunchState: null,
 		previewLaunchPort: null,
 		previewUrl: null,
@@ -254,9 +251,6 @@ function applyFinalizeToState(state: ReapPipelineState, r: FinalizeResult): void
 	state.seedsCommitted = r.events.some((e) => e.kind === "reap.seeds_committed");
 	state.branchPushed = r.pushed;
 	state.commitsAhead = r.commitsAhead;
-	// ubuntu-c929: the pushed branch, kept for the scorecard's check-runs read
-	// (the CI verdict hangs off the branch the PR was opened from).
-	state.prBranch = r.prBranch;
 	// warren-495d: push failed/timed out (commits left unpushed).
 	state.finalizeFailed = r.stages.some((s) => s.stage === "branch_push" && s.status === "failed");
 	// warren-5ea1: a warren-synthesized result (pod never posted) carries its cause.

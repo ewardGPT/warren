@@ -66,7 +66,6 @@ export function makeReapRunResult(overrides: Partial<ReapRunResult> = {}): ReapR
 		salvagePath: null,
 		errors: [],
 		alreadyTerminal: false,
-		scorecard: null,
 		...overrides,
 	};
 }

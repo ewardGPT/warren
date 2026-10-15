@@ -6,7 +6,6 @@ import { runWorkspaceDestroy } from "./destroy.ts";
 import { createPipelineState, runReapPipeline } from "./pipeline.ts";
 import { detectTerminalProviderError } from "./provider-error.ts";
 import { salvageWorkspace, type WorkspaceSalvageOutcome } from "./salvage.ts";
-import { assembleScorecard } from "./scorecard.ts";
 import { inferFailureReason, isTerminal, transitionToTerminal } from "./state.ts";
 import type { ReapRunInput, ReapRunResult, ReapStep, ReapStepError } from "./types.ts";
 import { buildAlreadyTerminalResult, createSeqAllocator, defaultExec, defaultFs } from "./util.ts";
@@ -31,7 +30,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// that reach that workspace before falling back to the host's own. The
 	// provider routes by run handle, so this waits for the row's burrow ids. A
 	// fleet box's workspace is not on this machine, and reading it with the
-	// host's filesystem (as salvage and the scorecard's diff once did) fails.
+	// host's filesystem (as salvage once did) fails.
 	const held = provider.workspaceSeams?.({
 		runId: run.id,
 		sandboxId: run.burrowId ?? "",
@@ -327,28 +326,6 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		errors,
 	});
 
-	// ubuntu-c929: the deterministic scorecard. Assembled BEFORE the workspace
-	// teardown below, because the diff read needs the still-live workspace, and
-	// every field is observed fact rather than a model's opinion. An unreadable
-	// field is null.
-	const scorecard = await assembleScorecard({
-		run,
-		state,
-		outcome: effectiveOutcome,
-		failureReason,
-		errors,
-		events: input.repos.events,
-		// A never-started run produced no work, so there is nothing to size — and
-		// reap's no-op path must stay free of side effects (its own test pins that).
-		// Null reads as "not observed", which is the accurate claim.
-		workspacePath: stateOnEntry === "queued" ? null : workspacePath,
-		baseBranch,
-		...(exec === undefined ? {} : { exec }),
-		...(input.autoOpenPr === undefined ? {} : { autoOpenPr: input.autoOpenPr }),
-		now,
-	});
-	await emit("run.scorecard", scorecard);
-
 	// Final sub-step (warren-0d89): destroy the burrow workspace now that
 	// every result has been extracted and the branch pushed. Best-effort —
 	// skipped for conversation runs and still-live previews, and a failure
@@ -452,6 +429,5 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		salvagePath: salvage?.bundlePath ?? null,
 		errors,
 		alreadyTerminal: false,
-		scorecard,
 	};
 }

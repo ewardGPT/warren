@@ -42,9 +42,6 @@ export function buildAlreadyTerminalResult(run: RunRow): ReapRunResult {
 		salvagePath: run.salvagePath,
 		errors: [],
 		alreadyTerminal: true,
-		// A skipped reap observed nothing: an all-null scorecard would read as a
-		// run that did nothing, which is a different claim.
-		scorecard: null,
 	};
 }
 
