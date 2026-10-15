@@ -96,7 +96,7 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 		});
 	fleetGroup
 		.command("dispatch")
-		.description("place one run on a box (the smoke test for the lane)")
+		.description("place one run on a box, unreaped (the lane's smoke test)")
 		.requiredOption("--repo <url>", "git origin the run works on")
 		.requiredOption("--prompt <text>", "the brief handed to the agent")
 		.option("--runtime <id>", "agent runtime id (default pi)")
@@ -137,7 +137,7 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 
 	fleetGroup
 		.command("pump")
-		.description("claim ready seeds and place a run for each, so the boxes fill")
+		.description("claim ready seeds and place a run for each, unreaped (run it by hand)")
 		.requiredOption("--repo <url>", "git origin the runs work on")
 		.option("--limit <n>", "how many seeds to take (default one per box)")
 		.option("--lease <minutes>", "claim lease, so a stalled run's seed returns to the queue")
