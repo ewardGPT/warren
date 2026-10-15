@@ -172,6 +172,46 @@ Register an ssh entry by address, not by ssh-config alias. `rig host list` probe
 `unreachable` while every real check passes. The key and user still come from the
 ssh config.
 
+## The fleet view
+
+The kernel's TUI reads one daemon, and `hosts.yaml` is a client-side registry the
+daemon never merges, so upstream has no single screen for a fleet.
+`scripts/fleet-tui.ts` is that screen: every reachable http host with its kernel
+health, its rigs and its seats, on a five-second refresh.
+
+```sh
+OPENRIG_HOME=/home/ubuntu/warren-data/kernel bun scripts/fleet-tui.ts
+```
+
+Keys are `j` and `k` to move between hosts, `r` to refresh now, `q` to leave.
+`--once` prints a single frame for a script or a screenshot. It only reads: one
+`/healthz` and one `ps --json` per host, and it never writes anywhere.
+
+Two layers sit under it. `scripts/fleet-status.sh --watch` is the plain-text
+version for a log or a wall display, and the per-host kernel TUI is one ssh away
+when a host needs depth:
+
+```sh
+ssh -t headroom-aws 'sudo -u openrig -H env OPENRIG_HOME=/home/openrig/.openrig rig tui'
+```
+
+## Replicating omp onto a box
+
+The fleet boxes run the same harness as the workstation. Per box:
+
+1. `unzip`, then the bun installer, then `bun add -g @oh-my-pi/pi-coding-agent
+   @os-eco/mulch-cli @os-eco/seeds-cli`.
+2. Copy `~/.omp/agent`: `config.yml`, `models.yml`, `hooks/pre/`,
+   `extensions/`, `lib/`, `bin/`, `mcp/` and the `jev-*` state directories. The
+   hooks import `lib/jev-core.ts`, so the library travels with them.
+3. Provide the provider gateway. The `headroom-bifrost` provider reads its key
+   from `/home/ubuntu/bifrost/.env` through the shell command in `models.yml`, so
+   that file must exist at the same path, mode 600.
+4. Point `baseUrl` at a reachable gateway: `http://127.0.0.1:8085/openai/v1` on
+   the box that runs bifrost, and `http://localhost:18086/openai/v1` elsewhere,
+   with a systemd unit holding an ssh forward from 18086 to that box's 8085.
+5. Verify with a real call: `omp -p "Reply with the single word: ok"`.
+
 ## Alternatives rejected
 
 | Alternative | Why not |
