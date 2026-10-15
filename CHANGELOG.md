@@ -58,6 +58,19 @@ Releases **0.9.10 and earlier** live in
 
 ### Fixed
 
+- **The analytics window no longer table-scans `runs`, and
+  `events_kind_ts_idx` finally lands on a database that skipped it**
+  (ubuntu-b968). `listForAnalytics`'s bare `started_at` range had no
+  index — unlike the project-scoped variant — so it planned as
+  `SCAN runs` + a temp b-tree; migration `0038_broken_invaders.sql` adds
+  `runs_started_idx` (both dialect folders). That migration also
+  backfills `events_kind_ts_idx`, which `0037_elite_paladin.sql` declared
+  but never applied: drizzle's migrator skips any journaled entry whose
+  `when` is at or below the max `created_at` already in
+  `__drizzle_migrations`, whether or not that entry's hash is recorded,
+  and the live ledger's watermark sat above `0037`'s. The backfill is
+  `IF NOT EXISTS`, so a fresh database that does replay `0037` is
+  unaffected.
 - **In-pod salvage reaches the control plane again** (warren-7c1e).
   `POST /runs/:id/salvage` was missing from
   `RUN_CALLBACK_ROUTE_PATTERNS`, so the run-scoped token every pod

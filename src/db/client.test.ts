@@ -155,11 +155,13 @@ describe("openDatabase", () => {
 				.all();
 			const names = idx.map((i) => i.name);
 			for (const expected of [
+				"events_kind_ts_idx",
 				"events_run_seq_idx",
 				"events_run_ts_idx",
 				"projects_git_url_idx",
 				"runs_agent_started_idx",
 				"runs_project_started_idx",
+				"runs_started_idx",
 				"runs_state_idx",
 			]) {
 				expect(names).toContain(expected);

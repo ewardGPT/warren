@@ -50,6 +50,12 @@ export const INDEX_NAMES = {
 	runsState: "runs_state_idx",
 	runsProjectStarted: "runs_project_started_idx",
 	runsAgentStarted: "runs_agent_started_idx",
+	// ubuntu-b968: the analytics window lists runs over a bare `started_at`
+	// range with no project predicate (`listForAnalytics` default 30-day
+	// window, newest-first, LIMIT 10000). Without a `started_at`-leading
+	// index that query is `SCAN runs` + a temp b-tree for the ORDER BY even
+	// though `runs_project_started_idx` covers the project-scoped variant.
+	runsStarted: "runs_started_idx",
 	runsWorkerState: "runs_worker_state_idx",
 	runsMode: "runs_mode_idx",
 	// warren-0b75: the CI-fixer poller counts prior fixer attempts per PR by

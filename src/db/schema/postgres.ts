@@ -131,6 +131,9 @@ export const runs = pgTable(
 		index(INDEX_NAMES.runsState).on(t.state),
 		index(INDEX_NAMES.runsProjectStarted).on(t.projectId, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsAgentStarted).on(t.agentName, sql`${t.startedAt} DESC`),
+		// ubuntu-b968: back the unmatched `started_at` analytics window — see
+		// INDEX_NAMES.runsStarted.
+		index(INDEX_NAMES.runsStarted).on(sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsWorkerState).on(t.workerId, t.state),
 		index(INDEX_NAMES.runsMode).on(t.mode),
 		index(INDEX_NAMES.runsPrUrl).on(t.prUrl),
