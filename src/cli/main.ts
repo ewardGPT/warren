@@ -13,8 +13,6 @@
 import { Command } from "commander";
 import { WarrenClient } from "../client/index.ts";
 import { PLAN_RUN_STATES, type PlanRunState } from "../core/wire.ts";
-import { openDatabase } from "../db/client.ts";
-import { parseDatabaseUrl } from "../db/url.ts";
 import { VERSION } from "../index.ts";
 import { loadProjectsConfigFromEnv } from "../projects/config.ts";
 import { resolvePublicAllowlist } from "../projects/public-allowlist.ts";
@@ -23,7 +21,7 @@ import { resolveLocalRunBackend } from "../runtime/local/diagnostics/burrow.ts";
 import { runAddProject } from "./commands/add-project.ts";
 import { runConfigMigrate } from "./commands/config-migrate.ts";
 import { registerCoordinationCommands } from "./commands/coordination.ts";
-import { runMigrateToPostgres } from "./commands/db.ts";
+import { registerDbCommands } from "./commands/db.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInit } from "./commands/init.ts";
 import { runPlanCancel, runPlanRun } from "./commands/plan-run.ts";
@@ -238,59 +236,10 @@ export function buildProgram(context: CliContext): Command {
 
 	// `db` is a subcommand group rather than a flat top-level so future
 	// db-admin tools (dump, restore, prune) can land alongside without
-	// inflating warren's first-page help. Today it has one child:
-	// `migrate-to-postgres` (R-13, pl-f17e step 8, warren-14ac).
-	const dbGroup = program.command("db").description("database admin tools");
-	dbGroup
-		.command("migrate-to-postgres")
-		.description("one-shot copy of a SQLite warren.db into a Postgres database")
-		.requiredOption(
-			"--from <sqlite>",
-			"source SQLite path or URL (bare path, sqlite://, file://, :memory:)",
-		)
-		.requiredOption("--to <pg-url>", "target Postgres URL (postgres:// or postgresql://)")
-		.action(async (opts: { from: string; to: string }) => {
-			const fromParsed = parseDatabaseUrl(opts.from);
-			if (fromParsed.dialect !== "sqlite") {
-				context.stdio.stderr.write(
-					`warren: --from must be a SQLite source (got dialect=${fromParsed.dialect})\n`,
-				);
-				process.exit(2);
-			}
-			const toParsed = parseDatabaseUrl(opts.to);
-			if (toParsed.dialect !== "postgres") {
-				context.stdio.stderr.write(
-					`warren: --to must be a Postgres URL (got dialect=${toParsed.dialect})\n`,
-				);
-				process.exit(2);
-			}
-			// Source: open read-only-style. We don't run sqlite migrations
-			// against an existing operator warren.db — the schema is
-			// already at the journal head, and skipping migrations keeps
-			// the tool from touching the source's mtime.
-			const source = await openDatabase({ url: opts.from, skipMigrations: true });
-			if (source.dialect !== "sqlite") {
-				// Belt-and-suspenders: parseDatabaseUrl already enforced this.
-				await source.close().catch(() => undefined);
-				throw new Error(`expected sqlite source, got ${source.dialect}`);
-			}
-			// Target: open with migrations so a freshly-provisioned pg
-			// database (empty schema) lands at the right journal head
-			// before we copy rows into it.
-			const target = await openDatabase({ url: opts.to });
-			if (target.dialect !== "postgres") {
-				await source.close().catch(() => undefined);
-				await target.close().catch(() => undefined);
-				throw new Error(`expected postgres target, got ${target.dialect}`);
-			}
-			try {
-				const result = await runMigrateToPostgres(context, { source, target });
-				process.exit(result.exitCode);
-			} finally {
-				await source.close().catch(() => undefined);
-				await target.close().catch(() => undefined);
-			}
-		});
+	// inflating warren's first-page help. Registered from
+	// `./commands/db.ts` (warren-14ac + ubuntu-4f98) so this file stays
+	// under its size budget.
+	registerDbCommands(program, context);
 
 	// `plan` is a thin HTTP-client subcommand group (warren-ec6a, pl-55df) —
 	// the first command family that talks to a remote warren via

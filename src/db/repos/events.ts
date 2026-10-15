@@ -266,4 +266,20 @@ export class EventsRepo {
 		);
 		return Number(row?.n ?? 0);
 	}
+
+	/**
+	 * Event rows across many runs, in one query. Retention (ubuntu-4f98) uses
+	 * this both to report what a delete reclaimed and to size a
+	 * `--dry-run` page before touching it. Empty `runIds` short-circuits.
+	 */
+	async countByRunIds(runIds: readonly string[]): Promise<number> {
+		if (runIds.length === 0) return 0;
+		const row = await this.adapter.pickOne<{ n: number | string }>(
+			this.db
+				.select({ n: sql<number>`count(*)` })
+				.from(this.events)
+				.where(inArray(this.events.runId, runIds as string[])),
+		);
+		return Number(row?.n ?? 0);
+	}
 }

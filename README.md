@@ -265,6 +265,7 @@ The `warren` (or `wr`) admin CLI is for ops. The web UI is for daily work.
 | `warren doctor` | Runtime reachable? Bwrap working? DB reachable? |
 | `warren serve` | Start the HTTP server (default in entrypoint) |
 | `warren db migrate-to-postgres --from <sqlite> --to <pg-url>` | One-shot SQLite → Postgres porter |
+| `warren db prune --older-than 14d` | Delete aged-out `never_started` runs and their events |
 
 `warren run claude-code <project> -p "..."` does the full composition end-to-end. It resolves the agent, provisions the sandbox, dispatches the run, streams events back, then pushes the branch. A project with `.mulch/` or `.seeds/` round-trips those too.
 

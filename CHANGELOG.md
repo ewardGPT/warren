@@ -10,6 +10,16 @@ Releases **0.9.10 and earlier** live in
 
 ## [Unreleased]
 
+### Added
+
+- **`warren db prune` reclaims the transient `never_started` rows**
+  (ubuntu-4f98). A runtime outage makes the scheduler mint one row per
+  tick, and the retry GC drops those rows one at a time. The command
+  deletes the rows older than a cutoff, page by page, with their events.
+  `--older-than` sets the cutoff in `ms`, `s`, `m`, `h` or `d` units.
+  `--batch` sets the page size and `--max-batches` caps one sweep. The
+  command prints the counts as one JSON line.
+
 ### Security
 
 - **Agent output can no longer terminalize its own run** — stream

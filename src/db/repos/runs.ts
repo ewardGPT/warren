@@ -34,6 +34,7 @@ import {
 	listByState,
 	listForAnalytics,
 } from "./runs-queries.ts";
+import { deleteNeverStartedBatch, listExpiredNeverStartedIds } from "./runs-retention.ts";
 
 const ALLOWED_TRANSITIONS: Record<RunState, readonly RunState[]> = {
 	queued: ["running", "cancelled"],
@@ -227,19 +228,12 @@ export class RunsRepo {
 	 * the guard rejected it.
 	 */
 	async deleteNeverStarted(id: string): Promise<boolean> {
-		return this.adapter.runInTransaction(async (tx) => {
-			const txDb = tx.drizzle as SqliteDrizzleDb;
-			const runs = tx.schema.runs;
-			const events = tx.schema.events;
-			const existing = await tx.pickOne<RunRow>(txDb.select().from(runs).where(eq(runs.id, id)));
-			if (!existing) return false;
-			if (existing.state !== "failed" || existing.failureReason !== "never_started") {
-				return false;
-			}
-			await tx.runWrite(txDb.delete(events).where(eq(events.runId, id)));
-			await tx.runWrite(txDb.delete(runs).where(eq(runs.id, id)));
-			return true;
-		});
+		return (await this.deleteNeverStartedBatch([id])).runs > 0;
+	}
+
+	/** {@link deleteNeverStarted} over a page of ids; see `runs-retention.ts`. */
+	deleteNeverStartedBatch(ids: readonly string[]): Promise<{ runs: number; events: number }> {
+		return deleteNeverStartedBatch(this.adapter, ids);
 	}
 
 	/** Read/query methods (warren-ac7f); bodies live in runs-queries.ts. */
@@ -294,6 +288,11 @@ export class RunsRepo {
 
 	listByIds(ids: readonly string[]): Promise<RunRow[]> {
 		return listByIds(this.adapter, ids);
+	}
+
+	/** Retention's selection half — see {@link listExpiredNeverStartedIds}. */
+	listExpiredNeverStartedIds(opts: { cutoff: string; limit: number }): Promise<string[]> {
+		return listExpiredNeverStartedIds(this.adapter, opts);
 	}
 
 	listByState(state: RunState | RunState[]): Promise<RunRow[]> {

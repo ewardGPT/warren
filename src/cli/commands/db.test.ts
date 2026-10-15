@@ -18,8 +18,9 @@ import { Client } from "pg";
 import { openDatabase, type PostgresWarrenDb, type SqliteWarrenDb } from "../../db/client.ts";
 import { createRepos } from "../../db/repos/index.ts";
 import { WARREN_TEST_PG_URL_ENV } from "../../db/testing.ts";
+import type { RetentionRunsRepo } from "../../runs/retention.ts";
 import type { CliContext } from "../output.ts";
-import { runMigrateToPostgres } from "./db.ts";
+import { runMigrateToPostgres, runPruneRuns } from "./db.ts";
 
 function captureContext(): { context: CliContext; out: string[]; err: string[] } {
 	const out: string[] = [];
@@ -255,5 +256,68 @@ describe.skipIf(!pgEnabled)("runMigrateToPostgres", () => {
 				"VALUES ('r1', 1, 't', 'k', 'stdout', '{}'::jsonb) RETURNING id",
 		);
 		expect(inserted.rows[0]?.id).toBe(1);
+	});
+});
+
+/**
+ * `runPruneRuns` is the operator surface over `pruneNeverStartedRuns`
+ * (ubuntu-4f98): the sweep's own predicates, batching and guard are covered
+ * against a real temp sqlite in `src/runs/retention.test.ts`; what this
+ * exercises is the plumbing a caller sees — the resolved cutoff, the counts
+ * and the single JSON line on stdout.
+ */
+describe("runPruneRuns", () => {
+	const DAY_MS = 24 * 60 * 60 * 1000;
+	const NOW = new Date("2026-06-01T00:00:00.000Z");
+
+	function stubRuns(ids: readonly string[]): {
+		runs: RetentionRunsRepo;
+		seen: { cutoff: string; limit: number }[];
+	} {
+		const seen: { cutoff: string; limit: number }[] = [];
+		return {
+			seen,
+			runs: {
+				async listExpiredNeverStartedIds(opts) {
+					seen.push(opts);
+					return [...ids];
+				},
+				async deleteNeverStartedBatch(page) {
+					return { runs: page.length, events: page.length };
+				},
+			},
+		};
+	}
+
+	test("emits one JSON line with the sweep counts", async () => {
+		const { context, out } = captureContext();
+		const { runs, seen } = stubRuns(["run_a", "run_b"]);
+
+		const result = await runPruneRuns(context, {
+			runs,
+			olderThanMs: 7 * DAY_MS,
+			batchSize: 2,
+			maxBatches: 1,
+			now: () => NOW,
+		});
+
+		expect(result).toMatchObject({
+			exitCode: 0,
+			batches: 1,
+			runs: 2,
+			events: 2,
+			exhausted: false,
+			cutoff: "2026-05-25T00:00:00.000Z",
+		});
+		expect(seen).toEqual([{ cutoff: "2026-05-25T00:00:00.000Z", limit: 2 }]);
+		expect(out).toHaveLength(1);
+		expect(JSON.parse(out[0] ?? "")).toEqual({
+			ok: true,
+			cutoff: "2026-05-25T00:00:00.000Z",
+			batches: 1,
+			runs: 2,
+			events: 2,
+			exhausted: false,
+		});
 	});
 });

@@ -62,11 +62,21 @@
  *     "inserted": 5, "skipped": 0}, ...]}
  */
 
-import type { PostgresWarrenDb, SqliteWarrenDb } from "../../db/client.ts";
+import type { Command } from "commander";
+import { openDatabase, type PostgresWarrenDb, type SqliteWarrenDb } from "../../db/client.ts";
 import * as pgSchema from "../../db/schema/postgres.ts";
 import * as sqliteSchema from "../../db/schema/sqlite.ts";
-import type { CliContext } from "../output.ts";
-import { writeJsonLine } from "../output.ts";
+import { parseDatabaseUrl } from "../../db/url.ts";
+import { parseDurationMs } from "../../preview/duration.ts";
+import {
+	DEFAULT_RETENTION_BATCH,
+	DEFAULT_RETENTION_DAYS,
+	type PruneNeverStartedResult,
+	pruneNeverStartedRuns,
+	type RetentionRunsRepo,
+} from "../../runs/retention.ts";
+import { withCliDb } from "../context.ts";
+import { type CliContext, formatError, writeJsonLine } from "../output.ts";
 
 /**
  * Default chunk size for pg insert batches. node-postgres binds one
@@ -229,4 +239,162 @@ export async function runMigrateToPostgres(
 
 	writeJsonLine(context.stdio.stdout, { ok: true, tables });
 	return { exitCode: 0, tables };
+}
+
+export interface PruneRunsInput {
+	readonly runs: RetentionRunsRepo;
+	readonly olderThanMs: number;
+	readonly batchSize?: number;
+	readonly maxBatches?: number;
+	readonly now?: () => Date;
+}
+
+export interface PruneRunsResult extends PruneNeverStartedResult {
+	readonly exitCode: number;
+}
+
+/**
+ * `warren db prune` — age-based retention for transient `never_started` runs,
+ * the rows the scheduler mints one-per-tick while the runtime is unreachable
+ * and the bounded-retry GC (warren-a0a2) only removes one at a time
+ * (ubuntu-4f98).
+ *
+ * The sweep itself is `pruneNeverStartedRuns`; this function is the operator
+ * surface: it runs it against the local warren DB's `runs`/`events` repos and
+ * emits one JSON line on stdout, the same shape contract
+ * `migrate-to-postgres` uses, so a run can be logged or piped:
+ *
+ *   {"ok":true,"cutoff":"...","batches":119,"runs":59341,"events":148955,
+ *    "exhausted":true}
+ *
+ * `exhausted:false` means the sweep stopped at `maxBatches` (or lost a page to
+ * a concurrent dispatch) and there is more to reclaim — re-run it. Nothing is
+ * deleted that the guard does not re-check inside its own transaction, and
+ * deleting rows does NOT shrink the file: the freed pages are reused, and
+ * reclaiming them on disk needs an offline `VACUUM` the operator must run.
+ */
+export async function runPruneRuns(
+	context: CliContext,
+	input: PruneRunsInput,
+): Promise<PruneRunsResult> {
+	const sweep = await pruneNeverStartedRuns(input);
+	writeJsonLine(context.stdio.stdout, { ok: true, ...sweep });
+	return { ...sweep, exitCode: 0 };
+}
+
+/**
+ * Register the `warren db` group: `migrate-to-postgres` (R-13, pl-f17e step 8,
+ * warren-14ac) and `prune` (ubuntu-4f98).
+ *
+ * A subcommand group rather than two flat top-level commands, so db-admin
+ * tools land without inflating warren's first-page help. Registered from
+ * `src/cli/main.ts` the same way `registerCoordinationCommands` is, which is
+ * also what keeps `main.ts` inside its file-size budget.
+ */
+export function registerDbCommands(program: Command, context: CliContext): void {
+	const dbGroup = program.command("db").description("database admin tools");
+	dbGroup
+		.command("migrate-to-postgres")
+		.description("one-shot copy of a SQLite warren.db into a Postgres database")
+		.requiredOption(
+			"--from <sqlite>",
+			"source SQLite path or URL (bare path, sqlite://, file://, :memory:)",
+		)
+		.requiredOption("--to <pg-url>", "target Postgres URL (postgres:// or postgresql://)")
+		.action(async (opts: { from: string; to: string }) => {
+			const fromParsed = parseDatabaseUrl(opts.from);
+			if (fromParsed.dialect !== "sqlite") {
+				context.stdio.stderr.write(
+					`warren: --from must be a SQLite source (got dialect=${fromParsed.dialect})\n`,
+				);
+				process.exit(2);
+			}
+			const toParsed = parseDatabaseUrl(opts.to);
+			if (toParsed.dialect !== "postgres") {
+				context.stdio.stderr.write(
+					`warren: --to must be a Postgres URL (got dialect=${toParsed.dialect})\n`,
+				);
+				process.exit(2);
+			}
+			// Source: open read-only-style. We don't run sqlite migrations
+			// against an existing operator warren.db — the schema is
+			// already at the journal head, and skipping migrations keeps
+			// the tool from touching the source's mtime.
+			const source = await openDatabase({ url: opts.from, skipMigrations: true });
+			if (source.dialect !== "sqlite") {
+				// Belt-and-suspenders: parseDatabaseUrl already enforced this.
+				await source.close().catch(() => undefined);
+				throw new Error(`expected sqlite source, got ${source.dialect}`);
+			}
+			// Target: open with migrations so a freshly-provisioned pg
+			// database (empty schema) lands at the right journal head
+			// before we copy rows into it.
+			const target = await openDatabase({ url: opts.to });
+			if (target.dialect !== "postgres") {
+				await source.close().catch(() => undefined);
+				await target.close().catch(() => undefined);
+				throw new Error(`expected postgres target, got ${target.dialect}`);
+			}
+			try {
+				const result = await runMigrateToPostgres(context, { source, target });
+				process.exit(result.exitCode);
+			} finally {
+				await source.close().catch(() => undefined);
+				await target.close().catch(() => undefined);
+			}
+		});
+	dbGroup
+		.command("prune")
+		.description("delete transient never_started runs older than a cutoff, with their events")
+		.option(
+			"--older-than <duration>",
+			"age cutoff as a duration (ms|s|m|h|d, e.g. 7d, 36h)",
+			`${DEFAULT_RETENTION_DAYS}d`,
+		)
+		.option("--batch <n>", "runs per delete transaction", String(DEFAULT_RETENTION_BATCH))
+		.option("--max-batches <n>", "stop after N batches (0 sweeps until exhausted)", "0")
+		.action(async (opts: { olderThan: string; batch: string; maxBatches: string }) => {
+			const usage = (detail: string): never => {
+				context.stdio.stderr.write(`warren: ${detail}\n`);
+				return process.exit(2);
+			};
+			let olderThanMs: number;
+			try {
+				olderThanMs = parseDurationMs(opts.olderThan);
+			} catch (err) {
+				return usage(`--older-than ${formatError(err)}`);
+			}
+			const batchSize = Number.parseInt(opts.batch, 10);
+			if (
+				!Number.isInteger(batchSize) ||
+				batchSize <= 0 ||
+				String(batchSize) !== opts.batch.trim()
+			) {
+				return usage(`--batch must be a positive integer, got ${JSON.stringify(opts.batch)}`);
+			}
+			const maxBatches = Number.parseInt(opts.maxBatches, 10);
+			if (
+				!Number.isInteger(maxBatches) ||
+				maxBatches < 0 ||
+				String(maxBatches) !== opts.maxBatches.trim()
+			) {
+				return usage(
+					`--max-batches must be zero or a positive integer, got ${JSON.stringify(opts.maxBatches)}`,
+				);
+			}
+			// Same lifecycle as `doctor`: the local warren DB (WARREN_DB_URL,
+			// else WARREN_DB_PATH, else <WARREN_DATA_DIR>/warren.db), opened and
+			// closed by `withCliDb`. Running this inside the warren container
+			// against the supervised data volume is the intended invocation.
+			const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
+				const result = await runPruneRuns(context, {
+					runs: repos.runs,
+					olderThanMs,
+					batchSize,
+					maxBatches,
+				});
+				return result.exitCode;
+			});
+			process.exit(exitCode);
+		});
 }

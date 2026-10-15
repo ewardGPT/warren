@@ -57,17 +57,23 @@ describe("buildProgram", () => {
 		expect(runCmd?.options.find((o) => o.long === "--no-follow")).toBeDefined();
 	});
 
-	test("`db migrate-to-postgres` is registered under the db group", () => {
+	test("`db migrate-to-postgres` and `db prune` are registered under the db group", () => {
 		const program = buildProgram(silentContext());
 		const dbCmd = program.commands.find((c) => c.name() === "db");
 		expect(dbCmd).toBeDefined();
 		const subNames = dbCmd?.commands.map((c) => c.name()).sort() ?? [];
-		expect(subNames).toEqual(["migrate-to-postgres"]);
+		expect(subNames).toEqual(["migrate-to-postgres", "prune"]);
 		const migrateCmd = dbCmd?.commands.find((c) => c.name() === "migrate-to-postgres");
 		const fromOpt = migrateCmd?.options.find((o) => o.long === "--from");
 		const toOpt = migrateCmd?.options.find((o) => o.long === "--to");
 		expect(fromOpt?.mandatory).toBe(true);
 		expect(toOpt?.mandatory).toBe(true);
+		// `prune` (ubuntu-4f98) carries a default cutoff + batch size, so an
+		// operator can run it with no arguments and still get a bounded sweep.
+		const pruneCmd = dbCmd?.commands.find((c) => c.name() === "prune");
+		expect(pruneCmd?.options.find((o) => o.long === "--older-than")?.defaultValue).toBe("14d");
+		expect(pruneCmd?.options.find((o) => o.long === "--batch")?.defaultValue).toBe("500");
+		expect(pruneCmd?.options.find((o) => o.long === "--max-batches")?.defaultValue).toBe("0");
 	});
 
 	test("`config migrate` is registered under the config group (warren-5840)", () => {
