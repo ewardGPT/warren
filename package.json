@@ -1,7 +1,7 @@
 {
 	"name": "@os-eco/warren-cli",
 	"version": "0.13.1",
-	"description": "Self-hostable control plane for ephemeral cloud agents — spawn sandboxed agents at your GitHub repos, watch them work live, steer them, get a branch back",
+	"description": "Self-hostable control plane for ephemeral cloud agents \u2014 spawn sandboxed agents at your GitHub repos, watch them work live, steer them, get a branch back",
 	"type": "module",
 	"bin": {
 		"warren": "./src/cli/main.ts",
@@ -42,7 +42,7 @@
 		"test:pg": "bun run scripts/test-pg.ts",
 		"report:test-timing": "bun run scripts/report-test-timing.ts",
 		"report:quality-metrics": "bun run scripts/report-quality-metrics.ts",
-		"lint": "biome check --error-on-warnings . && bun run scripts/check-layers.ts && bun run scripts/check-version-sync.ts && bun run scripts/check-wire-types.ts && bun run scripts/check-prose.ts && bun run scripts/check-seeds-integrity.ts",
+		"lint": "biome check --error-on-warnings . && bun run scripts/check-layers.ts && bun run scripts/check-version-sync.ts && bun run scripts/check-wire-types.ts && bun run scripts/check-prose.ts && bun run scripts/check-seeds-integrity.ts && bun run scripts/check-closure-contract.ts",
 		"lint:fix": "biome check --write --error-on-warnings . && bun run scripts/check-layers.ts && bun run scripts/check-version-sync.ts && bun run scripts/check-wire-types.ts && bun run scripts/check-prose.ts",
 		"check:layers": "bun run scripts/check-layers.ts",
 		"check:version-sync": "bun run scripts/check-version-sync.ts",
@@ -74,7 +74,8 @@
 		"acceptance:container": "bun run scripts/acceptance/run.ts --mode container",
 		"acceptance:public": "bun run scripts/acceptance/run.ts --only 39 --stop-on-failure",
 		"acceptance:nightly": "bun run scripts/acceptance/run.ts --only 01,03,04,05,06,07,08,09,10,11,12,14,15,16,17,21,22,26,30,35,36",
-		"prepare": "[ -e .git ] && git config core.hooksPath scripts/hooks || true"
+		"prepare": "[ -e .git ] && git config core.hooksPath scripts/hooks || true",
+		"check:closure-contract": "bun run scripts/check-closure-contract.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.10",

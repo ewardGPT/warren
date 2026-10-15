@@ -1,0 +1,10 @@
+{
+	"_comment": "Offline answers for the stub provider (WARREN_JEV_STUB=1). `answers` overrides are keyed by question name; `defaults` supplies a per-question-type fallback. A choice whose value is not one of the question's criteria falls back to the first criterion key. These values mirror the recorded 200 body from api.typesafe.ai so stub and live decisions are comparable.",
+	"model": "jev-stub-1",
+	"defaults": {
+		"noul": { "noul": 0.81, "confidence": 0.79 },
+		"score": { "score": 1.76, "confidence": 0.62 },
+		"choice": { "choice": "act", "confidence": 0.79 }
+	},
+	"usage": { "input_tokens": 0, "output_tokens": 0 }
+}

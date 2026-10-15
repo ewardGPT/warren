@@ -19,13 +19,27 @@ describe("buildProgram", () => {
 		const names = program.commands.map((c) => c.name()).sort();
 		expect(names).toEqual([
 			"add-project",
+			"closure",
 			"config",
 			"db",
+			"decide",
 			"doctor",
 			"init",
+			"kernel",
 			"plan",
 			"run",
 			"serve",
+		]);
+	});
+
+	test("`kernel` is a group over the absorbed kernel's four lifecycle verbs", () => {
+		const program = buildProgram(silentContext());
+		const kernel = program.commands.find((c) => c.name() === "kernel");
+		expect(kernel?.commands.map((c) => c.name()).sort()).toEqual([
+			"doctor",
+			"start",
+			"status",
+			"stop",
 		]);
 	});
 
