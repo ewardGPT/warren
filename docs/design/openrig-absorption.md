@@ -337,6 +337,20 @@ diff, artifacts) is host filesystem and host git work.
 So the provider hands each box's `LocalProvider` ssh-backed `fs` and `exec` seams
 (`remote-seams.ts`). Reap itself does not change.
 
+**What the lane does not do yet.** The CLI places work and leaves warren's
+lifecycle alone. `fleet dispatch` and `fleet pump` call the provider directly,
+so warren writes no run row, nothing reaps the result, and no pull request
+follows.
+
+The provider carries the seams reap needs, so the missing half is the domain
+half. Until it lands, an operator drives the pump by hand and the box keeps the
+workspace for inspection.
+
+The kernel queue stays out of this on purpose. A qitem is work addressed to a
+session, and a burrow run has no session. All three kernels report an empty queue
+today, so a registered item would show nothing new and name a destination that
+does not exist.
+
 A third fact follows. `LocalProvider` computes the callback URL as
 `http://localhost:PORT`, and a box cannot dial warren's loopback.
 
@@ -350,26 +364,29 @@ The operator surface is `warren fleet status` for state and load per box.
 `/readyz` adds one aggregate line that is always ok, for the same reason the
 kernel line is.
 
-### What a box can run today
+### What a box runs today
 
-The lane places runs, materializes the workspace and cleans up. Execution stops
-at the agent step, and the reason is upstream of warren.
+A box runs the built-in `pi` runtime, and a dispatched run reaches `succeeded`.
+`pi` on each box is a wrapper around `omp`, which is why the section above
+exists at all.
 
 burrow resolves the agent for a daemon-dispatched run against its BUILT-IN
-registry. The create request accepts built-in ids as strings, and a declarative
-agent in a project `burrow.toml` does not register with the daemon.
+registry. The create request accepts built-in ids as strings, so a declarative
+agent in a project `burrow.toml` never reaches a daemon run.
 
-Two observations confirm this. `burrow agents show stub` in a project that
-declares `stub` answers `not_found`, and a dispatched run finalizes as
-`agent 'stub' is not registered`.
+That still holds. `burrow agents show stub` in a project that declares `stub`
+answers `not_found`, and such a run finalizes as `agent 'stub' is not
+registered`. The fleet lane therefore uses the built-in `pi` id, and gives it a
+working runtime.
 
-None of the four built-in agents is installed and authenticated on the boxes.
-`omp` is installed there, it reaches the fleet's model gateway, and it offers
-`--mode rpc`, which is the protocol burrow's built-in `pi` runtime drives.
+Proven live in this order: `pi --mode rpc` answers with JSON, a dispatched run
+spawns the agent, and a run reaches `succeeded (exit 0)` on all three boxes.
+`runs.json` in the box's archive records the run, and a settled agent session
+writes events beside it.
 
-So the shortest path to real agent work is to make `pi` resolvable on a box, or
-to install and authenticate `claude-code` there. That is an operator decision
-about credentials.
+The remaining gap is lifecycle, not execution. See "What the lane does not do
+yet" above: nothing reaps a CLI-placed run, so an operator watches it and the
+workspace stays on the box.
 
 ## Alternatives rejected
 
