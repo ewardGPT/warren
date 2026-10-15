@@ -1,0 +1,14 @@
+# openrig-testbed stub runtime assets (plan §1 layer 4: "the 51-01 stub script + its registry
+# wiring — zero tokens by construction"). This file is the EXACT census scope the manifest hashes
+# and the build verb stages into the image (census-scope-match-code-path — this list IS the code
+# path; never a recursive walk that would over-count).
+#
+# One repo-relative path per line; comments (#) and blank lines are ignored.
+#
+# RESOLVED (2026-08-06 VM-side) — the concrete zero-token stub payload: a runtime:stub rig.yaml +
+# its agent fixture + culture.md that boot a settled topology for the L3 daemon-in-container leg.
+# Shape grounded on the proven 51-02 runner fixture (test/fixtures/scenarios/topo-stub-baton.yaml),
+# not guessed. The base-image digest slot (docker/testbed/base-image) remains host-resolved (L0.1).
+docker/testbed/stub-assets/rig.yaml
+docker/testbed/stub-assets/culture.md
+docker/testbed/stub-assets/agents/worker/agent.yaml

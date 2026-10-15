@@ -1,0 +1,345 @@
+// V1 attempt-3 Phase 5 P5-7 — Topology terminal grid view.
+//
+// Per topology-terminal-view.md L13-L80: pinned-card grid where each card
+// is a transcript-tail preview of an agent's terminal output. V1 reuses
+// the existing SessionPreviewPane primitive (preserved per code-map AFTER
+// tree). V2 ships interactive xterm.js + tmux-attach (out of scope here).
+//
+// Key behaviors (canon-load-bearing):
+//   - Pulsing-ring on cards whose agent is "running" (active recently)
+//     per topology-terminal-view.md L47 — at-a-glance scan signal
+//     ("humans must be able to spot which agents to attend to without
+//     reading every card"). CSS keyframe is pseudo-element-paint
+//     (jsdom-incompatible) so a CSS-source-assertion test guards it.
+//   - safe-N pagination at host scope (L70-L80): default 12 cards;
+//     "show all N" toggle for operators who need the full grid.
+//   - Polling cadence: SessionPreviewPane uses useSessionPreview which
+//     respects the configured ui.preview.refresh_interval_seconds
+//     (default 3s). Per L60-L65, larger scopes = lower frequency; the
+//     existing config covers it.
+
+import { useMemo, useState } from "react";
+import { useRigSummary, type RigSummary } from "../../hooks/useRigSummary.js";
+import { useNodeInventory, type NodeInventoryEntry } from "../../hooks/useNodeInventory.js";
+import { useSelectedHostId } from "../../hooks/useHosts.js";
+import { LOCAL_HOST_ID } from "../../lib/host-param.js";
+import { displayAgentName } from "../../lib/display-name.js";
+import { ProgressiveTerminal } from "../terminal/ProgressiveTerminal.js";
+import { EmptyState } from "../ui/empty-state.js";
+import { SectionHeader } from "../ui/section-header.js";
+import { cn } from "../../lib/utils.js";
+import { RuntimeBadge } from "../graphics/RuntimeMark.js";
+import { formatCompactTokenCount, formatTokenTotalTitle, sumTokenCounts } from "../../lib/token-format.js";
+import { contextUsageTextClass } from "../ContextUsageRing.js";
+
+const SAFE_N = 12;
+
+interface TopologyTerminalViewProps {
+  scope: "host" | "rig" | "pod";
+  /** Required for rig + pod scopes. */
+  rigId?: string;
+  /** Required for pod scope. */
+  podName?: string;
+}
+
+function isActiveRunning(seat: NodeInventoryEntry): boolean {
+  // Per topology-terminal-view.md L47: pulsing-ring on cards for "active"
+  // agents (output emitted within polling window). The PL-019 agentActivity
+  // summary's "running" state is the closest available proxy.
+  return seat.agentActivity?.state === "running";
+}
+
+function ContextMetric({ seat }: { seat: NodeInventoryEntry }) {
+  const usage = seat.contextUsage;
+  const known = usage?.availability === "known" && typeof usage.usedPercentage === "number";
+  return (
+    <span
+      data-testid={`terminal-card-context-${seat.rigId}-${seat.logicalId}`}
+      className={`font-mono text-[8px] font-bold uppercase tracking-wide ${contextUsageTextClass(usage?.usedPercentage, usage?.fresh, usage?.availability)}`}
+      title={
+        known
+          ? usage?.fresh === false
+            ? "Context usage (stale sample)"
+            : "Context usage (fresh)"
+          : "Context sample unavailable"
+      }
+    >
+      {known ? `${usage.usedPercentage}%` : "--"}
+    </span>
+  );
+}
+
+function TokenMetric({ seat }: { seat: NodeInventoryEntry }) {
+  const usage = seat.contextUsage;
+  const total = sumTokenCounts(usage?.totalInputTokens, usage?.totalOutputTokens);
+  const label = formatCompactTokenCount(total);
+  const title = formatTokenTotalTitle(usage?.totalInputTokens, usage?.totalOutputTokens);
+  return (
+    <span
+      data-testid={`terminal-card-tokens-${seat.rigId}-${seat.logicalId}`}
+      className={`font-mono text-[8px] font-bold uppercase tracking-wide ${label ? "text-on-surface-variant" : "text-on-surface-variant"}`}
+      title={title ?? "Token sample unavailable"}
+    >
+      {label ?? "--"}
+    </span>
+  );
+}
+
+// V0.3.1 slice 14 walk-item 17 — TerminalView card.
+// OPR.0.4.0.39 (FR-1/FR-3/FR-4/FR-6 founder spec-correction): each grid cell is the
+// agent name + Claude/Codex stats in a header ABOVE a FULL-WIDTH ProgressiveTerminal
+// (static-by-default -> click -> live IN PLACE). The static IS the click-to-live
+// target -- there is NO separate expand-out popover trigger and NO white card
+// wrapper (too contrasty with the terminal). The static renders translucent smoked-
+// GLASS; clicking flips it to the OPAQUE #0c0a09 live xterm in place (the activation
+// affordance). The live xterm scrolls/pans within the cell (38 pins 90x27 +
+// overflow-auto) -- fine; the grid is a scan-and-click-to-intervene view, not for
+// long sessions. The global live cap binds on go-live (shared LiveTerminalProvider).
+// FR-3: origin-top-left + a per-breakpoint CSS scale-down (xl:scale-90 starting
+// value; QA measures the legibility floor + forward-fixes the value) fits the full
+// terminal width in the densest 3-col cells -- prefer too-small over CLIP, never cut
+// off the right edge (no overflow-hidden; the static <pre> pans wider lines). The
+// pulsing-ring active treatment is preserved as the at-a-glance scan signal.
+
+function SeatTerminalCard({ seat }: { seat: NodeInventoryEntry }) {
+  const sessionName = seat.canonicalSessionName ?? seat.logicalId;
+  const active = isActiveRunning(seat);
+  const memberName = displayAgentName(seat.logicalId);
+  return (
+    <div
+      data-testid={`terminal-card-${seat.rigId}-${seat.logicalId}`}
+      data-active={active ? "true" : "false"}
+      className={cn(
+        // OPR.0.4.0.39 FR-4: NO white card wrapper (bg-surface-lowest/40 was too contrasty);
+        // tight p-1.5/gap-1.5 so the grid does not waste edge space. The active
+        // pulsing-ring border stays as the scan signal; inactive is borderless.
+        "relative flex flex-col gap-1.5 p-1.5",
+        active ? "terminal-card-active border border-secondary" : "border border-transparent",
+      )}
+    >
+      <header className="flex items-center justify-between gap-2">
+        <span className="font-mono text-[8px] font-semibold uppercase tracking-[0.10em] text-on-surface-variant truncate">
+          {memberName}
+        </span>
+        <span className="inline-flex shrink-0 items-center gap-1">
+          <RuntimeBadge runtime={seat.runtime} size="xs" compact variant="inline" />
+          <ContextMetric seat={seat} />
+          <TokenMetric seat={seat} />
+        </span>
+      </header>
+      {/* OPR.0.4.0.39 FR-1/FR-3/FR-6 (founder spec): ProgressiveTerminal IS the
+          in-place click-to-live target (static smoked-glass -> click -> opaque live
+          xterm at the SAME 90x27 geometry, same place). It wraps both states in the
+          shared ScaleToFitTerminal, which measures the fixed 90-col block and scales
+          it to fit the cell width (fit-width, never clip - no hardcoded per-breakpoint
+          scale). No separate popover trigger. */}
+      <ProgressiveTerminal
+        sessionName={sessionName}
+        terminalKey={`${seat.rigId}:${seat.logicalId}`}
+        testIdPrefix={`terminal-grid-${seat.rigId}-${seat.logicalId}`}
+      />
+    </div>
+  );
+}
+
+function TerminalGrid({
+  seats,
+  emptyLabel,
+  emptyDescription,
+}: {
+  seats: NodeInventoryEntry[];
+  emptyLabel: string;
+  emptyDescription: string;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const visible = showAll ? seats : seats.slice(0, SAFE_N);
+  const hasMore = seats.length > SAFE_N;
+
+  if (seats.length === 0) {
+    return (
+      <EmptyState
+        label={emptyLabel}
+        description={emptyDescription}
+        variant="card"
+        testId="topology-terminal-empty"
+      />
+    );
+  }
+
+  return (
+    <div data-testid="topology-terminal-grid" className="space-y-3">
+      <div className="font-mono text-[9px] text-on-surface-variant flex items-center justify-between">
+        <span data-testid="topology-terminal-count">
+          showing {visible.length} of {seats.length} terminal{seats.length === 1 ? "" : "s"}
+        </span>
+        {hasMore ? (
+          <button
+            type="button"
+            data-testid="topology-terminal-show-toggle"
+            onClick={() => setShowAll((s) => !s)}
+            className="px-2 py-0.5 border border-outline-variant font-mono text-[9px] uppercase tracking-wide text-on-surface hover:bg-surface-low/60"
+          >
+            {showAll ? `show first ${SAFE_N}` : `show all ${seats.length}`}
+          </button>
+        ) : null}
+      </div>
+      {/* OPR.0.4.0.39 FR-2 (founder: 2 columns MAXIMUM): 1-col narrow / 2-col wider.
+          3-col was dropped - at 3-across the scaled 90-col terminal is too small to
+          read; 2-col keeps each cell wide enough for legible terminals. */}
+      <div className="grid gap-2 grid-cols-1 md:grid-cols-2">
+        {visible.map((seat) => (
+          <SeatTerminalCard
+            key={`${seat.rigId}-${seat.logicalId}`}
+            seat={seat}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RigTerminalSection({ rigId, rigName }: { rigId: string; rigName: string }) {
+  const { data: nodes } = useNodeInventory(rigId);
+  const seats = useMemo(
+    () => (nodes ?? []).filter((n) => n.nodeKind !== "infrastructure"),
+    [nodes],
+  );
+  if (seats.length === 0) return null;
+  return (
+    <section
+      data-testid={`topology-terminal-rig-${rigId}`}
+      className="border-t border-outline-variant pt-4 first:border-t-0 first:pt-0"
+    >
+      <SectionHeader tone="muted">{rigName}</SectionHeader>
+      <div className="mt-2">
+        <TerminalGrid
+          seats={seats}
+          emptyLabel="NO SEATS"
+          emptyDescription={`No agent seats in ${rigName}.`}
+        />
+      </div>
+    </section>
+  );
+}
+
+function HostRigPicker({
+  rigs,
+  onSelectRig,
+}: {
+  rigs: RigSummary[];
+  onSelectRig: (rigId: string) => void;
+}) {
+  return (
+    <div data-testid="topology-terminal-host-picker" className="space-y-3">
+      <SectionHeader tone="muted">RIG TERMINALS</SectionHeader>
+      <div className="grid gap-2 grid-cols-1 md:grid-cols-2">
+        {rigs.map((rig) => (
+          <button
+            key={rig.id}
+            type="button"
+            data-testid={`topology-terminal-host-rig-${rig.id}`}
+            onClick={() => onSelectRig(rig.id)}
+            className="flex items-center justify-between gap-2 border border-outline-variant bg-surface/70 px-3 py-2 text-left hover:bg-surface-low/70"
+          >
+            <span className="min-w-0">
+              <span className="block truncate font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-on-surface">
+                {rig.name}
+              </span>
+              <span className="block font-mono text-[9px] uppercase tracking-[0.10em] text-on-surface-variant">
+                {rig.nodeCount} node{rig.nodeCount === 1 ? "" : "s"}
+              </span>
+            </span>
+            <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.12em] text-on-surface-variant">
+              Open
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function TopologyTerminalView({ scope, rigId, podName }: TopologyTerminalViewProps) {
+  const [selectedHostRigId, setSelectedHostRigId] = useState<string | null>(null);
+  const { data: rigs } = useRigSummary();
+  const { data: rigNodes } = useNodeInventory(scope !== "host" ? (rigId ?? null) : null);
+  const selectedHostRig = useMemo(
+    () => rigs?.find((rig) => rig.id === selectedHostRigId) ?? null,
+    [rigs, selectedHostRigId],
+  );
+  // OPR.0.4.6.MH2 rev1-r2 B1: every terminal card is a LOCAL session surface
+  // (session-name preview reads + click-to-live typeable xterm) — under a
+  // remote selection none of them may mount. The list hooks above are
+  // retargeted reads (harmless); the honest gate replaces the grid.
+  const terminalsAreRemote = useSelectedHostId() !== LOCAL_HOST_ID;
+
+  if (terminalsAreRemote) {
+    return (
+      <div className="p-6">
+        <EmptyState
+          label="TERMINALS NOT AVAILABLE FOR REMOTE HOSTS"
+          description="Terminal streams are this host's local sessions. Viewing a remote host is read-only; acting on it arrives with MH-3/MH-4."
+          variant="card"
+          testId="topology-terminal-remote-gated"
+        />
+      </div>
+    );
+  }
+
+  if (scope === "host") {
+    if (!rigs || rigs.length === 0) {
+      return (
+        <div className="p-6">
+          <EmptyState
+            label="NO RIGS"
+            description="No rigs registered. Register a rig to see terminals at host scope."
+            variant="card"
+            testId="topology-terminal-empty"
+          />
+        </div>
+      );
+    }
+    if (selectedHostRig) {
+      return (
+        <div data-testid="topology-terminal-host" className="p-6 space-y-4">
+          <button
+            type="button"
+            data-testid="topology-terminal-host-back"
+            onClick={() => setSelectedHostRigId(null)}
+            className="font-mono text-[9px] uppercase tracking-[0.14em] text-on-surface-variant hover:text-on-surface"
+          >
+            Back to rigs
+          </button>
+          <RigTerminalSection rigId={selectedHostRig.id} rigName={selectedHostRig.name} />
+        </div>
+      );
+    }
+    return (
+      <div data-testid="topology-terminal-host" className="p-6 space-y-6">
+        <HostRigPicker rigs={rigs} onSelectRig={setSelectedHostRigId} />
+      </div>
+    );
+  }
+
+  // Rig + Pod scopes share the same single-rig data source; pod filters by
+  // podName.
+  const seatsAll = (rigNodes ?? []).filter((n) => n.nodeKind !== "infrastructure");
+  const seats =
+    scope === "pod" && podName
+      ? seatsAll.filter((s) => (s.podNamespace ?? s.podId) === podName)
+      : seatsAll;
+
+  return (
+    <div data-testid={`topology-terminal-${scope}`} className="p-6">
+      <TerminalGrid
+        seats={seats}
+        emptyLabel="NO SEATS"
+        emptyDescription={
+          scope === "pod"
+            ? `No agent seats in pod ${podName}.`
+            : "No agent seats in this rig."
+        }
+      />
+    </div>
+  );
+}

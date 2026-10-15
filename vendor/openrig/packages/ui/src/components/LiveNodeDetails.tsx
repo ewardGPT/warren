@@ -1,0 +1,743 @@
+// V1 agent-detail canonical surface.
+//
+// V0.3.1 slice 25 reshapes the seat-detail page into a 2-tab
+// Overview + Details layout. Overview is the default and answers the
+// most-common at-a-glance questions: a dense 9-field info table at
+// the top, the black-glass smoked terminal inline below it, then the
+// Activity + Recent Events cards. Details holds everything else
+// (edges, peers, agent spec, startup content sans preview, transcript).
+//
+// Previous 5-tab structure (identity / agent-spec / startup /
+// transcript / terminal) collapses into the 2 new tabs. The terminal
+// is no longer in its own tab — it lives inline in Overview. The
+// Startup section in Details no longer shows the preview pane (since
+// the terminal moved up to Overview).
+
+import { useMemo, useState } from "react";
+import { CirclePlay } from "lucide-react";
+import { useNodeDetail, type NodeDetailData } from "../hooks/useNodeDetail.js";
+import { useTopologyActivity } from "../hooks/useTopologyActivity.js";
+import { useSpecLibrary, useLibraryReview } from "../hooks/useSpecLibrary.js";
+import { WorkspacePage } from "./WorkspacePage.js";
+import { WorkflowHeader } from "./WorkflowScaffold.js";
+import { AgentSpecDisplay } from "./AgentSpecDisplay.js";
+// Slice 3.3 fix-B — Plugins section per dispatch §3.2 / velocity-qa
+// VM verify failure #2. Reads plugin IDs from the agent spec review
+// defensively (the resources.plugins field is owned by batch 1 on
+// plugin-primitive-v0; on main it's absent and we render empty state).
+import { AgentPluginsList } from "./specs/AgentPluginsList.js";
+// V0.3.1 slice 25 — PreviewPane no longer rendered (Startup section
+// in Details tab drops the preview; the terminal moved up to Overview
+// via SessionPreviewPane). PreviewPane is still owned by other
+// surfaces in the codebase; this file simply doesn't reference it.
+import { SessionPreviewPane } from "./preview/SessionPreviewPane.js";
+import { ProgressiveTerminal } from "./terminal/ProgressiveTerminal.js";
+import { SeatOverviewTable } from "./SeatOverviewTable.js";
+import { SeatOverviewSecondary } from "./SeatOverviewSecondary.js";
+import { SeatNotificationBanner } from "./SeatNotificationBanner.js";
+import { FileReferenceTrigger } from "./drawer-triggers/FileReferenceTrigger.js";
+import { displayPodName, inferPodName } from "../lib/display-name.js";
+import { copyText } from "../lib/copy-text.js";
+import { useSelectedHostId } from "../hooks/useHosts.js";
+import { LOCAL_HOST_ID } from "../lib/host-param.js";
+// V0.3.1 slice 25 follow-on — activity helpers no longer imported here
+// (LiveNodeCurrentState was removed; SeatOverviewTable + StatusSection
+// own their own activity rendering paths).
+import {
+  buildTopologySessionIndex,
+  type TopologyActivityVisual,
+} from "../lib/topology-activity.js";
+import { getRestoreStatusColorClass } from "../lib/restore-status-colors.js";
+import type { AgentSpecReview } from "../hooks/useSpecReview.js";
+import { RuntimeBadge, ToolMark } from "./graphics/RuntimeMark.js";
+import { postOpenCmux } from "../hooks/useCmuxLaunch.js";
+
+type Tab = "overview" | "details";
+
+interface LiveNodeDetailsProps {
+  rigId: string;
+  logicalId: string;
+}
+
+const SECTION_CLASS = "border border-outline-variant bg-surface-lowest/30 p-3";
+
+function statusColor(status: string | null): string {
+  switch (status) {
+    case "ready": return "text-green-600";
+    case "pending": return "text-amber-600";
+    case "attention_required": return "text-orange-600";
+    case "failed": return "text-red-600";
+    default: return "text-on-surface-variant";
+  }
+}
+
+function startupStatusLabel(status: string | null): string {
+  switch (status) {
+    case "attention_required": return "attention required";
+    default: return status ?? "stopped";
+  }
+}
+
+function resolveAgentName(agentRef: string | null): string | null {
+  if (!agentRef) return null;
+  const match = agentRef.match(/^local:agents\/([^/]+)$/);
+  return match?.[1] ?? null;
+}
+
+function InfoRow({ label, value }: { label: string; value: string | number | null | undefined }) {
+  if (value === null || value === undefined || value === "") return null;
+  return (
+    <div className="flex justify-between gap-3 font-mono text-[10px]">
+      <span className="text-on-surface-variant">{label}</span>
+      <span className="truncate text-right text-on-surface">{value}</span>
+    </div>
+  );
+}
+
+function AgentSpecSection({ data }: { data: NodeDetailData }) {
+  const agentName = resolveAgentName(data.agentRef);
+  const { data: agentEntries = [], isLoading: entriesLoading } = useSpecLibrary("agent");
+
+  const matches = agentName
+    ? agentEntries.filter((entry) => entry.name === agentName)
+    : [];
+
+  const entryId = matches.length === 1 ? matches[0]!.id : null;
+  const { data: review, isLoading: reviewLoading } = useLibraryReview(entryId);
+
+  return (
+    <div data-testid="live-agent-spec-section" className="space-y-4">
+      {data.compactSpec.name && (
+        <section data-testid="detail-compact-spec" className={SECTION_CLASS}>
+          <div className="mb-2 font-mono text-[8px] uppercase tracking-wider text-on-surface-variant">Resolved Agent Spec</div>
+          <div className="space-y-0.5">
+            <InfoRow label="Spec" value={data.compactSpec.name} />
+            <InfoRow label="Version" value={data.compactSpec.version} />
+            <InfoRow label="Profile" value={data.compactSpec.profile} />
+            <InfoRow label="Skills" value={data.compactSpec.skillCount} />
+            <InfoRow label="Guidance" value={data.compactSpec.guidanceCount} />
+          </div>
+        </section>
+      )}
+
+      {!agentName ? (
+        <div data-testid="agent-spec-unavailable" className="p-4 font-mono text-[10px] text-on-surface-variant">No agent spec available</div>
+      ) : entriesLoading || reviewLoading ? (
+        <div className="p-4 font-mono text-[10px] text-on-surface-variant">Loading agent spec...</div>
+      ) : matches.length === 0 ? (
+        <div data-testid="agent-spec-unavailable" className="p-4 font-mono text-[10px] text-on-surface-variant">No agent spec available</div>
+      ) : matches.length > 1 ? (
+        <div data-testid="agent-spec-ambiguous" className="p-4 font-mono text-[10px] text-amber-600">
+          Agent spec ambiguous ({matches.length} matches for &quot;{agentName}&quot;)
+        </div>
+      ) : !review || review.kind !== "agent" ? (
+        <div data-testid="agent-spec-unavailable" className="p-4 font-mono text-[10px] text-on-surface-variant">No agent spec available</div>
+      ) : (
+        <>
+          <AgentSpecDisplay
+            review={review as AgentSpecReview}
+            yaml={review.raw}
+            testIdPrefix="live-agent"
+            sourcePath={review.sourcePath}
+          />
+          {/* Slice 3.3 fix-B — Plugins section sits between AgentSpecDisplay
+              (which renders Skills among other things) and the surrounding
+              tabs' Startup Files block. Extracts plugin IDs from review
+              defensively: the field is owned by batch 1 on plugin-primitive-v0;
+              renders empty state on main + populated state post-merge. */}
+          <section
+            data-testid="live-agent-plugins-section"
+            className="border border-outline-variant bg-surface-lowest/30 p-3"
+          >
+            <div className="mb-2 font-mono text-[8px] uppercase tracking-wider text-on-surface-variant">
+              Plugins
+            </div>
+            <AgentPluginsList pluginIds={extractAgentPluginIds(review)} />
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Slice 3.3 fix-B — read plugin IDs from an agent review defensively.
+// On main without batch 1 merged, AgentSpecReview doesn't have
+// resources.plugins; we read via duck-typed any-cast so the field is
+// optional. Post-merge into plugin-primitive-v0, the typed
+// resources.plugins[] populates this naturally. The function also
+// tolerates the shorthand string form for forward-compat with future
+// agent.yaml shapes.
+function extractAgentPluginIds(review: unknown): string[] {
+  if (!review || typeof review !== "object") return [];
+  const resources = (review as Record<string, unknown>)["resources"];
+  if (!resources || typeof resources !== "object") return [];
+  const plugins = (resources as Record<string, unknown>)["plugins"];
+  if (!Array.isArray(plugins)) return [];
+  const ids: string[] = [];
+  for (const p of plugins) {
+    if (p && typeof p === "object" && typeof (p as Record<string, unknown>).id === "string") {
+      ids.push((p as Record<string, unknown>).id as string);
+    } else if (typeof p === "string") {
+      ids.push(p);
+    }
+  }
+  return ids;
+}
+
+function ActionButtonsRow({ rigId, logicalId, data }: { rigId: string; logicalId: string; data: NodeDetailData }) {
+  // OPR.0.4.6.MH2 rev1-r2 B1: every button here is a LOCAL action (cmux-open
+  // POST; tmux-attach / resume commands for THIS host's sessions). Under a
+  // remote selection the row renders an honest read-only marker instead —
+  // acting on a remote host is MH-3/MH-4.
+  const actionsAreRemote = useSelectedHostId() !== LOCAL_HOST_ID;
+  const handleCopyAttach = async () => {
+    if (data.tmuxAttachCommand) await copyText(data.tmuxAttachCommand);
+  };
+  const handleOpenCmux = async () => {
+    try {
+      await postOpenCmux({ rigId, logicalId });
+    } catch {
+      // best effort
+    }
+  };
+  const handleCopyResume = async () => {
+    if (data.resumeCommand) await copyText(data.resumeCommand);
+  };
+  if (actionsAreRemote) {
+    return (
+      <div
+        data-testid="live-node-actions-remote-readonly"
+        data-remote-readonly="true"
+        className="font-mono text-[9px] uppercase tracking-wide text-on-surface-variant"
+      >
+        read-only — remote host
+      </div>
+    );
+  }
+  return (
+    <div data-testid="live-node-actions" className="flex flex-wrap gap-2">
+      <button
+        onClick={handleOpenCmux}
+        data-testid="detail-cmux-open"
+        className="inline-flex min-h-11 items-center gap-1.5 px-3 py-2 border border-outline-variant bg-surface-lowest/30 font-mono text-[10px] uppercase tracking-wide text-on-surface hover:bg-surface-low/60"
+      >
+        <ToolMark tool="cmux" size="sm" />
+        Open CMUX
+      </button>
+      {data.tmuxAttachCommand && (
+        <button
+          onClick={handleCopyAttach}
+          data-testid="detail-copy-attach"
+          className="inline-flex min-h-11 items-center gap-1.5 px-3 py-2 border border-outline-variant bg-surface-lowest/30 font-mono text-[10px] uppercase tracking-wide text-on-surface hover:bg-surface-low/60"
+        >
+          <ToolMark tool="tmux" size="sm" />
+          Copy tmux attach
+        </button>
+      )}
+      {data.resumeCommand && (
+        <button
+          onClick={handleCopyResume}
+          data-testid="detail-copy-resume"
+          className="inline-flex min-h-11 items-center gap-1.5 px-3 py-2 border border-outline-variant bg-surface-lowest/30 font-mono text-[10px] uppercase tracking-wide text-on-surface hover:bg-surface-low/60"
+        >
+          <CirclePlay aria-hidden="true" className="h-4 w-4 shrink-0" strokeWidth={1.5} />
+          Copy resume command
+        </button>
+      )}
+    </div>
+  );
+}
+
+function StatusSection({ data }: { data: NodeDetailData }) {
+  const showFailure =
+    data.startupStatus === "failed" ||
+    data.startupStatus === "attention_required" ||
+    !!data.latestError;
+  return (
+    <section
+      data-testid="live-node-status"
+      className="grid gap-2 border border-outline-variant bg-surface-lowest/30 p-3 sm:grid-cols-2"
+    >
+      <div className="flex items-baseline gap-2">
+        <span className="font-mono text-[8px] uppercase tracking-wider text-on-surface-variant">Startup</span>
+        <span className={statusColor(data.startupStatus)} data-testid="detail-startup-status">
+          {startupStatusLabel(data.startupStatus)}
+        </span>
+      </div>
+      <div className="flex items-baseline gap-2">
+        <span className="font-mono text-[8px] uppercase tracking-wider text-on-surface-variant">Restore</span>
+        <span
+          className={`font-mono text-xs font-bold ${getRestoreStatusColorClass(data.restoreOutcome)}`}
+          data-testid="detail-restore-outcome"
+        >
+          {data.restoreOutcome}
+        </span>
+      </div>
+      {showFailure && (
+        <div
+          className={`sm:col-span-2 mt-1 p-2 border ${
+            data.startupStatus === "attention_required"
+              ? "bg-orange-50 border-orange-200"
+              : "bg-red-50 border-red-200"
+          }`}
+          data-testid="detail-failure-banner"
+        >
+          <div
+            className={`font-mono text-[9px] font-bold mb-1 ${
+              data.startupStatus === "attention_required" ? "text-orange-700" : "text-red-700"
+            }`}
+          >
+            {data.startupStatus === "attention_required"
+              ? "Attention Required"
+              : data.startupStatus === "failed"
+                ? "Startup Failed"
+                : "Error"}
+          </div>
+          {data.latestError && (
+            <div
+              className={`font-mono text-[9px] mb-1 ${
+                data.startupStatus === "attention_required" ? "text-orange-700" : "text-red-600"
+              }`}
+            >
+              {data.latestError}
+            </div>
+          )}
+          <div className="font-mono text-[8px] text-on-surface-variant">
+            {data.startupStatus === "attention_required"
+              ? `Use rig capture ${data.canonicalSessionName ?? "<session>"} to inspect the prompt, then rig send ${data.canonicalSessionName ?? "<session>"} to clear it.`
+              : data.startupStatus === "failed"
+                ? "Check logs with: rig ps --nodes --rig <name>, or restart with: rig up"
+                : "Try: rig restore <snapshotId>"}
+          </div>
+          {data.recoveryGuidance && (
+            <div className="mt-2 border-t border-outline-variant pt-2" data-testid="detail-recovery-guidance">
+              <div className="font-mono text-[8px] font-bold text-on-surface mb-1">Recovery</div>
+              <div className="font-mono text-[8px] text-on-surface-variant mb-1">{data.recoveryGuidance.summary}</div>
+              <div className="space-y-0.5 mb-1">
+                {data.recoveryGuidance.commands.map((command, index) => (
+                  <code key={`${command}-${index}`} className="font-mono text-[8px] text-on-surface bg-surface-low px-1 py-0.5 block">
+                    {command}
+                  </code>
+                ))}
+              </div>
+              <div className="space-y-0.5">
+                {data.recoveryGuidance.notes.map((note, index) => (
+                  <div key={`${note}-${index}`} className="font-mono text-[8px] text-on-surface-variant">
+                    {note}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// V0.3.1 slice 25 follow-on — LiveNodeCurrentState removed.
+// Activity now lives as a column in SeatOverviewTable; current-work
+// lives as a full-width row in the same table. The standalone card
+// was redundant and dropped from the Overview tab. Grep confirmed no
+// external callers in packages/ui/src/ at the time of removal.
+
+function RecentEventsSection({ data }: { data: NodeDetailData }) {
+  if (!data.recentEvents || data.recentEvents.length === 0) return null;
+  return (
+    <section data-testid="live-node-recent-events" className={SECTION_CLASS}>
+      <div className="font-mono text-[8px] uppercase tracking-wider text-on-surface-variant mb-2">
+        Recent Events
+      </div>
+      <div className="space-y-0.5">
+        {data.recentEvents.slice(0, 10).map((e, i) => (
+          <div key={`${e.type}-${i}`} className="font-mono text-[9px] flex justify-between gap-3">
+            <span className="text-on-surface truncate">{e.type}</span>
+            <span className="text-on-surface-variant ml-2 shrink-0">{e.createdAt}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// V0.3.1 slice 25 — IdentitySummary card is replaced by SeatOverviewTable
+// (dense 9-field info table at the top of Overview; 7 compact rows
+// + 2 full-width rows per the slice 25 scope amendment).
+
+function EdgesSection({ data }: { data: NodeDetailData }) {
+  const { outgoing, incoming } = data.edges;
+  if (outgoing.length === 0 && incoming.length === 0) return null;
+  return (
+    <section data-testid="detail-edges" className={SECTION_CLASS}>
+      <div className="font-mono text-[8px] text-on-surface-variant uppercase tracking-wider mb-2">Edges</div>
+      <div className="space-y-0.5 font-mono text-[10px]">
+        {outgoing.map((e, i) => (
+          <div key={`out-${i}`} className="flex gap-1">
+            <span className="text-on-surface-variant">-&gt;</span>
+            <span className="text-on-surface-variant">{e.kind}</span>
+            <span className="text-on-surface">{e.to?.logicalId ?? "?"}</span>
+          </div>
+        ))}
+        {incoming.map((e, i) => (
+          <div key={`in-${i}`} className="flex gap-1">
+            <span className="text-on-surface-variant">&lt;-</span>
+            <span className="text-on-surface-variant">{e.kind}</span>
+            <span className="text-on-surface">{e.from?.logicalId ?? "?"}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function PeersSection({ data }: { data: NodeDetailData }) {
+  if (data.peers.length === 0) return null;
+  return (
+    <section data-testid="detail-peers" className={SECTION_CLASS}>
+      <div className="font-mono text-[8px] text-on-surface-variant uppercase tracking-wider mb-2">Peers</div>
+      <div className="space-y-1 font-mono text-[10px]">
+        {data.peers.map((p) => (
+          <div key={p.logicalId} className="space-y-0">
+            <div className="flex justify-between gap-3">
+              <span className="text-on-surface">{p.logicalId}</span>
+              <span className="text-on-surface-variant">{p.runtime ?? "-"}</span>
+            </div>
+            {p.canonicalSessionName && (
+              <div className="text-[9px] text-on-surface-variant truncate">{p.canonicalSessionName}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ContextUsageSection({ data }: { data: NodeDetailData }) {
+  const contextUsage = data.contextUsage;
+  return (
+    <section data-testid="detail-context-usage" className={SECTION_CLASS}>
+      <div className="font-mono text-[8px] text-on-surface-variant uppercase tracking-wider mb-2">Context</div>
+      {contextUsage?.availability === "known" ? (
+        <div className="space-y-0.5 font-mono text-[10px]">
+          <InfoRow label="Used" value={contextUsage.usedPercentage != null ? `${contextUsage.usedPercentage}%` : null} />
+          <InfoRow label="Remaining" value={contextUsage.remainingPercentage != null ? `${contextUsage.remainingPercentage}%` : null} />
+          <InfoRow label="Window" value={contextUsage.contextWindowSize?.toLocaleString()} />
+          <InfoRow label="Input tokens" value={contextUsage.totalInputTokens?.toLocaleString()} />
+          <InfoRow label="Output tokens" value={contextUsage.totalOutputTokens?.toLocaleString()} />
+          <InfoRow label="Sampled" value={contextUsage.sampledAt} />
+          {contextUsage.fresh === false && (
+            <div className="font-mono text-[9px] text-amber-600 mt-1">Stale sample</div>
+          )}
+        </div>
+      ) : (
+        <div className="font-mono text-[10px] text-on-surface-variant">
+          unknown{contextUsage?.reason ? ` (${contextUsage.reason})` : ""}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// V0.3.1 slice 25 follow-on — Overview tab. Stack order:
+//   1. Notification banner (renders only when active message exists)
+//   2. Info table (column-oriented; cwd + current-work full-width)
+//   3. Inline black-glass terminal
+//   4. Recent Events card (at bottom)
+//
+// V0.3.1 slice 25 follow-on-2 — Overview stack:
+//   1. SeatNotificationBanner (real-alert-only; hidden for normal seats)
+//   2. SeatOverviewTable (column-headers + data row; vertical grid lines)
+//   3. SeatOverviewSecondary (cwd + current-work, visually separated
+//      from the column table above)
+//   4. InlineTerminal (black-glass)
+//   5. RecentEventsSection (at bottom)
+function OverviewTab({ data, activityVisual }: { data: NodeDetailData; activityVisual?: TopologyActivityVisual | null }) {
+  return (
+    <div data-testid="live-overview-section" className="space-y-4">
+      <SeatNotificationBanner data={data} />
+      <SeatOverviewTable data={data} activityVisual={activityVisual} />
+      <SeatOverviewSecondary data={data} />
+      <InlineTerminal data={data} />
+      <RecentEventsSection data={data} />
+    </div>
+  );
+}
+
+// V0.3.1 slice 25 follow-on — Details tab. Re-ordered to put
+// Startup first (operator's go-to triage view), then the
+// spec/topology group (AgentSpec + Edges + Peers + Context usage
+// detail), then Transcript at the bottom.
+function DetailsTab({
+  rigId,
+  logicalId,
+  data,
+  isAgent,
+}: {
+  rigId: string;
+  logicalId: string;
+  data: NodeDetailData;
+  isAgent: boolean;
+}) {
+  return (
+    <div data-testid="live-details-section" className="space-y-4">
+      <StartupContent rigId={rigId} logicalId={logicalId} data={data} />
+      {isAgent ? <AgentSpecSection data={data} /> : null}
+      <EdgesSection data={data} />
+      <PeersSection data={data} />
+      <ContextUsageSection data={data} />
+      <TranscriptContent data={data} />
+    </div>
+  );
+}
+
+// V0.3.1 slice 25 — Inline black-glass terminal. Renders the same
+// SessionPreviewPane the old Terminal tab rendered, but embedded
+// directly in Overview rather than behind a tab. The black-glass
+// chrome class is preserved verbatim so the visual feel matches the
+// pre-slice-25 terminal tab.
+function InlineTerminal({ data }: { data: NodeDetailData }) {
+  // OPR.0.4.6.MH2 rev1-r2 B1: the inline terminal is a LOCAL session surface
+  // (session-name preview + click-to-live typeable xterm). Under a remote
+  // selection a same-named LOCAL session must never render beneath the
+  // remote seat's label — honest gate instead.
+  const terminalIsRemote = useSelectedHostId() !== LOCAL_HOST_ID;
+  if (terminalIsRemote) {
+    return (
+      <div
+        data-testid="node-detail-terminal-remote-gated"
+        className="font-mono text-[10px] text-on-surface-variant p-4"
+      >
+        Terminal not available for remote hosts — terminal streams are this
+        host&apos;s local sessions. Viewing a remote host is read-only.
+      </div>
+    );
+  }
+  if (!data.canonicalSessionName) {
+    return (
+      <div className="font-mono text-[10px] text-on-surface-variant p-4">
+        No canonical session name; terminal preview unavailable.
+      </div>
+    );
+  }
+  return (
+    <div data-testid="live-terminal-shell" className="bg-stone-950/65 text-stone-50 backdrop-blur-sm h-[500px]">
+      {/* OPR.0.4.0.1 (round-two QA ruling): the node-detail inline terminal joins
+          the reusable progressive default-static -> click-inside-to-go-live model
+          under the global live-terminal cap, instead of an always-live uncapped
+          FocusedTerminal. terminalKey is session-scoped so the registry tracks it.
+          OPR.0.4.0.39: fit="contain" - this panel gives the terminal a big dedicated
+          500px area, so the 90x27 mirror scales up (capped) to FILL it, centered,
+          instead of sitting small top-left (the grid cells keep the default
+          fit-width). */}
+      <ProgressiveTerminal
+        sessionName={data.canonicalSessionName}
+        terminalKey={`node-detail:${data.canonicalSessionName}`}
+        testIdPrefix="node-detail-terminal"
+        fit="contain"
+      />
+    </div>
+  );
+}
+
+function StartupContent({ rigId: _rigId, logicalId: _logicalId, data }: { rigId: string; logicalId: string; data: NodeDetailData }) {
+  void _rigId; void _logicalId;
+  return (
+    <div data-testid="live-startup-section" className="space-y-4">
+      <StatusSection data={data} />
+
+      {data.infrastructureStartupCommand && (
+        <section data-testid="live-node-infra-startup" className={SECTION_CLASS}>
+          <div className="font-mono text-[8px] uppercase tracking-wider text-on-surface-variant mb-2">
+            Startup Command
+          </div>
+          <code className="font-mono text-[9px] text-on-surface bg-surface-low px-2 py-1 block">
+            {data.infrastructureStartupCommand}
+          </code>
+        </section>
+      )}
+
+      {data.startupActions.length > 0 && (
+        <section data-testid="live-startup-actions" className={SECTION_CLASS}>
+          <div className="font-mono text-[8px] uppercase tracking-wider text-on-surface-variant mb-2">Startup Actions</div>
+          <div className="space-y-1">
+            {data.startupActions.map((action, index) => (
+              <div key={`${action.type}-${action.value}-${index}`} className="font-mono text-[10px] text-on-surface">
+                <span className="text-on-surface-variant">{action.type}:</span> {action.value}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {data.startupFiles.length > 0 ? (
+        <section className="border border-outline-variant bg-surface-lowest/30">
+          <div className="px-3 py-2 border-b border-outline-variant font-mono text-xs font-bold">
+            Startup Files
+          </div>
+          <ul className="divide-y divide-outline-variant">
+            {data.startupFiles.map((f, i) => (
+              <li
+                key={`${f.path}-${i}`}
+                data-testid={`live-startup-file-${f.path}`}
+              >
+                <FileReferenceTrigger
+                  data={{ path: f.path, absolutePath: f.absolutePath }}
+                  testId={`live-startup-file-trigger-${f.path}`}
+                  className="block w-full px-3 py-2 text-left hover:bg-surface-low/60 transition-colors font-mono text-[10px]"
+                >
+                  <span className="font-bold underline decoration-dotted decoration-outline">
+                    {f.path}
+                  </span>
+                  <span className="text-on-surface-variant ml-2">({f.deliveryHint})</span>
+                  {f.required && (
+                    <span className="text-red-500 text-[8px] ml-1">REQUIRED</span>
+                  )}
+                </FileReferenceTrigger>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : (
+        <div className="font-mono text-[10px] text-on-surface-variant p-4">
+          No startup files declared
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TranscriptContent({ data }: { data: NodeDetailData }) {
+  if (!data.transcript.enabled) {
+    return (
+      <div data-testid="live-transcript-section" className="font-mono text-[10px] text-on-surface-variant p-4">
+        Transcript capture not enabled
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="live-transcript-section" className="space-y-4">
+      <section data-testid="detail-transcript" className={SECTION_CLASS}>
+        <div className="font-mono text-xs font-bold mb-2">Transcript</div>
+        <div className="font-mono text-[10px] text-on-surface">{data.transcript.path ?? "enabled"}</div>
+        {data.transcript.tailCommand && (
+          <button
+            type="button"
+            onClick={() => copyText(data.transcript.tailCommand!)}
+            className="mt-2 w-full border border-outline-variant bg-surface-lowest/40 px-2 py-1 text-left font-mono text-[8px] uppercase text-on-surface hover:bg-surface-low"
+          >
+            Copy tail command
+          </button>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function TabNav({
+  tabs,
+  activeTab,
+  onSelect,
+}: {
+  tabs: Tab[];
+  activeTab: Tab;
+  onSelect: (tab: Tab) => void;
+}) {
+  return (
+    <div className="flex gap-1 border-b border-outline-variant" role="tablist" data-testid="live-node-tabs">
+      {tabs.map((tab) => (
+        <button
+          key={tab}
+          role="tab"
+          aria-selected={activeTab === tab}
+          data-testid={`live-tab-${tab}`}
+          onClick={() => onSelect(tab)}
+          className={`min-h-11 px-3 py-2 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+            activeTab === tab
+              ? "border-b-2 border-on-surface text-on-surface font-bold -mb-px"
+              : "text-on-surface-variant hover:text-on-surface"
+          }`}
+        >
+          {tab.replace("-", " ")}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function LiveNodeDetails({ rigId, logicalId }: LiveNodeDetailsProps) {
+  const { data, isLoading, error } = useNodeDetail(rigId, logicalId);
+  const sessionIndex = useMemo(() => buildTopologySessionIndex(data ? [{
+    nodeId: `${data.rigId}::${data.logicalId}`,
+    rigId: data.rigId,
+    rigName: data.rigName,
+    logicalId: data.logicalId,
+    canonicalSessionName: data.canonicalSessionName,
+    agentActivity: data.agentActivity ?? null,
+    currentQitems: data.currentQitems ?? null,
+    startupStatus: data.startupStatus,
+    terminalActive: data.terminalActive,
+    hasAssignedWork: data.hasAssignedWork ?? false,
+    pendingWorkCount: data.pendingWorkCount ?? 0,
+  }] : []), [data]);
+  const topologyActivity = useTopologyActivity(sessionIndex);
+  const activityVisual = data
+    ? topologyActivity.getNodeActivity(`${data.rigId}::${data.logicalId}`, {
+      agentActivity: data.agentActivity ?? null,
+      currentQitems: data.currentQitems ?? null,
+      startupStatus: data.startupStatus,
+      terminalActive: data.terminalActive,
+      hasAssignedWork: data.hasAssignedWork ?? false,
+      pendingWorkCount: data.pendingWorkCount ?? 0,
+    })
+    : null;
+  // V0.3.1 slice 25 — 2-tab Overview/Details restructure. Default
+  // tab is Overview so operators landing from topology see the
+  // at-a-glance info table + inline terminal without tab-switching.
+  // Analogous to slice 12's project-scope default-tab flip
+  // (story → overview).
+  const [activeTab, setActiveTab] = useState<Tab>("overview");
+  const isAgent = data ? data.nodeKind !== "infrastructure" : true;
+  const tabs: Tab[] = ["overview", "details"];
+
+  return (
+    <WorkspacePage>
+      <div data-testid="live-node-details" className="space-y-4">
+        <WorkflowHeader
+          eyebrow="Live Node Details"
+          title={data?.canonicalSessionName ?? logicalId}
+          description={`${data?.rigName ?? rigId} / ${data?.podNamespace ?? inferPodName(logicalId) ?? displayPodName(data?.podId ?? null)} / ${logicalId}`}
+          actions={data ? (
+            <RuntimeBadge
+              runtime={data.runtime}
+              model={data.model}
+              size="sm"
+              compact
+              className="bg-surface-lowest/40 backdrop-blur-sm"
+            />
+          ) : null}
+        />
+
+        {isLoading && <div className="font-mono text-[10px] text-on-surface-variant">Loading...</div>}
+        {error && (
+          <div className="p-3 bg-red-50 border border-red-200 font-mono text-[10px] text-red-700">
+            {(error as Error).message}
+          </div>
+        )}
+
+        {data && (
+          <>
+            <ActionButtonsRow rigId={rigId} logicalId={logicalId} data={data} />
+            <TabNav tabs={tabs} activeTab={activeTab} onSelect={setActiveTab} />
+            <div data-testid="live-node-tab-body" className="space-y-4">
+              {activeTab === "overview" && <OverviewTab data={data} activityVisual={activityVisual} />}
+              {activeTab === "details" && (
+                <DetailsTab rigId={rigId} logicalId={logicalId} data={data} isAgent={isAgent} />
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </WorkspacePage>
+  );
+}

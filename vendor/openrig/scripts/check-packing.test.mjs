@@ -1,0 +1,160 @@
+import { execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+test("npm pack of @openrig/cli includes scripts/check-abi.mjs in tarball", () => {
+  const output = execSync("npm pack --dry-run --json 2>/dev/null", {
+    cwd: "packages/cli",
+    encoding: "utf-8",
+  });
+  const entries = JSON.parse(output);
+  const files = entries[0]?.files?.map((f) => f.path) ?? [];
+
+  assert.ok(
+    files.some((f) => f.includes("scripts/check-abi.mjs")),
+    `scripts/check-abi.mjs missing from npm pack output. Published tarball will fail postinstall.\nFiles found: ${files.filter((f) => f.includes("scripts")).join(", ") || "(none under scripts/)"}`
+  );
+});
+
+test("factory topology defaults have a clean-checkout source and package path", () => {
+  const expectedDefaults = [
+    "instance/CRAFT.md",
+    "rig/CRAFT.md",
+    "rig/ORCHESTRATION-CRAFT.md",
+    "seats/orch-lead/CRAFT.md",
+    "seats/review-r1/CRAFT.md",
+    "seats/review-r2/CRAFT.md",
+    "seats/dev-qa/CRAFT.md",
+  ];
+  const sourceRoot = "packages/daemon/specs/rigs/launch/factory/topology";
+  for (const rel of expectedDefaults) {
+    const source = `${sourceRoot}/${rel}`;
+    assert.ok(existsSync(source), `shipped factory topology default missing from source: ${source}`);
+    assert.ok(readFileSync(source).length > 0, `shipped factory topology default is empty: ${source}`);
+  }
+
+  const buildScript = readFileSync("scripts/build-package.sh", "utf-8");
+  assert.match(
+    buildScript,
+    /cp -r "\$DAEMON_DIR\/specs" "\$CLI_DIR\/daemon\/specs"/,
+    "build-package no longer stages the complete daemon specs tree; factory topology defaults would be absent from the published CLI package",
+  );
+  const pkg = JSON.parse(readFileSync("packages/cli/package.json", "utf-8"));
+  assert.ok(
+    Array.isArray(pkg.files) && pkg.files.includes("daemon"),
+    `packages/cli must publish the staged daemon tree. Found files: ${JSON.stringify(pkg.files)}`,
+  );
+});
+
+test("build-package scans the complete daemon specs tree before LP-7 copies it", () => {
+  const buildScript = readFileSync("scripts/build-package.sh", "utf8");
+  const scan = buildScript.indexOf("check-internal-leak-guard.mjs");
+  const specsTree = buildScript.indexOf('"$DAEMON_DIR/specs"', scan);
+  const copy = buildScript.indexOf('cp -r "$DAEMON_DIR/specs" "$CLI_DIR/daemon/specs"');
+
+  assert.ok(scan >= 0, "build-package must run the internal leak guard at the tarball trust boundary");
+  assert.ok(specsTree > scan, "the package-boundary guard must explicitly scan the complete daemon specs tree");
+  assert.ok(copy > specsTree, "the specs scan must finish before the wholesale LP-7 copy");
+});
+
+test("build-package emits the substance roots from the staging branches that actually ran", () => {
+  const buildScript = readFileSync("scripts/build-package.sh", "utf8");
+  assert.match(buildScript, /SUBSTANCE_SURFACE_ROOTS=\(\)/);
+  assert.match(buildScript, /cp -r "\$DAEMON_DIR\/assets"[\s\S]*SUBSTANCE_SURFACE_ROOTS\+=\("daemon\/assets"\)/);
+  assert.match(buildScript, /cp -r "\$DAEMON_DIR\/specs"[\s\S]*SUBSTANCE_SURFACE_ROOTS\+=\("daemon\/specs"\)/);
+  assert.match(buildScript, /cp -r "\$DAEMON_DIR\/context-packs"[\s\S]*SUBSTANCE_SURFACE_ROOTS\+=\("daemon\/context-packs"\)/);
+  assert.match(buildScript, /substance-surfaces\.json/);
+});
+
+test("the private product-factory VPS runbook and its pointers do not ship", () => {
+  const privateRunbook = "docs/reference/product-factory-vps-runbook.md";
+  assert.equal(
+    existsSync(privateRunbook),
+    false,
+    `${privateRunbook} is private operator canon and must not ship in the public repo or package`,
+  );
+
+  const publicPointerSources = [
+    "CHANGELOG.md",
+    "scripts/bootstrap-product-factory-vps.sh",
+    "docs/as-built/cli-reference.md",
+    "packages/daemon/assets/plugins/openrig-core/skills/openrig-user/SKILL.md",
+  ];
+  for (const source of publicPointerSources) {
+    assert.doesNotMatch(
+      readFileSync(source, "utf8"),
+      /product-factory-vps-runbook/,
+      `${source} still points public readers at the private VPS runbook`,
+    );
+  }
+});
+
+// aa922842 — the conventions doc reaches agents through a THREE-path model:
+//   repo source      docs/reference/sdlc-conventions.md            (what repo readers cite)
+//   packed INTERNAL  daemon/docs/reference/sdlc-conventions.md     (assembly input only —
+//                                                                   NEVER taught as a user path)
+//   installed stable $OPENRIG_HOME/reference/sdlc-conventions.md   (default ~/.openrig/…)
+// The daemon materializes the stable path at startup by reading `../docs/reference`
+// relative to its dist dir (packages/daemon/src/startup.ts), which is exactly why
+// scripts/build-package.sh stages the docs at daemon/docs/reference/. That internal input
+// is therefore load-bearing and completely unguarded today: if the copy step regressed, the
+// stable path would silently stop materializing and every teaching pointer would go stale
+// with no failing test. This pins it.
+// HERMETIC BY CONSTRUCTION: packages/cli/daemon is gitignored build output, so any assertion
+// that reads it (or runs `npm pack` against it) passes on a developer machine with a stale
+// assembled package and FAILS in a clean checkout before anything is built. This test therefore
+// asserts the three contracts that make the stable path work, using only git-tracked inputs,
+// and never runs or mutates the real package build.
+test("build-package stages the conventions doc as the daemon's stable-path input, and the package allowlist ships it", () => {
+  const buildScript = readFileSync("scripts/build-package.sh", "utf-8");
+
+  // (a) STAGING CONTRACT — build-package must stage the repo's docs/reference into
+  //     daemon/docs/reference. The daemon resolves `../docs/reference` from its dist dir at
+  //     startup to materialize $OPENRIG_HOME/reference/; if this staging is dropped or
+  //     retargeted, the stable agent-facing path silently stops existing.
+  assert.match(
+    buildScript,
+    /mkdir -p "\$CLI_DIR\/daemon\/docs\/reference"/,
+    "scripts/build-package.sh no longer creates daemon/docs/reference — the daemon's startup resolver (../docs/reference) would find nothing and $OPENRIG_HOME/reference/ would never materialize."
+  );
+  assert.match(
+    buildScript,
+    /cp -r "\$REPO_ROOT\/docs\/reference\/"\* "\$CLI_DIR\/daemon\/docs\/reference\/"/,
+    "scripts/build-package.sh no longer copies docs/reference verbatim into the staged package. Byte preservation is what makes the shipped conventions doc trustworthy — a transforming copy (sed/awk/envsubst) would let installed agents read something the repo never said."
+  );
+
+  // (b) INCLUSION CONTRACT — npm only publishes what the files allowlist names. Staging into
+  //     daemon/ is useless if "daemon" is not published.
+  const pkg = JSON.parse(readFileSync("packages/cli/package.json", "utf-8"));
+  assert.ok(
+    Array.isArray(pkg.files) && pkg.files.includes("daemon"),
+    `packages/cli package.json "files" must include "daemon" or nothing staged there is published. Found: ${JSON.stringify(pkg.files)}`
+  );
+
+  // (c) SOURCE CONTRACT — the doc being staged must actually exist in the repo and be
+  //     non-trivial. This is the git-tracked input; everything above is plumbing around it.
+  const repoDoc = readFileSync("docs/reference/sdlc-conventions.md");
+  assert.ok(
+    repoDoc.length > 1000,
+    `docs/reference/sdlc-conventions.md is ${repoDoc.length}B — implausibly small for the conventions SSOT; staging would ship a truncated doc.`
+  );
+});
+
+// OPPORTUNISTIC, never required: when an assembled package happens to be present, verify the
+// staged copy really is byte-identical. Skipped (not failed) in a clean checkout, so this
+// cannot make `npm run test:repo` depend on build state — the contracts above are the
+// hermetic guarantee; this is the belt-and-braces check on an actual artifact.
+test("staged conventions doc is byte-identical to the repo source (skipped when no assembled package present)", (t) => {
+  const staged = "packages/cli/daemon/docs/reference/sdlc-conventions.md";
+  if (!existsSync(staged)) {
+    t.skip("no assembled package at packages/cli/daemon — run scripts/build-package.sh to exercise this check");
+    return;
+  }
+  const repoDoc = readFileSync("docs/reference/sdlc-conventions.md");
+  const stagedDoc = readFileSync(staged);
+  assert.ok(
+    repoDoc.equals(stagedDoc),
+    `${staged} is not byte-identical to docs/reference/sdlc-conventions.md (repo ${repoDoc.length}B vs staged ${stagedDoc.length}B). Re-run scripts/build-package.sh; a drifted staged copy teaches installed agents stale conventions.`
+  );
+});

@@ -1,0 +1,4 @@
+# Docker Hub library/debian bookworm-slim OCI index, resolved 2026-09-29.
+# Registry response bytes SHA256 verified against Docker-Content-Digest.
+# amd64 and arm64 are present; image execution is verified in CI, not by this pin.
+debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251

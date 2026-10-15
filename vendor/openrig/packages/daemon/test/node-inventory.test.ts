@@ -1,0 +1,911 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import type Database from "better-sqlite3";
+import { createFullTestDb } from "./helpers/test-app.js";
+import { getNodeInventory, getNodeDetail, getNodeInventoryWithContext, getNodeDetailWithContext } from "../src/domain/node-inventory.js";
+import { setDaemonTmuxServer } from "../src/adapters/tmux-server.js";
+import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
+import type { ContextUsage } from "../src/domain/types.js";
+import type { ContextUsageStore } from "../src/domain/context-usage-store.js";
+
+function seedPodAwareRig(db: Database.Database, opts?: { rigName?: string }) {
+  const rigName = opts?.rigName ?? "test-rig";
+  db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("rig-1", rigName);
+  // Pod
+  db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)").run("pod-1", "rig-1", "dev", "Dev");
+  // Agent node
+  db.prepare(
+    "INSERT INTO nodes (id, rig_id, logical_id, runtime, cwd, pod_id, agent_ref, profile, resolved_spec_name, resolved_spec_version, resolved_spec_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run("node-1", "rig-1", "dev.impl", "claude-code", "/project", "pod-1", "local:agents/impl", "default", "impl", "1.0.0", "abc123");
+  // Terminal/infrastructure node
+  db.prepare(
+    "INSERT INTO nodes (id, rig_id, logical_id, runtime, cwd, pod_id, agent_ref, profile) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run("node-2", "rig-1", "infra.server", "terminal", "/project", "pod-1", "builtin:terminal", "none");
+}
+
+function seedSession(db: Database.Database, nodeId: string, sessionName: string, opts?: {
+  id?: string;
+  status?: string;
+  startupStatus?: string;
+  resumeType?: string;
+  resumeToken?: string;
+  startupCompletedAt?: string;
+}) {
+  const id = opts?.id ?? `sess-${nodeId}-${Date.now()}`;
+  db.prepare(
+    "INSERT INTO sessions (id, node_id, session_name, status, startup_status, resume_type, resume_token, startup_completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    id, nodeId, sessionName,
+    opts?.status ?? "running",
+    opts?.startupStatus ?? "ready",
+    opts?.resumeType ?? null,
+    opts?.resumeToken ?? null,
+    opts?.startupCompletedAt ?? null,
+  );
+  // Binding with real PK
+  const bindingId = `bind-${nodeId}`;
+  db.prepare("INSERT OR REPLACE INTO bindings (id, node_id, tmux_session) VALUES (?, ?, ?)").run(bindingId, nodeId, sessionName);
+  return id;
+}
+
+function seedEvent(db: Database.Database, rigId: string, nodeId: string, type: string, payload: Record<string, unknown>) {
+  db.prepare(
+    "INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, ?, ?)"
+  ).run(rigId, nodeId, type, JSON.stringify({ ...payload, type }));
+}
+
+function seedStartupContext(db: Database.Database, nodeId: string, opts?: {
+  files?: Array<{ path: string; deliveryHint: string; required: boolean }>;
+  actions?: Array<{ type: string; value: string }>;
+  projectionEntries?: Array<Record<string, string>>;
+  runtime?: string;
+}) {
+  db.prepare(
+    "INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)"
+  ).run(
+    nodeId,
+    JSON.stringify(opts?.projectionEntries ?? []),
+    JSON.stringify(opts?.files ?? []),
+    JSON.stringify(opts?.actions ?? []),
+    opts?.runtime ?? "claude-code",
+  );
+}
+
+function mockAdapter(overrides?: Partial<RuntimeAdapter>): RuntimeAdapter {
+  return {
+    runtime: "claude-code",
+    listInstalled: vi.fn(async () => []),
+    project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+    deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+    checkReady: vi.fn(async () => ({ ready: true })),
+    launchHarness: vi.fn(async () => ({ ok: true })),
+    ...overrides,
+  };
+}
+
+describe("Node Inventory Projection", () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = createFullTestDb();
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  // Test 1: Inventory includes all nodes for a pod-aware rig
+  it("includes all nodes for a pod-aware rig", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedSession(db, "node-2", "infra-server@test-rig");
+
+    const entries = getNodeInventory(db, "rig-1");
+    expect(entries).toHaveLength(2);
+    expect(entries.find((e) => e.logicalId === "dev.impl")?.nodeId).toBe("node-1");
+    expect(entries.map((e) => e.logicalId).sort()).toEqual(["dev.impl", "infra.server"]);
+    expect(entries.every((e) => e.podNamespace === "dev")).toBe(true);
+  });
+
+  // Test 2: Inventory includes correct canonical session names
+  it("includes correct canonical session names", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+
+    const entries = getNodeInventory(db, "rig-1");
+    const agentEntry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(agentEntry?.canonicalSessionName).toBe("dev-impl@test-rig");
+  });
+
+  // Test 3: nodeKind is 'agent' for claude-code/codex, 'infrastructure' for terminal
+  it("nodeKind distinguishes agent from infrastructure", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedSession(db, "node-2", "infra-server@test-rig");
+
+    const entries = getNodeInventory(db, "rig-1");
+    const agent = entries.find((e) => e.logicalId === "dev.impl");
+    const infra = entries.find((e) => e.logicalId === "infra.server");
+    expect(agent?.nodeKind).toBe("agent");
+    expect(infra?.nodeKind).toBe("infrastructure");
+  });
+
+  // Test 4: tmuxAttachCommand computed correctly
+  it("tmuxAttachCommand computed from session name", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+
+    const entries = getNodeInventory(db, "rig-1");
+    const entry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(entry?.tmuxAttachCommand).toBe("tmux attach -t dev-impl@test-rig");
+  });
+
+  it("tmuxAttachCommand names the daemon's tmux server when it isn't the default one", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    setDaemonTmuxServer(["-L", "person"]);
+    try {
+      const entry = getNodeInventory(db, "rig-1").find((e) => e.logicalId === "dev.impl");
+      expect(entry?.tmuxAttachCommand).toBe("tmux -L person attach -t dev-impl@test-rig");
+    } finally {
+      setDaemonTmuxServer([]);
+    }
+  });
+
+  // Test 5: resumeCommand uses correct runtime syntax
+  it("resumeCommand uses correct runtime syntax", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", {
+      resumeType: "claude",
+      resumeToken: "abc-123-def",
+    });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const entry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(entry?.resumeCommand).toBe("claude --resume 'abc-123-def'");
+  });
+
+  // Test 6: resumeCommand is null when no resume token
+  it("resumeCommand is null when no resume token", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+
+    const entries = getNodeInventory(db, "rig-1");
+    const entry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(entry?.resumeCommand).toBeNull();
+  });
+
+  it("recoveryGuidance prefers native Claude resume but includes picker fallback", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", {
+      resumeToken: "abc-123-def",
+    });
+
+    // OPR.0.4.0.26: recoveryGuidance is relocated off the LIST onto the
+    // single-node detail path. The LIST entry no longer inlines it.
+    const entry = getNodeInventory(db, "rig-1").find((e) => e.logicalId === "dev.impl");
+    expect(entry?.recoveryGuidance).toBeNull();
+    const detail = getNodeDetail(db, "rig-1", "dev.impl");
+    expect(detail?.recoveryGuidance?.summary).toContain("native Claude resume");
+    expect(detail?.recoveryGuidance?.commands).toContain("claude --resume 'abc-123-def' --name 'dev-impl@test-rig'");
+    expect(detail?.recoveryGuidance?.commands).toContain("cd /project");
+    expect(detail?.recoveryGuidance?.commands).toContain("claude --resume");
+    expect(detail?.recoveryGuidance?.notes).toContain("Look for session name: dev-impl@test-rig");
+    expect(detail?.recoveryGuidance?.notes).toContain("Choose the full conversation option, not summary.");
+  });
+
+  it("recoveryGuidance for Codex without token uses workspace-local picker fallback", () => {
+    db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("rig-2", "test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)").run("pod-2", "rig-2", "dev", "Dev");
+    db.prepare(
+      "INSERT INTO nodes (id, rig_id, logical_id, runtime, cwd, pod_id, agent_ref, profile, resolved_spec_name, resolved_spec_version, resolved_spec_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run("node-codex", "rig-2", "dev.qa", "codex", "/workspace/app", "pod-2", "local:agents/qa", "default", "qa", "1.0.0", "hash");
+    seedSession(db, "node-codex", "dev-qa@test-rig");
+
+    const entry = getNodeInventory(db, "rig-2").find((e) => e.logicalId === "dev.qa");
+    expect(entry?.resumeCommand).toBeNull();
+    expect(entry?.recoveryGuidance).toBeNull(); // relocated to detail
+    const detail = getNodeDetail(db, "rig-2", "dev.qa");
+    expect(detail?.recoveryGuidance?.summary).toContain("codex -s workspace-write resume --last");
+    expect(detail?.recoveryGuidance?.summary).toContain("explicit -s workspace-write floor flag");
+    expect(detail?.recoveryGuidance?.commands).toEqual(["cd /workspace/app", "codex -s workspace-write resume --last"]);
+    expect(detail?.recoveryGuidance?.notes).toContain("Use workspace and recent prompt text to identify the right conversation.");
+    expect(detail?.recoveryGuidance?.notes).toContain("If the identity anchor was captured, the picker may include: dev-qa@test-rig");
+  });
+
+  it("resumeCommand and recoveryGuidance preserve Codex config profile", () => {
+    db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("rig-2", "test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)").run("pod-2", "rig-2", "platform", "Platform");
+    db.prepare(
+      "INSERT INTO nodes (id, rig_id, logical_id, runtime, codex_config_profile, cwd, pod_id, agent_ref, profile, resolved_spec_name, resolved_spec_version, resolved_spec_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run("node-codex", "rig-2", "platform.mac-admin", "codex", "sysadmin", "/Users/example", "pod-2", "local:agents/mac-admin", "default", "mac-admin", "1.0.0", "hash");
+    seedSession(db, "node-codex", "platform-mac-admin@kernel", {
+      resumeType: "codex_id",
+      resumeToken: "sess-456",
+    });
+
+    const entry = getNodeInventory(db, "rig-2").find((e) => e.logicalId === "platform.mac-admin");
+
+    expect(entry?.codexConfigProfile).toBe("sysadmin");
+    expect(entry?.resumeCommand).toBe("codex -p 'sysadmin' resume 'sess-456'");
+    expect(entry?.recoveryGuidance).toBeNull(); // relocated to detail
+    const detail = getNodeDetail(db, "rig-2", "platform.mac-admin");
+    expect(detail?.codexConfigProfile).toBe("sysadmin");
+    expect(detail?.recoveryGuidance?.commands).toContain("codex -p 'sysadmin' resume 'sess-456'");
+    expect(detail?.recoveryGuidance?.notes).toContain("Preserve Codex config profile: sysadmin");
+  });
+
+  // Test 7: startupStatus reflects session startup_status column
+  it("startupStatus reflects session startup_status", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", { startupStatus: "failed" });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const entry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(entry?.startupStatus).toBe("failed");
+  });
+
+  // Test 8: restoreOutcome populated from restore.completed event
+  it("restoreOutcome = 'resumed' from restore.completed event", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedEvent(db, "rig-1", "node-1", "restore.completed", {
+      rigId: "rig-1",
+      snapshotId: "snap-1",
+      result: {
+        snapshotId: "snap-1",
+        preRestoreSnapshotId: "snap-0",
+        nodes: [
+          { nodeId: "node-1", logicalId: "dev.impl", status: "resumed" },
+          { nodeId: "node-2", logicalId: "infra.server", status: "failed" },
+        ],
+        warnings: [],
+      },
+    });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const agent = entries.find((e) => e.logicalId === "dev.impl");
+    const infra = entries.find((e) => e.logicalId === "infra.server");
+    expect(agent?.restoreOutcome).toBe("resumed");
+    expect(infra?.restoreOutcome).toBe("failed");
+  });
+
+  // OPR.0.3.4.6 — cross-surface regression guard: restoreOutcome attention_required
+  // projects to both restoreOutcome=attention_required AND lifecycleState=attention_required.
+  it("OPR.0.3.4.6 guard: restoreOutcome attention_required projects to node lifecycleState attention_required (never failed)", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedEvent(db, "rig-1", "node-1", "restore.completed", {
+      rigId: "rig-1",
+      snapshotId: "snap-1",
+      result: {
+        snapshotId: "snap-1",
+        preRestoreSnapshotId: "snap-0",
+        nodes: [
+          { nodeId: "node-1", logicalId: "dev.impl", status: "attention_required" },
+        ],
+        warnings: [],
+      },
+    });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const node = entries.find((e) => e.logicalId === "dev.impl");
+    expect(node?.restoreOutcome).toBe("attention_required");
+    expect(node?.lifecycleState).toBe("attention_required");
+    expect(node?.lifecycleState).not.toBe("failed");
+  });
+
+  // Resume state naming: rebuilt and fresh outcomes from inventory
+  it("restoreOutcome maps checkpoint_written to 'rebuilt' and fresh_no_checkpoint to 'fresh'", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedSession(db, "node-2", "infra-server@test-rig");
+    seedEvent(db, "rig-1", "node-1", "restore.completed", {
+      rigId: "rig-1",
+      snapshotId: "snap-1",
+      result: {
+        snapshotId: "snap-1",
+        preRestoreSnapshotId: "snap-0",
+        nodes: [
+          { nodeId: "node-1", logicalId: "dev.impl", status: "rebuilt" },
+          { nodeId: "node-2", logicalId: "infra.server", status: "fresh" },
+        ],
+        warnings: [],
+      },
+    });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const agent = entries.find((e) => e.logicalId === "dev.impl");
+    const infra = entries.find((e) => e.logicalId === "infra.server");
+    expect(agent?.restoreOutcome).toBe("rebuilt");
+    expect(infra?.restoreOutcome).toBe("fresh");
+  });
+
+  // Test 9: latestError populated from startup_failed events
+  it("latestError from startup_failed event", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", { startupStatus: "failed" });
+    seedEvent(db, "rig-1", "node-1", "node.startup_failed", {
+      rigId: "rig-1",
+      nodeId: "node-1",
+      error: "harness launch timeout after 30s",
+    });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const entry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(entry?.latestError).toBe("harness launch timeout after 30s");
+  });
+
+  it("clears stale latestError when the newest session is ready", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", { startupStatus: "ready" });
+    seedEvent(db, "rig-1", "node-1", "node.startup_failed", {
+      rigId: "rig-1",
+      nodeId: "node-1",
+      error: "old startup failure",
+    });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const entry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(entry?.latestError).toBeNull();
+  });
+
+  it("clears stale attention_required residue when the newest session is ready", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig-old", { id: "sess-node-1-0001", startupStatus: "attention_required" });
+    seedSession(db, "node-1", "dev-impl@test-rig", { id: "sess-node-1-0002", startupStatus: "ready" });
+    seedEvent(db, "rig-1", "node-1", "node.startup_failed", {
+      rigId: "rig-1",
+      nodeId: "node-1",
+      error: "Claude was waiting for trust approval",
+    });
+
+    const entries = getNodeInventory(db, "rig-1");
+    const entry = entries.find((e) => e.logicalId === "dev.impl");
+    expect(entry?.startupStatus).toBe("ready");
+    expect(entry?.latestError).toBeNull();
+  });
+
+  // Test 10: Legacy rigs produce inventory with legacy session names
+  it("legacy rigs produce inventory with legacy session names", () => {
+    db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("rig-leg", "r01");
+    db.prepare(
+      "INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES (?, ?, ?, ?)"
+    ).run("node-leg", "rig-leg", "worker", "claude-code");
+    seedSession(db, "node-leg", "r01-worker");
+
+    const entries = getNodeInventory(db, "rig-leg");
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.canonicalSessionName).toBe("r01-worker");
+    expect(entries[0]!.nodeKind).toBe("agent");
+    expect(entries[0]!.podId).toBeNull();
+  });
+
+  // Test 11: getNodeDetail returns startupFiles from node_startup_context
+  it("getNodeDetail returns startupFiles from node_startup_context", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedStartupContext(db, "node-1", {
+      files: [
+        { path: "role.md", deliveryHint: "send_text", required: true },
+        { path: "culture.md", deliveryHint: "guidance_merge", required: false },
+      ],
+    });
+
+    const detail = getNodeDetail(db, "rig-1", "dev.impl");
+    expect(detail).not.toBeNull();
+    expect(detail!.startupFiles).toHaveLength(2);
+    expect(detail!.startupFiles[0]!.path).toBe("role.md");
+    // Binding.id regression: must match the real PK from bindings table
+    expect(detail!.binding).not.toBeNull();
+    expect(detail!.binding!.id).toBe("bind-node-1");
+  });
+
+  // Test 12: getNodeDetail returns recentEvents using events.node_id
+  it("getNodeDetail returns recentEvents for the node", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedEvent(db, "rig-1", "node-1", "node.startup_pending", { rigId: "rig-1", nodeId: "node-1" });
+    seedEvent(db, "rig-1", "node-1", "node.startup_ready", { rigId: "rig-1", nodeId: "node-1" });
+    // Event for a different node — should not appear
+    seedEvent(db, "rig-1", "node-2", "node.startup_pending", { rigId: "rig-1", nodeId: "node-2" });
+
+    const detail = getNodeDetail(db, "rig-1", "dev.impl");
+    expect(detail).not.toBeNull();
+    expect(detail!.recentEvents).toHaveLength(2);
+    expect(detail!.recentEvents.map((e) => e.type)).toEqual(["node.startup_ready", "node.startup_pending"]);
+  });
+
+  // Test 13: getNodeDetail installedResources fallback from startup context projection
+  it("getNodeDetail installedResources from startup context projection fallback", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    seedStartupContext(db, "node-1", {
+      // Use real persisted shape from startup-orchestrator.ts line 139
+      projectionEntries: [
+        { effectiveId: "skill-1", category: "skills", target: ".claude/skills/skill-1", sourceSpec: "impl", sourcePath: "skills/s1", resourcePath: "s1", absolutePath: "/project/agents/impl/skills/s1", mergeStrategy: "overwrite" },
+        { effectiveId: "guidance-1", category: "guidance", target: "CLAUDE.md", sourceSpec: "impl", sourcePath: "guidance.md", resourcePath: "guidance.md", absolutePath: "/project/agents/impl/guidance.md", mergeStrategy: "append" },
+      ],
+    });
+
+    const detail = getNodeDetail(db, "rig-1", "dev.impl");
+    expect(detail).not.toBeNull();
+    expect(detail!.installedResources).toHaveLength(2);
+    expect(detail!.installedResources[0]!.id).toBe("skill-1");
+    expect(detail!.installedResources[0]!.targetPath).toBe(".claude/skills/skill-1");
+  });
+
+  // Test 14: getNodeDetail infrastructureStartupCommand from terminal send_text
+  it("getNodeDetail infrastructureStartupCommand for terminal node", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-2", "infra-server@test-rig");
+    seedStartupContext(db, "node-2", {
+      actions: [
+        { type: "send_text", value: "npm run dev" },
+        { type: "send_text", value: "echo ready" },
+      ],
+      runtime: "terminal",
+    });
+
+    const detail = getNodeDetail(db, "rig-1", "infra.server");
+    expect(detail).not.toBeNull();
+    expect(detail!.infrastructureStartupCommand).toBe("npm run dev");
+    expect(detail!.nodeKind).toBe("infrastructure");
+  });
+
+  // Test 15: getNodeDetail installedResources adapter-backed path
+  it("getNodeDetail installedResources via adapter listInstalled", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    const adapter = mockAdapter({
+      listInstalled: vi.fn(() => [
+        { effectiveId: "live-skill", category: "skills", installedPath: ".claude/skills/live" },
+      ]),
+    });
+
+    const detail = getNodeDetail(db, "rig-1", "dev.impl", {
+      adapters: { "claude-code": adapter },
+    });
+    expect(detail).not.toBeNull();
+    expect(detail!.installedResources).toHaveLength(1);
+    expect(detail!.installedResources[0]!.id).toBe("live-skill");
+  });
+
+  // L2 lifecycleState projection
+  describe("lifecycleState (L2)", () => {
+    function seedSnapshotForRig(rigId: string, sessions: Array<{ nodeId: string; resumeToken: string | null }>): void {
+      const data = {
+        rig: { id: rigId, name: "rig-name", createdAt: "2026-04-28T00:00:00Z", updatedAt: "2026-04-28T00:00:00Z" },
+        nodes: [],
+        edges: [],
+        sessions: sessions.map((s, i) => ({
+          id: `sess-snap-${i}`,
+          nodeId: s.nodeId,
+          sessionName: `tmux-${s.nodeId}`,
+          status: "detached",
+          resumeType: s.resumeToken ? "claude" : null,
+          resumeToken: s.resumeToken,
+          restorePolicy: "resume_if_possible",
+          lastSeenAt: null,
+          createdAt: "2026-04-28T00:00:00Z",
+          origin: "launched" as const,
+          startupStatus: "ready" as const,
+          startupCompletedAt: null,
+        })),
+        checkpoints: {},
+      };
+      db.prepare("INSERT INTO snapshots (id, rig_id, kind, status, data) VALUES (?, ?, ?, ?, ?)")
+        .run(`snap-${rigId}`, rigId, "manual", "complete", JSON.stringify(data));
+    }
+
+    it("running session -> lifecycleState=running", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig", { status: "running" });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.lifecycleState).toBe("running");
+    });
+
+    it("detached session + usable snapshot with token for THIS node -> lifecycleState=recoverable", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig", { status: "detached" });
+      seedSnapshotForRig("rig-1", [{ nodeId: "node-1", resumeToken: "abc-123" }]);
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.lifecycleState).toBe("recoverable");
+    });
+
+    it("detached session + snapshot exists but resume token is null for this node -> lifecycleState=detached", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig", { status: "detached" });
+      // Snapshot has token for a DIFFERENT node, not this one
+      seedSnapshotForRig("rig-1", [{ nodeId: "node-2", resumeToken: "xyz-789" }]);
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.lifecycleState).toBe("detached");
+    });
+
+    it("detached session + no snapshot -> lifecycleState=detached", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig", { status: "detached" });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.lifecycleState).toBe("detached");
+    });
+
+    it("restoreOutcome=failed + tmux session alive -> lifecycleState=attention_required (Claude resume-prompt proxy)", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig", { status: "running" });
+      // Persist a restore.completed event with this node failed
+      seedEvent(db, "rig-1", "node-1", "restore.completed", {
+        result: { rigResult: "partially_restored", nodes: [{ nodeId: "node-1", status: "failed" }] },
+      });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.restoreOutcome).toBe("failed");
+      expect(entry?.lifecycleState).toBe("attention_required");
+    });
+
+    it("exited session + no snapshot -> lifecycleState=detached", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig", { status: "exited" });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.lifecycleState).toBe("detached");
+    });
+  });
+
+  describe("deriveRestoreOutcome per-node-latest (OPR.0.3.4.11)", () => {
+    it("reads restore.subset_completed for a target node", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig");
+      seedEvent(db, "rig-1", "node-1", "restore.subset_completed", {
+        rigId: "rig-1",
+        snapshotId: "snap-1",
+        result: {
+          snapshotId: "snap-1",
+          nodes: [
+            { nodeId: "node-1", logicalId: "dev.impl", status: "resumed" },
+          ],
+          warnings: [],
+        },
+      });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const agent = entries.find((e) => e.logicalId === "dev.impl");
+      expect(agent?.restoreOutcome).toBe("resumed");
+    });
+
+    it("non-target node keeps prior restore.completed outcome after restore.subset_completed", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig");
+      seedSession(db, "node-2", "infra-server@test-rig");
+      // Prior full restore: node-2 was attention_required
+      seedEvent(db, "rig-1", "node-2", "restore.completed", {
+        rigId: "rig-1",
+        snapshotId: "snap-0",
+        result: {
+          snapshotId: "snap-0",
+          nodes: [
+            { nodeId: "node-1", logicalId: "dev.impl", status: "resumed" },
+            { nodeId: "node-2", logicalId: "infra.server", status: "attention_required" },
+          ],
+          warnings: [],
+        },
+      });
+      // Later subset launch: only node-1
+      seedEvent(db, "rig-1", "node-1", "restore.subset_completed", {
+        rigId: "rig-1",
+        snapshotId: "snap-1",
+        result: {
+          snapshotId: "snap-1",
+          nodes: [
+            { nodeId: "node-1", logicalId: "dev.impl", status: "resumed" },
+          ],
+          warnings: [],
+        },
+      });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const target = entries.find((e) => e.logicalId === "dev.impl");
+      const nonTarget = entries.find((e) => e.logicalId === "infra.server");
+      expect(target?.restoreOutcome).toBe("resumed");
+      // Non-target keeps its prior outcome, NOT clobbered to n-a
+      expect(nonTarget?.restoreOutcome).toBe("attention_required");
+    });
+
+    it("never-restored node remains n-a even after subset_completed for other nodes", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig");
+      seedEvent(db, "rig-1", "node-1", "restore.subset_completed", {
+        rigId: "rig-1",
+        snapshotId: "snap-1",
+        result: {
+          snapshotId: "snap-1",
+          nodes: [
+            { nodeId: "node-1", logicalId: "dev.impl", status: "resumed" },
+          ],
+          warnings: [],
+        },
+      });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const other = entries.find((e) => e.logicalId === "infra.server");
+      expect(other?.restoreOutcome).toBe("n-a");
+    });
+  });
+
+  describe("heldReason (OPR.0.3.4.11)", () => {
+    it("derives heldReason from node.held event", () => {
+      seedPodAwareRig(db);
+      seedEvent(db, "rig-1", "node-2", "node.held", {
+        rigId: "rig-1",
+        nodeId: "node-2",
+        logicalId: "infra.server",
+        reason: "codex auth expired",
+      });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const held = entries.find((e) => e.logicalId === "infra.server");
+      expect(held?.heldReason).toBe("codex auth expired");
+    });
+
+    it("heldReason is null when no node.held event exists", () => {
+      seedPodAwareRig(db);
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.heldReason).toBeNull();
+    });
+
+    it("heldReason is superseded (null) when node has a running session", () => {
+      seedPodAwareRig(db);
+      seedEvent(db, "rig-1", "node-1", "node.held", {
+        rigId: "rig-1",
+        nodeId: "node-1",
+        logicalId: "dev.impl",
+        reason: "excluded_from_subset",
+      });
+      seedSession(db, "node-1", "dev-impl@test-rig", { status: "running" });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.heldReason).toBeNull();
+    });
+
+    it("heldReason is superseded by a newer restore.subset_completed containing the node (rig-scoped event, no node_id)", () => {
+      seedPodAwareRig(db);
+      // First: held (node-scoped)
+      seedEvent(db, "rig-1", "node-1", "node.held", {
+        rigId: "rig-1",
+        nodeId: "node-1",
+        logicalId: "dev.impl",
+        reason: "excluded_from_subset",
+      });
+      // Then: launched via subset — rig-scoped event (node_id NULL in production)
+      db.prepare(
+        "INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, NULL, ?, ?)"
+      ).run("rig-1", "restore.subset_completed", JSON.stringify({
+        type: "restore.subset_completed",
+        rigId: "rig-1",
+        snapshotId: "snap-2",
+        result: {
+          snapshotId: "snap-2",
+          nodes: [
+            { nodeId: "node-1", logicalId: "dev.impl", status: "resumed" },
+          ],
+          warnings: [],
+        },
+      }));
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.heldReason).toBeNull();
+    });
+  });
+
+  describe("deriveRestoreOutcome folds restore.outcome_reconciled (OPR.0.4.0.16)", () => {
+    it("reconcile event overrides earlier failed restore outcome", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig");
+      seedEvent(db, "rig-1", "node-1", "restore.completed", {
+        rigId: "rig-1", snapshotId: "snap-1",
+        result: { snapshotId: "snap-1", nodes: [{ nodeId: "node-1", logicalId: "dev.impl", status: "failed" }], warnings: [] },
+      });
+      db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, ?, ?)").run(
+        "rig-1", "node-1", "restore.outcome_reconciled",
+        JSON.stringify({ type: "restore.outcome_reconciled", rigId: "rig-1", nodeId: "node-1", attemptId: 1, from: "failed", to: "operator_recovered", evidence: { source: "strict" } }),
+      );
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.restoreOutcome).toBe("operator_recovered");
+    });
+
+    it("newer failed restore outcome is NOT overridden by older reconcile", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig");
+      db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, ?, ?)").run(
+        "rig-1", "node-1", "restore.outcome_reconciled",
+        JSON.stringify({ type: "restore.outcome_reconciled", rigId: "rig-1", nodeId: "node-1", attemptId: 1, from: "failed", to: "operator_recovered", evidence: { source: "strict" } }),
+      );
+      seedEvent(db, "rig-1", "node-1", "restore.completed", {
+        rigId: "rig-1", snapshotId: "snap-2",
+        result: { snapshotId: "snap-2", nodes: [{ nodeId: "node-1", logicalId: "dev.impl", status: "failed" }], warnings: [] },
+      });
+
+      const entries = getNodeInventory(db, "rig-1");
+      const entry = entries.find((e) => e.logicalId === "dev.impl");
+      expect(entry?.restoreOutcome).toBe("failed");
+    });
+
+    it("reconcile for one node does not affect another node", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig");
+      seedSession(db, "node-2", "infra-server@test-rig");
+      seedEvent(db, "rig-1", "node-1", "restore.completed", {
+        rigId: "rig-1", snapshotId: "snap-1",
+        result: { snapshotId: "snap-1", nodes: [
+          { nodeId: "node-1", logicalId: "dev.impl", status: "failed" },
+          { nodeId: "node-2", logicalId: "infra.server", status: "failed" },
+        ], warnings: [] },
+      });
+      db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, ?, ?)").run(
+        "rig-1", "node-1", "restore.outcome_reconciled",
+        JSON.stringify({ type: "restore.outcome_reconciled", rigId: "rig-1", nodeId: "node-1", attemptId: 1, from: "failed", to: "operator_recovered", evidence: { source: "strict" } }),
+      );
+
+      const entries = getNodeInventory(db, "rig-1");
+      expect(entries.find((e) => e.logicalId === "dev.impl")?.restoreOutcome).toBe("operator_recovered");
+      expect(entries.find((e) => e.logicalId === "infra.server")?.restoreOutcome).toBe("failed");
+    });
+
+    it("no reconcile event leaves failed restore outcome unchanged", () => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig");
+      seedEvent(db, "rig-1", "node-1", "restore.completed", {
+        rigId: "rig-1", snapshotId: "snap-1",
+        result: { snapshotId: "snap-1", nodes: [{ nodeId: "node-1", logicalId: "dev.impl", status: "failed" }], warnings: [] },
+      });
+
+      const entries = getNodeInventory(db, "rig-1");
+      expect(entries.find((e) => e.logicalId === "dev.impl")?.restoreOutcome).toBe("failed");
+    });
+  });
+});
+
+// OPR.0.4.0.26 — node-LIST payload source dedupe. The LIST drops the heavy
+// per-node recoveryGuidance prose and the currentUsage blob; the full data
+// is RELOCATED (not deleted) onto the single-node detail / whoami path.
+describe("OPR.0.4.0.26 — node-list payload source dedupe", () => {
+  let db: Database.Database;
+  beforeEach(() => { db = createFullTestDb(); });
+  afterEach(() => { db.close(); });
+
+  // A quote-free marker inside the blob so substring checks survive JSON
+  // escaping when the value is serialized inside a larger payload.
+  const HEAVY_BLOB_MARKER = "ZZHEAVYCURRENTUSAGEBLOBZZ";
+  const HEAVY_CURRENT_USAGE = JSON.stringify({ model_context_window: 258400, blob: HEAVY_BLOB_MARKER + "x".repeat(4000) });
+
+  function fullUsage(): ContextUsage {
+    return {
+      availability: "known",
+      reason: null,
+      source: "codex_token_count_jsonl",
+      usedPercentage: 42,
+      remainingPercentage: 58,
+      contextWindowSize: 200000,
+      totalInputTokens: 1000,
+      totalOutputTokens: 2000,
+      currentUsage: HEAVY_CURRENT_USAGE,
+      transcriptPath: null,
+      sessionId: "sess-x",
+      sessionName: "dev-impl@test-rig",
+      sampledAt: "2026-06-20T00:00:00.000Z",
+      fresh: true,
+    };
+  }
+
+  // Stub store: returns the full usage for every node so we can observe the
+  // list-vs-detail split without persisting real samples.
+  function stubStore(): ContextUsageStore {
+    return {
+      getForNodes: (entries: Array<{ nodeId: string }>) =>
+        new Map(entries.map((e) => [e.nodeId, fullUsage()])),
+      getForNode: () => fullUsage(),
+      unknownUsage: () => ({ ...fullUsage(), availability: "unknown", reason: "no_data" }),
+    } as unknown as ContextUsageStore;
+  }
+
+  it("LIST omits recoveryGuidance (relocated to detail)", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", { resumeToken: "abc-123-def" });
+
+    const listEntry = getNodeInventory(db, "rig-1").find((e) => e.logicalId === "dev.impl");
+    expect(listEntry?.recoveryGuidance).toBeNull();
+
+    const detail = getNodeDetail(db, "rig-1", "dev.impl");
+    expect(detail?.recoveryGuidance).not.toBeNull();
+    expect(detail?.recoveryGuidance?.summary).toBeTruthy();
+  });
+
+  it("LIST contextUsage drops currentUsage but keeps every scalar", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+
+    const listEntry = getNodeInventoryWithContext(db, "rig-1", stubStore())
+      .find((e) => e.logicalId === "dev.impl");
+    const ctx = listEntry?.contextUsage;
+    // The heavy blob is gone from the LIST...
+    expect(ctx?.currentUsage).toBeNull();
+    // ...but the scalars the ring/table/filter consumers use are intact.
+    expect(ctx?.usedPercentage).toBe(42);
+    expect(ctx?.remainingPercentage).toBe(58);
+    expect(ctx?.contextWindowSize).toBe(200000);
+    expect(ctx?.totalInputTokens).toBe(1000);
+    expect(ctx?.totalOutputTokens).toBe(2000);
+    expect(ctx?.sampledAt).toBe("2026-06-20T00:00:00.000Z");
+    expect(ctx?.fresh).toBe(true);
+    expect(ctx?.source).toBe("codex_token_count_jsonl");
+    expect(ctx?.availability).toBe("known");
+  });
+
+  it("LIST exposes per-seat transcript ingest health from the capture store", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    const getIngestHealth = vi.fn(() => ({
+      state: "degraded",
+      reason: "capture_stale",
+      lastCapturedAt: "2026-08-02T08:00:00.000Z",
+    }));
+    const getWithTranscriptHealth = getNodeInventoryWithContext as unknown as (
+      db: Database.Database,
+      rigId: string,
+      contextStore: ContextUsageStore,
+      transcriptStore: { getIngestHealth: typeof getIngestHealth },
+    ) => ReturnType<typeof getNodeInventoryWithContext>;
+
+    const entry = getWithTranscriptHealth(db, "rig-1", stubStore(), { getIngestHealth })
+      .find((candidate) => candidate.logicalId === "dev.impl");
+
+    expect(getIngestHealth).toHaveBeenCalledWith("test-rig", "dev-impl@test-rig");
+    expect(entry?.transcriptIngest).toEqual({
+      state: "degraded",
+      runtime: "claude-code",
+      reason: "capture_stale",
+      lastCapturedAt: "2026-08-02T08:00:00.000Z",
+    });
+  });
+
+  it("DETAIL contextUsage retains the full currentUsage (relocation, not loss)", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+
+    const detail = getNodeDetailWithContext(db, "rig-1", "dev.impl", stubStore());
+    expect(detail?.contextUsage?.currentUsage).toBe(HEAVY_CURRENT_USAGE);
+    // Detail also carries full recoveryGuidance.
+    expect(detail?.recoveryGuidance).not.toBeNull();
+  });
+
+  it("AC-1: LIST JSON omits the heavy blobs; DETAIL JSON keeps them (slimmed + relocated)", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", { resumeToken: "abc-123-def" });
+
+    const listJson = JSON.stringify(getNodeInventoryWithContext(db, "rig-1", stubStore()));
+    // The heavy currentUsage blob and the per-node guidance prose are NOT in
+    // the LIST payload — the two source hogs no longer dominate.
+    expect(listJson).not.toContain(HEAVY_BLOB_MARKER);
+    expect(listJson).not.toContain("Choose the full conversation option");
+    expect(listJson).toContain('"recoveryGuidance":null');
+
+    const detailJson = JSON.stringify(getNodeDetailWithContext(db, "rig-1", "dev.impl", stubStore()));
+    // The full data remains retrievable on the single-node DETAIL path.
+    expect(detailJson).toContain(HEAVY_BLOB_MARKER);
+    expect(detailJson).toContain("Choose the full conversation option");
+  });
+});

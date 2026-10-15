@@ -1,0 +1,741 @@
+// release-0.3.2 slice 12 — filesystem + git helpers shared across
+// `rig scope` verbs. Mission/slice discovery, frontmatter parse/write,
+// auto-numbering, git mv wrapper. Keeps slice/mission command files
+// thin.
+
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import YAML from "yaml";
+import { ConfigStore } from "../../config-store.js";
+
+import type {
+  MissionInfo,
+  SliceInfo,
+  SliceState,
+} from "./types.js";
+import { ScopeCliError } from "./types.js";
+import {
+  DEFAULT_PROJECT_PREFIX,
+  inferMissionDotId,
+  nextEscapeBandOrdinal,
+} from "./dot-id.js";
+import { deriveMissionDependencyGraph, type MissionDependencyGraph } from "./scope-audit.js";
+
+const SLICE_DIRNAME_RE = /^(\d+)-(.+)$/;
+
+// ---------------------------------------------------------------------
+// Frontmatter parse + write
+// ---------------------------------------------------------------------
+
+/** Split a markdown file into [frontmatter, body]. Returns `[{}, content]`
+ *  when no frontmatter delimiter is present. */
+export function splitFrontmatter(content: string): {
+  frontmatter: Record<string, unknown>;
+  body: string;
+} {
+  const opening = /^---[ \t]*\r?\n/.exec(content);
+  if (!opening) return { frontmatter: {}, body: content };
+  const rest = content.slice(opening[0].length);
+  const closing = /^---[ \t]*(?:\r?\n|(?![\s\S]))/m.exec(rest);
+  if (!closing) return { frontmatter: {}, body: content };
+  return {
+    frontmatter: parseYamlSafely(rest.slice(0, closing.index)),
+    body: rest.slice(closing.index + closing[0].length),
+  };
+}
+
+function parseYamlSafely(raw: string): Record<string, unknown> {
+  try {
+    const parsed = YAML.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Re-stitch frontmatter + body into a single markdown string. */
+export function joinFrontmatter(
+  frontmatter: Record<string, unknown>,
+  body: string,
+): string {
+  const yaml = YAML.stringify(frontmatter, { lineWidth: 0 }).trim();
+  const trailing = body.startsWith("\n") ? "" : "\n";
+  return `---\n${yaml}\n---\n${trailing}${body}`;
+}
+
+/** Read + parse frontmatter from a markdown file. Returns `{}` if the
+ *  file is missing OR has no frontmatter (graceful for placeholder
+ *  missions that pre-date the convention). */
+export function readFrontmatter(absPath: string): Record<string, unknown> {
+  try {
+    return splitFrontmatter(fs.readFileSync(absPath, "utf8")).frontmatter;
+  } catch {
+    return {};
+  }
+}
+
+/** Update specific keys in a markdown file's frontmatter. The writer owns only
+ *  those keys in valid mappings, preserving inline comments and unowned bytes.
+ *  Invalid mappings retain the legacy line-based update with a warning. Valid
+ *  mappings are matched by decoded YAML key identity and spliced by source range;
+ *  re-serializing the whole block destroys author quoting, folded scalars,
+ *  ordering, and therefore any hash derived before a repair. */
+export function updateFrontmatter(
+  absPath: string,
+  updates: Record<string, unknown>,
+): void {
+  const original = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf8") : "";
+  const match = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?=\r?\n|$)/.exec(original);
+  if (!match) {
+    const yaml = YAML.stringify(updates, { lineWidth: 0 }).trimEnd();
+    const separator = original.startsWith("\n") ? "" : "\n";
+    fs.writeFileSync(absPath, `---\n${yaml}\n---\n${separator}${original}`, "utf8");
+    return;
+  }
+
+  const originalBlock = match[1]!;
+  const blockStart = original.indexOf("\n") + 1;
+  const blockEnd = blockStart + originalBlock.length;
+  const newline = original.slice(blockEnd, blockEnd + 2) === "\r\n" ? "\r\n" : "\n";
+  let block: string;
+  try {
+    block = updateMappedFrontmatter(original.slice(blockStart, blockEnd), updates, newline, absPath);
+  } catch (error) {
+    if (!(error instanceof ScopeCliError)) throw error;
+    console.warn(`[warn] ${absPath}: frontmatter isn't valid YAML; using line-based updates. Listing cannot read its fields until the YAML is fixed.`);
+    // Start again from the original block, including when a splice removed a used anchor.
+    block = updateFrontmatterLines(originalBlock, updates);
+    const updated = original.slice(0, match.index) + `---\n${block}\n---` + original.slice(match.index + match[0].length);
+    fs.writeFileSync(absPath, updated, "utf8");
+    return;
+  }
+  fs.writeFileSync(absPath, original.slice(0, blockStart) + block + original.slice(blockEnd), "utf8");
+}
+
+/** Keep main's line-based update for YAML that cannot use source-range splicing. */
+function updateFrontmatterLines(block: string, updates: Record<string, unknown>): string {
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) continue;
+    const rendered = YAML.stringify({ [key]: value }, { lineWidth: 0 }).trimEnd();
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const keyRe = new RegExp(
+      `^${escaped}:[^\\n]*(?:\\n[ \\t]+[^\\n]*|\\n(?=(?:\\n)*[ \\t]+))*`,
+      "m",
+    );
+    const existing = keyRe.exec(block);
+    if (existing) {
+      block = block.slice(0, existing.index) + rendered + block.slice(existing.index + existing[0].length);
+    } else {
+      block = block.length > 0 ? `${block}\n${rendered}` : rendered;
+    }
+  }
+  return block;
+}
+
+function updateMappedFrontmatter(
+  block: string,
+  updates: Record<string, unknown>,
+  newline: string,
+  absPath: string,
+): string {
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) continue;
+    const mapping = frontmatterMapping(block, absPath);
+    const flow = mapping?.flow === true;
+    let rendered = YAML.stringify({ [key]: value }, { lineWidth: 0, collectionStyle: flow ? "flow" : "block" }).trimEnd();
+    if (flow) rendered = rendered.slice(1, -1).trim();
+    const existing = mapping?.items.find((pair) => YAML.isScalar(pair.key) && pair.key.value === key);
+    if (existing && YAML.isScalar(existing.key)) {
+      const start = existing.srcToken?.start.find((token) => token.type === "explicit-key-ind")?.offset ?? existing.key.range?.[0];
+      const end = YAML.isNode(existing.value) ? existing.value.range?.[1] : undefined;
+      if (start === undefined || end === undefined) refuseFrontmatterUpdate(absPath);
+      const ending = block.slice(start, end).endsWith("\n") ? newline : "";
+      block = block.slice(0, start) + rendered + ending + block.slice(end);
+    } else if (flow && mapping) {
+      const closing = mapping.range?.[1];
+      if (closing === undefined || block[closing - 1] !== "}") refuseFrontmatterUpdate(absPath);
+      const token = mapping.srcToken;
+      const last = token?.type === "flow-collection" ? token.items.at(-1) : undefined;
+      const trailingComma = last?.key === undefined && last?.start.some((entry) => entry.type === "comma");
+      const separator = mapping.items.length === 0 || trailingComma ? "" : ", ";
+      block = block.slice(0, closing - 1) + separator + rendered + block.slice(closing - 1);
+    } else {
+      block = block.length > 0 ? `${block}${newline}${rendered}` : rendered;
+    }
+  }
+  // Validate before writing; the caller falls back if a replaced anchor is still used.
+  frontmatterMapping(block, absPath);
+  return block;
+}
+
+function frontmatterMapping(block: string, absPath: string) {
+  const document = YAML.parseDocument(block, { keepSourceTokens: true });
+  if (document.errors.length > 0 || (document.contents !== null && !YAML.isMap(document.contents))) refuseFrontmatterUpdate(absPath);
+  try {
+    document.toJS();
+  } catch {
+    refuseFrontmatterUpdate(absPath);
+  }
+  return document.contents;
+}
+
+function refuseFrontmatterUpdate(absPath: string): never {
+  throw new ScopeCliError({
+    fact: `Frontmatter in ${absPath} cannot be updated as a valid YAML mapping.`,
+    consequence: "Authored file bytes were not changed.",
+    action: "Correct invalid YAML, duplicate keys, or unresolved aliases before retrying.",
+  });
+}
+
+// ---------------------------------------------------------------------
+// Mission discovery
+// ---------------------------------------------------------------------
+
+/**
+ * The typed `workspace.slices_root` setting, when it is a readable directory;
+ * null when it is unset or unreadable. The fallback every command resolves to
+ * when the caller names no workspace of its own.
+ */
+export function configuredMissionsRoot(configPath?: string): string | null {
+  const configured = new ConfigStore(configPath).get("workspace.slices_root") as string;
+  if (configured && fs.existsSync(configured) && fs.statSync(configured).isDirectory()) return configured;
+  return null;
+}
+
+/** Locate the missions root from an explicit workspace override or the typed
+ * `workspace.slices_root` setting. No cwd walk: discovery may enumerate
+ * candidates, but selection comes from configuration. */
+export function resolveMissionsRoot(opts: {
+  override?: string | null;
+  cwd?: string;
+  configPath?: string;
+  /**
+   * Fail instead of falling back to the configured root when an explicit
+   * override (`--workspace` or OPENRIG_WORK_ROOT) names no missions tree.
+   * A caller that writes to the root it resolved wants the refusal: the silent
+   * fallback would operate on a tree the caller never named (#995).
+   */
+  strictOverride?: boolean;
+} = {}): string {
+  const cwd = opts.cwd ?? process.cwd();
+  // Which one named it matters for the refusal below: dropping --workspace does
+  // not clear OPENRIG_WORK_ROOT, so the two need different remedies.
+  const fromFlag = opts.override ?? null;
+  const fromOverride = fromFlag ?? process.env.OPENRIG_WORK_ROOT;
+  if (fromOverride) {
+    const candidate = path.isAbsolute(fromOverride) ? fromOverride : path.resolve(cwd, fromOverride);
+    const missions = path.join(candidate, "missions");
+    if (fs.existsSync(missions) && fs.statSync(missions).isDirectory()) return missions;
+    if (path.basename(candidate) === "missions" && fs.existsSync(candidate)) return candidate;
+    if (opts.strictOverride) {
+      const source = fromFlag === null ? "OPENRIG_WORK_ROOT" : "--workspace";
+      throw new ScopeCliError({
+        fact: `The workspace named by ${source} has no missions tree: neither ${missions} nor ${candidate} is a readable directory.`,
+        consequence: "Nothing was written; the configured workspace was NOT used as a fallback.",
+        action: fromFlag === null
+          ? "Correct OPENRIG_WORK_ROOT to a workspace whose missions/ directory exists, or unset it to use the configured workspace."
+          : "Point --workspace at a workspace whose missions/ directory exists, or drop the flag — note that an OPENRIG_WORK_ROOT in the environment still applies once the flag is gone.",
+      });
+    }
+  }
+  const configured = configuredMissionsRoot(opts.configPath);
+  if (configured) return configured;
+  throw new ScopeCliError({
+    fact: `Configured workspace.slices_root is not a readable directory: ${(new ConfigStore(opts.configPath).get("workspace.slices_root") as string) || "(unset)"}.`,
+    consequence: "No mission tree to operate on.",
+    action: "Set workspace.slices_root with `rig config set`, or pass --workspace /path/to/your/workspace.",
+  });
+}
+
+/**
+ * The authored contract file at a work node, most-preferred first.
+ *
+ * `SPEC.md` is the current name; `README.md` is the legacy one and stays valid indefinitely. There
+ * is no migration: dormant missions and historical proof receipts are README-backed and must keep
+ * resolving untouched. A node carrying both is not an error here — SPEC.md wins and `scope audit`
+ * advises about the second file.
+ */
+export const NODE_FILE_PRECEDENCE = ["SPEC.md", "README.md"] as const;
+
+/** Current mission notes name followed by the indefinitely-readable legacy name. */
+export const NOTES_FILE_PRECEDENCE = ["NOTES.md", "MISSION_NOTES.md"] as const;
+
+export interface NotesFileResolution {
+  path: string;
+  name: (typeof NOTES_FILE_PRECEDENCE)[number];
+}
+
+/** Resolve the first readable mission notes file, preferring the current name. */
+export function resolveNotesFile(absPath: string): NotesFileResolution | null {
+  for (const name of NOTES_FILE_PRECEDENCE) {
+    const candidate = path.join(absPath, name);
+    try {
+      if (!fs.statSync(candidate).isFile()) continue;
+      fs.accessSync(candidate, fs.constants.R_OK);
+      return { path: candidate, name };
+    } catch {
+      // Missing, unreadable, and non-file candidates all fall through to the next name.
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a work node's authored contract file, or null when the directory declares no node.
+ *
+ * Null is the "not a declared mission/slice" signal every caller already keys on — this changes
+ * WHICH filenames count, never what absence means.
+ */
+export function resolveNodeFile(absPath: string): string | null {
+  for (const name of NODE_FILE_PRECEDENCE) {
+    const candidate = path.join(absPath, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** List mission folders under the missions root. A mission is any
+ *  top-level folder containing an authored node file (SPEC.md, or legacy
+ *  README.md). Directories with
+ *  neither are skipped — they represent scratch/junk, not declared missions. */
+export function listMissions(missionsRoot: string): MissionInfo[] {
+  if (!fs.existsSync(missionsRoot)) return [];
+  const entries = fs.readdirSync(missionsRoot, { withFileTypes: true });
+  const out: MissionInfo[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const absPath = path.join(missionsRoot, entry.name);
+    const readmePath = resolveNodeFile(absPath);
+    const hasReadme = readmePath !== null;
+    if (!hasReadme) continue;
+    const frontmatter = readFrontmatter(readmePath);
+    const slicesDir = path.join(absPath, "slices");
+    const closedDir = path.join(absPath, "closed");
+    const activeSliceCount = countSliceDirs(slicesDir);
+    const closedSliceCount = countSliceDirs(closedDir);
+    const id = pickIdFromFrontmatter(frontmatter);
+    out.push({
+      name: entry.name,
+      absPath,
+      readmePath: hasReadme ? readmePath : null,
+      frontmatter,
+      id,
+      activeSliceCount,
+      closedSliceCount,
+    });
+  }
+  // Stable order: by mission name.
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+function countSliceDirs(dir: string): number {
+  if (!fs.existsSync(dir)) return 0;
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && SLICE_DIRNAME_RE.test(e.name))
+    .length;
+}
+
+function pickIdFromFrontmatter(fm: Record<string, unknown>): string | null {
+  const candidate = fm.id ?? fm.dotId;
+  return typeof candidate === "string" && candidate.length > 0 ? candidate : null;
+}
+
+/** Resolve a mission by name OR path relative to the missions root.
+ *  Throws ScopeCliError on miss OR when the directory exists but lacks an
+ *  authored node file. Node-less dirs are scratch/junk, not declared missions,
+ *  so mutation commands must not silently target them. */
+export function findMission(missionsRoot: string, identifier: string): MissionInfo {
+  const candidates = [
+    path.join(missionsRoot, identifier),
+    path.isAbsolute(identifier) ? identifier : path.resolve(missionsRoot, identifier),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      if (resolveNodeFile(candidate) === null) {
+        throw new ScopeCliError({
+          fact: `Directory "${identifier}" exists at ${candidate} but contains no ${NODE_FILE_PRECEDENCE.join(" or ")}.`,
+          consequence: "It is not a declared mission. Command did not run.",
+          action: "Create it as a mission with: rig scope mission create " + identifier + ". Or add a SPEC.md if the folder is intended to be a mission.",
+        });
+      }
+      return buildMissionInfo(missionsRoot, candidate);
+    }
+  }
+  throw new ScopeCliError({
+    fact: `Mission "${identifier}" not found under ${missionsRoot}.`,
+    consequence: "Command did not run.",
+    action: "List available missions with: rig scope mission ls",
+  });
+}
+
+function buildMissionInfo(missionsRoot: string, absPath: string): MissionInfo {
+  const readmePath = resolveNodeFile(absPath);
+  const frontmatter = readmePath ? readFrontmatter(readmePath) : {};
+  return {
+    name: path.basename(absPath),
+    absPath,
+    readmePath,
+    frontmatter,
+    id: pickIdFromFrontmatter(frontmatter),
+    activeSliceCount: countSliceDirs(path.join(absPath, "slices")),
+    closedSliceCount: countSliceDirs(path.join(absPath, "closed")),
+  };
+}
+
+// ---------------------------------------------------------------------
+// Slice discovery
+// ---------------------------------------------------------------------
+
+export function listSlices(
+  mission: MissionInfo,
+  state: SliceState,
+): SliceInfo[] {
+  const dirs: Array<{ root: string; bucket: "active" | "closed" }> = [];
+  if (state === "active" || state === "shipped" || state === "all") {
+    dirs.push({ root: path.join(mission.absPath, "slices"), bucket: "active" });
+  }
+  if (state === "closed" || state === "all") {
+    dirs.push({ root: path.join(mission.absPath, "closed"), bucket: "closed" });
+  }
+  const out: SliceInfo[] = [];
+  for (const { root } of dirs) {
+    if (!fs.existsSync(root)) continue;
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const m = SLICE_DIRNAME_RE.exec(entry.name);
+      if (!m) continue;
+      const sliceInfo = buildSliceInfo(mission, root, entry.name);
+      out.push(sliceInfo);
+    }
+  }
+  out.sort((a, b) => (a.nn ?? Number.MAX_SAFE_INTEGER) - (b.nn ?? Number.MAX_SAFE_INTEGER) || a.name.localeCompare(b.name));
+  if (state === "active") {
+    // active = not in closed/, and not already delivered in-place.
+    return out.filter((s) => {
+      const st = (s.status ?? "").toLowerCase();
+      return st !== "done" && !st.startsWith("closed") && !st.startsWith("shipped");
+    });
+  }
+  if (state === "shipped") {
+    return out.filter((s) => (s.status ?? "").toLowerCase().startsWith("shipped"));
+  }
+  return out;
+}
+
+/** Read the advisory sibling-ordering graph for one mission. Unknown, stale,
+ * malformed, or cross-parent edges are reported and ignored: the graph is a
+ * sequencing hint, never a gate or a traversal pointer. */
+export function buildMissionDependencyGraph(mission: MissionInfo): MissionDependencyGraph {
+  const all = listSlices(mission, "all");
+  const activePaths = new Set(listSlices(mission, "active").map((slice) => slice.absPath));
+  return deriveMissionDependencyGraph({
+    mission: { id: mission.id, name: mission.name, dependsOn: mission.frontmatter.depends_on },
+    slices: all.map((slice) => ({
+      id: slice.id,
+      name: slice.name,
+      dependsOn: slice.frontmatter.depends_on,
+      active: activePaths.has(slice.absPath),
+    })),
+  });
+}
+
+function buildSliceInfo(mission: MissionInfo, sliceRoot: string, dirName: string): SliceInfo {
+  const m = SLICE_DIRNAME_RE.exec(dirName);
+  const nn = m ? Number(m[1]) : null;
+  const slug = m ? m[2]! : null;
+  const absPath = path.join(sliceRoot, dirName);
+  const readmePath = resolveNodeFile(absPath);
+  const frontmatter = readmePath ? readFrontmatter(readmePath) : {};
+  const id = pickIdFromFrontmatter(frontmatter);
+  const status = typeof frontmatter.status === "string" ? (frontmatter.status as string).toLowerCase() : null;
+  return {
+    name: dirName,
+    absPath,
+    readmePath,
+    frontmatter,
+    nn,
+    slug,
+    missionName: mission.name,
+    id,
+    status,
+  };
+}
+
+/** Resolve a slice path (absolute, relative-to-substrate, or
+ *  relative-to-mission) into a SliceInfo. */
+export function findSlice(
+  missionsRoot: string,
+  slicePath: string,
+  hintMission?: string | null,
+): SliceInfo {
+  // Only a bare name with a mission hint can fall through an unrelated
+  // directory. Explicit paths keep their existing refusal and precedence.
+  const hintedName = Boolean(hintMission) && slicePath !== "" &&
+    slicePath !== "." && slicePath !== ".." &&
+    !path.isAbsolute(slicePath) && path.basename(slicePath) === slicePath;
+  let firstContextError: ScopeCliError | null = null;
+  const candidates: string[] = [];
+  if (path.isAbsolute(slicePath)) {
+    candidates.push(slicePath);
+  } else {
+    candidates.push(path.resolve(missionsRoot, "..", slicePath));
+    candidates.push(path.resolve(missionsRoot, slicePath));
+    if (hintMission) {
+      candidates.push(path.join(missionsRoot, hintMission, "slices", slicePath));
+      candidates.push(path.join(missionsRoot, hintMission, "closed", slicePath));
+    }
+  }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      // Walk up to find the owning mission.
+      const owningMissionPath = findOwningMission(missionsRoot, candidate);
+      if (!owningMissionPath) {
+        const error = new ScopeCliError({
+          fact: `Slice path "${slicePath}" resolved to ${candidate} but no parent mission was found.`,
+          consequence: "Cannot determine mission context for this slice.",
+          action: "Ensure the slice lives under <missionsRoot>/<mission>/{slices,closed}/.",
+        });
+        if (!hintedName) throw error;
+        firstContextError ??= error;
+        continue;
+      }
+      const mission = buildMissionInfo(missionsRoot, owningMissionPath);
+      const sliceRoot = path.dirname(candidate);
+      return buildSliceInfo(mission, sliceRoot, path.basename(candidate));
+    }
+  }
+  if (firstContextError) throw firstContextError;
+  throw new ScopeCliError({
+    fact: `Slice "${slicePath}" not found.`,
+    consequence: "Command did not run.",
+    action: "Check the path. List slices in a mission with: rig scope slice ls --mission <name>",
+  });
+}
+
+function findOwningMission(missionsRoot: string, slicePath: string): string | null {
+  let dir = path.dirname(slicePath);
+  while (dir.startsWith(missionsRoot) && dir !== missionsRoot) {
+    if (path.dirname(dir) === missionsRoot) return dir;
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------
+// Auto-numbering
+// ---------------------------------------------------------------------
+
+export { tryClaimSliceNN } from "./slice-claims.js";
+
+/** Find the next available NN for a mission's slices/ folder. Scans
+ *  BOTH slices/ AND closed/, including ordinal claims, so numbers are never reused (§3.2). */
+export function nextSliceNN(missionAbsPath: string): number {
+  let max = 0;
+  for (const subdir of ["slices", "closed"]) {
+    const root = path.join(missionAbsPath, subdir);
+    if (!fs.existsSync(root)) continue;
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      const marker = subdir === "slices" ? /^\.nn-(\d+)$/.exec(entry.name) : null;
+      const m = marker ?? (entry.isDirectory() ? SLICE_DIRNAME_RE.exec(entry.name) : null);
+      if (!m) continue;
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return max + 1;
+}
+
+/** Mint or read the dot-ID for a mission. If the mission's README has
+ *  an `id:` field, return it. Otherwise infer from the folder name
+ *  (release-X.Y.Z → OPR.X.Y.Z; otherwise escape band). */
+export function ensureMissionId(
+  mission: MissionInfo,
+  missionsRoot: string,
+): string {
+  if (mission.id) return mission.id;
+  // Try release-pattern first; if it matches, no peer scan needed.
+  try {
+    const id = inferMissionDotId(mission.name, null);
+    return id;
+  } catch {
+    // Fall through to escape-band path.
+  }
+  const peers = listMissions(missionsRoot).filter((m) => m.name !== mission.name);
+  const ordinal = nextEscapeBandOrdinal(peers.map((p) => p.id));
+  return inferMissionDotId(mission.name, ordinal);
+}
+
+/** Same as ensureMissionId, but ALSO writes the inferred id back into
+ *  the mission's README frontmatter when it was absent. Use this at
+ *  every site that mints a child id (slice create / ship / move target)
+ *  — per the convention's lazy-adoption rule: when a child is created
+ *  under a pre-existing parent with no id, assign the parent's id
+ *  on-demand at the same time. Narrow, single-parent, create-triggered;
+ *  never mass-migration. */
+export function ensureMissionIdPersisted(
+  mission: MissionInfo,
+  missionsRoot: string,
+): string {
+  const id = ensureMissionId(mission, missionsRoot);
+  if (!mission.id && mission.readmePath) {
+    updateFrontmatter(mission.readmePath, { id });
+    // Reflect the write on the in-memory MissionInfo so subsequent
+    // callers in the same command don't re-mint a different ordinal.
+    mission.id = id;
+  }
+  return id;
+}
+
+// ---------------------------------------------------------------------
+// Git move
+// ---------------------------------------------------------------------
+
+/** Return the git toplevel for a path, or null if not inside a repo. */
+export function gitTopLevel(absPath: string): string | null {
+  const dir = fs.existsSync(absPath) && fs.statSync(absPath).isDirectory() ? absPath : path.dirname(absPath);
+  try {
+    const out = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Refuse to move a path with uncommitted local changes. Catches the
+ *  "dirty working tree" risk in §11.1 / §3.4 — `git mv` would silently
+ *  carry along the user's in-progress edits. */
+export function assertCleanWorkingTree(repoRoot: string, relPath: string): void {
+  let status: string;
+  try {
+    status = execFileSync(
+      "git",
+      ["-C", repoRoot, "--literal-pathspecs", "status", "--porcelain", "--", relPath],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+  } catch (err) {
+    throw new ScopeCliError({
+      fact: `git status failed for ${relPath} in ${repoRoot}: ${(err as Error).message}`,
+      consequence: "Could not verify the slice's working-tree state. Move aborted.",
+      action: "Check the repository at " + repoRoot + " and retry.",
+    });
+  }
+  if (status.trim().length > 0) {
+    throw new ScopeCliError({
+      fact: `Working tree under ${relPath} has uncommitted changes:\n${status.trimEnd()}`,
+      consequence: "Refusing to git mv — your local edits would silently move with the slice.",
+      action: "Commit (git commit -m '...') or stash (git stash) and retry.",
+    });
+  }
+}
+
+/** Move a directory using `git mv` when inside a repo; fall back to
+ *  `fs.renameSync` with a warning when not. Returns true if git was
+ *  used. */
+export function moveSlice(srcAbs: string, destAbs: string, opts: {
+  /** Stage the move (default true). git mv stages by default; we
+   *  preserve that semantic. */
+  commit?: boolean;
+} = {}): { usedGit: boolean; repoRoot: string | null } {
+  if (!fs.existsSync(srcAbs)) {
+    throw new ScopeCliError({
+      fact: `Source path ${srcAbs} does not exist.`,
+      consequence: "Move did not run.",
+      action: "Verify the slice path and retry.",
+    });
+  }
+  if (fs.existsSync(destAbs)) {
+    throw new ScopeCliError({
+      fact: `Destination path ${destAbs} already exists.`,
+      consequence: "Refusing to overwrite an existing slice.",
+      action: "Pick a different destination, or remove the existing folder first.",
+    });
+  }
+  const destParent = path.dirname(destAbs);
+  const destParentExisted = fs.existsSync(destParent);
+  const removeEmptyCreatedParent = (): void => {
+    if (!destParentExisted && fs.existsSync(destParent) && fs.readdirSync(destParent).length === 0) {
+      fs.rmdirSync(destParent);
+    }
+  };
+  const repoRoot = gitTopLevel(srcAbs);
+  if (!repoRoot) {
+    fs.mkdirSync(destParent, { recursive: true });
+    try {
+      fs.renameSync(srcAbs, destAbs);
+    } catch (error) {
+      removeEmptyCreatedParent();
+      throw error;
+    }
+    return { usedGit: false, repoRoot: null };
+  }
+  // Normalize symlinks (macOS /var/folders → /private/var/folders) so
+  // path.relative produces a path INSIDE the repo, not a ../../escape.
+  const realSrcAbs = fs.realpathSync(srcAbs);
+  const srcRel = path.relative(repoRoot, realSrcAbs);
+  assertCleanWorkingTree(repoRoot, srcRel);
+  fs.mkdirSync(destParent, { recursive: true });
+  const realDestParent = fs.realpathSync(destParent);
+  const realDestAbs = path.join(realDestParent, path.basename(destAbs));
+  const destRel = path.relative(repoRoot, realDestAbs);
+  try {
+    execFileSync("git", ["-C", repoRoot, "mv", "--", srcRel, destRel], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    removeEmptyCreatedParent();
+    throw new ScopeCliError({
+      fact: `git mv ${srcRel} ${destRel} failed: ${(err as Error).message}`,
+      consequence: "Move aborted; source unchanged.",
+      action: "Inspect the repo state and retry.",
+    });
+  }
+  if (opts.commit) {
+    // Future hook; v0 doesn't auto-commit.
+  }
+  return { usedGit: true, repoRoot };
+}
+
+/** Best-effort inverse used only inside a failed scope composition command. */
+export function rollbackMovedSlice(
+  srcAbs: string,
+  destAbs: string,
+  move: { usedGit: boolean; repoRoot: string | null },
+): void {
+  if (!fs.existsSync(destAbs) || fs.existsSync(srcAbs)) return;
+  if (!move.usedGit || !move.repoRoot) {
+    fs.renameSync(destAbs, srcAbs);
+    return;
+  }
+  const srcRel = path.relative(move.repoRoot, fs.realpathSync(path.dirname(srcAbs)) + path.sep + path.basename(srcAbs));
+  const destRel = path.relative(move.repoRoot, fs.realpathSync(destAbs));
+  execFileSync("git", ["-C", move.repoRoot, "mv", "--", destRel, srcRel], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+// ---------------------------------------------------------------------
+// Misc
+// ---------------------------------------------------------------------
+
+export function todayDateISO(): string {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+export { DEFAULT_PROJECT_PREFIX };

@@ -1,0 +1,85 @@
+{
+  "version": 0,
+  "provisional": true,
+  "product_public": {
+    "clean": [
+      "agent-operated-software",
+      "agent-operated-workflows",
+      "mission-slice-sop",
+      "openrig-cmux",
+      "openrig-herdr",
+      "loading-addressable-markdown",
+      "messaging-the-human",
+      "software-for-agents",
+      "openrig-skills",
+      "openrig-operating-model",
+      "refocusing",
+      "delegating-work",
+      "context-engineering",
+      "openrig-software-factory"
+    ],
+    "ship_after_fix": [
+      "openrig-user",
+      "forming-an-openrig-mental-model",
+      "queue-handoff",
+      "seat-continuity-and-handover",
+      "claude-compaction-restore",
+      "openrig-architect",
+      "agent-startup-and-context-ingestion",
+      "applying-a-permission-policy",
+      "retiring-and-inheriting-a-seat",
+      "oversight-team",
+      "orienting-to-an-inherited-seat"
+    ],
+    "ship_misses_add": [
+      "topology-mutation-and-seat-management",
+      "rig-lifecycle",
+      "session-compaction-and-restore"
+    ],
+    "sanitize_borderlines_ship": [
+      "rig-bundles-and-shareable-artifacts",
+      "cross-host-rig-commands",
+      "openrig-upgrade",
+      "agent-starters",
+      "specification-system",
+      "human-in-the-loop",
+      "watchdog",
+      "session-source-fork"
+    ],
+    "restored_role_pm_selected": [
+      "orchestration-team",
+      "development-team",
+      "review-team",
+      "office-hours",
+      "context-builder",
+      "requirements-writer",
+      "ui-mockup",
+      "plan-review",
+      "exec-summary",
+      "backlog-capture"
+    ]
+  },
+  "vendored_ship_with_provenance": [
+    "agent-browser",
+    "systematic-debugging",
+    "test-driven-development",
+    "verification-before-completion",
+    "frontend-design",
+    "dogfood"
+  ],
+  "not_public": {
+    "reclass_host_only": [
+      "openrig-operator"
+    ],
+    "obsolete_internal": [
+      "attention-queue"
+    ],
+    "private_with_public_sibling_pending": [
+      "security-and-consequence-boundary-policy"
+    ]
+  },
+  "pending_author_public": [
+    "openrig-operator",
+    "foot-guns"
+  ]
+}

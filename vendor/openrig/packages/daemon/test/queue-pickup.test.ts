@@ -1,0 +1,238 @@
+// S04 (OPR.0.5.5.4) — PICKUP RECEIPTS, RED-first. "A durable row nobody woke is
+// indistinguishable from work in progress" — this slice derives the distinction from EXISTING
+// facts only: claimedAt + the first substantive post-claim transition (or heartbeat) within a
+// config-keyed threshold. No claimant-written receipt field, no sweep loop. States:
+//   unclaimed            — no claim yet;
+//   working              — claimed AND (substantive motion since the claim OR still inside
+//                          the threshold — the anti-noise direction);
+//   stalled-after-claim  — claimed, past threshold, zero substantive motion; evidence named;
+//   parked               — state=blocked only. Wake health is a separate `rig parked`
+//                          diagnosis; a wakeless blocked row still projects as parked;
+//   terminal             — the obligation is closed (done/handed-off/failed/denied/canceled):
+//                          no pickup question is outstanding, regardless of claim age.
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { migrate } from "../src/db/migrate.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { QueueRepository, type QueueItem } from "../src/domain/queue-repository.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { ViewProjector } from "../src/domain/view-projector.js";
+import { SettingsStore } from "../src/domain/user-settings/settings-store.js";
+
+const THRESHOLD_ENV = "OPENRIG_QUEUE_PICKUP_STALL_THRESHOLD_MINUTES";
+
+interface PickupShape {
+  state: "unclaimed" | "working" | "stalled-after-claim" | "parked" | "terminal";
+  evidence?: string;
+}
+const pickupOf = (item: QueueItem): PickupShape | undefined =>
+  (item as unknown as { pickup?: PickupShape }).pickup;
+
+const DOMAIN_ROOT = resolve(import.meta.dirname, "../src/domain");
+
+describe("S04 pickup receipts — derived, visible, threshold-honest", () => {
+  let db: Database.Database;
+  let repo: QueueRepository;
+  let priorEnv: string | undefined;
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    migrate(db, ALL_MIGRATIONS);
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true });
+    priorEnv = process.env[THRESHOLD_ENV];
+    delete process.env[THRESHOLD_ENV];
+  });
+  afterEach(() => {
+    if (priorEnv === undefined) delete process.env[THRESHOLD_ENV];
+    else process.env[THRESHOLD_ENV] = priorEnv;
+    db.close();
+  });
+
+  /** Age a claim: move claimed_at (and the claim transition) N minutes into the past. Fixture
+   *  aging of an EXISTING fact — the product code never sees an injected clock. */
+  function ageClaim(qitemId: string, minutes: number): void {
+    const past = new Date(Date.now() - minutes * 60_000).toISOString();
+    const beforePast = new Date(Date.now() - (minutes + 1) * 60_000).toISOString();
+    db.prepare("UPDATE queue_items SET claimed_at = ?, ts_created = ? WHERE qitem_id = ?").run(past, beforePast, qitemId);
+    db.prepare("UPDATE queue_transitions SET ts = ? WHERE qitem_id = ? AND transition_note = 'claimed'").run(past, qitemId);
+    // Coherent history: everything that happened BEFORE the claim (creation) ages with it —
+    // otherwise the created transition lands after the aged claim and reads as motion.
+    db.prepare("UPDATE queue_transitions SET ts = ? WHERE qitem_id = ? AND transition_note = 'created'").run(beforePast, qitemId);
+  }
+
+  async function mkRow(): Promise<QueueItem> {
+    return repo.create({ sourceSession: "a@r", destinationSession: "worker@r", body: "work" });
+  }
+
+  it("UNCLAIMED: a never-claimed row reads pickup.state=unclaimed on the getById projection", async () => {
+    const row = await mkRow();
+    const item = repo.getById(row.qitemId)!;
+    expect(pickupOf(item)?.state).toBe("unclaimed");
+  });
+
+  it("WORKING (early motion): a claim followed by a substantive transition reads working — even past the threshold", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    repo.update({ qitemId: row.qitemId, actorSession: "worker@r", transitionNote: "starting on the seam" });
+    ageClaim(row.qitemId, 60); // well past any sane threshold — motion already proved pickup
+    const item = repo.getById(row.qitemId)!;
+    expect(pickupOf(item)?.state).toBe("working");
+  });
+
+  it("WORKING (heartbeat): a post-claim heartbeat counts as motion", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    ageClaim(row.qitemId, 60);
+    db.prepare("UPDATE queue_items SET last_heartbeat = ? WHERE qitem_id = ?").run(new Date().toISOString(), row.qitemId);
+    const item = repo.getById(row.qitemId)!;
+    expect(pickupOf(item)?.state).toBe("working");
+  });
+
+  it("NEGATIVE CONTROL (threshold honesty): a fresh claim with no motion yet reads WORKING inside the threshold — never prematurely stalled", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    const item = repo.getById(row.qitemId)!;
+    expect(pickupOf(item)?.state).toBe("working");
+  });
+
+  it("FOUNDER DEFAULT: the daemon config surface defaults the pickup stall threshold to 3 minutes", () => {
+    const missingConfig = `/tmp/openrig-s04-missing-${process.pid}-${Date.now()}.json`;
+    const setting = new SettingsStore(missingConfig).resolveOne(
+      "queue.pickup_stall_threshold_minutes" as never,
+    );
+    expect(setting).toMatchObject({ value: 3, source: "default", defaultValue: 3 });
+  });
+
+  it("FOUNDER DEFAULT: the pickup resolver's fail-open fallback is also 3 minutes", async () => {
+    const mod = await import("../src/domain/queue-pickup.js");
+    expect(mod.DEFAULT_PICKUP_STALL_THRESHOLD_MINUTES).toBe(3);
+  });
+
+  it("STALLED-AFTER-CLAIM: past threshold, zero substantive motion — and the EVIDENCE is named in the projection", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    ageClaim(row.qitemId, 60); // default threshold is far below 60min
+    const item = repo.getById(row.qitemId)!;
+    const p = pickupOf(item);
+    expect(p?.state).toBe("stalled-after-claim");
+    expect(p?.evidence).toMatch(/no meaningful queue change/i); // "claimed N min ago…"
+    expect(p?.evidence).toContain("owner activity unknown"); // "…zero transitions since"
+  });
+
+  it("PARKED (the fourth honest state): a blocked row is NEVER stalled — it reads parked", async () => {
+    const blocker = await mkRow();
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: blocker.qitemId, transitionNote: "parked on blocker" });
+    ageClaim(row.qitemId, 60);
+    const item = repo.getById(row.qitemId)!;
+    expect(pickupOf(item)?.state).toBe("parked");
+  });
+
+  it("TERMINAL: a claimed-and-closed done row past the threshold stops reading stalled-after-claim", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "done", closureReason: "no-follow-on", transitionNote: "closed" });
+    // Age the WHOLE history 60 min: the closed row must not fall through to the
+    // stall timer once its last meaningful change is older than the threshold.
+    ageClaim(row.qitemId, 60);
+    db.prepare("UPDATE queue_transitions SET ts = ? WHERE qitem_id = ? AND state = 'done'")
+      .run(new Date(Date.now() - 60 * 60_000).toISOString(), row.qitemId);
+    const item = repo.getById(row.qitemId)!;
+    expect(item.state).toBe("done");
+    expect(pickupOf(item)?.state).toBe("terminal");
+  });
+
+  it("TERMINAL: every closed state derives terminal, and a terminal row is never a stalled finding", async () => {
+    const mod = (await import("../src/domain/queue-pickup.js")) as {
+      derivePickup: (facts: {
+        state: string; claimedAt: string | null; lastHeartbeat: string | null;
+        postClaimMotionCount: number; lastMeaningfulAt?: string;
+      }) => PickupShape;
+      stalledPickupFinding: (item: QueueItem) => { kind: string } | null;
+    };
+    const old = new Date(Date.now() - 60 * 60_000).toISOString();
+    for (const state of ["done", "failed", "denied", "canceled", "handed-off"]) {
+      expect(mod.derivePickup({ state, claimedAt: old, lastHeartbeat: null, postClaimMotionCount: 0 }))
+        .toEqual({ state: "terminal", evidence: `closed (${state})` });
+    }
+    // A terminal row never feeds the S02 sweep as a stalled-claim finding.
+    const done = await mkRow();
+    repo.update({ qitemId: done.qitemId, actorSession: "daemon@kernel", state: "done", closureReason: "no-follow-on", transitionNote: "closed" });
+    expect(mod.stalledPickupFinding(repo.getById(done.qitemId)!)).toBeNull();
+  });
+
+  it("THRESHOLD from CONFIG, observed by EFFECT: raising the threshold flips a stalled row back to working", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    ageClaim(row.qitemId, 60);
+    expect(pickupOf(repo.getById(row.qitemId)!)?.state).toBe("stalled-after-claim");
+    process.env[THRESHOLD_ENV] = "120"; // fresh-read config surface: no restart needed
+    expect(pickupOf(repo.getById(row.qitemId)!)?.state).toBe("working");
+  });
+
+  it("LIST projection carries pickup too (the row face answers park-vs-strand in one read)", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    ageClaim(row.qitemId, 60);
+    const listed = repo.list({ destinationSession: "worker@r" }).find((i) => i.qitemId === row.qitemId)!;
+    expect(pickupOf(listed)?.state).toBe("stalled-after-claim");
+  });
+
+  it("SCHEMA PROOF: no new claimant-written receipt field exists — queue tables carry NO pickup/receipt column", () => {
+    for (const table of ["queue_items", "queue_transitions"]) {
+      const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+      expect(cols.some((c) => /pickup|receipt/i.test(c)), `${table} must carry no derived-state column`).toBe(false);
+    }
+  });
+
+  it("SUPERSESSION: the dead queue-row writer stays absent while the live daemon heartbeat and null-tolerant readers remain", () => {
+    const queueRepository = readFileSync(resolve(DOMAIN_ROOT, "queue-repository.ts"), "utf8");
+    const daemonLifecycle = readFileSync(resolve(DOMAIN_ROOT, "daemon-lifecycle-store.ts"), "utf8");
+    const daemonEntry = readFileSync(resolve(DOMAIN_ROOT, "../index.ts"), "utf8");
+    const rowWriter = /\brecordHeartbeat\s*\(/;
+    const daemonWriter = ["record", "Heartbeat(nowIso"].join("");
+    const daemonCall = ["daemonLifecycleStore.record", "Heartbeat"].join("");
+
+    expect(queueRepository).not.toMatch(rowWriter);
+    expect(daemonLifecycle).toContain(daemonWriter);
+    expect(daemonEntry).toContain(daemonCall);
+    for (const reader of ["queue-pickup.ts", "queue-stuck-sweep.ts", "queue-wake-ladder.ts"]) {
+      expect(readFileSync(resolve(DOMAIN_ROOT, reader), "utf8")).toContain(
+        "0.5.7 mechanized-pull turn-end hook that knows the in-flight row",
+      );
+    }
+  });
+
+  it("S02 SEAM: stalledPickupFinding() is a pure INPUT CONTRACT (kind, claimant target, evidence) — a library shape, not a loop", async () => {
+    const mod = (await import("../src/domain/queue-pickup.js")) as {
+      stalledPickupFinding: (item: QueueItem) => { kind: string; target: string; qitemId: string; evidence: string } | null;
+    };
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    ageClaim(row.qitemId, 60);
+    const finding = mod.stalledPickupFinding(repo.getById(row.qitemId)!);
+    expect(finding?.kind).toBe("stalled-after-claim");
+    expect(finding?.target).toBe("worker@r"); // the claimant first; S02 owns the escalation chain
+    expect(finding?.qitemId).toBe(row.qitemId);
+    expect(finding?.evidence).toMatch(/no meaningful queue change/i);
+    // and a WORKING row produces no finding:
+    const fresh = await mkRow();
+    repo.claim({ qitemId: fresh.qitemId, destinationSession: "worker@r" });
+    expect(mod.stalledPickupFinding(repo.getById(fresh.qitemId)!)).toBeNull();
+  });
+
+  it("VIEW LENS 'pickup': claimed rows with derived state + named stalled evidence, queryable", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    ageClaim(row.qitemId, 60);
+    const projector = new ViewProjector(db, new EventBus(db));
+    const result = projector.show("pickup");
+    const mine = result.rows.find((r) => r.qitem_id === row.qitemId) as Record<string, unknown> | undefined;
+    expect(mine, "the pickup lens must list the claimed row").toBeDefined();
+    expect(String(mine!.pickup_state)).toBe("stalled-after-claim");
+    expect(String(mine!.pickup_evidence)).toMatch(/no meaningful queue change/i);
+  });
+});

@@ -1,0 +1,39 @@
+Warren
+
+This product includes software developed at OpenRig
+(https://github.com/mvschwarz/openrig), Copyright 2026 Mike Schwarz,
+licensed under the Apache License, Version 2.0. A verbatim copy of that
+work, unmodified at import, lives in vendor/openrig/ — see
+vendor/openrig/UPSTREAM.md for the pinned commit, the update procedure,
+and the per-file log required by Apache-2.0 §4(b) for any file we later
+modify.
+
+Apache License 2.0
+------------------
+The vendored tree ships its own copy of the license at
+vendor/openrig/LICENSE. Nothing in that license grants trademark rights
+(Apache-2.0 §6); the OpenRig name, its domain, its npm scope and its
+imagery are therefore not used as Warren's brand.
+
+Third-party material inside the vendored tree
+---------------------------------------------
+The following artifacts are vendored upstream content whose own upstream
+license is either not carried by OpenRig or is not Apache-2.0. They are
+not redistributed in any Warren build artifact and are held here only for
+the rebase. Confirm the upstream terms before shipping any of them.
+
+- skills/_canonical/process/frontend-design/ — upstream marks the vendor
+  as unknown ("LICENSE.txt present at copy time").
+- skills/_canonical/process/{systematic-debugging,test-driven-development,
+  verification-before-completion}/ — attributed to obra/superpowers
+  without upstream license text.
+- skills/_canonical/process/{agent-browser,dogfood}/ — attributed to
+  vercel/agent-browser without upstream license text.
+- packages/ui font packages (@fontsource-variable/jetbrains-mono,
+  space-grotesk, inter) — SIL Open Font License 1.1: retain copyright and
+  license notices if a built UI is ever redistributed, and do not use the
+  Reserved Font Names for derivatives.
+
+Runtime dependencies of the vendored tree keep their own licenses and are
+installed from their own lockfile into vendor/openrig/node_modules, which
+is never committed.

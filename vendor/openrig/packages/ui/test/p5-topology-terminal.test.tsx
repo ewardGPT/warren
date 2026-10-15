@@ -1,0 +1,334 @@
+// V1 attempt-3 Phase 5 P5-7 — Topology terminal grid (safe-N + pulsing-ring).
+//
+// Coverage:
+//   - safe-N pagination: with > 12 seats, only 12 cards render by default;
+//     "show all N" toggle reveals the rest.
+//   - Pulsing-ring: active seats render with terminal-card-active class
+//     (CSS keyframe is paint-only — pseudo-element-paint test contract
+//     ritual #7; CSS-source-assertion guards the @keyframes rule).
+//   - data-active attribute reflects activity state.
+//   - Empty state when no seats.
+//   - Pod scope filters by podName.
+//
+// Pseudo-element-paint contract: jsdom can't render @keyframes. The
+// CSS-source-assertion test reads globals.css and asserts the
+// @keyframes terminal-card-active-frames rule + .terminal-card-active
+// selector are present — guards the at-a-glance scan signal from being
+// silently removed in a refactor.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, fireEvent, cleanup, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { TopologyTerminalView } from "../src/components/topology/TopologyTerminalView.js";
+import type { NodeInventoryEntry } from "../src/hooks/useNodeInventory.js";
+
+const mockFetch = vi.fn();
+globalThis.fetch = mockFetch;
+
+beforeEach(() => {
+  mockFetch.mockReset();
+});
+
+afterEach(() => {
+  cleanup();
+});
+
+function withQueryClient(ui: React.ReactNode) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+}
+
+function makeSeat(opts: {
+  rigId?: string;
+  logicalId: string;
+  pod?: string;
+  active?: boolean;
+  runtime?: string;
+  contextUsedPercentage?: number;
+  contextTotalInputTokens?: number;
+  contextTotalOutputTokens?: number;
+}): NodeInventoryEntry {
+  return {
+    rigId: opts.rigId ?? "rig-1",
+    rigName: "test-rig",
+    logicalId: opts.logicalId,
+    podId: opts.pod ?? "default",
+    podNamespace: opts.pod ?? "default",
+    canonicalSessionName: `${opts.logicalId}@test-rig`,
+    nodeKind: "agent",
+    runtime: opts.runtime ?? "claude-code",
+    sessionStatus: "running",
+    startupStatus: "ready",
+    restoreOutcome: "n-a",
+    tmuxAttachCommand: null,
+    resumeCommand: null,
+    latestError: null,
+    agentActivity: opts.active
+      ? {
+          state: "running",
+          reason: "test",
+          evidenceSource: "test",
+          sampledAt: "2026-05-06T18:00:00Z",
+        }
+      : { state: "idle", reason: "test", evidenceSource: "test", sampledAt: "2026-05-06T18:00:00Z" },
+    contextUsage: typeof opts.contextUsedPercentage === "number"
+      ? {
+          usedPercentage: opts.contextUsedPercentage,
+          remainingPercentage: 100 - opts.contextUsedPercentage,
+          contextWindowSize: 320000,
+          availability: "known",
+          sampledAt: "2026-05-09T10:00:00Z",
+          fresh: true,
+          totalInputTokens: opts.contextTotalInputTokens ?? null,
+          totalOutputTokens: opts.contextTotalOutputTokens ?? null,
+        }
+      : undefined,
+  };
+}
+
+function setupFetch(opts: {
+  rigs?: Array<{ id: string; name: string }>;
+  seatsByRig?: Record<string, NodeInventoryEntry[]>;
+}) {
+  mockFetch.mockImplementation(async (url: string) => {
+    if (url.includes("/api/rigs/summary")) {
+      return new Response(JSON.stringify(opts.rigs ?? []));
+    }
+    const m = url.match(/\/api\/rigs\/([^/]+)\/nodes/);
+    if (m) {
+      const rigId = decodeURIComponent(m[1]!);
+      return new Response(JSON.stringify(opts.seatsByRig?.[rigId] ?? []));
+    }
+    // SessionPreviewPane fetches /api/preview/session/:name etc.
+    return new Response(JSON.stringify({
+      sessionName: "test", content: "", lines: 0, capturedAt: new Date().toISOString(),
+    }));
+  });
+}
+
+describe("TopologyTerminalView P5-7 grid", () => {
+  it("rig scope: renders one card per seat under safe-N=12", async () => {
+    const seats = [
+      makeSeat({ logicalId: "orch.lead" }),
+      makeSeat({ logicalId: "review.lead" }),
+      makeSeat({ logicalId: "driver.impl", active: true }),
+    ];
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": seats } });
+    const { findByTestId, container } = withQueryClient(
+      <TopologyTerminalView scope="rig" rigId="rig-1" />,
+    );
+    expect(await findByTestId("topology-terminal-grid")).toBeTruthy();
+    expect(await findByTestId("terminal-card-rig-1-orch.lead")).toBeTruthy();
+    expect(await findByTestId("terminal-card-rig-1-driver.impl")).toBeTruthy();
+    // Active seat carries data-active='true' AND the pulse class.
+    const driverCard = container.querySelector(
+      "[data-testid='terminal-card-rig-1-driver.impl']",
+    );
+    expect(driverCard?.getAttribute("data-active")).toBe("true");
+    expect(driverCard?.className).toMatch(/terminal-card-active/);
+    // Idle seat does NOT carry the pulse class.
+    const idleCard = container.querySelector(
+      "[data-testid='terminal-card-rig-1-orch.lead']",
+    );
+    expect(idleCard?.getAttribute("data-active")).toBe("false");
+    expect(idleCard?.className ?? "").not.toMatch(/terminal-card-active/);
+  });
+
+  it("safe-N pagination: with > 12 seats, default shows 12; toggle reveals all", async () => {
+    const seats: NodeInventoryEntry[] = [];
+    for (let i = 0; i < 15; i++) {
+      seats.push(makeSeat({ logicalId: `seat${i.toString().padStart(2, "0")}` }));
+    }
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": seats } });
+    const { findByTestId, container } = withQueryClient(
+      <TopologyTerminalView scope="rig" rigId="rig-1" />,
+    );
+    await findByTestId("topology-terminal-grid");
+    // Default: 12 cards visible.
+    expect(
+      container.querySelectorAll("[data-testid^='terminal-card-rig-1-']").length,
+    ).toBe(12);
+    expect((await findByTestId("topology-terminal-count")).textContent).toContain("12 of 15");
+    // Toggle: show all.
+    const toggle = await findByTestId("topology-terminal-show-toggle");
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(
+        container.querySelectorAll("[data-testid^='terminal-card-rig-1-']").length,
+      ).toBe(15);
+    });
+  });
+
+  it("pod scope filters seats by podName", async () => {
+    const seats = [
+      makeSeat({ logicalId: "orch.lead", pod: "orch" }),
+      makeSeat({ logicalId: "driver.impl", pod: "implementation" }),
+      makeSeat({ logicalId: "qa.codex", pod: "implementation" }),
+    ];
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": seats } });
+    const { findByTestId, container } = withQueryClient(
+      <TopologyTerminalView scope="pod" rigId="rig-1" podName="implementation" />,
+    );
+    await findByTestId("topology-terminal-grid");
+    expect(container.querySelector("[data-testid='terminal-card-rig-1-orch.lead']")).toBeNull();
+    expect(container.querySelector("[data-testid='terminal-card-rig-1-driver.impl']")).toBeTruthy();
+    expect(container.querySelector("[data-testid='terminal-card-rig-1-qa.codex']")).toBeTruthy();
+  });
+
+  it("renders Codex context percentage and token total in terminal cards", async () => {
+    const seats = [
+      makeSeat({
+        logicalId: "guard.codex",
+        runtime: "codex",
+        contextUsedPercentage: 21,
+        contextTotalInputTokens: 54000,
+        contextTotalOutputTokens: 615,
+      }),
+    ];
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": seats } });
+    const { findByTestId } = withQueryClient(
+      <TopologyTerminalView scope="rig" rigId="rig-1" />,
+    );
+    const context = await findByTestId("terminal-card-context-rig-1-guard.codex");
+    const tokens = await findByTestId("terminal-card-tokens-rig-1-guard.codex");
+    expect(context.textContent).toBe("21%");
+    expect(tokens.textContent).toBe("55k");
+    expect(tokens.getAttribute("title")).toContain("Tokens: 54,615");
+  });
+
+  it("renders unknown context affordance when terminal cards have no sample", async () => {
+    const seats = [makeSeat({ logicalId: "orch.lead" })];
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": seats } });
+    const { findByTestId } = withQueryClient(
+      <TopologyTerminalView scope="rig" rigId="rig-1" />,
+    );
+    expect((await findByTestId("terminal-card-context-rig-1-orch.lead")).textContent).toBe("--");
+    expect((await findByTestId("terminal-card-tokens-rig-1-orch.lead")).textContent).toBe("--");
+  });
+
+  it("empty state when scope has no agent seats", async () => {
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": [] } });
+    const { findByTestId } = withQueryClient(
+      <TopologyTerminalView scope="rig" rigId="rig-1" />,
+    );
+    expect(await findByTestId("topology-terminal-empty")).toBeTruthy();
+  });
+
+  it("host scope with no rigs renders empty state", async () => {
+    setupFetch({ rigs: [] });
+    const { findByTestId } = withQueryClient(<TopologyTerminalView scope="host" />);
+    expect(await findByTestId("topology-terminal-empty")).toBeTruthy();
+  });
+
+  it("host scope demand-loads one rig instead of fetching every rig inventory on tab open", async () => {
+    setupFetch({
+      rigs: [
+        { id: "rig-1", name: "test-rig" },
+        { id: "rig-2", name: "other-rig" },
+      ],
+      seatsByRig: {
+        "rig-1": [makeSeat({ logicalId: "orch.lead", rigId: "rig-1" })],
+        "rig-2": [makeSeat({ logicalId: "ops.lead", rigId: "rig-2" })],
+      },
+    });
+
+    const { findByTestId } = withQueryClient(<TopologyTerminalView scope="host" />);
+    expect(await findByTestId("topology-terminal-host-picker")).toBeTruthy();
+    expect(
+      mockFetch.mock.calls.filter(([url]) => String(url).includes("/nodes")),
+    ).toHaveLength(0);
+
+    fireEvent.click(await findByTestId("topology-terminal-host-rig-rig-1"));
+    expect(await findByTestId("terminal-card-rig-1-orch.lead")).toBeTruthy();
+
+    const nodeFetches = mockFetch.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes("/nodes"));
+    expect(nodeFetches).toHaveLength(1);
+    expect(nodeFetches[0]).toContain("/api/rigs/rig-1/nodes");
+  });
+});
+
+// OPR.0.4.0.39 (FR-6 founder spec-correction -- REVERSES the slice-01 expand-out):
+// each grid card's static IS the single in-place click-to-live target (a full-width
+// ProgressiveTerminal static button) -- there is NO separate TerminalPreviewPopover
+// trigger. So each card has exactly ONE tab-reachable control (the static itself),
+// preserving the a11y intent (one trigger per card) while restoring live-in-place.
+describe("TerminalView card a11y (OPR.0.4.0.39 in-place click-to-live)", () => {
+  it("each terminal card exposes exactly one tab-reachable control: the in-place static button (no popover trigger)", async () => {
+    const seats = [
+      makeSeat({ logicalId: "alpha" }),
+      makeSeat({ logicalId: "beta" }),
+    ];
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": seats } });
+    const { findByTestId, container } = withQueryClient(
+      <TopologyTerminalView scope="rig" rigId="rig-1" />,
+    );
+    await findByTestId("topology-terminal-grid");
+
+    // FR-6: the static ITSELF is the in-place click-to-live target (ProgressiveTerminal
+    // static, full-width) -- exactly ONE per card.
+    const inPlaceStatic = container.querySelectorAll(
+      "button[data-testid^='terminal-grid-'][data-testid$='-static']",
+    );
+    expect(inPlaceStatic).toHaveLength(2);
+
+    // The separate expand-out popover trigger is REMOVED from the grid.
+    const popoverTriggers = container.querySelectorAll(
+      "button[data-testid^='terminal-grid-'][data-testid$='-terminal-open']",
+    );
+    expect(popoverTriggers).toHaveLength(0);
+  });
+
+  it("OPR.0.4.0.39 (FR-1/FR-6): the grid static carries the smoked-glass plate AND is the in-place click-to-live button", async () => {
+    setupFetch({ rigs: [{ id: "rig-1", name: "test-rig" }], seatsByRig: { "rig-1": [makeSeat({ logicalId: "alpha" })] } });
+    const { findByTestId, container } = withQueryClient(
+      <TopologyTerminalView scope="rig" rigId="rig-1" />,
+    );
+    await findByTestId("topology-terminal-grid");
+
+    // The grid is a TRULY BARE surface (no popover/shell plate behind it), so the
+    // static carries its OWN borderless smoked-glass plate; and per FR-6 it IS the
+    // click-to-live button (ProgressiveTerminal static), not a non-interactive
+    // thumbnail beside a separate popover trigger.
+    const staticPlate = await findByTestId("terminal-grid-rig-1-alpha-static");
+    expect(staticPlate.tagName).toBe("BUTTON");
+    expect(staticPlate.className).toContain("bg-stone-950/85");
+    expect(staticPlate.className).toContain("backdrop-blur-sm");
+
+    // ...exactly ONE in-place static button + NO expand-out popover trigger.
+    expect(container.querySelectorAll("button[data-testid$='-static']")).toHaveLength(1);
+    expect(container.querySelectorAll("button[data-testid$='-terminal-open']")).toHaveLength(0);
+  });
+});
+
+describe("globals.css pulsing-ring CSS contract (ritual #7 pseudo-element-paint)", () => {
+  const cssPath = path.resolve(__dirname, "../src/globals.css");
+  it("globals.css declares @keyframes terminal-card-active-frames", () => {
+    const src = readFileSync(cssPath, "utf8");
+    expect(src).toMatch(/@keyframes\s+terminal-card-active-frames/);
+  });
+  it("globals.css declares .terminal-card-active selector binding the keyframes", () => {
+    const src = readFileSync(cssPath, "utf8");
+    expect(src).toMatch(/\.terminal-card-active\s*\{[^}]*animation:\s*terminal-card-active-frames/);
+  });
+  it("globals.css honors prefers-reduced-motion for terminal-card-active", () => {
+    const src = readFileSync(cssPath, "utf8");
+    // Reduced-motion block must include .terminal-card-active so the pulse
+    // animation is suppressed for users with motion-sensitivity preferences.
+    //
+    // globals.css has multiple @media (prefers-reduced-motion: reduce)
+    // blocks (one per animation cluster — vellum drift, activity rings,
+    // terminal cards, etc). Scan ALL of them — the prior single-match
+    // regex picked the first block (vellum-scroll-x) which doesn't
+    // include .terminal-card-active even though a later block does.
+    const blocks = Array.from(
+      src.matchAll(/@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\}\s*\}/g),
+    );
+    expect(blocks.length).toBeGreaterThan(0);
+    const anyBlockHasTerminal = blocks.some((m) => /\.terminal-card-active/.test(m[0]));
+    expect(anyBlockHasTerminal).toBe(true);
+  });
+});

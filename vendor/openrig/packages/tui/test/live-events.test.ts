@@ -1,0 +1,295 @@
+import { describe, it, expect, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { subscribeActivityEvents } from "../src/live-events.js";
+import { createLiveRefresh } from "../src/live.js";
+import { emptySnapshot } from "../src/state.js";
+import type { FleetSnapshot } from "../src/types.js";
+
+// OPR.0.5.5.19 AM-R18 — the open view updates ITSELF: pushes from the oracle's SSE
+// stream drive the refresh owner; zero clicks, zero manual refresh, zero idle polling.
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+function sseServer(): Promise<{ server: Server; url: string; push: (data: unknown) => void; pushRaw: (frame: string) => void; connections: () => number }> {
+  return new Promise((resolve) => {
+    const sockets = new Set<import("node:http").ServerResponse>();
+    const server = createServer((req, res) => {
+      if (!req.url!.endsWith("/api/activity/events")) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.write(": connected\n\n");
+      sockets.add(res);
+      req.on("close", () => sockets.delete(res));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        server,
+        url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+        push: (data) => { for (const s of sockets) s.write(`data: ${JSON.stringify(data)}\n\n`); },
+        pushRaw: (frame) => { for (const s of sockets) s.write(frame); },
+        connections: () => sockets.size,
+      });
+    });
+  });
+}
+
+function until(cond: () => boolean, ms = 2_000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (cond()) return resolve();
+      if (Date.now() - t0 > ms) return reject(new Error("condition not reached"));
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
+describe("S19 AM-R18 — the subscription path", () => {
+  it("each pushed oracle change fires onEvent with the notification payload (no activity fields consumed)", async () => {
+    const { server, url, push, connections } = await sseServer();
+    const events: Array<{ type: string; seq?: number }> = [];
+    const sub = subscribeActivityEvents({ open: () => fetch(`${url}/api/activity/events`), onEvent: (e) => events.push(e) });
+    try {
+      await until(() => connections() === 1);
+      push({ type: "seat.activity_changed", seatNodeId: "node-1", seq: 7 });
+      push({ type: "seat.activity_changed", seatNodeId: "node-1", seq: 8 });
+      await until(() => events.length === 2);
+      expect(events[0]).toMatchObject({ type: "seat.activity_changed", seq: 7 });
+    } finally {
+      sub.close();
+      server.close();
+    }
+  });
+
+  it("THE OPEN VIEW UPDATES ITSELF (by effect): a pushed change re-renders the refresh owner's snapshot with ZERO manual refreshes", async () => {
+    const { server, url, push, connections } = await sseServer();
+    let served = 1;
+    const hydrate = vi.fn(async (): Promise<FleetSnapshot> => ({ ...emptySnapshot(), generatedAt: `snap-${served++}` } as unknown as FleetSnapshot));
+    const frames: string[] = [];
+    const live = createLiveRefresh({ hydrate, onFrame: () => frames.push("frame"), now: () => Date.now() });
+    const sub = subscribeActivityEvents({ open: () => fetch(`${url}/api/activity/events`), onEvent: () => { void live.refresh(); } });
+    try {
+      await until(() => connections() === 1);
+      expect(hydrate).not.toHaveBeenCalled(); // ZERO idle polling: nothing fires without a push
+      push({ type: "seat.activity_changed", seatNodeId: "node-1", seq: 1 });
+      await until(() => hydrate.mock.calls.length === 1);
+      await until(() => (live.snapshot() as unknown as { generatedAt?: string }).generatedAt === "snap-1");
+      // A second driven change updates again — the founder sits at the table, it keeps up:
+      push({ type: "seat.activity_changed", seatNodeId: "node-1", seq: 2 });
+      await until(() => hydrate.mock.calls.length === 2);
+    } finally {
+      sub.close();
+      server.close();
+    }
+  });
+
+  it("ZERO IDLE-POLLING REGRESSION: with the subscription open and NO pushes, no hydrate ever fires", async () => {
+    const { server, url, connections } = await sseServer();
+    const hydrate = vi.fn(async () => emptySnapshot());
+    const sub = subscribeActivityEvents({ open: () => fetch(`${url}/api/activity/events`), onEvent: () => { void hydrate(); } });
+    try {
+      await until(() => connections() === 1);
+      await new Promise((r) => setTimeout(r, 300)); // a quiet window
+      expect(hydrate).not.toHaveBeenCalled();
+    } finally {
+      sub.close();
+      server.close();
+    }
+  });
+
+  it("a dropped connection reconnects (connection maintenance, not data polling) and pushes resume", async () => {
+    const first = await sseServer();
+    const events: unknown[] = [];
+    const sub = subscribeActivityEvents({ open: () => fetch(`${first.url}/api/activity/events`), onEvent: (e) => events.push(e), reconnectDelayMs: 30 });
+    try {
+      await until(() => first.connections() === 1);
+      // Drop every socket (server closes connections) — the subscription must come back.
+      first.push({ type: "seat.activity_changed", seq: 1 });
+      await until(() => events.length === 1);
+      for (const res of [] as never[]) void res;
+      await new Promise<void>((r) => { first.server.closeAllConnections(); r(); });
+      await until(() => first.connections() === 0);
+      // server still listening; reconnect should land a fresh connection
+      await until(() => first.connections() === 1, 3_000);
+      first.push({ type: "seat.activity_changed", seq: 2 });
+      await until(() => events.length === 2, 3_000);
+    } finally {
+      sub.close();
+      first.server.close();
+    }
+  });
+
+  it("S16 CADENCE HOLDS AGAINST A NON-SSE SERVER: a JSON answer disables the leg permanently — one probe, zero retries", async () => {
+    let hits = 0;
+    const server = createServer((_req, res) => {
+      hits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const statuses: string[] = [];
+    const open = async () => {
+      const res = await fetch(`${url}/api/activity/events`, { headers: { accept: "text/event-stream" } });
+      return (res.headers.get("content-type") ?? "").includes("text/event-stream") ? res : null;
+    };
+    const sub = subscribeActivityEvents({ open, onEvent: () => {}, onStatus: (s) => statuses.push(s), reconnectDelayMs: 20 });
+    try {
+      await until(() => statuses.includes("unavailable"));
+      await new Promise((r) => setTimeout(r, 200)); // plenty of reconnect windows
+      expect(hits).toBe(1); // exactly the feature-detect probe — never polled
+    } finally {
+      sub.close();
+      server.close();
+    }
+  });
+
+  it("NO SECOND ACTIVITY MECHANISM (trace): main wires pushes to live.refresh, and the subscription module derives no activity", () => {
+    const main = readFileSync(join(repoRoot, "packages", "tui", "src", "main.ts"), "utf8");
+    expect(main).toContain("subscribeActivityEvents");
+    const mod = readFileSync(join(repoRoot, "packages", "tui", "src", "live-events.ts"), "utf8");
+    expect(mod).not.toMatch(/working|idle-at-prompt|terminalActive/); // notification-only: no vocabulary
+    expect(mod).not.toMatch(/setInterval/); // no idle timers on the data path
+  });
+});
+
+describe("standard SSE notification framing", () => {
+  function controlledStream() {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; } });
+    return { response: new Response(body), write: (s: string) => controller.enqueue(new TextEncoder().encode(s)) };
+  }
+
+  it("delivers multiline CRLF notifications through actual localhost HTTP", async () => {
+    const { server, url, pushRaw, connections } = await sseServer();
+    const events: unknown[] = [];
+    const sub = subscribeActivityEvents({ open: () => fetch(`${url}/api/activity/events`), onEvent: e => events.push(e) });
+    try {
+      await until(() => connections() === 1);
+      pushRaw('data: {"type":"seat.activity_changed",\r\ndata: "seatNodeId":"工程师","seq":6}\r\n\r\n');
+      await until(() => events.length === 1, 300);
+      expect(events).toEqual([{ type: "seat.activity_changed", seatNodeId: "工程师", seq: 6 }]);
+    } finally { sub.close(); server.closeAllConnections(); server.close(); }
+  });
+
+  it("delivers CRLF frames even when CR and LF arrive in different chunks", async () => {
+    const stream = controlledStream();
+    const events: unknown[] = [];
+    const sub = subscribeActivityEvents({ open: async () => stream.response, onEvent: e => events.push(e) });
+    try {
+      stream.write('data: {"type":"seat.activity_changed","seq":1}\r');
+      stream.write('\n\r');
+      stream.write('\ndata: {"type":"seat.activity_changed","seq":2}\r\n\r\n');
+      await until(() => events.length === 2, 300);
+      expect(events).toEqual([{ type: "seat.activity_changed", seq: 1 }, { type: "seat.activity_changed", seq: 2 }]);
+    } finally { sub.close(); }
+  });
+
+  it("joins data lines into one notification before parsing JSON", async () => {
+    const stream = controlledStream();
+    const events: unknown[] = [];
+    const sub = subscribeActivityEvents({ open: async () => stream.response, onEvent: e => events.push(e) });
+    try {
+      stream.write('event: activity\n: keepalive\ndata: {"type":"seat.activity_changed",\ndata: "seq":3}\n\n');
+      await until(() => events.length === 1, 300);
+      expect(events).toEqual([{ type: "seat.activity_changed", seq: 3 }]);
+    } finally { sub.close(); }
+  });
+
+  it("accepts bare CR delimiters and preserves subsequent LF notifications", async () => {
+    const stream = controlledStream();
+    const events: unknown[] = [];
+    const sub = subscribeActivityEvents({ open: async () => stream.response, onEvent: e => events.push(e) });
+    try {
+      stream.write('data: {"type":"seat.activity_changed","seq":4}\r\r');
+      stream.write('data: {"type":"seat.activity_changed","seq":5}\n\n');
+      await until(() => events.length === 2, 300);
+      expect(events).toEqual([{ type: "seat.activity_changed", seq: 4 }, { type: "seat.activity_changed", seq: 5 }]);
+    } finally { sub.close(); }
+  });
+});
+
+
+describe("bounded activity stream frames", () => {
+  const limit = 1_048_576;
+
+  function controlledStream(rejectCancel = false) {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const cancel = vi.fn(() => rejectCancel ? Promise.reject(new Error("cancel failed")) : undefined);
+    const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; }, cancel });
+    return { response: new Response(body), cancel, write: (s: string) => controller.enqueue(new TextEncoder().encode(s)) };
+  }
+
+  it.each([
+    ["unterminated line", "x".repeat(limit + 1)],
+    ["terminated line", "x".repeat(limit + 1) + "\n"],
+    ["event spanning individually short lines", ("data: " + "x".repeat(1024) + "\n").repeat(1025)],
+    ["empty data fields", "data\n".repeat(limit + 1)],
+  ])("cancels an oversized %s before scheduling a reconnect", async (_name, frame) => {
+    const first = controlledStream();
+    const recovered = controlledStream();
+    const events: unknown[] = [];
+    const statuses: string[] = [];
+    const open = vi.fn(async () => open.mock.calls.length === 1 ? first.response : recovered.response);
+    const sub = subscribeActivityEvents({ open, onEvent: e => events.push(e), onStatus: s => statuses.push(s), reconnectDelayMs: 200 });
+    try {
+      first.write(frame);
+      await until(() => first.cancel.mock.calls.length === 1, 500);
+      expect(events).toEqual([]);
+      expect(statuses).toEqual(["connected", "dropped"]);
+      expect(open).toHaveBeenCalledTimes(1);
+      await until(() => open.mock.calls.length === 2, 600);
+      recovered.write('data: {"type":"seat.activity_changed","seq":7}\n\n');
+      await until(() => events.length === 1, 300);
+      expect(events).toEqual([{ type: "seat.activity_changed", seq: 7 }]);
+    } finally { sub.close(); }
+  });
+
+  it("still reconnects when cancellation of an oversized frame rejects", async () => {
+    const stream = controlledStream(true);
+    const statuses: string[] = [];
+    const open = vi.fn(async () => open.mock.calls.length === 1 ? stream.response : null);
+    const sub = subscribeActivityEvents({ open, onEvent: () => {}, onStatus: s => statuses.push(s), reconnectDelayMs: 20 });
+    try {
+      stream.write("x".repeat(limit + 1));
+      await until(() => statuses.includes("unavailable"), 500);
+      expect(stream.cancel).toHaveBeenCalledTimes(1);
+      expect(statuses).toEqual(["connected", "dropped", "reconnecting", "unavailable"]);
+    } finally { sub.close(); }
+  });
+
+  it("resets the frame budget so one chunk can contain many ordinary notifications", async () => {
+    const stream = controlledStream();
+    const events: unknown[] = [];
+    const frame = 'data: {"type":"seat.activity_changed","seq":1}\n\n';
+    const count = Math.ceil((limit + 1) / frame.length);
+    const sub = subscribeActivityEvents({ open: async () => stream.response, onEvent: e => events.push(e) });
+    try {
+      stream.write(frame.repeat(count));
+      await until(() => events.length === count, 500);
+      expect(stream.cancel).not.toHaveBeenCalled();
+      expect(events.at(-1)).toEqual({ type: "seat.activity_changed", seq: 1 });
+    } finally { sub.close(); }
+  });
+
+  it("reconnects without waiting for underlying oversized-frame cancellation", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const cancel = vi.fn(() => pending);
+    const response = new Response(new ReadableStream<Uint8Array>({ start(c) { controller = c; }, cancel }));
+    const statuses: string[] = [];
+    const open = vi.fn(async () => open.mock.calls.length === 1 ? response : null);
+    const sub = subscribeActivityEvents({ open, onEvent: () => {}, onStatus: s => statuses.push(s), reconnectDelayMs: 20 });
+    try {
+      controller.enqueue(new TextEncoder().encode("x".repeat(limit + 1)));
+      await until(() => statuses.includes("unavailable"), 200);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(statuses).toEqual(["connected", "dropped", "reconnecting", "unavailable"]);
+    } finally { finish(); sub.close(); }
+  });
+
+});

@@ -1,0 +1,1000 @@
+// Rig Context / Composable Context Injection — the `rig context` CLI verb
+// family (Atom-7 renamed the retired `context-pack` grammar to `rig context`;
+// the pack STORE contract — kind/id/API/on-disk dir — is unchanged).
+//
+// Delivery-free subcommands parallel to `rig specs`:
+//   list / show / preview / compose / add / rm / sync
+//
+// Each delegates to /api/context-packs/library/* against the daemon.
+// The `add` verb installs a pack from a directory at
+// $OPENRIG_HOME/context/<name>/ — host-symlink-free contract,
+// matches `rig specs add` shape (regular files only; no symlinks).
+
+import { Command } from "commander";
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
+import { join, resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
+import { assertSafeInstallRef, assertTreeHasNoSymlinks, assertDestinationNamespaceContained, validateContextPackManifestForInstall } from "../lib/context-install.js";
+import { addGitContext, inspectGitContext, updateGitContext } from "../lib/context-git.js";
+import { ConfigStore } from "../config-store.js";
+import { DaemonClient, formatDaemonHostForUrl } from "../client.js";
+import { enumArg } from "../cli-error.js";
+import { getDaemonStatus, getDaemonUrl, startDaemon, statusGuardMessage} from "../daemon-lifecycle.js";
+import { resolveWorkPosition, type WorkInstallPlan } from "../lib/work-install.js";
+import {
+  reconcileSkillLoadout,
+  resolveSkillLoadout,
+  type ReconcileSkillLoadoutResult,
+  type SkillLoadout,
+} from "@openrig/daemon/skill-loadout";
+import { realDeps } from "./daemon.js";
+import { prepareDaemonAutoStart } from "../daemon-auto-start.js";
+import { readOpenRigEnv } from "../openrig-compat.js";
+import type { StatusDeps } from "./status.js";
+
+const contextRuntimeArg = enumArg(["claude-code", "claude", "codex"]);
+
+interface ContextPackEntryWire {
+  id: string;
+  kind: "context-pack";
+  name: string;
+  version: string;
+  purpose: string | null;
+  /** OPR.0.5.6.10 — pack-level classification from the daemon's ATOM_TAXONOMIES enum. */
+  taxonomy: string;
+  sourceType: "builtin" | "user_file" | "workspace";
+  sourcePath: string;
+  relativePath: string;
+  updatedAt: string;
+  manifestEstimatedTokens: number | null;
+  derivedEstimatedTokens: number;
+  files: Array<{
+    path: string;
+    role: string;
+    summary: string | null;
+    absolutePath: string | null;
+    bytes: number | null;
+    estimatedTokens: number | null;
+  }>;
+}
+
+/** Exact retry commands for a failed project selection, one per candidate id. */
+function projectRetryCommands(
+  code: string,
+  candidates: string[] | undefined,
+  opts: { mission?: string; slice?: string },
+): string[] | undefined {
+  if (!candidates || (code !== "project_required" && code !== "project_not_found")) return undefined;
+  const word = (value: string) => /^[A-Za-z0-9._\/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+  const narrowing = `${opts.mission !== undefined ? ` --mission ${word(opts.mission)}` : ""}${opts.slice !== undefined ? ` --slice ${word(opts.slice)}` : ""}`;
+  return candidates.map((id) => `rig context work-install --project ${word(id)}${narrowing}`);
+}
+
+function selectedIds(ids: string[], none: string): string {
+  return ids.length > 0 ? ids.join(", ") : none;
+}
+
+function printWorkInstallSelectors(result: WorkInstallPlan, topologySkills: string[]): void {
+  const world = result.systemWorld;
+  const identity = world.id ? ` ${world.id}@${world.version}` : "";
+  const path = world.manifestPath ? ` ${world.manifestPath}` : "";
+  console.log(`system  ${world.state} [${world.source}]${identity}${path}`);
+  const profiles = (selection: { profiles?: Record<string, string | undefined> }) => selection.profiles
+    ? ` (${Object.entries(selection.profiles).map(([runtime, profile]) => `${runtime}=${profile}`).join(", ")})`
+    : "";
+  for (const selection of world.context) console.log(`context system ${selection.ref}${profiles(selection)}`);
+  for (const selection of result.worlds ?? []) console.log(`context world ${selection.ref}${profiles(selection)}`);
+  if ((result.worlds ?? []).length > 0) console.log("worlds  read each with: rig context get <ref>");
+  console.log(`skills  system=${selectedIds(world.skills, "(none)")}`);
+  console.log(`skills  topology=${selectedIds(topologySkills, "(none)")}`);
+  console.log(`skills  project=${selectedIds(result.skills, "(none)")}`);
+}
+
+interface PreviewWire {
+  id: string;
+  name: string;
+  version: string;
+  bundleText: string;
+  bundleBytes: number;
+  estimatedTokens: number;
+  files: Array<{ path: string; role: string; bytes: number; estimatedTokens: number }>;
+  missingFiles: Array<{ path: string; role: string }>;
+}
+
+const SAFE_REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function assertSafeTopologySegment(kind: "rig" | "seat", value: string): void {
+  if (value === "." || value === ".." || !SAFE_REF_SEGMENT.test(value)) {
+    throw new Error(`unsafe ${kind} segment '${value}' — topology addresses require one bounded path segment`);
+  }
+}
+
+function assertLocalGitClient(client: DaemonClient): void {
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(new URL(client.baseUrl).hostname)) {
+    throw new Error("Run Git source selection/inspection/update on the daemon host through its loopback URL; these commands use local Git and filesystem paths.");
+  }
+}
+
+function isHttpUrl(source: string): boolean {
+  return /^https?:\/\//i.test(source);
+}
+
+async function fetchTextOrThrow(url: string, what: string): Promise<{ text: string; finalUrl: string }> {
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (err) {
+    throw new Error(`Could not reach ${what} at ${url}: ${(err as Error).message}`);
+  }
+  if (!res.ok) throw new Error(`Could not fetch ${what} at ${url}: HTTP ${res.status} ${res.statusText}`.trim());
+  // res.url is the FINAL url after any redirects — declared files must resolve
+  // relative to it, not the caller's original spelling (r2 MEDIUM-1).
+  return { text: await res.text(), finalUrl: res.url || url };
+}
+
+// OPR.0.5.3.7 R4 — install a context pack from a URL. <url> points at the pack's
+// manifest.yaml (a trailing '/' is treated as '<url>manifest.yaml'); every
+// files[].path is fetched relative to that manifest. ATOMIC BY CONSTRUCTION:
+// everything stages into a temp SIBLING of the target and is published by one
+// renameSync, so a malformed manifest, an unreachable URL, or a missing declared
+// file leaves NO partial pack behind. Deliberately dumb: no registry, no cache.
+async function installPackFromUrl(
+  url: string,
+  overrideName: string | undefined,
+  targetRoot: string,
+): Promise<{ targetDir: string; installName: string }> {
+  const manifestUrl = url.endsWith("/") ? `${url}manifest.yaml` : url;
+  mkdirSync(targetRoot, { recursive: true });
+  const staging = mkdtempSync(join(targetRoot, ".tmp-add-"));
+  try {
+    // Fetch + validate the manifest before touching the target namespace.
+    const { text: manifestText, finalUrl: finalManifestUrl } = await fetchTextOrThrow(manifestUrl, "manifest");
+    writeFileSync(join(staging, "manifest.yaml"), manifestText);
+    validateContextPackManifestForInstall(join(staging, "manifest.yaml"));
+    const manifest = parseYaml(manifestText) as { name: string; files: Array<{ path: string }> };
+    const installName = overrideName ?? manifest.name;
+    assertSafeInstallRef(installName);
+    assertDestinationNamespaceContained(targetRoot, installName);
+    const targetDir = join(targetRoot, installName);
+    if (existsSync(targetDir)) {
+      throw new Error(`A context pack named '${installName}' already exists at ${targetDir}. Remove it first or use --name to install under a different name.`);
+    }
+    // Fetch every declared file relative to the manifest's FINAL url (after
+    // redirects), via the platform URL resolver — never the caller's original
+    // spelling (r2 MEDIUM-1: a redirected manifest must not resolve files against
+    // the stale request base).
+    //
+    // BOUNDARY (r2 HIGH-1): new URL() also honors an ABSOLUTE f.path, and the
+    // manifest validator accepts a URL-shaped value as a filesystem-relative
+    // path. Require every resolved file URL to stay under the manifest's own
+    // directory (same origin + path prefix) so a stranger-supplied manifest can
+    // never make add fetch cross-origin or climb out of its pack. The trailing
+    // slash on the base defeats prefix-sibling ('/pack' vs '/pack-evil') tricks.
+    const manifestDirUrl = new URL("./", finalManifestUrl).href;
+    for (const f of manifest.files) {
+      const fileUrl = new URL(f.path, finalManifestUrl).href;
+      if (!fileUrl.startsWith(manifestDirUrl)) {
+        throw new Error(
+          `manifest file '${f.path}' resolves to ${fileUrl}, outside the pack directory ${manifestDirUrl}. ` +
+            `Declared files must be relative to the manifest (no absolute URLs, no escaping the pack).`,
+        );
+      }
+      const { text: fileText } = await fetchTextOrThrow(fileUrl, `file '${f.path}'`);
+      const dest = join(staging, f.path);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, fileText);
+    }
+    // Re-validate the on-disk staged pack, then publish atomically.
+    validateContextPackManifestForInstall(join(staging, "manifest.yaml"));
+    assertTreeHasNoSymlinks(staging);
+    renameSync(staging, targetDir);
+    return { targetDir, installName };
+  } catch (err) {
+    rmSync(staging, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+async function resolvePack(client: DaemonClient, nameOrRef: string): Promise<ContextPackEntryWire> {
+  if (nameOrRef.startsWith("context-pack:")) {
+    throw new Error(
+      "Context pack colon-id addressing ('context-pack:<name>:<version>') was removed. " +
+        "Address a pack by its path-like ref instead (for example 'packs/compaction-restore').",
+    );
+  }
+  if (nameOrRef.includes("/")) {
+    const res = await client.get<ContextPackEntryWire & { error?: string; message?: string }>(
+      `/api/context-packs/library/by-ref?ref=${encodeURIComponent(nameOrRef)}`,
+    );
+    if (res.status === 200) return res.data;
+    if (res.status === 404) throw new Error(`Context pack '${nameOrRef}' not found in library. Run 'rig context list' to see what's available.`);
+    if (res.status === 400) throw new Error(res.data?.message ?? `Unsafe context pack ref '${nameOrRef}'.`);
+    throw new Error(`Daemon returned HTTP ${res.status} for /api/context-packs/library/by-ref`);
+  }
+  const res = await client.get<ContextPackEntryWire[]>("/api/context-packs/library");
+  if (res.status !== 200) throw new Error(`Daemon returned HTTP ${res.status} for /api/context-packs/library`);
+  const entries = res.data ?? [];
+  const exactRef = entries.find((entry) => entry.relativePath === nameOrRef);
+  if (exactRef) return exactRef;
+  const matches = entries.filter((e) => e.name === nameOrRef);
+  if (matches.length === 0) {
+    throw new Error(`Context pack '${nameOrRef}' not found in library. Run 'rig context list' to see what's available.`);
+  }
+  if (matches.length > 1) {
+    const refs = matches.map((entry) => entry.relativePath).join(", ");
+    throw new Error(`Context pack name '${nameOrRef}' is ambiguous across refs: ${refs}. Address it by path-like ref.`);
+  }
+  return matches[0]!;
+}
+
+export function contextCommand(depsOverride?: StatusDeps & { preflightExec?: (cmd: string) => Promise<string> }): Command {
+  const cmd = new Command("context")
+    .description("Browse, preview, compose, and manage operator-authored context packs")
+    .addHelpText("after", `
+Examples:
+  rig context list
+  rig context show pl-005-phase-a-priming
+  rig context preview pl-005-phase-a-priming
+  rig context add ./my-pack
+  rig context rm packs/compaction-restore
+  rig context sync
+  rig context profile world-public --situation fresh --runtime claude-code
+  rig context work-install --runtime claude-code
+  rig context trace --rig factory --seat orch-lead --name LEARNED.md
+  rig context trace --rig factory --pod dev --seat dev-qa --name LEARNED.md
+`);
+
+  const getDeps = (): StatusDeps => depsOverride ?? {
+    lifecycleDeps: realDeps(),
+    clientFactory: (url: string) => new DaemonClient(url),
+  };
+
+  cmd.command("work-install")
+    .description("Resolve System World plus project work context and the managed skill loadout")
+    .option("--project <id>", "Exact project id from workspace.yaml")
+    .option("--mission <id>", "Exact mission id under the selected project")
+    .option("--slice <id>", "Exact slice id under the selected mission")
+    .option("--deliver", "Include the exact content of each extant planned file")
+    .option("--runtime <runtime>", "Inspect skills for claude-code (alias: claude) or codex", contextRuntimeArg)
+    .option("--cwd <path>", "Agent working directory that receives skill projections (default: current directory)")
+    .option("--topology <ids>", "Comma-separated topology/profile skill identities")
+    .option("--apply-skills", "Reconcile selected skills into the runtime harness directory")
+    .option("--json", "JSON output")
+    .action((opts: { project?: string; mission?: string; slice?: string; deliver?: boolean; runtime?: string; cwd?: string; topology?: string; applySkills?: boolean; json?: boolean }) => {
+      if (opts.applySkills && opts.runtime === undefined) {
+        console.error("invalid_runtime: --apply-skills requires --runtime claude-code (alias: claude) or codex");
+        process.exitCode = 1;
+        return;
+      }
+      const store = new ConfigStore();
+      const workspaceRoot = String(store.resolveWithSource("workspace.root").value);
+      const catalogPath = String(store.resolveWithSource("workspace.catalog_path").value);
+      const contextRoot = String(store.resolveWithSource("context.root").value);
+      const systemWorldSetting = store.resolveWithSource("context.system_world");
+      const result = resolveWorkPosition({
+        workspaceRoot,
+        catalogPath,
+        contextRoot,
+        systemWorldSelection: String(systemWorldSetting.value),
+        systemWorldSource: systemWorldSetting.source,
+        cwd: resolve(opts.cwd ?? process.cwd()),
+        ...(process.env["OPENRIG_SESSION_NAME"] ? { sessionName: process.env["OPENRIG_SESSION_NAME"] } : {}),
+        ...(opts.project !== undefined ? { project: opts.project } : {}),
+        ...(opts.mission !== undefined ? { mission: opts.mission } : {}),
+        ...(opts.slice !== undefined ? { slice: opts.slice } : {}),
+      });
+      if ("error" in result) {
+        const commands = projectRetryCommands(result.error.code, result.error.candidates, opts);
+        if (opts.json) {
+          console.log(JSON.stringify({ ok: false, error: { ...result.error, ...(commands ? { commands } : {}) } }));
+        } else {
+          console.error(`${result.error.code}: ${result.error.message}`);
+          const choices = commands ?? result.error.candidates ?? [];
+          if (choices.length > 0) {
+            console.error(commands ? "Run one of:" : "Candidates:");
+            for (const choice of choices) console.error(`  ${choice}`);
+          }
+        }
+        process.exitCode = 1;
+        return;
+      }
+      let skillLoadout: SkillLoadout | undefined;
+      let skillProjection: ReconcileSkillLoadoutResult | undefined;
+      if (opts.runtime) {
+        const topologySkills = (opts.topology ?? "").split(",").map((id) => id.trim()).filter(Boolean);
+        const resolvedSkills = resolveSkillLoadout({
+          catalogRoot: String(store.resolveWithSource("skills.root").value),
+          systemSkills: result.systemWorld.skills,
+          topologySkills,
+          projectRoot: result.position.projectRoot,
+          projectSkills: result.skills,
+        });
+        if (!resolvedSkills.ok) {
+          if (opts.json) console.log(JSON.stringify({ ok: false, errors: resolvedSkills.errors }, null, 2));
+          else for (const error of resolvedSkills.errors) console.error(`${error.code}: ${error.message}`);
+          process.exitCode = 1;
+          return;
+        }
+        skillLoadout = resolvedSkills.loadout;
+        // A skill with uncommitted catalog content blocks only itself: name it, project the rest, and exit non-zero
+        // when something selected it.
+        const skippedSkills = skillLoadout.skipped ?? [];
+        if (!opts.json) for (const skip of skippedSkills) console.error(`Warning: ${skip.message}`);
+        if (skippedSkills.some((skip) => skip.selectedBy.length > 0)) process.exitCode = 1;
+        skillProjection = reconcileSkillLoadout({
+          loadout: skillLoadout,
+          runtime: opts.runtime === "codex" ? "codex" : "claude-code",
+          cwd: resolve(opts.cwd ?? process.cwd()),
+          apply: opts.applySkills === true,
+        });
+        if (!skillProjection.ok) process.exitCode = 1;
+      }
+      if (opts.json) {
+        const output = opts.deliver
+          ? {
+              ...result,
+              pieces: result.pieces.map((piece) => piece.exists
+                ? { ...piece, content: readFileSync(piece.path, "utf8") }
+                : piece),
+              ...(skillLoadout ? { skillLoadout, skillProjection } : {}),
+            }
+          : { ...result, ...(skillLoadout ? { skillLoadout, skillProjection } : {}) };
+        console.log(JSON.stringify(output, null, 2));
+        return;
+      }
+      if (opts.deliver) {
+        for (const planned of result.pieces) {
+          if (!planned.exists) {
+            console.log(`=== ${planned.address} (absent: ${planned.path}) ===`);
+            continue;
+          }
+          console.log(`=== ${planned.altitude} ${planned.address} ===`);
+          console.log(readFileSync(planned.path, "utf8"));
+        }
+        printWorkInstallSelectors(result, (opts.topology ?? "").split(",").map((id) => id.trim()).filter(Boolean));
+        if (skillProjection) {
+          for (const receipt of skillProjection.receipts) {
+            console.log(`${receipt.status.padEnd(7)} ${receipt.id} [${receipt.selectedBy.join("+")}] ${receipt.target}`);
+          }
+          for (const id of skillProjection.removed) console.log(`removed ${id}`);
+          if (skillProjection.freshLaunchRequired) console.log("skills  fresh seat process required to observe changed ambient skills");
+          if (!opts.applySkills) console.log("skills  read-only; add --apply-skills to reconcile");
+        }
+        for (const warning of result.warnings) console.error(`Warning: ${warning}`);
+        return;
+      }
+      const selectedByLabels: Record<string, string> = {
+        rig: " (selected by this rig's catalog entry)",
+        cwd: " (selected by the working directory)",
+        unclaimed: " (the only project no rig claims)",
+      };
+      const selectedBy = selectedByLabels[result.position.selectedBy] ?? "";
+      console.log(`project ${result.position.projectId ?? "(unmanifested)"}: ${result.position.projectRoot}${selectedBy}`);
+      printWorkInstallSelectors(result, (opts.topology ?? "").split(",").map((id) => id.trim()).filter(Boolean));
+      for (const planned of result.pieces) {
+        console.log(`${planned.altitude.padEnd(7)} ${planned.address} [${planned.source}] ${planned.exists ? planned.path : `(absent: ${planned.path})`}`);
+      }
+      if (skillProjection) {
+        for (const receipt of skillProjection.receipts) {
+          console.log(`${receipt.status.padEnd(7)} ${receipt.id} [${receipt.selectedBy.join("+")}] ${receipt.target}`);
+        }
+        for (const id of skillProjection.removed) console.log(`removed ${id}`);
+        if (skillProjection.freshLaunchRequired) console.log("skills  fresh seat process required to observe changed ambient skills");
+        if (!opts.applySkills) console.log("skills  read-only; add --apply-skills to reconcile");
+      }
+      for (const warning of result.warnings) console.error(`Warning: ${warning}`);
+    });
+
+  async function getClient(autoStartLocal = false): Promise<DaemonClient> {
+    const deps = getDeps();
+    let status = await getDaemonStatus(deps.lifecycleDeps);
+    if (autoStartLocal && (status.state === "stopped" || status.state === "stale")
+      && !readOpenRigEnv("OPENRIG_URL", "RIGGED_URL")) {
+      // Startup uses current config. A retained endpoint must not mask an
+      // explicitly selected host when deciding whether startup is local.
+      const selection = new ConfigStore().resolveWithSource("daemon.host");
+      const host = selection.source === "default"
+        ? new URL(new DaemonClient().baseUrl).hostname
+        : new URL(`http://${formatDaemonHostForUrl(String(selection.value))}`).hostname;
+      if (["127.0.0.1", "localhost", "[::1]"].includes(host)) {
+        const prepared = await prepareDaemonAutoStart(deps.lifecycleDeps, depsOverride?.preflightExec);
+        if (!prepared.preflight.ready) {
+          throw new Error(prepared.preflight.checks.filter((check) => !check.ok)
+            .map((check) => `${check.name}: ${check.error}${check.fix ? ` Fix: ${check.fix}` : ""}`).join("\n"));
+        }
+        await startDaemon(prepared.options, deps.lifecycleDeps);
+        status = await getDaemonStatus(deps.lifecycleDeps);
+      }
+    }
+    if (status.state !== "running" || status.healthy === false) {
+      // B8-1b: epistemic-matched language via the one helper (down ≠ busy).
+      const gm = statusGuardMessage(status); throw new Error(`${gm.fact} ${gm.action}`);
+    }
+    return deps.clientFactory(getDaemonUrl(status));
+  }
+
+  // OPR.0.5.3.6 — the productized chain-file trace. Daemon-independent by
+  // design: the walk is a config read + filesystem reads, so it works on a
+  // box whose daemon is down (orientation is exactly when that happens).
+  cmd.command("trace")
+    .description("Walk the topology tree for one chain filename (instance -> rig -> optional pod -> optional seat), keyed off topology.root")
+    .requiredOption("--rig <rig>", "Rig name (the rigs/<rig> altitude)")
+    .option("--pod <pod>", "Pod id (the pods/<pod> altitude); omit when no pod context is selected")
+    .option("--seat <seat>", "Seat folder name (<pod>-<member>, e.g. dev1-qa); omit for a rig-level trace")
+    .requiredOption("--name <file>", "Chain filename, identical at every altitude (e.g. LEARNED.md, CULTURE.md)")
+    .option("--json", "JSON output for agents")
+    .action(async (opts: { rig: string; pod?: string; seat?: string; name: string; json?: boolean }) => {
+      const { ConfigStore } = await import("../config-store.js");
+      const { traceTopologyChain } = await import("../lib/topology-trace.js");
+      const store = new ConfigStore();
+      const resolved = store.resolveWithSource("topology.root");
+      let result;
+      try {
+        result = traceTopologyChain({
+          topologyRoot: String(resolved.value),
+          name: opts.name,
+          rig: opts.rig,
+          pod: opts.pod ?? null,
+          seat: opts.seat ?? null,
+        });
+      } catch (err) {
+        // r2-B3: traversal-shaped input is a clean refusal, never a stack trace.
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+        return;
+      }
+      // Advisories go to stderr on BOTH output modes — a legacy read must
+      // never pass silently, and stdout stays clean for piping.
+      for (const level of result.levels) {
+        if (level.advisory) console.error(`ADVISORY ${level.advisory}`);
+      }
+      if (opts.json) {
+        console.log(JSON.stringify({ topologyRootSource: resolved.source, ...result }, null, 2));
+        return;
+      }
+      console.log(`chain "${result.name}" under topology.root=${result.topologyRoot} (source: ${resolved.source})`);
+      for (const level of result.levels) {
+        if (level.source === "absent") {
+          console.log(`\n== ${level.altitude} — absent (${level.path})`);
+          continue;
+        }
+        const origin = level.source === "legacy" ? ` [LEGACY: ${level.resolvedPath}]` : "";
+        console.log(`\n== ${level.altitude} — ${level.path}${origin}`);
+        console.log(level.content?.trimEnd() ?? "");
+      }
+    });
+
+  cmd.command("compose")
+    .description("Compose ordered files into a durable context-pack ref (never delivers)")
+    .requiredOption("--out <ref>", "Path-like durable output ref")
+    .requiredOption("--from <files...>", "Ordered source files")
+    .action(async (opts: { out: string; from: string[] }) => {
+      const deps = getDeps();
+      const status = await getDaemonStatus(deps.lifecycleDeps);
+      if (status.state !== "running" || status.healthy === false) {
+        console.error("Daemon is not running. Start it with: rig daemon start");
+        process.exitCode = 1;
+        return;
+      }
+      const client = deps.clientFactory(getDaemonUrl(status));
+      try {
+        const res = await client.post<{
+          ref?: string;
+          bytes?: number;
+          estimatedTokens?: number;
+          files?: unknown[];
+          error?: string;
+          message?: string;
+        }>("/api/context-packs/library/compose", {
+          outRef: opts.out,
+          sources: opts.from.map((path) => ({ path: resolve(path), label: path })),
+        });
+        if (res.status !== 201) {
+          throw new Error(res.data.message ?? res.data.error ?? `Daemon returned HTTP ${res.status}`);
+        }
+        console.log(
+          `Composed ${res.data.files?.length ?? opts.from.length} file(s) -> ${res.data.ref} ` +
+          `(${res.data.bytes ?? 0} bytes, ~${res.data.estimatedTokens ?? 0} tokens).`,
+        );
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  cmd.command("list")
+    .description("List all context packs in the library")
+    .option("--json", "JSON output")
+    .action(async (opts: { json?: boolean }) => {
+      try {
+        const client = await getClient();
+        const res = await client.get<ContextPackEntryWire[]>("/api/context-packs/library");
+        if (res.status !== 200) throw new Error(`Daemon returned HTTP ${res.status}`);
+        const entries = res.data ?? [];
+        if (opts.json) {
+          console.log(JSON.stringify(entries, null, 2));
+          return;
+        }
+        if (entries.length === 0) {
+          console.log("No context packs in library. Author one under `rig config get context.root`, then run: rig context sync");
+          return;
+        }
+        for (const e of entries) {
+          console.log(`${e.relativePath.padEnd(36)} ${e.name.padEnd(24)} v${String(e.version).padEnd(6)} ${(e.taxonomy ?? "—").padEnd(8)} ${String(e.files.length).padStart(2)} files  ~${String(e.derivedEstimatedTokens).padStart(6)} tokens  ${e.sourceType}  ${e.sourcePath}`);
+        }
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  cmd.command("show")
+    .argument("<name-or-ref>", "Context pack name or path-like ref")
+    .description("Show pack manifest + per-file metadata")
+    .option("--json", "JSON output")
+    .action(async (nameOrId: string, opts: { json?: boolean }) => {
+      try {
+        const client = await getClient();
+        const entry = await resolvePack(client, nameOrId);
+        if (opts.json) {
+          console.log(JSON.stringify(entry, null, 2));
+          return;
+        }
+        console.log(`Ref:         ${entry.relativePath}`);
+        console.log(`Name:        ${entry.name}`);
+        console.log(`Version:     ${entry.version}`);
+        console.log(`Source:      ${entry.sourceType} (${entry.sourcePath})`);
+        console.log(`Files:       ${entry.files.length}`);
+        console.log(`Tokens (~):  ${entry.derivedEstimatedTokens}${entry.manifestEstimatedTokens !== null ? ` (manifest: ${entry.manifestEstimatedTokens})` : ""}`);
+        if (entry.purpose) {
+          console.log("");
+          console.log("Purpose:");
+          console.log(`  ${entry.purpose.replaceAll("\n", "\n  ")}`);
+        }
+        console.log("");
+        for (const f of entry.files) {
+          const sizeStr = f.bytes === null ? "(missing)" : `${f.bytes}B`;
+          const tokenStr = f.estimatedTokens === null ? "—" : `~${f.estimatedTokens} tokens`;
+          console.log(`  ${f.path.padEnd(40)} role=${f.role.padEnd(20)} ${sizeStr.padEnd(12)} ${tokenStr}`);
+          if (f.summary) console.log(`    ${f.summary}`);
+        }
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  cmd.command("preview")
+    .argument("<name-or-ref>", "Context pack name or path-like ref")
+    .description("Show the assembled bundle without delivering it")
+    .option("--json", "JSON output")
+    .action(async (nameOrRef: string, opts: { json?: boolean }) => {
+      try {
+        const client = await getClient();
+        const entry = await resolvePack(client, nameOrRef);
+        const res = await client.get<PreviewWire>(`/api/context-packs/library/by-ref/preview?ref=${encodeURIComponent(entry.relativePath)}`);
+        if (res.status !== 200) throw new Error(`Daemon returned HTTP ${res.status}`);
+        const preview = res.data;
+        if (opts.json) {
+          console.log(JSON.stringify(preview, null, 2));
+          return;
+        }
+        if (preview.missingFiles.length > 0) {
+          console.error(`Warning: ${preview.missingFiles.length} file(s) referenced by manifest are missing on disk:`);
+          for (const m of preview.missingFiles) console.error(`  - ${m.path} (role: ${m.role})`);
+          console.error("");
+        }
+        console.log(`# Preview: ${preview.name} v${preview.version}`);
+        console.log(`# Bundle: ${preview.bundleBytes} bytes (~${preview.estimatedTokens} tokens), ${preview.files.length} files`);
+        console.log("# ---");
+        console.log(preview.bundleText);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  // OPR.0.5.3.7 R1 — the PULL verb: an agent-facing serving verb over the EXISTING assembler
+  // path (the same by-ref/preview machinery `preview` uses — never a parallel assembler).
+  // `preview` is the operator's pre-send check; `get` is what a seat runs on demand to LOAD a
+  // library entry. Output is the assembled bundle itself (so the agent consumes exactly those
+  // bytes), warnings to stderr; `--json` for programmatic use. Naming ruled: `rig context get`
+  // (one library, one verb — NOT `rig skills get`; "skills" is an org category in the library).
+  cmd.command("get")
+    .argument("<name-or-ref>", "Context library entry name, path-like ref, or address (<pack-ref>/<file>#H2-slug/H3-slug)")
+    .description("Serve the assembled bundle for an agent to load on demand (the pull verb)")
+    .option("--json", "JSON output")
+    .action(async (nameOrRef: string, opts: { json?: boolean }) => {
+      try {
+        const client = await getClient();
+        // OPR.0.5.3.5 Atom 4c: fragment addresses route directly to the
+        // daemon's resolver. A bare slash-containing value may be either a
+        // pack ref or a whole-file address, so exact-pack lookup wins and only
+        // its 404 falls through to the same resolver.
+        if (nameOrRef.includes("#")) {
+          const res = await client.get<{ text?: string; message?: string; error?: string }>(
+            `/api/context-packs/library/resolve-address?address=${encodeURIComponent(nameOrRef)}`,
+          );
+          if (res.status !== 200) {
+            throw new Error(res.data?.message ?? res.data?.error ?? `Daemon returned HTTP ${res.status} for resolve-address`);
+          }
+          if (opts.json) console.log(JSON.stringify(res.data, null, 2));
+          else console.log(res.data.text);
+          return;
+        }
+        let entry: ContextPackEntryWire;
+        if (nameOrRef.includes("/")) {
+          const exact = await client.get<ContextPackEntryWire & { error?: string; message?: string }>(
+            `/api/context-packs/library/by-ref?ref=${encodeURIComponent(nameOrRef)}`,
+          );
+          if (exact.status === 404) {
+            const res = await client.get<{ text?: string; message?: string; error?: string }>(
+              `/api/context-packs/library/resolve-address?address=${encodeURIComponent(nameOrRef)}`,
+            );
+            if (res.status !== 200) {
+              throw new Error(res.data?.message ?? res.data?.error ?? `Daemon returned HTTP ${res.status} for resolve-address`);
+            }
+            if (opts.json) console.log(JSON.stringify(res.data, null, 2));
+            else process.stdout.write(res.data.text ?? "");
+            return;
+          }
+          if (exact.status === 400) throw new Error(exact.data?.message ?? `Unsafe context pack ref '${nameOrRef}'.`);
+          if (exact.status !== 200) throw new Error(`Daemon returned HTTP ${exact.status} for /api/context-packs/library/by-ref`);
+          entry = exact.data;
+        } else {
+          entry = await resolvePack(client, nameOrRef);
+        }
+        const res = await client.get<PreviewWire>(`/api/context-packs/library/by-ref/preview?ref=${encodeURIComponent(entry.relativePath)}`);
+        if (res.status !== 200) throw new Error(`Daemon returned HTTP ${res.status}`);
+        const bundle = res.data;
+        if (opts.json) {
+          console.log(JSON.stringify(bundle, null, 2));
+          return;
+        }
+        // Warnings go to stderr so stdout is exactly the served bundle bytes.
+        if (bundle.missingFiles.length > 0) {
+          console.error(`Warning: ${bundle.missingFiles.length} file(s) referenced by manifest are missing on disk.`);
+          for (const m of bundle.missingFiles) console.error(`  - ${m.path} (role: ${m.role})`);
+        }
+        console.log(bundle.bundleText);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  // OPR.0.5.3.5 Atom 4d — situation-composed delivery (the profile verb).
+  // Serving only: pieces to stdout with their source labels (Q2-Amendment 1),
+  // budget report + provenance warnings to stderr. Delivery-free like every
+  // library verb — nothing here sends to a seat. Naming rig/seat (or mission)
+  // is the caller's explicit grant of read access to that directory subtree.
+  cmd.command("profile")
+    .argument("<name-or-ref>", "Context pack name or path-like ref (its manifest must declare atoms)")
+    .requiredOption("--situation <situation>", "fresh | handover | post-compaction")
+    // r1 4d obs 2: default from the seat's own environment — a codex seat that
+    // forgets the flag must not silently get a claude profile (mini-req 3 is
+    // the rule that the runtimes compose DIFFERENT profiles). Flag beats env;
+    // an unrecognized env value falls back to claude rather than erroring a
+    // surface the env owner may not control.
+    .option("--runtime <runtime>", "claude-code (alias: claude) or codex (default: $OPENRIG_RUNTIME, else claude-code)", contextRuntimeArg)
+    .option("--profile <profile>", "Named install profile declared by the pack (selection + ordered phases)")
+    .option("--budget <tokens>", "Situation token budget — overage is REPORTED, never truncated")
+    .option("--rig <rig>", "With --seat: grant read access to that seat's tree (seat: atoms)")
+    .option("--seat <seat>", "With --rig: the seat whose tree seat: atoms may read")
+    .option("--mission <mission>", "Grant read access to that mission's tree (mission: atoms)")
+    .option("--slice <slice>", "With --mission: compose the legacy default project/mission/slice SPEC walk")
+    .option("--json", "JSON output (the full composed profile)")
+    .action(async (nameOrRef: string, opts: { situation: string; runtime?: string; profile?: string; budget?: string; rig?: string; seat?: string; mission?: string; slice?: string; json?: boolean }) => {
+      try {
+        const client = await getClient();
+        const entry = await resolvePack(client, nameOrRef);
+        // r1 F2: the product's runtime vocabulary is "claude-code" / "codex"
+        // (the adapters' values, live on real seats) — map it EXPLICITLY. A
+        // genuinely unknown value falls back to claude WITH A VOICE: a future
+        // third runtime must not silently get a claude profile (the exact
+        // mini-req 3 hazard this default exists to close).
+        const envRuntime = process.env["OPENRIG_RUNTIME"];
+        let runtime = opts.runtime;
+        if (runtime === undefined) {
+          if (envRuntime === "codex") runtime = "codex";
+          else if (envRuntime === "claude-code" || envRuntime === "claude") runtime = "claude";
+          else {
+            if (envRuntime) console.error(`Warning: unrecognized OPENRIG_RUNTIME '${envRuntime}' — composing the claude profile; pass --runtime to override.`);
+            runtime = "claude";
+          }
+        }
+        // Keep the composer/manifest key and returned metadata compatible.
+        if (runtime === "claude-code") runtime = "claude";
+        const params = new URLSearchParams({ ref: entry.relativePath, situation: opts.situation, runtime });
+        if (opts.profile !== undefined) params.set("profile", opts.profile);
+        if (opts.budget !== undefined) params.set("budget", opts.budget);
+        if (opts.rig !== undefined) params.set("rig", opts.rig);
+        if (opts.seat !== undefined) params.set("seat", opts.seat);
+        if (opts.mission !== undefined) params.set("mission", opts.mission);
+        if (opts.slice !== undefined) params.set("slice", opts.slice);
+        const res = await client.get<{
+          profileId?: string;
+          phases?: Array<{ id: string; kind: string; sources?: string[]; estimatedTokens: number }>;
+          pieces?: Array<{ atomId: string; address: string; sourceKind: string; text: string; estimatedTokens: number; writtenAt?: string }>;
+          totalEstimatedTokens?: number;
+          budget?: { limitTokens: number; overageTokens: number; dropCandidates: Array<{ atomId: string; priority: string; estimatedTokens: number }> };
+          warnings?: string[];
+          provenanceWarnings?: string[];
+          message?: string;
+          error?: string;
+        }>(`/api/context-packs/library/by-ref/profile?${params.toString()}`);
+        if (res.status !== 200) {
+          throw new Error(res.data?.message ?? res.data?.error ?? `Daemon returned HTTP ${res.status} for by-ref/profile`);
+        }
+        const profile = res.data;
+        if (opts.json) {
+          console.log(JSON.stringify(profile, null, 2));
+          return;
+        }
+        if (profile.profileId) {
+          console.error(`PROFILE ${profile.profileId}`);
+          for (const phase of profile.phases ?? []) {
+            const sources = phase.sources ? ` [${phase.sources.join(", ")}]` : "";
+            console.error(`PHASE ${phase.id} (${phase.kind}${sources}, ~${phase.estimatedTokens} tokens)`);
+          }
+        }
+        // Warnings and the budget report ride stderr so stdout is exactly the
+        // composed walk an agent consumes.
+        for (const w of profile.warnings ?? []) console.error(`WARNING ${w}`);
+        for (const w of profile.provenanceWarnings ?? []) console.error(`PROVENANCE ${w}`);
+        if (profile.budget) {
+          console.error(
+            `BUDGET: over by ~${profile.budget.overageTokens} tokens (limit ${profile.budget.limitTokens}); ` +
+            `drop candidates in order: ${profile.budget.dropCandidates.map((d) => `${d.atomId} (${d.priority}, ~${d.estimatedTokens})`).join(", ")}`,
+          );
+        }
+        for (const p of profile.pieces ?? []) {
+          // r1 4d obs 1: the escape marker rides the FRAMING header, so an
+          // agent that discards stderr still learns a piece's bytes came from
+          // outside its root — self-describing payload, zero composed bytes
+          // touched.
+          const escaped = (p as { provenance?: { escapesRoot?: boolean } }).provenance?.escapesRoot ? " !ESCAPED-ROOT" : "";
+          const written = p.writtenAt ? ` written ${p.writtenAt}` : "";
+          console.log(`=== ${p.atomId} [${p.sourceKind}${escaped}] ${p.address} (~${p.estimatedTokens} tokens)${written}`);
+          console.log(p.text);
+          console.log("");
+        }
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  // OPR.0.5.3.5 mini-req 7 — the outgoing occupant's boundary write (the Q2
+  // requirement the store alone does not satisfy). Daemon-independent like
+  // trace: the seat dir resolves from topology.root CONFIG; the write flows
+  // through the ONE store (supersession + addressability gate); advisory
+  // contract findings ride stderr while the write still lands — the boundary
+  // is never blocked on prose shape.
+  cmd.command("recap-write")
+    .description("Write this seat's authored RECAP (decisions-with-rationale) at the handover boundary; supersedes the previous recap into the seat's chain")
+    .requiredOption("--rig <rig>", "Rig name (the rigs/<rig> altitude)")
+    .requiredOption("--seat <seat>", "Seat id (the seats/<seat> altitude)")
+    .requiredOption("--file <path>", "Markdown file containing the recap content")
+    .action(async (opts: { rig: string; seat: string; file: string }) => {
+      try {
+        const { writeSeatRecap, validateRecapContract, listRecapChain } = await import("@openrig/daemon/seat-recap-store");
+        const content = readFileSync(opts.file, "utf-8");
+        const store = new ConfigStore();
+        const topologyRoot = String(store.resolveWithSource("topology.root").value);
+        assertSafeTopologySegment("rig", opts.rig);
+        assertSafeTopologySegment("seat", opts.seat);
+        const rigDir = join(topologyRoot, "rigs", opts.rig);
+        if (!existsSync(rigDir)) {
+          throw new Error(`rig directory ${rigDir} does not exist — check --rig against the topology tree (topology.root=${topologyRoot}).`);
+        }
+        const seatDir = join(topologyRoot, "rigs", opts.rig, "seats", opts.seat);
+        assertDestinationNamespaceContained(join(topologyRoot, "rigs"), `${opts.rig}/seats/${opts.seat}/RECAP.md`);
+        mkdirSync(seatDir, { recursive: true });
+        for (const f of validateRecapContract(content)) {
+          console.error(f.kind === "no-decisions-section"
+            ? "ADVISORY no-decisions-section: the authoring contract asks for decisions WITH rationale — conclusions alone are the lossy handoff shape."
+            : `ADVISORY nonstandard-unverified-marker (line ${f.line}): use the canonical 'UNVERIFIED:' form so uncertain facts stay findable.`);
+        }
+        writeSeatRecap({ seatDir, content });
+        const chain = listRecapChain(seatDir);
+        console.log(`Recap written: ${join(seatDir, "RECAP.md")}${chain.length > 0 ? ` (${chain.length} superseded predecessor${chain.length === 1 ? "" : "s"} retained)` : ""}`);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  cmd.command("sync")
+    .description("Re-walk discovery roots and refresh the library index")
+    .option("--json", "JSON output")
+    .action(async (opts: { json?: boolean }) => {
+      try {
+        const client = await getClient();
+        const res = await client.post<{ count: number; errors: Array<{ source: string; error: string }>; entries: ContextPackEntryWire[] }>(
+          "/api/context-packs/library/sync",
+        );
+        if (res.status !== 200) throw new Error(`Daemon returned HTTP ${res.status}`);
+        const data = res.data;
+        if (opts.json) {
+          console.log(JSON.stringify(data, null, 2));
+          return;
+        }
+        console.log(`Indexed ${data.count} context pack(s).`);
+        if (data.errors.length > 0) {
+          console.log(`Encountered ${data.errors.length} parse error(s):`);
+          for (const e of data.errors) console.log(`  - ${e.source}: ${e.error}`);
+        }
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  cmd.command("add")
+    .argument("<source>", "Pack directory/manifest URL, or Git repository path/URL with --git")
+    .description("Install a pack; --git discovers a pack in a Git repository and retains its update relationship")
+    .option("--name <name>", "Override the install name (defaults to the manifest name / source basename)")
+    .option("--git", "Fetch a Git repository's advertised commit at depth 1 with existing credentials; select a pack snapshot")
+    .option("--checkout", "With --git, select an existing checkout instead of cloning; updates may merge in it")
+    .option("--pack <path>", "With --git, select a repository-relative pack; default discovers manifest.yaml or .openrig/context-packs")
+    .option("--json", "JSON output")
+    .addHelpText("after", "\nGit downloads omit history and tags initially. A server that refuses shallow retrieval gets a full clone instead, with a warning on stderr (also with --json).\nExisting --checkout history is unchanged; context source update explicitly fetches and merges later revisions.\n")
+    .action(async (source: string, opts: { name?: string; json?: boolean; git?: boolean; checkout?: boolean; pack?: string }) => {
+      try {
+        // OPR.0.5.9.5 Wave B — config-resolved context library,
+        // never a hardcoded ~/.openrig literal; the daemon resolves the same key.
+        const targetRoot = new ConfigStore().resolve().context.root;
+        let targetDir: string;
+        let gitSelection: ReturnType<typeof addGitContext>["selected"] | undefined;
+        if ((opts.pack || opts.checkout) && !opts.git) throw new Error("--pack and --checkout require --git.");
+        if (opts.git) {
+          const gitClient = await getClient(true);
+          assertLocalGitClient(gitClient);
+          const added = addGitContext(source, { ...opts, onWarning: (message) => console.error(`Warning: ${message}`) }, targetRoot);
+          ({ installedAt: targetDir, selected: gitSelection } = added);
+        } else if (isHttpUrl(source)) {
+          // R4 — URL install: fetch → validate → atomic stage+rename (no partial pack).
+          ({ targetDir } = await installPackFromUrl(source, opts.name, targetRoot));
+        } else {
+          // Local directory install.
+          if (!existsSync(source)) throw new Error(`Source directory not found: ${source}`);
+          const stat = lstatSync(source);
+          if (stat.isSymbolicLink()) throw new Error(`Source must not be a symlink: ${source}`);
+          if (!stat.isDirectory()) throw new Error(`Source must be a directory containing manifest.yaml: ${source}`);
+          const manifestPath = join(source, "manifest.yaml");
+          if (!existsSync(manifestPath)) {
+            throw new Error(`Source directory must contain manifest.yaml: ${source}`);
+          }
+          validateContextPackManifestForInstall(manifestPath);
+          const manifest = parseYaml(readFileSync(manifestPath, "utf-8")) as { name: string };
+          const installName = opts.name ?? manifest.name;
+          assertSafeInstallRef(installName);
+          assertTreeHasNoSymlinks(source);
+          mkdirSync(targetRoot, { recursive: true });
+          assertDestinationNamespaceContained(targetRoot, installName);
+          targetDir = join(targetRoot, installName);
+          let targetExists = false;
+          try {
+            lstatSync(targetDir);
+            targetExists = true;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          }
+          if (targetExists) {
+            throw new Error(`A context pack named '${installName}' already exists at ${targetDir}. Remove it first or use --name to install under a different name.`);
+          }
+          const staging = mkdtempSync(join(targetRoot, ".tmp-add-"));
+          try {
+            cpSync(source, staging, { recursive: true });
+            mkdirSync(dirname(targetDir), { recursive: true });
+            renameSync(staging, targetDir);
+          } finally {
+            rmSync(staging, { recursive: true, force: true });
+          }
+        }
+        // Sync the daemon library so the new pack appears immediately.
+        const client = await getClient(true);
+        const syncRes = await client.post<{ count: number; errors?: Array<{ source: string; error: string }>; entries: ContextPackEntryWire[] }>("/api/context-packs/library/sync");
+        if (syncRes.status !== 200) {
+          // Install succeeded; sync failed → still surface install path.
+          if (opts.json) console.log(JSON.stringify({ installedAt: targetDir, syncError: `HTTP ${syncRes.status}` }, null, 2));
+          else console.log(`Installed at ${targetDir}; daemon sync failed (HTTP ${syncRes.status}). Run 'rig context sync' manually.`);
+          return;
+        }
+        const syncError = syncRes.data.errors?.find((e) => e.source === targetDir);
+        if (syncError) {
+          throw new Error(`Installed at ${targetDir}, but daemon rejected the pack during sync: ${syncError.error}`);
+        }
+        if (gitSelection && !syncRes.data.entries.some((entry) => resolve(entry.sourcePath) === resolve(targetDir))) {
+          throw new Error(`Git selection retained at ${targetDir}, but this daemon does not serve it. Check context.root and workspace ref precedence before using it.`);
+        }
+        if (opts.json) {
+          console.log(JSON.stringify({ installedAt: targetDir, count: syncRes.data.count, ...(gitSelection ? { gitSource: gitSelection } : {}) }, null, 2));
+        } else {
+          console.log(`Installed at ${targetDir}. Library now has ${syncRes.data.count} context pack(s).`);
+          if (gitSelection) console.log(`Git ${gitSelection.revision} from ${gitSelection.checkout}; inspect/update with rig context source.`);
+        }
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  const source = cmd.command("source")
+    .description("Inspect Git checkout vs served context, or explicitly fetch/merge and select an update")
+    .addHelpText("after", "\nStart: rig context add <repository-path-or-URL> --git [--pack path]\nEdit/commit in the reported checkout with ordinary Git. Updates never push or reset.\nConflicts retain the old selection; resolve/commit or abort in the checkout before retrying.\nSelection does not prove agent consumption; use context get and check the actual consumer.\n");
+  for (const operation of ["inspect", "update"] as const) {
+    source.command(operation)
+      .argument("<ref>", "Selected Git-backed context pack ref")
+      .description(operation === "inspect"
+        ? "Read local revision, edits, conflicts and selection; no fetch or consumption claim"
+        : "Explicitly fetch/merge the upstream, then select the clean pack; refuse local selection edits")
+      .option("--json", "JSON output")
+      .action(async (ref: string, opts: { json?: boolean }) => {
+        try {
+          const client = await getClient();
+          assertLocalGitClient(client);
+          const entry = await resolvePack(client, ref);
+          const localRoot = new ConfigStore().resolve().context.root;
+          if (resolve(entry.sourcePath) !== resolve(localRoot, entry.relativePath)) throw new Error("This pack is not in the locally configured context library. Run Git source commands on its owning instance.");
+          if (entry.sourceType === "builtin") throw new Error("Builtin context is not a writable Git selection.");
+          const result = operation === "inspect" ? inspectGitContext(entry.sourcePath) : updateGitContext(entry.sourcePath);
+          if (operation === "update") {
+            const sync = await client.post<{ errors?: Array<{ source: string; error: string }>; entries: ContextPackEntryWire[] }>("/api/context-packs/library/sync");
+            if (sync.status !== 200) throw new Error(`Selection updated, but library sync failed (HTTP ${sync.status}); run rig context sync.`);
+            if (!sync.data.entries.some((candidate) => resolve(candidate.sourcePath) === resolve(entry.sourcePath))) throw new Error(`Selection retained, but the daemon cannot serve it: ${sync.data.errors?.map((error) => error.error).join("; ") || "check context root and ref precedence"}`);
+          }
+          // Structured output keeps checkout/selected bytes/consumption distinct
+          // in both terminal and machine use, without a second status renderer.
+          console.log(JSON.stringify(result, null, 2));
+        } catch (err) {
+          const message = (err as Error).message;
+          console.error(opts.json ? JSON.stringify({ error: message }) : message);
+          process.exitCode = 1;
+        }
+      });
+  }
+
+  cmd.command("rm")
+    .argument("<ref>", "Path-like ref of the context pack to remove (e.g. packs/compaction-restore)")
+    .description("Remove a context pack from the library by its path-like ref")
+    .option("--json", "JSON output")
+    .action(async (ref: string, opts: { json?: boolean }) => {
+      try {
+        const client = await getClient();
+        const res = await client.delete<{
+          removed?: boolean;
+          ref?: string;
+          removedPath?: string;
+          count?: number;
+          error?: string;
+          message?: string;
+        }>(`/api/context-packs/library/by-ref?ref=${encodeURIComponent(ref)}`);
+        if (res.status !== 200) {
+          throw new Error(res.data?.message ?? res.data?.error ?? `Daemon returned HTTP ${res.status}`);
+        }
+        if (opts.json) {
+          console.log(JSON.stringify(res.data, null, 2));
+          return;
+        }
+        console.log(`Removed context pack '${res.data.ref}'.${typeof res.data.count === "number" ? ` Library now has ${res.data.count} context pack(s).` : ""}`);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  return cmd;
+}

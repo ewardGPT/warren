@@ -1,0 +1,1163 @@
+import { randomUUID } from "node:crypto";
+import { Command } from "commander";
+import { resolveEffectiveHost } from "../host-selection.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, terminalAuthHeaders } from "../client.js";
+import { getDaemonStatus, getDaemonUrl, fetchSelfHostId, resolveOriginSelfHostId } from "../daemon-lifecycle.js";
+import { realDeps } from "./daemon.js";
+import type { StatusDeps } from "./status.js";
+import { loadHostRegistry, resolveHost, hostDisplayTarget, type HttpHostEntry } from "../host-registry.js";
+import { runCrossHostCommand, type RunCrossHostCommandOpts } from "../cross-host-executor.js";
+import { emitCrossHostError, emitCrossHostFailure, emitRemoteHttpFailure } from "../cross-host-cli-helpers.js";
+import { resolveCrossHostTarget } from "../cross-host-target.js";
+import { runRemoteHttpOp } from "../remote-host-ops.js";
+import { readOpenRigEnv } from "../openrig-compat.js";
+import { resolveSenderSession, SENDER_FALLBACK } from "../sender-identity.js";
+import { COMPOSER_PROMPT_CLASS } from "@openrig/daemon/composer-prompts";
+import { resolveContextRef, walkSizedWarning } from "../context-resolve.js";
+
+const WAIT_FOR_IDLE_REQUEST_OVERHEAD_MS = 5_000;
+// A cross-host send waits for the remote to deliver, and the remote has no fixed deadline of its own (its tmux
+// calls run without a timeout), so no client budget is exact. This one sits well above a normal send, and above
+// fetch's 10 s connect timeout, so a host that never accepts the connection still reads as unreachable. A send
+// that outlasts it reads as unconfirmed, never as failed.
+const CROSS_HOST_SEND_TIMEOUT_MS = 30_000;
+
+/** The shared composer glyph set (Claude `❯`, Codex `›`, Codex 0.153 `»`) from the daemon's
+ * composer-prompts surface, so the CLI staged check can never disagree with the daemon guard. */
+const PROMPT_LINE_PATTERN = new RegExp(`^\\s*[${COMPOSER_PROMPT_CLASS}]`);
+
+/**
+ * Wrap a `rig send` body with an email-style envelope so the recipient
+ * pane has both the sender's identity and a copy-pasteable reply hint.
+ * Cross-host sends do NOT wrap locally: the remote rig wraps when it
+ * runs the same command, and double-wrapping would nest envelopes.
+ *
+ * V0.3.1 slice 23 parity contract: `packages/daemon/src/lib/pane-envelope.ts`
+ * exports `wrapPaneEnvelope` with BYTE-IDENTICAL output for the same inputs.
+ * P18 (deletion atom) REVERSES A1: an env-less `rig send`/`broadcast` no longer
+ * refuses at the seat boundary — it DELIVERS carrying the honest `<unknown sender>`
+ * fallback (the daemon half delivers-and-labels the header-absent write, so the
+ * marker reaches the pane instead of a downstream 401). So this twin RE-GAINS the
+ * fallback branch and is byte-identical with wrapPaneEnvelope across the FULL input
+ * domain again (resolved AND undefined). The implementations live in separate
+ * packages because cli + daemon don't cross-import today. If you update this
+ * function, update wrapPaneEnvelope in lockstep.
+ */
+/** Send/broadcast header envelope metadata (ruling 03c35295) — the BYTE-IDENTICAL twin of the daemon's
+ *  pane-envelope EnvelopeMeta. Envelope = machine truth; rendered header = projection. */
+export interface EnvelopeScope {
+  kind: "dm" | "multi" | "rig-broadcast" | "topology";
+  recipients?: string[];
+  rig?: string;
+  seats?: number;
+}
+export interface EnvelopeMeta {
+  /** ISO-8601, stamped ONCE at transport send-time; render READS it, never re-derives. */
+  stampISO?: string;
+  scope?: EnvelopeScope;
+  /** GHOST-STAGE (g): the SENDER's atom-B occupant generation-uuid, stamped ONCE at transport.
+   *  ABSENT ⇒ UNKNOWN → the render OMITS the suffix (never forges). Twin of pane-envelope's field. */
+  genUuid?: string;
+}
+
+/** The To-line projection + anti-storm scale (header-alone distinguishability). */
+export function renderToLine(recipient: string, scope?: EnvelopeScope): string {
+  if (!scope || scope.kind === "dm") return `To: ${recipient}`;
+  if (scope.kind === "multi") return `To: ${(scope.recipients ?? [recipient]).join(", ")}`;
+  if (scope.kind === "rig-broadcast") return `To: broadcast to ${scope.rig} (${scope.seats} seats)`;
+  return "To: broadcast to topology";
+}
+
+/** Short glanceable stamp MM-DD HH:MMZ from the transport ISO. */
+export function renderShortStamp(stampISO: string): string {
+  return `${stampISO.slice(5, 7)}-${stampISO.slice(8, 10)} ${stampISO.slice(11, 16)}Z`;
+}
+
+export function wrapSendBody(
+  sender: string | undefined,
+  recipient: string,
+  body: string,
+  meta?: EnvelopeMeta,
+): string {
+  // P18 DELIVER-AND-LABEL: an env-less dispatch no longer refuses; the CLI RE-GAINS the honest
+  // `<unknown sender>` fallback so an unattributable send is DELIVERED with a truthful marker (the daemon
+  // half delivers-and-labels the header-absent write — no laundering, no downstream 401). Byte-identical
+  // with the daemon twin wrapPaneEnvelope across the full input domain.
+  //
+  // FOUNDER ROOT INVARIANT (2026-08-27, supersedes 51-09 incr 3 always-suffix): the sender
+  // renders EXACTLY AS RECEIVED — bare member@rig locally (copy-paste reply hint), and a
+  // cross-host caller constructs the origin triple at the forwarding boundary before wrapping.
+  const senderLabel = sender && sender.trim().length > 0 ? sender : SENDER_FALLBACK;
+  const header = [`From: ${senderLabel}`, renderToLine(recipient, meta?.scope)];
+  if (meta?.stampISO) {
+    // GHOST-STAGE (g): the sender's occupant generation rides the Sent: line as a short suffix
+    // (first8 of the uuid — discriminates at per-node scale; the ledger keeps the full uuid for
+    // exact joins). ABSENT gen ⇒ OMIT the suffix entirely — never "gen unknown", never a forged
+    // value. The suffix is positionally bound to the Sent: header line (a body line, always after
+    // the first "---", can contain " · gen …" but cannot inject a Sent: line — containment).
+    const genSuffix = meta.genUuid && meta.genUuid.length > 0 ? ` · gen ${meta.genUuid.slice(0, 8)}` : "";
+    header.push(`Sent: ${renderShortStamp(meta.stampISO)}${genSuffix}`);
+  }
+  const reply = senderLabel.endsWith("@external")
+    ? `↩ Reply if needed: rig queue create --destination ${senderLabel} --body "..." --verify`
+    : `↩ Reply: rig send ${senderLabel} "..."`;
+  return [...header, "---", body, "---", reply].join("\n");
+}
+
+/**
+ * 1b45cf21 — remediation after an ACTUAL transport failure, in the repo's
+ * fact / consequence / action shape (`daemon-lifecycle.ts:61-73`).
+ *
+ * Deliberately NOT `daemonNotRunningError()`: that helper's text ("Daemon not
+ * running." + restart advice) is the probe-derived claim qitem-c113bd41
+ * removed. The SHAPE is reused; the TEXT is not.
+ *
+ * A `DaemonConnectionError` proves the resolved target was UNREACHABLE — not
+ * why. Daemon down, wrong port, wrong host, firewall, and a wedged event loop
+ * are all live explanations, so the action stays diagnostic and asserts no
+ * daemon state. It also refuses to oversell `rig status`: with an env URL set,
+ * that command's own probe can report `stopped` for a mere timeout
+ * (`daemon-lifecycle.ts:575-585`) — the same false-stopped class this slice
+ * exists to remove — so the copy names that limitation instead of hiding it,
+ * and gates `rig daemon start` behind operator confirmation.
+ *
+ * Shared by both local paths so single-seat and fan-out remediation are
+ * IDENTICAL BY CONSTRUCTION rather than by hand-maintained duplication.
+ */
+function printTransportFailure(err: DaemonConnectionError, opts?: { json?: boolean }): void {
+  // Remediation values are defined ONCE; the human path adds its two-space
+  // indentation at render so the existing three-line output stays byte-identical,
+  // while the --json envelope carries the clean strings. Same
+  // {error:{fact,consequence,action}} shape as printDaemonNotRunning
+  // (daemon-lifecycle.ts) so an agent on the --json path gets a parseable record
+  // instead of empty stdout plus human prose on stderr.
+  const fact = err.message;
+  // B8-2 (shape 73ee4b25): a TIMEOUT is delivery-UNCONFIRMED — the daemon may have
+  // received AND delivered (two seats proved delivery-after-"not sent" live). Only a
+  // hard connection failure earns the "was not sent" consequence.
+  const timedOut = err instanceof DaemonTimeoutError;
+  const consequence = timedOut
+    ? "Delivery UNCONFIRMED — the daemon may have received and delivered the message."
+    : "The message was not sent.";
+  const action = timedOut
+    ? "Reconcile by EFFECT before any resend: check the pane/target for the message (rig capture <session>). " +
+      "A resend without checking risks a duplicate. Then 'rig daemon status' for the probe picture."
+    : "Inspect the configured target with 'rig status'; a failed health probe does not prove the daemon is stopped. " +
+      "If the target is wrong, check OPENRIG_URL / RIGGED_URL or daemon.host + daemon.port. " +
+      "If the daemon is confirmed stopped, run 'rig daemon start'.";
+  if (opts?.json) {
+    console.log(JSON.stringify({ error: { fact, consequence, action } }));
+    return;
+  }
+  console.error(fact);
+  console.error(`  ${consequence}`);
+  console.error(`  ${action}`);
+}
+
+/** Reject content that cannot communicate anything, before a transport call. */
+export function refuseEmptyMessage(body: string, verb: "send" | "broadcast", json = false): boolean {
+  if (body.trim().length > 0) return false;
+  const fact = `rig ${verb}: message is empty or whitespace-only.`;
+  const consequence = "The message transport did not run and nothing was delivered.";
+  const action = "Check whether shell backtick or $() substitution collapsed the argument, or whether a --body-file/stdin source resolved to 0 bytes; provide non-empty content.";
+  if (json) {
+    console.log(JSON.stringify({ ok: false, error: { fact, consequence, action } }));
+  } else {
+    console.error(`Error: ${fact}\n${consequence}\n${action}`);
+  }
+  process.exitCode = 1;
+  return true;
+}
+
+/** qitem-c113bd41 — the LOCAL send target. The status probe is advisory,
+ *  never authoritative: a busy/wedged daemon fails the probe while the
+ *  transport would succeed (the false-daemon-down incident). Resolution:
+ *  the configured env alias FIRST (exact string, custom port preserved;
+ *  OPENRIG_URL wins over legacy RIGGED_URL), else the status/state-derived
+ *  host:port when the probe found one, else the configured file/default
+ *  target (arg-less DaemonClient resolution).
+ *  The ACTUAL transport call decides success — its DaemonConnectionError
+ *  is the honest failure surface.
+ *
+ *  ff13bcdf — the probe is taken LAZILY, by this resolver, because an
+ *  explicit env alias already determines the target: probing first cost
+ *  ~818ms (instantly-failing probe) to ~2.05s (timeout-shaped: 5x250ms
+ *  bounds + 4x200ms backoff) of pure latency on the incident path, then
+ *  threw the result away at the first branch. Owning the probe here also
+ *  keeps the single-seat and fan-out callers from having to sequence it
+ *  identically in two places. */
+async function resolveLocalDaemonUrl(deps: SendDeps): Promise<string> {
+  const envUrl = readOpenRigEnv("OPENRIG_URL", "RIGGED_URL");
+  if (envUrl) return envUrl;
+  const status = await getDaemonStatus(deps.lifecycleDeps);
+  if (status.state === "running" && status.port !== undefined) return getDaemonUrl(status);
+  // Configured-target resolution reused verbatim from the arg-less
+  // DaemonClient (env alias > ConfigStore file > default) — never a
+  // hardcoded literal, so a config-file custom daemon.host/port is honored.
+  return new DaemonClient().baseUrl;
+}
+
+/**
+ * OPR.0.4.3.30 — Commander collector for `--to`: accepts BOTH a comma-list
+ * (`--to a,b`) and repetition (`--to a --to b`), accumulating into one array.
+ * Blank entries are dropped so a trailing comma is harmless.
+ */
+function collectSessions(value: string, previous: string[]): string[] {
+  const parts = value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  return previous.concat(parts);
+}
+
+export interface SendDeps extends StatusDeps {
+  /**
+   * Cross-host hooks. Both default to the production loaders/executors; tests
+   * inject in-package mocks so no real ssh / no real ~/.ssh / no real network
+   * is touched.
+   */
+  hostRegistryLoader?: () => ReturnType<typeof loadHostRegistry>;
+  crossHostRun?: (
+    host: Parameters<typeof runCrossHostCommand>[0],
+    argv: readonly string[],
+    opts?: RunCrossHostCommandOpts,
+  ) => ReturnType<typeof runCrossHostCommand>;
+}
+
+export function sendCommand(depsOverride?: SendDeps): Command {
+  const cmd = new Command("send").description("Send a message to an agent's terminal");
+  const getDeps = (): SendDeps => depsOverride ?? {
+    lifecycleDeps: realDeps(),
+    clientFactory: (url: string) => new DaemonClient(url),
+  };
+
+  cmd
+    // OPR.0.4.3.30 — both positionals are optional so the message can stand alone with a
+    // targeting flag (`rig send --pod x "text"`). Disambiguated in the action: with a
+    // targeting flag the FIRST positional IS the message; without one it's `<session> <text>`.
+    .argument("[session]", "Target session name for a single-seat send (e.g. dev-impl@my-rig)")
+    .argument("[text]", "Message text to send")
+    .option("--to <sessions>", "Multi-recipient: comma-list or repeated (--to a,b or --to a --to b)", collectSessions, [] as string[])
+    .option("--pod <name>", "Send to every seat in a pod (fan-out, per-recipient results)")
+    .option("--rig <name>", "Send to every seat in a rig (fan-out, per-recipient results)")
+    .option("--verify", "Verify pane only delivery by checking content after send")
+    .option("--force", "Back-compat no-op: a mid-task/busy pane already sends-with-advisory by default; --force never bypasses the interactive-prompt/permission guard")
+    .option("--wait-for-idle <seconds>", "Wait until the target is explicitly idle before sending")
+    .option("--raw", "Send exact text/keystrokes without the From/To messaging envelope (still guarded against interactive prompts)")
+    .option("--dangerously-interact", "DANGEROUS: type an answer as keystrokes into an interactive prompt (implies --raw; requires --reason). Letters can select menu shortcuts; CR/ESC act as keys. Enter is added only for the complete visibly staged answer.")
+    .option("--reason <text>", "Why the prompt is being driven (required with --dangerously-interact; recorded in the audit log)")
+    .option("--host <id>", "Send on a remote host declared in ~/.openrig/hosts.yaml (ssh hosts shell out; http hosts go CLI-direct to the remote daemon)")
+    .option("--from <session>", "DEPRECATED + IGNORED (P21 I4). The rendered From:/actor now DERIVES from the transport identity ($OPENRIG_SESSION_NAME, stamped as X-OpenRig-Session) — never a caller-supplied string, which was specimen-5's forgeable surface. Cross-host origin is carried by the relay re-stamping from its authenticated context.")
+    .option("--context <ref>", "Deliver a context pack by its path-like ref (e.g. packs/compaction-restore). The resolved content is sent; an oversized ref is flagged as 'walk-sized'.")
+    .option("--json", "JSON output for agents")
+    .addHelpText("after", `
+Examples:
+  rig send dev-impl@my-rig "Context update: QA approved. Proceed."
+  rig send dev-impl@my-rig "message" --verify
+  rig send --to dev-impl@my-rig,dev-qa@my-rig "message to two seats"
+  rig send --pod dev "message to the whole dev pod"
+  rig send --rig my-rig "message to the whole rig"
+  rig send dev-impl@my-rig "safe proof prompt" --wait-for-idle 30 --verify
+  rig send dev-impl@my-rig "Stop and read the spec." --force
+  rig send dev-impl@my-rig "message" --json
+  rig send --host remote-dev dev-impl@my-rig "remote message" --verify
+  rig send dev-impl@my-rig@vps-b "host-qualified target sugar (suffix must be a registered host id)"
+
+Targeting: a bare seat (single send), OR one of --to / --pod / --rig (fan-out).
+Fan-out reports per-recipient results + an "N/M delivered" summary; one recipient's
+guard refusal does NOT block the others. Each recipient gets its own From/To envelope.
+
+The two-step send pattern (paste text, wait, submit Enter) is handled
+automatically. By default a send is REFUSED only on POSITIVE evidence the target
+is at an interactive prompt or permission block (so a message can never
+select/approve another agent's prompt). When the target's activity CANNOT be
+determined (unknown / missing / stale telemetry) the send PROCEEDS with an
+advisory note — telemetry is advisory, not authority over whether agents can
+communicate. Use --wait-for-idle to send only after explicit idle evidence. Use
+--verify to confirm the message appeared in the pane only; it is not agent
+acknowledgement. With transport.verify_input_box on, a Claude Code or Codex send
+reads verified only when the seat was proven idle before the paste (its screen
+matched an idle layout recorded from Claude Code 2.1.296 or Codex 0.160.0; a
+screen that names another version reads unconfirmed, and a matching layout that
+shows no version is evidence about the layout, not the version) and its input
+box held the exact text, word boundaries kept, before Enter and was empty after
+it: the box was cleared, normally by that Enter (a clear by anything else at
+that moment, or a text the agent runs as a command, looks the same). A Claude
+Code seat OpenRig launched counts as idle in any posture it launches when the
+row two above its empty box is the last turn's completion row ("✻ Cooked for 9s
+· done 5:24 PM", time of day today) or, before its first turn, blank under the
+welcome banner; a blank row under transcript text, or anything else there, reads
+unconfirmed. On Claude Code only a text shown inline in the box can verify: a
+multi-line text, including every enveloped send and queue wake, collapses to a
+paste label and reads unconfirmed. A send to a busy seat, or to a seat whose
+screen is not a known idle layout, always reads unconfirmed; a turn that starts
+in the ~200 ms before Enter is caught only when the screen shows it. An audited
+prompt answer (--dangerously-interact) is not checked and reads unconfirmed.
+The extra reads add up to about 500 ms before Enter and 500 ms before the reply
+(budgets, not guarantees).
+
+A mid-task/busy target now sends-with-advisory by default (busy is not a block);
+--force is a back-compat no-op and never bypasses the interactive-prompt/permission
+guard. Use --raw to send exact text/keystrokes
+without the From/To envelope (e.g. a slash command); it is still guarded. Use
+--dangerously-interact --reason "<why>" to DELIBERATELY drive a prompt (select an
+option or approve a permission) — the only override of the prompt guard; it
+implies --raw and is audit-logged. The answer is typed as keystrokes: letters may
+be menu shortcuts, and CR/ESC act as keys. An Enter is added only when the complete
+answer is visibly staged in a recognized text input. Combining --verify with
+--dangerously-interact never adds an automatic submit retry, even when the daemon
+did not detect a prompt or did not report its disposition. Unknown consumption
+is not a send failure.
+
+--host sends on a remote host declared in ~/.openrig/hosts.yaml. The host
+entry's transport decides the path: ssh hosts run the same command via
+single-hop ssh (SSH success is NOT verify success: the remote rig's
+'Verified: yes/no' line is what counts and is surfaced verbatim); http hosts
+(e.g. pair-registered) go CLI-direct to the remote daemon's send route — the
+result and verify verdict are the REMOTE's, verbatim. A target of the form
+agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
+(explicit --host > target sugar > persisted selection; a conflict between
+--host and the sugar is an error).`)
+    .action(async (session: string | undefined, text: string | undefined, opts: { to?: string[]; pod?: string; rig?: string; verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; host?: string; from?: string; context?: string; json?: boolean }) => {
+      // OPR.0.4.6.MH1 FR-2: selected-host routing — explicit --host wins;
+      // else the persisted selection feeds the SHIPPED --host path; no
+      // selection = today exactly. OPR.0.4.6.MH4 §4: the raw flag is kept
+      // so the single-seat target sugar can slot BETWEEN explicit and
+      // selection (explicit > sugar > selection).
+      const explicitHost = opts.host;
+      opts.host = resolveEffectiveHost(opts.host);
+      const waitForIdleMs = parseWaitForIdleMs(opts.waitForIdle);
+      if (opts.force && waitForIdleMs !== undefined) {
+        console.error("--wait-for-idle cannot be combined with --force");
+        process.exitCode = 1;
+        return;
+      }
+      if (waitForIdleMs === null) {
+        console.error("--wait-for-idle must be a positive number of seconds");
+        process.exitCode = 1;
+        return;
+      }
+      // OPR.0.4.1.10 — the danger override requires a reason (for the audit) and cannot compose with
+      // wait mode. Reject locally before contacting the daemon.
+      if (opts.dangerouslyInteract && (!opts.reason || opts.reason.trim().length === 0)) {
+        console.error("--dangerously-interact requires --reason \"<why>\" (recorded in the audit log)");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.dangerouslyInteract && waitForIdleMs !== undefined) {
+        console.error("--dangerously-interact cannot be combined with --wait-for-idle");
+        process.exitCode = 1;
+        return;
+      }
+
+      // OPR.0.4.3.30 — targeting-mode resolution. Exactly one of: a bare seat, --to, --pod, --rig.
+      const toList = opts.to && opts.to.length > 0 ? opts.to : undefined;
+      const fanModes = [toList ? "to" : null, opts.pod ? "pod" : null, opts.rig ? "rig" : null].filter(Boolean);
+      if (fanModes.length > 1) {
+        console.error("Choose exactly ONE target: a seat, --to, --pod, or --rig (not several).");
+        process.exitCode = 1;
+        return;
+      }
+      const isFanOut = fanModes.length === 1;
+
+      // Slice-03 Atom 6b: --context is single-seat LOCAL in v1 (fan-out and
+      // cross-host --context are follow-ons). Reject loudly rather than silently
+      // dropping the requested context.
+      if (opts.context && (isFanOut || opts.host)) {
+        console.error("--context is supported on a single-seat LOCAL send in v1 (not with --to/--pod/--rig or --host).");
+        process.exitCode = 1;
+        return;
+      }
+
+      const deps = getDeps();
+
+      // P18 DELIVER-AND-LABEL — the seat boundary no longer refuses. Resolve the sender from the seat env
+      // (OPENRIG_SESSION_NAME/RIGGED_SESSION_NAME; --from is deprecated + ignored); when it is unresolvable
+      // the dispatch STILL proceeds carrying the honest `<unknown sender>` marker and a NULL actorSession —
+      // never a forged actor. `seatSender` is therefore `string | undefined` and is threaded through every
+      // dispatch path (fan-out, cross-host, single-seat). Mirrors the daemon half, which delivers-and-labels
+      // the header-absent write (no 401): unverified is labelled unknown, never laundered to verified.
+      const seatSender = resolveSenderSession();
+
+      if (isFanOut) {
+        // With a targeting flag the FIRST positional IS the message; a second positional (or a
+        // bare seat name) means the caller mixed a single-seat and a fan-out target — reject.
+        if (text !== undefined) {
+          console.error("A bare seat name cannot be combined with --to/--pod/--rig. Provide only the message.");
+          process.exitCode = 1;
+          return;
+        }
+        const message = session;
+        if (message === undefined) {
+          console.error("Provide a message to send.");
+          process.exitCode = 1;
+          return;
+        }
+        if (refuseEmptyMessage(message, "send", Boolean(opts.json))) return;
+        if (opts.host) {
+          console.error("--host (cross-host) supports single-seat sends only; --to/--pod/--rig are local.");
+          process.exitCode = 1;
+          return;
+        }
+        if (waitForIdleMs !== undefined) {
+          console.error("--wait-for-idle is not supported with a multi/pod/rig target (cumulative wait risks a client timeout). Send single-seat, or drop --wait-for-idle.");
+          process.exitCode = 1;
+          return;
+        }
+        await runFanOutSend({ toList, pod: opts.pod, rig: opts.rig, message, opts, deps, seatSender });
+        return;
+      }
+
+      // --- Single-seat path (byte-identical to pre-0.4.3.30) ---
+      // Atom 6b: --context supplies the payload, so <text> is optional with it.
+      if (session === undefined || (text === undefined && !opts.context)) {
+        console.error("Usage: rig send <session> <text>  (or rig send <session> --context <ref>, or --to/--pod/--rig <message> for fan-out)");
+        process.exitCode = 1;
+        return;
+      }
+      if (!opts.context && refuseEmptyMessage(text!, "send", Boolean(opts.json))) return;
+
+      // The endpoint selects delivery; the local durable store identifies the origin.
+      const localDaemonUrl = await resolveLocalDaemonUrl(deps);
+      const selfHostId = await fetchSelfHostId(deps.lifecycleDeps, localDaemonUrl);
+
+      // OPR.0.4.6.MH4 §4 — the `agent@rig@host` target sugar (single-seat
+      // only; the fan-out positional is message text). Suffix must match a
+      // REGISTERED host id, else the target passes through unchanged and
+      // the hint rides any later failure. Precedence: explicit --host >
+      // sugar > persisted selection (already folded into opts.host above).
+      // 51-09 incr 3: a suffix == this host's self-id strips-and-routes-home.
+      const targetResolution = resolveCrossHostTarget(session, explicitHost, deps.hostRegistryLoader, selfHostId);
+      if (!targetResolution.ok) {
+        console.error(targetResolution.error);
+        process.exitCode = 1;
+        return;
+      }
+      session = targetResolution.target;
+      const crossHostHint = targetResolution.hint;
+      if (targetResolution.warning) console.error(targetResolution.warning);
+      opts.host = explicitHost ?? targetResolution.sugarHost ?? opts.host;
+
+      // Atom 6b QA fix (root cause): re-reject --context on the cross-host path
+      // AFTER the agent@rig@host sugar host folds into opts.host. The early guard
+      // runs before resolveCrossHostTarget, so it cannot see the sugar host — the
+      // hole that let a sugar-form --context reach the remote argv (shipping a
+      // literal null with no message, or silently dropping the context with one).
+      // --context is single-seat LOCAL in v1; it is never handed to a remote send.
+      if (opts.context && opts.host) {
+        console.error("--context is supported on a LOCAL send in v1 (not with --host or an agent@rig@host cross-host target).");
+        process.exitCode = 1;
+        return;
+      }
+
+      // --- Cross-host short-circuit (CLI-side; ssh shell-out or the MH-4 http branch; daemon untouched) ---
+      if (opts.host) {
+        // text is validated-defined here: --context is rejected with --host (above,
+        // for both explicit and sugar forms), and the single-seat (no text && no
+        // context) guard requires it on this path.
+        const originId = await resolveOriginSelfHostId(deps.lifecycleDeps);
+        await runCrossHostSend(opts.host, session, text!, opts, deps, waitForIdleMs, crossHostHint, originId, seatSender);
+        return;
+      }
+
+      // qitem-c113bd41 — the status probe is ADVISORY (target discovery
+      // only); the actual transport is authoritative. A probe-timeout or
+      // running/unhealthy verdict no longer refuses the send. ff13bcdf —
+      // the resolver takes that probe lazily, and skips it entirely when an
+      // explicit env alias already names the target.
+      const client = deps.clientFactory(localDaemonUrl);
+      // P21 I4: the rendered From: (specimen-5's forged surface) derives from the SEAT ENV, never
+      // --from. --from is deprecated + ignored here (its cross-host origin-carry is superseded by the
+      // relay re-stamping from its authenticated context). Env == the X-OpenRig-Session the DaemonClient
+      // stamps, so the client-side From: + the body actor stay consistent with the daemon's derived actor.
+      const senderSession = seatSender; // P18: seat env identity, or undefined → delivers-and-labels (unknown marker, null actor).
+      // --raw (and --dangerously-interact, which implies it) send EXACT text with no messaging envelope.
+      const raw = Boolean(opts.raw || opts.dangerouslyInteract);
+
+      // Atom 6b: --context resolves a pack ref to its whole content (all-or-nothing
+      // — a missing member aborts before any send) and delivers it. A message +
+      // --context sends the message then the context, blank-line separated. An
+      // oversized context surfaces the §4 walk-sized advisory.
+      let payload = text ?? "";
+      if (opts.context) {
+        let resolved;
+        try {
+          resolved = await resolveContextRef(client, opts.context);
+        } catch (err) {
+          console.error((err as Error).message);
+          process.exitCode = 1;
+          return;
+        }
+        payload = text && text.length > 0 ? `${text}\n\n${resolved.text}` : resolved.text;
+        const warn = walkSizedWarning(resolved, session);
+        if (warn && !opts.json) console.log(`Advisory: ${warn}`);
+      }
+      if (refuseEmptyMessage(payload, "send", Boolean(opts.json))) return;
+      // Send/broadcast header (ruling 03c35295): a directed `rig send` is a DM — stamp it at send-time
+      // (Sent: MM-DD HH:MMZ) so transcripts are timestamped; the To line stays the single recipient.
+      const outboundText = raw ? payload : wrapSendBody(senderSession, session, payload, { stampISO: new Date().toISOString() });
+      let res: { status: number; data: Record<string, unknown> };
+      try {
+        res = await client.post<Record<string, unknown>>("/api/transport/send", {
+          session, text: outboundText, deliveryId: randomUUID(), verify: opts.verify, force: opts.force, waitForIdleMs,
+          dangerouslyInteract: opts.dangerouslyInteract, reason: opts.reason, actorSession: senderSession ?? null,
+        }, transportRequestOptions(waitForIdleMs));
+      } catch (err) {
+        if (err instanceof DaemonConnectionError) {
+          // The REAL transport outcome, honestly surfaced (names the
+          // configured target + the underlying error) — never the bare
+          // probe-derived restart line. 1b45cf21 adds the actionable next
+          // step after that real failure.
+          printTransportFailure(err, { json: opts.json });
+          process.exitCode = 1;
+          return;
+        }
+        throw err;
+      }
+
+      if (res.data["outcome"] === "retained") {
+        console.log(opts.json ? JSON.stringify(res.data) : `Retained, not delivered to ${session}. ${String(res.data["warning"] ?? "")}`);
+        return;
+      }
+
+      // S3 wave-1 fix (r2 F2): effect classification runs BEFORE any output
+      // encoding or routing, so the human and JSON encoders render the same
+      // effect truth — no path may report sent/delivered from the transport
+      // return alone when --verify asked for consumption.
+      let effect: EffectCheck | undefined;
+      if (opts.verify && res.status < 400) {
+        effect = await classifyDeliveryEffect(client, session, stagedIdentityFor(payload, outboundText), waitForIdleMs, res.data["promptInteraction"], opts.dangerouslyInteract);
+      }
+
+      if (opts.json) {
+        // Round-2 F1: ONE verdict — a staged-unresolved envelope carries no
+        // delivered claim beside the staged effect.
+        const envelope = !effect
+          ? res.data
+          : effectUnresolved(effect)
+            ? { ...res.data, verified: false, outcome: "staged-not-consumed", effectCheck: effect }
+            : { ...res.data, effectCheck: effect };
+        console.log(JSON.stringify(envelope));
+        if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
+        if (effectUnresolved(effect)) process.exitCode = 1;
+        return;
+      }
+
+      if (res.status >= 400) {
+        const error = res.data["error"] as string | undefined;
+        console.error(error ?? `Send failed (HTTP ${res.status})`);
+        // MH-4 §4 loud-failure hint: the target was 3-part-shaped but its
+        // suffix matched no registered host — name the near-miss.
+        if (crossHostHint) console.error(`hint: ${crossHostHint}`);
+        process.exitCode = res.status >= 500 ? 2 : 1;
+        return;
+      }
+
+      console.log(`Sent to ${session}`);
+      // OPR.0.4.3.28 correction — an `unknown`-telemetry send now PROCEEDS with a non-blocking
+      // advisory (was a fail-closed refusal). Surface it on the human output, not only in --json.
+      const advisory = res.data["warning"] as string | undefined;
+      if (advisory) {
+        console.log(`Advisory: ${advisory}`);
+      }
+      if (opts.verify && effect) {
+        // S3 (OPR.0.5.4.6) — "sent" must mean CONSUMED, never merely typed. A
+        // positive staged residual overrides the transport's answer; absence of
+        // a residual proves nothing (a redrawn pane reads absent), so the
+        // transport's verdict stands unchanged in that case.
+        if (effect.checked && effect.state === "staged") {
+          console.log("Verified: no");
+          for (const line of effectHumanLines(effect, session)) console.log(line);
+          if (effectUnresolved(effect)) process.exitCode = 1;
+        } else {
+          // Legacy line preserved verbatim (existing scripts grep `Verified:`);
+          // the Delivery line below carries the honest three-outcome vocabulary
+          // (OPR.99.0.6.3): `Verified: no` alone collapsed a landed-but-redraw-
+          // raced send into the same line as a miss.
+          const verified = res.data["verified"] as boolean | undefined;
+          console.log(`Verified: ${verified ? "yes" : "no"}`);
+          const outcome = res.data["outcome"] as string | undefined;
+          const inputBoxLine = inputBoxDeliveryLine(outcome, res.data["inputBox"], session);
+          if (inputBoxLine) {
+            console.log(inputBoxLine);
+          } else if (outcome === "delivered") {
+            console.log("Delivery: delivered (message landed; render confirmed)");
+          } else if (outcome === "rendered-unconfirmed") {
+            console.log(`Delivery: rendered-unconfirmed (landed; pane re-render not confirmed - confirm with: rig capture ${session})`);
+          }
+          for (const line of effectHumanLines(effect, session)) console.log(line);
+        }
+      }
+    });
+
+  return cmd;
+}
+
+/**
+ * S3 (OPR.0.5.4.6) — the delivery-effect classification, run BEFORE any output
+ * encoding or routing (r2 F2) so every encoder — human, JSON, fan-out — renders
+ * the same effect truth. Runs the staged detector; a positive residual takes
+ * the ONE guarded submit (types nothing, cannot double-deliver) and one
+ * recheck, then stops. Pure classification: no printing here.
+ */
+type EffectCheck =
+  | { checked: true; state: "staged"; remedy: "submitted-cleared" | "submitted-still-staged" | "submit-refused"; detail?: string }
+  | { checked: true; state: "no-staged-residual" }
+  | { checked: false; why: string };
+
+/**
+ * Round-2 F2 — ONE identity source for staged evidence AND submit safety: the
+ * same bytes the guarded submit's precheck verifies decide what may count as
+ * THIS send's staged evidence. The identity check runs BEFORE any placeholder
+ * attribution (desk-binding refinement).
+ */
+interface StagedIdentity {
+  /** the bytes the guarded submit verifies against the pane residual */
+  expectedStagedText: string;
+  /** their line count — the binding for a pasted-text placeholder */
+  expectedLines: number;
+  /** recognizable head of the user's payload (contained in any wrap), daemon-precheck normalization */
+  payloadHead: string;
+}
+
+function stagedIdentityFor(payload: string, expectedStagedText: string): StagedIdentity {
+  return {
+    expectedStagedText,
+    expectedLines: expectedStagedText.split("\n").length,
+    payloadHead: payload.replace(/\s+/g, "").slice(0, 24),
+  };
+}
+
+async function classifyDeliveryEffect(
+  client: DaemonClient,
+  session: string,
+  identity: StagedIdentity,
+  waitForIdleMs?: number,
+  promptInteraction?: unknown,
+  dangerouslyInteract = false,
+): Promise<EffectCheck> {
+  // A prompt answer can consume itself and advance to another menu. Never
+  // let generic residual matching turn observational verification into a key.
+  // Our intent also covers an older daemon that cannot report the disposition,
+  // and a flagged send that the daemon treated as ordinary (no detected prompt).
+  if (dangerouslyInteract || promptInteraction === "enter-sent" || promptInteraction === "unverified") {
+    const disposition = promptInteraction === "enter-sent" || promptInteraction === "unverified"
+      ? promptInteraction : "not reported by the daemon";
+    return { checked: false, why: `explicit interaction (${disposition}); consumption unverified; no automatic submit retry` };
+  }
+  const probe = await detectStagedAtPrompt(client, session, identity);
+  if (probe.state === "unchecked") return { checked: false, why: probe.why };
+  if (probe.state === "not-staged") return { checked: true, state: "no-staged-residual" };
+  const enter = await client.post<Record<string, unknown>>("/api/transport/send", {
+    session,
+    submitOnly: true,
+    expectedStagedText: identity.expectedStagedText,
+    expectedStagedLineCount: identity.expectedLines,
+  }, transportRequestOptions(waitForIdleMs));
+  if (enter.status >= 400) {
+    return { checked: true, state: "staged", remedy: "submit-refused", detail: (enter.data?.["error"] as string | undefined) ?? `HTTP ${enter.status}` };
+  }
+  const recheck = await detectStagedAtPrompt(client, session, identity);
+  return recheck.state === "staged"
+    ? { checked: true, state: "staged", remedy: "submitted-still-staged" }
+    : { checked: true, state: "staged", remedy: "submitted-cleared" };
+}
+
+const SEAT_READING_WORDS: Record<string, string> = {
+  idle: "idle",
+  "not-idle": "not idle (a running turn, a queue, a pending input or a paste hint showed)",
+  unknown: "not a known idle layout",
+};
+
+const INPUT_BOX_READING_WORDS: Record<string, string> = {
+  exact: "the exact text",
+  ambiguous: "the text, but a line break in the box may split a word (word boundaries uncertain)",
+  empty: "empty",
+  queued: "queued or possibly queued (a queued label, or a turn was running)",
+  hidden: "a collapsed paste (text hidden)",
+  other: "other text",
+  unrecognized: "layout not recognized",
+  unavailable: "no capture",
+};
+
+/** The Delivery line for a send verified by its input box (transport.verify_input_box), shared by the local
+ *  and cross-host printers. Null when the result carries no inputBox, so the legacy lines print verbatim. */
+function inputBoxDeliveryLine(outcome: string | undefined, inputBox: unknown, session: string): string | null {
+  if (!inputBox || typeof inputBox !== "object") return null;
+  const box = inputBox as { seat?: unknown; before?: unknown; after?: unknown; sameProcess?: unknown };
+  const words = (reading: unknown) => INPUT_BOX_READING_WORDS[String(reading)] ?? String(reading);
+  if (outcome === "delivered") {
+    return "Delivery: delivered (seat idle before the paste; input box: the exact text before Enter, empty after it, same pane process; not agent acknowledgement)";
+  }
+  if (outcome !== "rendered-unconfirmed") return null;
+  // `rig capture` is an optional look, never a required follow-up, and nothing here suggests sending again.
+  const look = `not a failure; to look, optionally: rig capture ${session}`;
+  if (box.before === "unchecked") {
+    return `Delivery: rendered-unconfirmed (input box not checked: an audited prompt answer is typed as keys and its box is not read; ${look})`;
+  }
+  const paneProcess = box.sameProcess === true ? "" : "; pane process changed or unknown";
+  const seat = box.seat === undefined ? "" : `seat before the paste: ${SEAT_READING_WORDS[String(box.seat)] ?? String(box.seat)}; `;
+  return `Delivery: rendered-unconfirmed (${seat}input box before Enter: ${words(box.before)}; after Enter: ${words(box.after)}${paneProcess}; ${look})`;
+}
+
+/** Renders an EffectCheck on the human surface — shared wording across the
+ *  single-send and fan-out paths so the report is identical everywhere. */
+function effectHumanLines(effect: EffectCheck, session: string): string[] {
+  if (!effect.checked) {
+    return [`Note: the pane-effect check could not run (${effect.why}); the verdict above is transport-level only.`];
+  }
+  if (effect.state === "no-staged-residual") return [];
+  const out = ["Delivery: staged, not consumed (checked: post-send pane capture; observed: the sent text is still at the prompt — typed, never submitted)"];
+  if (effect.remedy === "submitted-cleared") {
+    out.push("Remedy: one guarded Enter submitted — the staged text left the prompt.");
+  } else if (effect.remedy === "submitted-still-staged") {
+    out.push(`Remedy: one guarded Enter submitted, but the text is STILL at the prompt — not consumed; stopping here (one submit is the contract). Inspect with: rig capture ${session}`);
+  } else {
+    out.push(`Remedy: the single guarded Enter (submit path) was refused (${effect.detail}); stopping here — one submit is the contract. Inspect with: rig capture ${session}`);
+  }
+  return out;
+}
+
+/** True when a staged detection did not end consumed — a non-silent failure. */
+function effectUnresolved(effect: EffectCheck | undefined): boolean {
+  return !!effect && effect.checked && effect.state === "staged" && effect.remedy !== "submitted-cleared";
+}
+
+/**
+ * S3 (OPR.0.5.4.6) — the staged-at-prompt detector, walk's staged-evidence
+ * primitive generalized to plain sends. POSITIVE evidence only: text rendered
+ * in the input-box region (on or after the LAST prompt line — scrollback above
+ * it never counts) or the TUI's pasted-text placeholder. It proves STAGED; it
+ * can never prove consumed (a redrawn pane reads absent — capture absence is
+ * not evidence), so callers treat a non-staged answer as "no override", not as
+ * a consumption proof.
+ */
+async function detectStagedAtPrompt(
+  client: DaemonClient,
+  session: string,
+  identity: StagedIdentity,
+): Promise<{ state: "staged" | "not-staged" } | { state: "unchecked"; why: string }> {
+  let cap: { status: number; data: Record<string, unknown> };
+  try {
+    cap = await client.post<Record<string, unknown>>("/api/transport/capture", { session, lines: 50 }, { headers: terminalAuthHeaders() });
+  } catch (err) {
+    return { state: "unchecked", why: (err as Error).message };
+  }
+  const pane = cap.data?.["content"] as string | undefined;
+  if (cap.status !== 200 || typeof pane !== "string") {
+    return { state: "unchecked", why: (cap.data?.["error"] as string | undefined) ?? `capture HTTP ${cap.status}` };
+  }
+  // r2 F3: isolate the CURRENT input region FIRST — from the LAST prompt-marker
+  // line to the end of the pane. Everything above it is history; a stale
+  // pasted-text placeholder in scrollback is never staged evidence, and the
+  // guarded submit must never fire on history.
+  const lines = pane.split("\n");
+  let lastPrompt = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (PROMPT_LINE_PATTERN.test(lines[i]!)) { lastPrompt = i; break; }
+  }
+  if (lastPrompt === -1) return { state: "not-staged" };
+  const inputRegionRaw = lines.slice(lastPrompt).join("\n").replace(PROMPT_LINE_PATTERN, "");
+  // IDENTITY FIRST (round-2 F2, desk-binding): the literal-residual match uses
+  // the daemon submit-precheck's own normalization (strip ALL whitespace,
+  // contiguous containment) so a detector-positive is compatible with the
+  // guarded submit's precheck by construction.
+  const norm = (s: string): string => s.replace(/\s+/g, "");
+  if (identity.payloadHead.length > 0 && norm(inputRegionRaw).includes(identity.payloadHead)) {
+    return { state: "staged" };
+  }
+  // Placeholder attribution ONLY AFTER identity: a pasted-text placeholder in
+  // the current input region is staged-as-THIS-send only when its line count
+  // binds to the same bytes the submit guard would verify. An unrelated
+  // placeholder (someone else's staged content) is UNVERIFIABLE — never
+  // staged-as-this-send, and the guarded submit must never fire on it.
+  const placeholder = inputRegionRaw.match(/\[Pasted text #\d+ \+(\d+) lines\]/);
+  if (placeholder) {
+    const extra = Number(placeholder[1]);
+    const binds = identity.expectedLines > 1 && Math.abs(extra - identity.expectedLines) <= 2;
+    if (binds) return { state: "staged" };
+    return {
+      state: "unchecked",
+      why: `a pasted-text placeholder is present in the input region (+${extra} lines) but does not match this send (${identity.expectedLines} line(s)) — unverifiable, not treated as this send; no submit issued`,
+    };
+  }
+  return { state: "not-staged" };
+}
+
+async function runCrossHostSend(
+  hostId: string,
+  session: string,
+  text: string,
+  opts: { verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; from?: string; json?: boolean },
+  deps: SendDeps,
+  waitForIdleMs?: number,
+  hint?: string,
+  selfHostId?: string,
+  seatSender: string | undefined = undefined,
+): Promise<void> {
+  const loader = deps.hostRegistryLoader ?? loadHostRegistry;
+  const runner = deps.crossHostRun ?? runCrossHostCommand;
+
+  const registry = loader();
+  if (!registry.ok) {
+    emitCrossHostError(hostId, "registry-load-failed", registry.error, opts.json);
+    return;
+  }
+  const resolved = resolveHost(registry.registry, hostId);
+  if (!resolved.ok) {
+    emitCrossHostError(hostId, "unknown-host", hint ? `${resolved.error} (${hint})` : resolved.error, opts.json);
+    return;
+  }
+  const host = resolved.host;
+
+  // OPR.0.4.6.MH4 — the http transport branch: an http-registered host (the
+  // founder's `pair` front door) takes the CLI-direct path to the remote
+  // daemon's shipped /api/transport/send. The ssh path below stays
+  // byte-verbatim for ssh hosts (transport is dictated by the host entry —
+  // ssh XOR http, never a fallback).
+  if (host.transport === "http") {
+    await runHttpHostSend(host, session, text, opts, deps, waitForIdleMs, hint, selfHostId, seatSender);
+    return;
+  }
+
+  // Reconstruct argv for the remote `rig send` invocation. Order is positional
+  // first so the remote Commander parses it the same way local does.
+  const argv: string[] = ["rig", "send", session, text];
+  if (opts.verify) argv.push("--verify");
+  if (opts.force) argv.push("--force");
+  if (opts.waitForIdle !== undefined) argv.push("--wait-for-idle", opts.waitForIdle);
+  if (opts.raw) argv.push("--raw");
+  if (opts.dangerouslyInteract) argv.push("--dangerously-interact");
+  if (opts.reason !== undefined) argv.push("--reason", opts.reason);
+  // Sender provenance: the ssh relay re-runs `rig send` on the remote, which
+  // would otherwise resolve ITS OWN session and degrade the envelope sender
+  // to "unknown". Carry the origin so the remote envelope names the originating
+  // session. Plumbing, not a gate.
+  // P21 I4 rail 2: the origin is THIS relay's authenticated context ($OPENRIG_SESSION_NAME),
+  // never a caller-supplied --from string (deprecated + ignored). NOTE: the remote now derives
+  // From:/actor from ITS X-OpenRig-Session header, so the proper cross-host re-stamp is to set the
+  // remote env (OPENRIG_SESSION_NAME=originTriple) rather than the --from argv below — the argv is a
+  // deprecated no-op on the shipped remote pending that runner env-plumbing (flagged to orch).
+  const originSender = seatSender; // P18: origin seat env, or undefined → remote renders the unknown-sender marker.
+  // 51-09 increment 3: carry the ORIGIN's full <member>@<rig>@<selfHostId> triple
+  // so the remote envelope names the ORIGIN host, not the relay's. Append this
+  // host's self-id only when the origin isn't already a triple (a --from already
+  // carrying an origin triple is preserved verbatim — never re-stamped).
+  const originTriple =
+    originSender && selfHostId && originSender.split("@").length < 3
+      ? `${originSender}@${selfHostId}`
+      : originSender;
+  if (originTriple) argv.push("--from", originTriple);
+  if (opts.json) argv.push("--json");
+
+  // A2 (P23): ADDITIVELY set OPENRIG_SESSION_NAME=<origin triple> on the remote command line so the
+  // remote's rig derives the ORIGIN identity from its env (the shipped derivation path), not its own
+  // seat. --from STAYS on argv above (a pre-I4 remote still reads origin from it; the argv removal is a
+  // separate P23-D1-gated increment). Same triple for both, composed once above.
+  const result = await runner(host, argv, originTriple ? { originTriple } : {});
+
+  if (opts.json) {
+    console.log(JSON.stringify({
+      cross_host: { host: host.id, target: hostDisplayTarget(host) },
+      result,
+    }));
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
+
+  console.log(`[via host=${host.id} (${hostDisplayTarget(host)})]`);
+  if (result.ok) {
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    return;
+  }
+  emitCrossHostFailure(host.id, hostDisplayTarget(host), result, opts.json);
+}
+
+/**
+ * OPR.0.4.6.MH4 C1 — cross-host send over http, CLI-DIRECT to the remote
+ * daemon's shipped POST /api/transport/send (zero daemon-side changes).
+ * Wrap parity BY CONSTRUCTION: the body is built exactly as the LOCAL path
+ * builds it (same wrapSendBody call, same fields), so the remote daemon
+ * receives what its own local CLI would post. `actorSession` is the local
+ * sender verbatim — honest provenance; unknown on the remote it degrades to
+ * the shipped non-blocking advisory, never a refusal. `--verify` prints the
+ * REMOTE route's verified/outcome verbatim (remote-authoritative, never
+ * locally synthesized). Deadline: CROSS_HOST_SEND_TIMEOUT_MS, plus waitForIdleMs
+ * when --wait-for-idle. A send that may have arrived reads as unconfirmed.
+ *
+ * Auth posture (named, v0): runRemoteHttpOp presents the REGISTRY bearer
+ * WHEN ONE IS CONFIGURED; for a URL-only anonymous host the Authorization
+ * header is omitted entirely (optional-bearer, a0c17305).
+ * /api/transport/* is gated by the remote's TERMINAL bearer class. Default
+ * (null) + tailnet binds = pass-through by design; a remote enforcing a
+ * DIFFERENT terminal bearer surfaces as the structured permission-gate step
+ * (never a hang, never silent). Remedy documented in cli-reference.md.
+ */
+async function runHttpHostSend(
+  host: HttpHostEntry,
+  session: string,
+  text: string,
+  opts: { verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; from?: string; json?: boolean },
+  deps: SendDeps,
+  waitForIdleMs?: number,
+  hint?: string,
+  selfHostId?: string,
+  seatSender: string | undefined = undefined,
+): Promise<void> {
+  // P21 I4: cross-host send — the origin is the LOCAL seat env (this daemon's authenticated context per
+  // rail 2), never a caller --from string. The remote renders From: = env; --from is deprecated + ignored.
+  const senderSession = seatSender; // P18: seat env identity, or undefined → delivers-and-labels (unknown marker, null actor).
+  // ROOT INVARIANT: host identity is added HERE, at the cross-host forwarding boundary — the
+  // origin triple is constructed once for the remote render; local sends never carry it.
+  const originSender =
+    senderSession && selfHostId && senderSession.split("@").length === 2
+      ? `${senderSession}@${selfHostId}`
+      : senderSession;
+  const raw = Boolean(opts.raw || opts.dangerouslyInteract);
+  const outboundText = raw ? text : wrapSendBody(originSender, session, text, { stampISO: new Date().toISOString() });
+
+  const result = await runRemoteHttpOp(host.id, "POST", "/api/transport/send", {
+    session, text: outboundText, deliveryId: randomUUID(), verify: opts.verify, force: opts.force, waitForIdleMs,
+    dangerouslyInteract: opts.dangerouslyInteract, reason: opts.reason, actorSession: senderSession ?? null,
+  }, deps, { timeoutMs: (waitForIdleMs ?? 0) + CROSS_HOST_SEND_TIMEOUT_MS });
+
+  // A send that may have reached the remote is unconfirmed, not unreachable: it may have been delivered, and a
+  // resend without checking risks a duplicate.
+  const unconfirmed = !result.ok && result.outcomeUnknown === true;
+  const shown = unconfirmed ? { ...result, failedStep: "remote-outcome-unknown" as const } : result;
+  const unconfirmedGuidance = {
+    consequence: "Delivery UNCONFIRMED — the remote daemon may have received and delivered the message.",
+    action: `Check the target before any resend: rig capture ${session} --host ${host.id}. A resend without checking risks a duplicate.`,
+  };
+
+  if (opts.json) {
+    console.log(JSON.stringify({
+      cross_host: { host: host.id, target: hostDisplayTarget(host), transport: "http" },
+      result: shown,
+      ...(unconfirmed ? { error: { fact: result.error, ...unconfirmedGuidance } } : {}),
+      // S3 wave-1 fix (r2 F2): the origin host cannot run the pane-effect
+      // check on a remote seat — say so, never imply effect verification.
+      ...(opts.verify ? { effectCheck: { checked: false, why: "cross-host http — the pane-effect check does not run cross-host" } } : {}),
+      ...(!result.ok && hint ? { hint } : {}),
+    }));
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
+
+  if (!result.ok) {
+    emitRemoteHttpFailure(host.id, hostDisplayTarget(host), shown, false, hint);
+    if (unconfirmed) {
+      console.error(`  ${unconfirmedGuidance.consequence}`);
+      console.error(`  ${unconfirmedGuidance.action}`);
+    }
+    return;
+  }
+
+  console.log(`[via host=${host.id} (${hostDisplayTarget(host)})]`);
+  const data = (result.data ?? {}) as Record<string, unknown>;
+  if (data["outcome"] === "retained") {
+    console.log(`Retained for ${session}; not delivered. ${data["warning"] ?? ""}`);
+    return;
+  }
+  console.log(`Sent to ${session}`);
+  const advisory = data["warning"] as string | undefined;
+  if (advisory) {
+    console.log(`Advisory: ${advisory}`);
+  }
+  if (opts.verify) {
+    // The REMOTE route's verdict, verbatim — mirrors the local render so
+    // scripts grepping `Verified:` behave identically across hosts.
+    const verified = data["verified"] as boolean | undefined;
+    console.log(`Verified: ${verified ? "yes" : "no"}`);
+    const outcome = data["outcome"] as string | undefined;
+    const inputBoxLine = inputBoxDeliveryLine(outcome, data["inputBox"], session);
+    if (inputBoxLine) {
+      console.log(inputBoxLine);
+    } else if (outcome === "delivered") {
+      console.log("Delivery: delivered (message landed; render confirmed)");
+    } else if (outcome === "rendered-unconfirmed") {
+      console.log(`Delivery: rendered-unconfirmed (landed; pane re-render not confirmed - confirm with: rig capture ${session})`);
+    }
+    // S3 wave-1 fix (r2 F2): honest cross-host limit — the verdict above is
+    // the REMOTE transport's; the pane-effect check does not run cross-host.
+    console.log("Effect: UNCHECKED — the pane-effect check does not run cross-host; the verdict above is transport-level only.");
+  }
+}
+
+// OPR.0.4.3.30 — fan-out send (`--to` / `--pod` / `--rig`). Reuses the DAEMON's broadcast
+// machinery (resolve → per-seat send loop → per-recipient results) via /api/transport/broadcast.
+// The message is sent BARE; the daemon wraps each recipient in its own From/To envelope
+// (envelopeSender). Ruling 03c35295: the daemon now renders the SCALE on the To line —
+// a `--to` multi-send shows the FULL recipient list (WHO got it), a `--rig`/`--pod` shows the
+// broadcast scale — plus a Sent stamp, so a recipient tells DM from broadcast header-alone.
+// --raw / --dangerously-interact send exact text with NO envelope (envelopeSender omitted).
+// Each recipient is guarded INDEPENDENTLY server-side; one refusal never aborts the set.
+async function runFanOutSend(params: {
+  toList: string[] | undefined;
+  pod: string | undefined;
+  rig: string | undefined;
+  message: string;
+  // ba41fea2 — `from` was omitted here while the caller already forwarded it
+  // at runtime, so an explicit --from was silently dropped on fan-out only
+  // (single-seat + both cross-host paths always honored it).
+  opts: { verify?: boolean; force?: boolean; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; from?: string; json?: boolean };
+  deps: SendDeps;
+  /** P18: the seat identity resolved from the seat env, or `undefined` when unresolvable (env-less send
+   *  DELIVERS with the `<unknown sender>` marker + null actorSession — no refusal). */
+  seatSender: string | undefined;
+}): Promise<void> {
+  const { toList, pod, rig, message, opts, deps, seatSender } = params;
+
+  // qitem-c113bd41 — same advisory-probe/transport-authoritative contract
+  // as the single-seat path, including ff13bcdf's lazy probe (see
+  // resolveLocalDaemonUrl).
+  const client = deps.clientFactory(await resolveLocalDaemonUrl(deps));
+  // P21 I4: the fan-out From: (specimen-5's forged surface, rendered into every recipient's terminal) is
+  // DERIVED daemon-side from the transport header — the body envelopeSender is now only the enveloped
+  // MARKER (its presence, not its value). So the origin is the seat env, never --from (deprecated +
+  // ignored). Env == the stamped X-OpenRig-Session, so the body actor matches the derived actor.
+  const senderSession = seatSender; // P18: seat env identity, or undefined → delivers-and-labels (unknown marker, null actor).
+  const raw = Boolean(opts.raw || opts.dangerouslyInteract);
+
+  const body: Record<string, unknown> = {
+    text: message,
+    verify: opts.verify,
+    force: opts.force,
+    dangerouslyInteract: opts.dangerouslyInteract,
+    reason: opts.reason,
+    actorSession: senderSession ?? null,
+  };
+  if (toList) body.sessions = toList;
+  else if (pod) body.pod = pod;
+  else if (rig) body.rig = rig;
+  // Per-recipient envelope daemon-side unless raw/danger. The marker's PRESENCE (not its value) signals
+  // the enveloped fan-out so the daemon derives From: from the transport header; its VALUE is ignored
+  // daemon-side (I4). P18: fall open to the `<unknown sender>` marker when the seat is unresolvable so the
+  // marker is ALWAYS present — an env-less fan-out still carries the anti-storm scale header (no
+  // session-less storm), delivered-and-labelled rather than refused.
+  if (!raw) {
+    body.envelopeSender = senderSession ?? SENDER_FALLBACK;
+  }
+
+  let res: { status: number; data: Record<string, unknown> };
+  try {
+    res = await client.post<Record<string, unknown>>("/api/transport/broadcast", body, transportRequestOptions());
+  } catch (err) {
+    if (err instanceof DaemonConnectionError) {
+      // 1b45cf21 — same helper as single-seat, so the remediation is
+      // byte-identical across both local paths by construction (including the
+      // --json envelope, threaded identically).
+      printTransportFailure(err, { json: opts.json });
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+
+  // S3 wave-1 fix (r2 F2): per-recipient effect classification BEFORE output
+  // encoding — a fan-out with --verify verifies each delivered recipient by
+  // pane effect (the daemon wraps per recipient, so the guarded submit's
+  // expected text is the bare payload, which the wrapped render contains).
+  let effects: Array<{ sessionName: string; effect: EffectCheck }> | undefined;
+  if (opts.verify && res.status < 400) {
+    effects = [];
+    const okRecipients = ((res.data["results"] as Array<{ sessionName: string; ok: boolean; outcome?: string; promptInteraction?: unknown }> | undefined) ?? []).filter((r) => r.ok && r.outcome !== "retained" && r.sessionName);
+    for (const r of okRecipients) {
+      effects.push({ sessionName: r.sessionName, effect: await classifyDeliveryEffect(client, r.sessionName, stagedIdentityFor(message, message), undefined, r.promptInteraction, opts.dangerouslyInteract) });
+    }
+  }
+  const effectBySeat = new Map((effects ?? []).map((e) => [e.sessionName, e.effect]));
+  const unresolvedCount = (effects ?? []).filter((e) => effectUnresolved(e.effect)).length;
+
+  if (opts.json) {
+    // Round-2 F1: ONE verdict per recipient — a staged-unresolved recipient's
+    // row is not a delivery claim in any encoding.
+    const rawResults = (res.data["results"] as Array<{ sessionName: string; ok: boolean; outcome?: string }> | undefined) ?? [];
+    const encodedResults = rawResults.map((r) =>
+      effectUnresolved(effectBySeat.get(r.sessionName))
+        ? { ...r, ok: false, verified: false, outcome: "staged-not-consumed", error: "staged, not consumed (pane effect); the one guarded submit did not clear it" }
+        : r
+    );
+    // Round-3 (r2 row 00fb3a68): the machine-readable AGGREGATE derives from
+    // the classified encoded outcomes, never the raw transport counts — a
+    // staged-unresolved recipient is not sent/delivered in any field.
+    const encodedSent = encodedResults.filter((r) => r.ok && r.outcome !== "retained").length;
+    console.log(JSON.stringify(effects
+      ? { ...res.data, results: encodedResults, sent: encodedSent, failed: encodedResults.filter(r => !r.ok).length, retained: encodedResults.filter(r => r.outcome === "retained").length, effectChecks: effects }
+      : res.data));
+    if (res.status >= 400 || rawResults.some((r) => !r.ok)) process.exitCode = 1;
+    if (unresolvedCount > 0) process.exitCode = 1;
+    return;
+  }
+
+  if (res.status >= 400) {
+    const error = res.data["error"] as string | undefined;
+    console.error(error ?? `Send failed (HTTP ${res.status})`);
+    process.exitCode = res.status >= 500 ? 2 : 1;
+    return;
+  }
+
+  const data = res.data;
+  const results = (data["results"] as Array<{ sessionName: string; ok: boolean; error?: string; outcome?: string }>) ?? [];
+  // Round-2 F1 (desk-binding): ONE verdict line per recipient. A
+  // staged-unresolved recipient gets its staged verdict INSTEAD of "sent" —
+  // the false delivery claim is suppressed entirely, not qualified.
+  for (const r of results) {
+    if (r.outcome === "retained") { console.log(`${r.sessionName}: retained, not delivered; inspect with rig seat held-messages`); continue; }
+    if (!r.ok) {
+      console.log(`${r.sessionName}: FAILED — ${r.error ?? "unknown error"}`);
+      continue;
+    }
+    const ec = effectBySeat.get(r.sessionName);
+    if (ec && ec.checked && ec.state === "staged") {
+      if (ec.remedy === "submitted-cleared") {
+        console.log(`${r.sessionName}: sent — staged at the prompt, cleared by one guarded Enter (consumed)`);
+      } else {
+        console.log(`${r.sessionName}: staged, not consumed — ${effectHumanLines(ec, r.sessionName).slice(-1)[0]}`);
+      }
+    } else if (ec && !ec.checked) {
+      console.log(`${r.sessionName}: sent (effect UNCHECKED: ${ec.why} — transport verdict only)`);
+    } else {
+      console.log(`${r.sessionName}: sent`);
+    }
+  }
+  // The delivered count never includes a staged-unresolved recipient.
+  const deliveredCount = Math.max(0, ((data["sent"] as number) ?? 0) - unresolvedCount);
+  console.log(`${deliveredCount}/${data["total"]} delivered${unresolvedCount > 0 ? `, ${unresolvedCount} staged-not-consumed` : ""}`);
+  // S2 (OPR.0.5.4.3): surface additive advisories (e.g. the unknown-sender
+  // sign-it notice) — an env-less operator must see it, not "sent" lines alone.
+  const fanoutAdvisory = data["warning"] as string | undefined;
+  if (fanoutAdvisory) {
+    console.log(`Advisory: ${fanoutAdvisory}`);
+  }
+  if (unresolvedCount > 0) process.exitCode = 1;
+  if ((data["failed"] as number) > 0 || results.some((r) => !r.ok)) {
+    process.exitCode = 1;
+  }
+}
+
+function parseWaitForIdleMs(value: string | undefined): number | undefined | null {
+  if (value === undefined) return undefined;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.ceil(seconds * 1000);
+}
+
+function waitForIdleRequestOptions(waitForIdleMs: number | undefined): { timeoutMs: number } | undefined {
+  if (waitForIdleMs === undefined) return undefined;
+  return { timeoutMs: waitForIdleMs + WAIT_FOR_IDLE_REQUEST_OVERHEAD_MS };
+}
+
+function transportRequestOptions(waitForIdleMs?: number): { timeoutMs?: number; headers?: Record<string, string> } | undefined {
+  const waitOptions = waitForIdleRequestOptions(waitForIdleMs);
+  const headers = terminalAuthHeaders();
+  const hasHeaders = Object.keys(headers).length > 0;
+  if (!waitOptions && !hasHeaders) return undefined;
+  return {
+    ...(waitOptions ?? {}),
+    ...(hasHeaders ? { headers } : {}),
+  };
+}
+
+/** B8-2 test seam: the transport-failure renderer, exported for the honesty pins. */
+export function printTransportFailureForTest(err: DaemonConnectionError, opts?: { json?: boolean }): void {
+  printTransportFailure(err, opts);
+}

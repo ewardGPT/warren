@@ -1,0 +1,84 @@
+import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
+
+// slice-07 R3 — RED-first pins for the thin router stub: the openrig-core router must carry the rig
+// TOOL GRANT and teach loading an entry on demand via `rig context get` (R1's serving verb), so the
+// harness has ONE skill that teaches the pull — the precondition for CE-08 thinning. The mass removal
+// of the other skills and hidden-from-listing are CE-08, fenced out of R3.
+const HERE = dirname(fileURLToPath(import.meta.url));
+const STUB = resolve(HERE, "..", "assets", "plugins", "openrig-core", "skills", "openrig-skills", "SKILL.md");
+const COMMAND_REFERENCE = resolve(
+  HERE,
+  "..",
+  "assets",
+  "plugins",
+  "openrig-core",
+  "skills",
+  "openrig-user",
+  "SKILL.md",
+);
+
+function frontmatterAndBody(md: string): { fm: Record<string, unknown>; body: string } {
+  const m = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/.exec(md);
+  if (!m) throw new Error("router stub has no YAML frontmatter");
+  return { fm: parseYaml(m[1]!) as Record<string, unknown>, body: m[2]! };
+}
+
+describe("R3 — openrig-core router stub teaches the pull", () => {
+  const { fm, body } = frontmatterAndBody(readFileSync(STUB, "utf-8"));
+  const { fm: commandReferenceFm } = frontmatterAndBody(
+    readFileSync(COMMAND_REFERENCE, "utf-8"),
+  );
+
+  it("carries the rig tool grant in allowed-tools", () => {
+    expect(String(fm["allowed-tools"] ?? "")).toMatch(/\brig\b/);
+  });
+
+  it("carries the R6 selection trigger net in its description", () => {
+    const description = String(fm.description ?? "");
+    const triggerNet = [
+      /\bfleet (recovery|restore)\b/i,
+      /\bseat handover\b/i,
+      /\bnew-seat orientation\b/i,
+      /\bwatchdog wake\b/i,
+      /\bcross-host\b/i,
+      /\brig packaging\b/i,
+      /\bOpenRig upgrade\b/i,
+      /\bsystematic debugging\b/i,
+      /\bqueue triage\b/i,
+      /\bimplementation planning\b/i,
+    ];
+
+    for (const trigger of triggerNet) expect(description).toMatch(trigger);
+  });
+
+  it("teaches loading an entry on demand via `rig context get`", () => {
+    expect(body).toMatch(/rig context get/);
+  });
+
+  it("stays mode-free in core (no mode-conditional trigger in the router)", () => {
+    // CE slice-05 ruling: mode knowledge rides mode plugins, not core. A descriptive host-scale
+    // mention is fine; a mode-CONDITIONAL trigger is not.
+    expect(body).not.toMatch(/\b(if|when)\b[^.\n]{0,40}\b(factory|lab|hq)\s+mode\b/i);
+  });
+
+  it("REPAIR 1 — teaches the ask->ref discovery step (list/select before get)", () => {
+    expect(body).toMatch(/rig context list/);
+  });
+
+  it("REPAIR 1 — teaches the canonical full-path ref format (skills/<ns>/<name>)", () => {
+    expect(body).toMatch(/rig context get\s+skills\//);
+  });
+
+  it("routes natural capability discovery to the router before the command reference", () => {
+    const routerDescription = String(fm.description ?? "").replace(/\s+/g, " ");
+    const commandReferenceDescription = String(commandReferenceFm.description ?? "").replace(/\s+/g, " ");
+
+    expect.soft(routerDescription).toMatch(/\bcross-host\b.*\banother machine\b/i);
+    expect.soft(commandReferenceDescription).toMatch(/\balready (known|selected)\b/i);
+    expect.soft(commandReferenceDescription).toMatch(/\bNOT for natural capability discovery\b/i);
+  });
+});

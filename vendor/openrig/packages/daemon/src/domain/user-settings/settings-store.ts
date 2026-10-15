@@ -1,0 +1,1330 @@
+// User Settings v0 — daemon-side settings store.
+//
+// The CLI's @openrig/cli ConfigStore is the canonical write surface
+// (operator + agent edit via `rig config`). The daemon needs read+write
+// access too — for the UI's System drawer Settings panel + the daemon
+// HTTP route at /api/config. Rather than depend on the CLI package
+// (which would require workspace exports + a dist build), this module
+// duplicates the small, stable resolution + write logic. The constants
+// (VALID_KEYS, ENV_MAP, KEY_TO_PATH) are kept in lockstep with
+// cli/src/config-store.ts via cross-package tests.
+//
+// Storage: same single source of truth at ~/.openrig/config.json.
+// Resolution: same env > file > default precedence. Decoded helpers
+// (parseNamedPairs / resolveAllowlist / resolveProgressScanRoots /
+// resolveWorkspacePaths) project the raw strings into structured data
+// the daemon's UEP routes + Slice Story View consume.
+
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, existsSync, lstatSync, readlinkSync, statSync, chmodSync, chownSync, openSync, closeSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import * as path from "node:path";
+import * as os from "node:os";
+
+const DEFAULT_CONFIG_PATH = path.join(
+  process.env["OPENRIG_HOME"] || process.env["RIGGED_HOME"] || path.join(os.homedir(), ".openrig"),
+  "config.json",
+);
+
+const DEFAULT_WORKSPACE_ROOT = path.join(
+  process.env["OPENRIG_HOME"] || process.env["RIGGED_HOME"] || path.join(os.homedir(), ".openrig"),
+  "workspace",
+);
+
+// OPR.0.5.3.6 D1/D2 — the topology tree's derived default. The instance
+// altitude is the TOP of this root: <root>/<CHAIN>.md, then
+// <root>/rigs/<rig>/<CHAIN>.md, then <root>/rigs/<rig>/seats/<seat>/<CHAIN>.md.
+const DEFAULT_TOPOLOGY_ROOT = path.join(
+  process.env["OPENRIG_HOME"] || process.env["RIGGED_HOME"] || path.join(os.homedir(), ".openrig"),
+  "topology",
+);
+
+// OPR.0.5.9.5 Wave B — canonical addressable context library.
+const DEFAULT_CONTEXT_ROOT = path.join(
+  process.env["OPENRIG_HOME"] || process.env["RIGGED_HOME"] || path.join(os.homedir(), ".openrig"),
+  "context",
+);
+
+const DEFAULT_SKILLS_ROOT = path.join(
+  process.env["OPENRIG_HOME"] || process.env["RIGGED_HOME"] || path.join(os.homedir(), ".openrig"),
+  "skills",
+);
+
+/** OPR.0.5.3.6 — the LEGACY topology location, ruled an arbitrary folder
+ *  (founder, 2026-08-14) but kept readable so pre-convention rigs migrate
+ *  instead of flag-daying. Resolves where legacy code ACTUALLY wrote —
+ *  mirroring the codex adapter's shared-docs precedent (OPENRIG_SHARED_DOCS_ROOT
+ *  env, else the literal ~/.openrig/shared-docs), NOT $OPENRIG_HOME: boxes with
+ *  a non-default home still carry their legacy tree at ~/.openrig/shared-docs.
+ *  This helper is the ONE home for the literal: walkers call it for their
+ *  fallback and must emit the named advisory when a read resolves here. */
+export function resolveLegacyTopologyRigsRoot(): string {
+  const sharedDocsRoot = process.env["OPENRIG_SHARED_DOCS_ROOT"]?.trim()
+    || path.join(os.homedir(), ".openrig", "shared-docs");
+  return path.join(sharedDocsRoot, "rigs");
+}
+
+export const SETTINGS_VALID_KEYS = [
+  "daemon.port",
+  "daemon.host",
+  // OPR.0.4.6.MH1 FR-1 — the persisted host-selection pointer, ONE
+  // static key, lockstep with cli/src/config-store.ts VALID_KEYS (the
+  // twins parity test pins both). Default "local" (unset ≡ local host).
+  // Value registry-validation lives at the `rig host select` verb.
+  "host.selected",
+  // OPR.0.4.6.MH1 FR-4 — the own-host display name (arch Ruling 1: home =
+  // the settings twins, never hosts.yaml). Default "localhost".
+  "host.name",
+  // OPR.0.4.6.WF5 FR-2 — the host-level maturity-dial default (arch config
+  // ruling: the MH-1 dynamic-key pattern class). "orchestrator" |
+  // "human_only"; unset ≡ the orchestrator-first engine default. Consumed
+  // at exception-item creation only — dial flips are never retroactive.
+  "workflow.exception_routing",
+  "db.path",
+  "transcripts.enabled",
+  "transcripts.path",
+  // V1 pre-release CLI/daemon Item 1 — capture-pane rotation tunables.
+  // SC-29 EXCEPTION #4 allowlist sub-piece (lockstep with
+  // cli/src/config-store.ts).
+  "transcripts.lines",
+  "transcripts.poll_interval_seconds",
+  "workspace.root",
+  "workspace.slices_root",
+  "workspace.steering_path",
+  "workspace.specs_root",
+  "workspace.projects_root",
+  "workspace.catalog_path",
+  // OPR.0.5.3.6 D1 — the TOPOLOGY tree root (instance altitude at its top,
+  // rigs/<rig>/seats/<seat> beneath). Derived default $OPENRIG_HOME/topology;
+  // keying to the home makes the ~/.openrig-vs-$OPENRIG_HOME split a
+  // non-question (a box with two homes is two instances, each with its own
+  // topology tree). Legacy shared-docs/rigs stays readable as a fallback WITH
+  // a named advisory — resolveLegacyTopologyRigsRoot below is the one home
+  // for that literal, so walkers carry none. Lockstep with the CLI
+  // config-store twin (each side's parity test pins its own list).
+  "topology.root",
+  // OPR.0.5.9.5 Wave B — canonical context library; old key is refused.
+  "context.root",
+  "context.system_world",
+  "skills.root",
+  "onboarding.default_pack.enabled",
+  "launch.non_interruptive",
+  "health.context_pressure.warning_percent",
+  "health.context_pressure.critical_percent",
+  "files.allowlist",
+  "progress.scan_roots",
+  "ui.preview.refresh_interval_seconds",
+  "ui.preview.max_pins",
+  "ui.preview.default_lines",
+  "ui.timezone",
+  // The web UI and its terminal WebSocket are off unless this is true (read at daemon start).
+  "ui.enabled",
+  // OPR.0.4.0.1 — global cap on simultaneously-live terminals (default 2).
+  "ui.terminal.max_live_terminals",
+  "recovery.auto_drive_provider_prompts",
+  "recovery.provider_auth_env_allowlist",
+  // V1 attempt-3 Phase 4 - Advisor / Operator rail icon V1 placeholders
+  // per universal-shell.md L82–L84. SC-29 EXCEPTION declared in
+  // dispatch ACK §4: allowlist-only edit; no migrations / new
+  // endpoints / event types.
+  "agents.advisor_session",
+  "agents.operator_session",
+  // Explicit operator override; unset means discover the registered human.
+  "workspace.operator_seat_name",
+  // V1 attempt-3 Phase 5 P5-3 — For You feed subscription toggles per
+  // for-you-feed.md L144–L151. SC-29 EXCEPTION declared in Phase 5
+  // dispatch ACK §5 (DRIFT P5-D2; same scope as Phase 4: allowlist-only;
+  // no migrations / new endpoints / event types). action_required is
+  // forced ON in the UI (cannot be toggled per L145); the key exists
+  // for future operator override but is not surfaced as a toggle in V1.
+  "feed.subscriptions.action_required",
+  "feed.subscriptions.approvals",
+  "feed.subscriptions.shipped",
+  "feed.subscriptions.progress",
+  "feed.subscriptions.audit_log",
+  // plugin-primitive Phase 3a slice 3.5 — Codex feature flag.
+  // When true (default), daemon ensures `codex_hooks = true` in
+  // ~/.codex/config.toml on launch so plugin-shipped hooks fire on
+  // Codex runtime. When false, operator is managing Codex config
+  // independently — daemon does NOT mutate.
+  "runtime.codex.hooks_enabled",
+  "runtime.readiness_timeout_seconds",
+  // Slice 27 — Claude auto-compaction policy. SC-29 EXCEPTION #10:
+  // 7 keys (lockstep with cli/src/config-store.ts VALID_KEYS).
+  // Opt-in default-off; daemon ContextMonitor reads `enabled` +
+  // `threshold_percent` to decide when to send pre-compact prep +
+  // /compact. The daemon wraps `pre_compact_instruction` with usage
+  // variables, passes `compact_instruction` as slash-command args for
+  // the actual compaction phase, uses `message_inline` +
+  // `message_file_path` for post-compaction restore guidance, then
+  // wraps `post_restore_audit_instruction` as the read-depth nudge.
+  "policies.claude_compaction.enabled",
+  "policies.claude_compaction.threshold_percent",
+  "policies.claude_compaction.pre_compact_instruction",
+  "policies.claude_compaction.compact_instruction",
+  "policies.claude_compaction.message_inline",
+  "policies.claude_compaction.message_file_path",
+  "policies.claude_compaction.post_restore_audit_instruction",
+  "policies.idle_gate_qitem.scan_interval_seconds",
+  "policies.idle_gate_qitem.active_wake_interval_seconds",
+  // B6 founder ruling — idle-gate auto-registration is NOT default-on. "off"
+  // (default) registers no new jobs; "all" restores fleet-wide registration.
+  // opt_in_sessions is a comma-separated list of canonical session names that
+  // get a job while the mode is off. Existing registered jobs always survive
+  // and keep being maintained regardless of either key.
+  "policies.idle_gate_qitem.auto_register",
+  "policies.idle_gate_qitem.opt_in_sessions",
+  "snapshots.periodic.enabled",
+  "snapshots.periodic.interval_seconds",
+  "snapshots.periodic.retention_keep",
+  // OPR.0.4.6.02 S1 — the inner-tmux status-bar default applied to a
+  // session at LAUNCH. ONE static boolean key (default off), lockstep
+  // with cli/src/config-store.ts VALID_KEYS (the parity test pins both
+  // twins). Consumed by NodeLauncher at session-create only; a flip is
+  // future-launches-only and never retroactive (BR-1 never-retro).
+  "terminal.status_bar",
+  // Slice 15 (OPR.0.7.0.15) — compact command-output defaults; CLI-read, twin of the CLI key.
+  "output.compact",
+  "output.whoami_peers",
+  // Slice 01 (OPR.0.7.0.1) — Codex and Claude usage windows in the provider view; daemon-read, twin of the CLI key.
+  "provider.usage_windows",
+  "usage.pi_cost_facts",
+  "usage.pi_openrouter_charge",
+  // A verified Claude Code or Codex send reports on input-box evidence; daemon-read, twin of the CLI key.
+  "transport.verify_input_box",
+  // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs (arch D3; closed-set,
+  // arch-safe defaults BAKED in getDefaultValue, bounded validation in
+  // KEY_CONSTRAINTS). CLI-settable twin: lockstep with cli/src/config-store.ts
+  // VALID_KEYS (each side's exact-equality parity test pins its own list). A
+  // flip is read at the next daily maintenance tick — never retroactive to an
+  // in-flight sweep.
+  "retention.enabled",
+  "retention.transitions_days",
+  "retention.watchdog_days",
+  "retention.usage_samples_days",
+  "retention.watchdog_keep_per_job",
+  "retention.batch_size",
+  // S04 (OPR.0.5.5.4) — pickup-receipt stall threshold; net-new key, OPENRIG_* only,
+  // CLI-settable twin lockstep with cli/src/config-store.ts VALID_KEYS. Fresh-read per
+  // derivation (a flip applies to the next projection read; never retroactive).
+  "queue.pickup_stall_threshold_minutes",
+  // S02 (OPR.0.5.5.2) — standing stuck sweep: cadence + the A1 unclaimed-obligation age.
+  // Same lockstep contract as the pickup key.
+  "queue.stuck_sweep_interval_seconds",
+  "queue.stuck_sweep_unclaimed_age_minutes",
+  // S01 (OPR.0.5.5.1) — wake-or-escalate ladder: retry cadence + cap, the F1
+  // unconfirmed-confirmation window, and the F2 post-swap grace. Same lockstep contract.
+  "queue.wake_retry_interval_seconds",
+  "queue.wake_retry_cap",
+  "queue.wake_unconfirmed_window_minutes",
+  "queue.wake_swap_grace_seconds",
+  // #811 — whether the operator rung posts agent-to-agent escalations to a person.
+  // Under explicit-only, an ask that needs a person must be addressed to the person;
+  // without a human registry, explicit-only posts everything, as always does.
+  "queue.wake_human_rung",
+] as const;
+
+export type SettingsValidKey = typeof SETTINGS_VALID_KEYS[number];
+
+const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = {
+  // Only the original runtime keys keep RIGGED_* aliases for upgrade
+  // compatibility. New typed keys use OPENRIG_* only.
+  "daemon.port": { primary: "OPENRIG_PORT", legacy: "RIGGED_PORT" },
+  "daemon.host": { primary: "OPENRIG_HOST", legacy: "RIGGED_HOST" },
+  "db.path": { primary: "OPENRIG_DB", legacy: "RIGGED_DB" },
+  "transcripts.enabled": { primary: "OPENRIG_TRANSCRIPTS_ENABLED", legacy: "RIGGED_TRANSCRIPTS_ENABLED" },
+  "transcripts.path": { primary: "OPENRIG_TRANSCRIPTS_PATH", legacy: "RIGGED_TRANSCRIPTS_PATH" },
+  "transcripts.lines": { primary: "OPENRIG_TRANSCRIPTS_LINES" },
+  "transcripts.poll_interval_seconds": { primary: "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS" },
+  "workspace.root": { primary: "OPENRIG_WORKSPACE_ROOT" },
+  "workspace.slices_root": { primary: "OPENRIG_WORKSPACE_SLICES_ROOT" },
+  "workspace.steering_path": { primary: "OPENRIG_WORKSPACE_STEERING_PATH" },
+  "workspace.specs_root": { primary: "OPENRIG_WORKSPACE_SPECS_ROOT" },
+  "workspace.projects_root": { primary: "OPENRIG_WORKSPACE_PROJECTS_ROOT" },
+  "workspace.catalog_path": { primary: "OPENRIG_WORKSPACE_CATALOG_PATH" },
+  "topology.root": { primary: "OPENRIG_TOPOLOGY_ROOT" },
+  "context.root": { primary: "OPENRIG_CONTEXT_ROOT" },
+  "context.system_world": { primary: "OPENRIG_CONTEXT_SYSTEM_WORLD" },
+  "skills.root": { primary: "OPENRIG_SKILLS_ROOT" },
+  "onboarding.default_pack.enabled": { primary: "OPENRIG_ONBOARDING_DEFAULT_PACK_ENABLED" },
+  "launch.non_interruptive": { primary: "OPENRIG_LAUNCH_NON_INTERRUPTIVE" },
+  "health.context_pressure.warning_percent": { primary: "OPENRIG_HEALTH_CONTEXT_PRESSURE_WARNING_PERCENT" },
+  "health.context_pressure.critical_percent": { primary: "OPENRIG_HEALTH_CONTEXT_PRESSURE_CRITICAL_PERCENT" },
+  "files.allowlist": { primary: "OPENRIG_FILES_ALLOWLIST" },
+  "progress.scan_roots": { primary: "OPENRIG_PROGRESS_SCAN_ROOTS" },
+  "ui.preview.refresh_interval_seconds": { primary: "OPENRIG_UI_PREVIEW_REFRESH_INTERVAL_SECONDS" },
+  "ui.preview.max_pins": { primary: "OPENRIG_UI_PREVIEW_MAX_PINS" },
+  "ui.timezone": { primary: "OPENRIG_UI_TIMEZONE" },
+  "ui.enabled": { primary: "OPENRIG_UI_ENABLED" },
+  "ui.preview.default_lines": { primary: "OPENRIG_UI_PREVIEW_DEFAULT_LINES" },
+  "ui.terminal.max_live_terminals": { primary: "OPENRIG_UI_TERMINAL_MAX_LIVE_TERMINALS" },
+  "recovery.auto_drive_provider_prompts": { primary: "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS" },
+  "recovery.provider_auth_env_allowlist": { primary: "OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST" },
+  "agents.advisor_session": { primary: "OPENRIG_AGENTS_ADVISOR_SESSION" },
+  "host.selected": { primary: "OPENRIG_HOST_SELECTED" },
+  "host.name": { primary: "OPENRIG_HOST_NAME" },
+  // OPR.0.4.6.WF5 FR-2 — new key, OPENRIG_* only.
+  "workflow.exception_routing": { primary: "OPENRIG_WORKFLOW_EXCEPTION_ROUTING" },
+  "agents.operator_session": { primary: "OPENRIG_AGENTS_OPERATOR_SESSION" },
+  "workspace.operator_seat_name": { primary: "OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME" },
+  "feed.subscriptions.action_required": { primary: "OPENRIG_FEED_SUBSCRIPTIONS_ACTION_REQUIRED" },
+  "feed.subscriptions.approvals": { primary: "OPENRIG_FEED_SUBSCRIPTIONS_APPROVALS" },
+  "feed.subscriptions.shipped": { primary: "OPENRIG_FEED_SUBSCRIPTIONS_SHIPPED" },
+  "feed.subscriptions.progress": { primary: "OPENRIG_FEED_SUBSCRIPTIONS_PROGRESS" },
+  "feed.subscriptions.audit_log": { primary: "OPENRIG_FEED_SUBSCRIPTIONS_AUDIT_LOG" },
+  // plugin-primitive Phase 3a slice 3.5 — net-new key post-rename;
+  // OPENRIG_X primary only per the post-rename 5-key boundary doctrine
+  // (no RIGGED_X legacy on net-new keys).
+  "runtime.codex.hooks_enabled": { primary: "OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED" },
+  "runtime.readiness_timeout_seconds": { primary: "OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS" },
+  // Slice 27 — Claude auto-compaction policy. Net-new keys; OPENRIG_X
+  // primary only.
+  "policies.claude_compaction.enabled": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED" },
+  "policies.claude_compaction.threshold_percent": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT" },
+  "policies.claude_compaction.pre_compact_instruction": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION" },
+  "policies.claude_compaction.compact_instruction": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_COMPACT_INSTRUCTION" },
+  "policies.claude_compaction.message_inline": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_MESSAGE_INLINE" },
+  "policies.claude_compaction.message_file_path": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_MESSAGE_FILE_PATH" },
+  "policies.claude_compaction.post_restore_audit_instruction": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_POST_RESTORE_AUDIT_INSTRUCTION" },
+  "policies.idle_gate_qitem.scan_interval_seconds": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_SCAN_INTERVAL_SECONDS" },
+  "policies.idle_gate_qitem.active_wake_interval_seconds": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_ACTIVE_WAKE_INTERVAL_SECONDS" },
+  "policies.idle_gate_qitem.auto_register": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_AUTO_REGISTER" },
+  "policies.idle_gate_qitem.opt_in_sessions": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_OPT_IN_SESSIONS" },
+  "snapshots.periodic.enabled": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_ENABLED" },
+  "snapshots.periodic.interval_seconds": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_INTERVAL_SECONDS" },
+  "snapshots.periodic.retention_keep": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_RETENTION_KEEP" },
+  // OPR.0.4.6.02 S1 — net-new key; OPENRIG_* primary only (no RIGGED_* legacy).
+  "terminal.status_bar": { primary: "OPENRIG_TERMINAL_STATUS_BAR" },
+  "output.compact": { primary: "OPENRIG_OUTPUT_COMPACT" },
+  "output.whoami_peers": { primary: "OPENRIG_OUTPUT_WHOAMI_PEERS" },
+  "provider.usage_windows": { primary: "OPENRIG_PROVIDER_USAGE_WINDOWS" },
+  "usage.pi_cost_facts": { primary: "OPENRIG_USAGE_PI_COST_FACTS" },
+  "usage.pi_openrouter_charge": { primary: "OPENRIG_USAGE_PI_OPENROUTER_CHARGE" },
+  "transport.verify_input_box": { primary: "OPENRIG_TRANSPORT_VERIFY_INPUT_BOX" },
+  // OPR.0.4.6.FS-1 W2 — retention knobs; net-new keys, OPENRIG_* primary only.
+  "retention.enabled": { primary: "OPENRIG_RETENTION_ENABLED" },
+  "retention.transitions_days": { primary: "OPENRIG_RETENTION_TRANSITIONS_DAYS" },
+  "retention.watchdog_days": { primary: "OPENRIG_RETENTION_WATCHDOG_DAYS" },
+  "retention.usage_samples_days": { primary: "OPENRIG_RETENTION_USAGE_SAMPLES_DAYS" },
+  "retention.watchdog_keep_per_job": { primary: "OPENRIG_RETENTION_WATCHDOG_KEEP_PER_JOB" },
+  "retention.batch_size": { primary: "OPENRIG_RETENTION_BATCH_SIZE" },
+  // S04 — net-new key; OPENRIG_* primary only.
+  "queue.pickup_stall_threshold_minutes": { primary: "OPENRIG_QUEUE_PICKUP_STALL_THRESHOLD_MINUTES" },
+  "queue.stuck_sweep_interval_seconds": { primary: "OPENRIG_QUEUE_STUCK_SWEEP_INTERVAL_SECONDS" },
+  "queue.stuck_sweep_unclaimed_age_minutes": { primary: "OPENRIG_QUEUE_STUCK_SWEEP_UNCLAIMED_AGE_MINUTES" },
+  "queue.wake_retry_interval_seconds": { primary: "OPENRIG_QUEUE_WAKE_RETRY_INTERVAL_SECONDS" },
+  "queue.wake_retry_cap": { primary: "OPENRIG_QUEUE_WAKE_RETRY_CAP" },
+  "queue.wake_unconfirmed_window_minutes": { primary: "OPENRIG_QUEUE_WAKE_UNCONFIRMED_WINDOW_MINUTES" },
+  "queue.wake_human_rung": { primary: "OPENRIG_QUEUE_WAKE_HUMAN_RUNG" },
+  "queue.wake_swap_grace_seconds": { primary: "OPENRIG_QUEUE_WAKE_SWAP_GRACE_SECONDS" },
+};
+
+const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
+  "daemon.port": ["daemon", "port"],
+  "daemon.host": ["daemon", "host"],
+  "db.path": ["db", "path"],
+  "transcripts.enabled": ["transcripts", "enabled"],
+  "transcripts.path": ["transcripts", "path"],
+  "transcripts.lines": ["transcripts", "lines"],
+  "transcripts.poll_interval_seconds": ["transcripts", "pollIntervalSeconds"],
+  "workspace.root": ["workspace", "root"],
+  "workspace.slices_root": ["workspace", "slicesRoot"],
+  "workspace.steering_path": ["workspace", "steeringPath"],
+  "workspace.specs_root": ["workspace", "specsRoot"],
+  "workspace.projects_root": ["workspace", "projectsRoot"],
+  "workspace.catalog_path": ["workspace", "catalogPath"],
+  "topology.root": ["topology", "root"],
+  "context.root": ["context", "root"],
+  "context.system_world": ["context", "systemWorld"],
+  "skills.root": ["skills", "root"],
+  "onboarding.default_pack.enabled": ["onboarding", "defaultPack", "enabled"],
+  "launch.non_interruptive": ["launch", "nonInterruptive"],
+  "health.context_pressure.warning_percent": ["health", "contextPressure", "warningPercent"],
+  "health.context_pressure.critical_percent": ["health", "contextPressure", "criticalPercent"],
+  "files.allowlist": ["files", "allowlist"],
+  "progress.scan_roots": ["progress", "scanRoots"],
+  "ui.preview.refresh_interval_seconds": ["ui", "preview", "refreshIntervalSeconds"],
+  "ui.preview.max_pins": ["ui", "preview", "maxPins"],
+  "ui.timezone": ["ui", "timezone"],
+  "ui.enabled": ["ui", "enabled"],
+  "ui.preview.default_lines": ["ui", "preview", "defaultLines"],
+  "ui.terminal.max_live_terminals": ["ui", "terminal", "maxLiveTerminals"],
+  "recovery.auto_drive_provider_prompts": ["recovery", "autoDriveProviderPrompts"],
+  "recovery.provider_auth_env_allowlist": ["recovery", "providerAuthEnvAllowlist"],
+  "agents.advisor_session": ["agents", "advisorSession"],
+  "host.selected": ["host", "selected"],
+  "host.name": ["host", "name"],
+  "workflow.exception_routing": ["workflow", "exceptionRouting"],
+  "agents.operator_session": ["agents", "operatorSession"],
+  "workspace.operator_seat_name": ["workspace", "operatorSeatName"],
+  "feed.subscriptions.action_required": ["feed", "subscriptions", "actionRequired"],
+  "feed.subscriptions.approvals": ["feed", "subscriptions", "approvals"],
+  "feed.subscriptions.shipped": ["feed", "subscriptions", "shipped"],
+  "feed.subscriptions.progress": ["feed", "subscriptions", "progress"],
+  "feed.subscriptions.audit_log": ["feed", "subscriptions", "auditLog"],
+  "runtime.codex.hooks_enabled": ["runtime", "codex", "hooksEnabled"],
+  "runtime.readiness_timeout_seconds": ["runtime", "readinessTimeoutSeconds"],
+  "policies.claude_compaction.enabled": ["policies", "claudeCompaction", "enabled"],
+  "policies.claude_compaction.threshold_percent": ["policies", "claudeCompaction", "thresholdPercent"],
+  "policies.claude_compaction.pre_compact_instruction": ["policies", "claudeCompaction", "preCompactInstruction"],
+  "policies.claude_compaction.compact_instruction": ["policies", "claudeCompaction", "compactInstruction"],
+  "policies.claude_compaction.message_inline": ["policies", "claudeCompaction", "messageInline"],
+  "policies.claude_compaction.message_file_path": ["policies", "claudeCompaction", "messageFilePath"],
+  "policies.claude_compaction.post_restore_audit_instruction": ["policies", "claudeCompaction", "postRestoreAuditInstruction"],
+  "policies.idle_gate_qitem.scan_interval_seconds": ["policies", "idleGateQitem", "scanIntervalSeconds"],
+  "policies.idle_gate_qitem.active_wake_interval_seconds": ["policies", "idleGateQitem", "activeWakeIntervalSeconds"],
+  "policies.idle_gate_qitem.auto_register": ["policies", "idleGateQitem", "autoRegister"],
+  "policies.idle_gate_qitem.opt_in_sessions": ["policies", "idleGateQitem", "optInSessions"],
+  "snapshots.periodic.enabled": ["snapshots", "periodic", "enabled"],
+  "snapshots.periodic.interval_seconds": ["snapshots", "periodic", "intervalSeconds"],
+  "snapshots.periodic.retention_keep": ["snapshots", "periodic", "retentionKeep"],
+  "terminal.status_bar": ["terminal", "statusBar"],
+  "output.compact": ["output", "compact"],
+  "output.whoami_peers": ["output", "whoamiPeers"],
+  "provider.usage_windows": ["provider", "usageWindows"],
+  "usage.pi_cost_facts": ["usage", "piCostFacts"],
+  "usage.pi_openrouter_charge": ["usage", "piOpenRouterCharge"],
+  "transport.verify_input_box": ["transport", "verifyInputBox"],
+  "retention.enabled": ["retention", "enabled"],
+  "retention.transitions_days": ["retention", "transitionsDays"],
+  "retention.watchdog_days": ["retention", "watchdogDays"],
+  "retention.usage_samples_days": ["retention", "usageSamplesDays"],
+  "retention.watchdog_keep_per_job": ["retention", "watchdogKeepPerJob"],
+  "retention.batch_size": ["retention", "batchSize"],
+  "queue.pickup_stall_threshold_minutes": ["queue", "pickupStallThresholdMinutes"],
+  "queue.stuck_sweep_interval_seconds": ["queue", "stuckSweepIntervalSeconds"],
+  "queue.stuck_sweep_unclaimed_age_minutes": ["queue", "stuckSweepUnclaimedAgeMinutes"],
+  "queue.wake_retry_interval_seconds": ["queue", "wakeRetryIntervalSeconds"],
+  "queue.wake_retry_cap": ["queue", "wakeRetryCap"],
+  "queue.wake_unconfirmed_window_minutes": ["queue", "wakeUnconfirmedWindowMinutes"],
+  "queue.wake_human_rung": ["queue", "wakeHumanRung"],
+  "queue.wake_swap_grace_seconds": ["queue", "wakeSwapGraceSeconds"],
+};
+
+export type SettingSource = "env" | "file" | "default";
+
+export interface ResolvedSetting {
+  value: string | number | boolean;
+  source: SettingSource;
+  defaultValue: string | number | boolean;
+}
+
+export function isSettingsValidKey(key: string): key is SettingsValidKey {
+  return (SETTINGS_VALID_KEYS as readonly string[]).includes(key);
+}
+
+const REMOVED_CONTEXT_KEY = "context.packs_root";
+const REMOVED_CONTEXT_ENV = "OPENRIG_CONTEXT_PACKS_ROOT";
+
+export function removedContextSettingMessage(key: string): string | null {
+  return key === REMOVED_CONTEXT_KEY
+    ? 'Config key "context.packs_root" was removed; use "context.root".'
+    : null;
+}
+
+function assertNoRemovedContextSetting(fileConfig: Record<string, unknown>): void {
+  if (process.env[REMOVED_CONTEXT_ENV]?.trim()) {
+    throw new Error(
+      "OPENRIG_CONTEXT_PACKS_ROOT was removed; use OPENRIG_CONTEXT_ROOT (config key context.root).",
+    );
+  }
+  if (getNestedValue(fileConfig, ["context", "packsRoot"]) !== undefined) {
+    throw new Error(
+      'Config file contains removed key "context.packs_root" (context.packsRoot); replace it with "context.root" (context.root).',
+    );
+  }
+}
+
+// ── OPR.0.4.4.15 (guard G15-P1 fold, arch-endorsed) ─────────────────────────
+// ONE registered dynamic key CLASS — NOT a general dynamic-key mechanism:
+// `feed.subscriptions.<hostId>.enabled` (boolean; the v1 per-host key set is
+// CLOSED to {enabled}). The closed-set discipline applies to the store's key
+// GRAMMAR: only this pattern is accepted beyond SETTINGS_VALID_KEYS; every
+// other unknown key keeps the existing reject-loud behavior byte-for-byte.
+// hostId segment: [A-Za-z0-9_-]+ (a dotted host id is inexpressible in
+// dotted keys — the write gate rejects it as unknown; readers warn-and-
+// ignore); RESERVED segments (the flat toggle tails + 'enabled') never parse
+// as host ids, so the flat keys and the dynamic class cannot collide.
+// No env-var mapping for the dynamic class in v1 — file/API only.
+// Twin: packages/cli/src/config-store.ts carries the same class (parity test
+// pins them — the host-registry twin discipline).
+const FEED_HOST_KEY_RE = /^feed\.subscriptions\.([A-Za-z0-9_-]+)\.enabled$/;
+// Reserved in BOTH spellings: the key-level snake_case toggle tails AND the
+// camelCase FILE-level leaf names (KEY_TO_PATH maps audit_log→auditLog etc.),
+// so no host id can ever shadow a flat toggle at either layer.
+export const FEED_HOST_RESERVED_SEGMENTS = new Set([
+  "action_required",
+  "actionRequired",
+  "approvals",
+  "shipped",
+  "progress",
+  "audit_log",
+  "auditLog",
+  "enabled",
+]);
+
+export function parseFeedHostSubscriptionKey(key: string): { hostId: string } | null {
+  const m = key.match(FEED_HOST_KEY_RE);
+  if (!m) return null;
+  const hostId = m[1]!;
+  if (FEED_HOST_RESERVED_SEGMENTS.has(hostId)) return null;
+  return { hostId };
+}
+
+function coerceFeedHostSubscriptionValue(key: string, raw: string): boolean {
+  const v = raw.trim().toLowerCase();
+  if (v === "true") return true;
+  if (v === "false") return false;
+  throw new Error(`Invalid value for ${key}: expected "true" or "false", got "${raw}"`);
+}
+
+function readEnv(primary: string, legacy?: string): string | undefined {
+  const p = process.env[primary];
+  if (p !== undefined && p !== "") return p;
+  if (legacy) {
+    const l = process.env[legacy];
+    if (l !== undefined && l !== "") return l;
+  }
+  return undefined;
+}
+
+function getNestedValue(obj: Record<string, unknown>, parts: string[]): unknown {
+  let current: unknown = obj;
+  for (const part of parts) {
+    if (current == null || typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+function setNestedValue(obj: Record<string, unknown>, parts: string[], value: unknown): void {
+  let current = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]!;
+    if (!(part in current) || typeof current[part] !== "object" || current[part] === null) {
+      current[part] = {};
+    }
+    current = current[part] as Record<string, unknown>;
+  }
+  current[parts[parts.length - 1]!] = value;
+}
+
+function deriveWorkspaceDefault(key: SettingsValidKey, workspaceRoot: string): string {
+  switch (key) {
+    case "workspace.slices_root":      return path.join(workspaceRoot, "missions");
+    case "workspace.steering_path":    return path.join(workspaceRoot, "STEERING.md");
+    case "workspace.specs_root":       return path.join(workspaceRoot, "specs");
+    case "workspace.projects_root":    return path.join(workspaceRoot, "projects");
+    case "workspace.catalog_path":     return path.join(workspaceRoot, "workspace.yaml");
+    case "files.allowlist":            return `workspace:${workspaceRoot}`;
+    case "progress.scan_roots":        return `workspace:${workspaceRoot}`;
+    default: return "";
+  }
+}
+
+function deriveLegacyWorkspaceDefault(key: SettingsValidKey, workspaceRoot: string): string | null {
+  switch (key) {
+    case "workspace.slices_root": return path.join(workspaceRoot, "slices");
+    case "workspace.steering_path": return path.join(workspaceRoot, "steering", "STEERING.md");
+    default: return null;
+  }
+}
+
+const WORKSPACE_DERIVED_KEYS: ReadonlySet<SettingsValidKey> = new Set([
+  "workspace.slices_root",
+  "workspace.steering_path",
+  "workspace.specs_root",
+  "workspace.projects_root",
+  "workspace.catalog_path",
+  "files.allowlist",
+  "progress.scan_roots",
+]);
+
+const DEFAULT_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION =
+  "Read the claude-compaction-restore skill and follow its \"If You Are About To Compact\" protocol. Create or update the mental-model restore map before compaction. If you are in the middle of a tiny atomic step, finish that step first; otherwise this preparation is the next priority.";
+
+const DEFAULT_CLAUDE_COMPACTION_COMPACT_INSTRUCTION = "";
+
+const DEFAULT_CLAUDE_COMPACTION_RESTORE_INSTRUCTION =
+  "Read the claude-compaction-restore skill and follow its \"If You Just Compacted\" protocol.";
+
+const DEFAULT_CLAUDE_COMPACTION_POST_RESTORE_AUDIT_INSTRUCTION =
+  "Read the claude-compaction-restore skill and follow its \"Required Read-Depth Audit\" protocol.";
+
+const DEFAULT_CLAUDE_COMPACTION_EXTRA_INSTRUCTION_RELATIVE_PATH = path.join(
+  "compaction",
+  "post-compact-extra.md",
+);
+
+export const DEFAULT_CLAUDE_COMPACTION_EXTRA_INSTRUCTION_FILE_CONTENT = `# OpenRig Post-Compact Extra Instructions
+
+No mission-specific extra restore instructions are configured yet.
+
+Add additional file paths, reading lists, or mission-specific restore notes here
+when this session needs more context than the canonical claude-compaction-restore
+skill provides.
+`;
+
+export function defaultClaudeCompactionExtraInstructionFilePath(openrigHome = path.dirname(DEFAULT_CONFIG_PATH)): string {
+  return path.join(openrigHome, DEFAULT_CLAUDE_COMPACTION_EXTRA_INSTRUCTION_RELATIVE_PATH);
+}
+
+export function ensureDefaultClaudeCompactionFiles(openrigHome = path.dirname(DEFAULT_CONFIG_PATH)): string {
+  const filePath = defaultClaudeCompactionExtraInstructionFilePath(openrigHome);
+  if (!existsSync(filePath)) {
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    writeFileSync(filePath, DEFAULT_CLAUDE_COMPACTION_EXTRA_INSTRUCTION_FILE_CONTENT, "utf-8");
+  }
+  return filePath;
+}
+
+function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string | number | boolean {
+  if (WORKSPACE_DERIVED_KEYS.has(key)) {
+    return deriveWorkspaceDefault(key, workspaceRoot);
+  }
+  switch (key) {
+    case "daemon.port": return 7433;
+    case "daemon.host": return "127.0.0.1";
+    case "db.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "openrig.sqlite");
+    case "transcripts.enabled": return true;
+    case "transcripts.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "transcripts");
+    // V1 pre-release CLI/daemon Item 1 — capture-pane rotation defaults.
+    case "transcripts.lines": return 1000;
+    case "transcripts.poll_interval_seconds": return 2;
+    case "workspace.operator_seat_name": return ""; // unset: discover a registered human, never invent a kernel seat
+    // OPR.0.4.6.MH1 FR-1 — "local" ≡ no remote selection (LOCAL_HOST_ID);
+    // the FR-2 zero-regression posture by construction.
+    case "host.selected": return "local";
+    // OPR.0.4.6.MH1 FR-4 — the own-host display-name default (PRD-named).
+    case "host.name": return "localhost";
+    case "workspace.root": return DEFAULT_WORKSPACE_ROOT;
+    // OPR.0.5.3.6 D1 — derived under $OPENRIG_HOME, never a shared-docs literal.
+    case "topology.root": return DEFAULT_TOPOLOGY_ROOT;
+    case "context.root": return DEFAULT_CONTEXT_ROOT;
+    case "context.system_world": return "default";
+    case "skills.root": return DEFAULT_SKILLS_ROOT;
+    case "onboarding.default_pack.enabled": return true;
+    case "launch.non_interruptive": return false;
+    case "health.context_pressure.warning_percent": return 95;
+    case "health.context_pressure.critical_percent": return 99;
+    // Preview Terminal v0 (PL-018) defaults — match cli/src/config-store.ts.
+    case "ui.preview.refresh_interval_seconds": return 3;
+    case "ui.preview.max_pins": return 4;
+    case "ui.preview.default_lines": return 50;
+    case "ui.timezone": return "America/Los_Angeles";
+    case "ui.enabled": return false;
+    case "recovery.auto_drive_provider_prompts": return false;
+    case "recovery.provider_auth_env_allowlist": return "";
+    // V1 Phase 4 — Advisor default per universal-shell.md L83;
+    // Operator default empty per L84 ("not configured").
+    case "agents.advisor_session": return "advisor-lead@kernel";
+    case "agents.operator_session": return "";
+    // V1 Phase 5 P5-3 — For You feed subscription defaults per
+    // for-you-feed.md L144–L151. action_required is forced ON in the UI
+    // (cannot be disabled per L145 — load-bearing human-gate items);
+    // approvals/shipped/progress default ON; audit_log default OFF
+    // (verbose; opt-in for triage runs).
+    case "feed.subscriptions.action_required": return true;
+    case "feed.subscriptions.approvals": return true;
+    case "feed.subscriptions.shipped": return true;
+    case "feed.subscriptions.progress": return true;
+    case "feed.subscriptions.audit_log": return false;
+    // plugin-primitive Phase 3a slice 3.5 — Codex feature flag default ON.
+    // Daemon ensures `codex_hooks = true` in ~/.codex/config.toml on
+    // launch unless operator explicitly sets to false.
+    case "runtime.codex.hooks_enabled": return true;
+    case "runtime.readiness_timeout_seconds": return 30;
+    // Slice 27 — Claude auto-compaction policy defaults. Opt-in
+    // default-off; threshold 80% per spec. Pre/post defaults point at
+    // the canonical restore skill; compact_instruction is intentionally
+    // blank because Claude's native compact summary is less reliable
+    // than the explicit pre-compact and post-compact user-channel flow.
+    case "policies.claude_compaction.enabled": return false;
+    case "policies.claude_compaction.threshold_percent": return 80;
+    case "policies.claude_compaction.pre_compact_instruction": return DEFAULT_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION;
+    case "policies.claude_compaction.compact_instruction": return DEFAULT_CLAUDE_COMPACTION_COMPACT_INSTRUCTION;
+    case "policies.claude_compaction.message_inline": return DEFAULT_CLAUDE_COMPACTION_RESTORE_INSTRUCTION;
+    case "policies.claude_compaction.message_file_path": return defaultClaudeCompactionExtraInstructionFilePath();
+    case "policies.claude_compaction.post_restore_audit_instruction": return DEFAULT_CLAUDE_COMPACTION_POST_RESTORE_AUDIT_INSTRUCTION;
+    case "policies.idle_gate_qitem.scan_interval_seconds": return 60;
+    case "policies.idle_gate_qitem.active_wake_interval_seconds": return 900;
+    // B6 — NOT default-on by founder ruling; "all" is the explicit fleet opt-in.
+    case "policies.idle_gate_qitem.auto_register": return "off";
+    case "policies.idle_gate_qitem.opt_in_sessions": return "";
+    case "snapshots.periodic.enabled": return true;
+    case "snapshots.periodic.interval_seconds": return 300;
+    case "snapshots.periodic.retention_keep": return 10;
+    // OPR.0.4.6.02 S1 — inner-tmux status bar OFF at launch by default
+    // (herdr's pane label already carries identity; the inner tmux status
+    // is redundant chrome). Operator flip is future-launches-only.
+    case "terminal.status_bar": return false;
+    case "output.compact": return false;
+    case "output.whoami_peers": return 8;
+    case "provider.usage_windows": return false;
+    // Slice 02 — Pi cost facts from persisted entries; off until the switch is on.
+    case "usage.pi_cost_facts": return false;
+    case "usage.pi_openrouter_charge": return false;
+    // Input-box evidence for verified Claude Code and Codex sends; off until the switch is on.
+    case "transport.verify_input_box": return false;
+    // OPR.0.4.6.FS-1 W2 — retention defaults (arch D3 safe values: archive
+    // terminal+aged transitions >30d; prune watchdog_history >14d keep-50/job;
+    // 500 rows/qitems per bounded batch; enabled by default).
+    case "retention.enabled": return true;
+    case "retention.transitions_days": return 30;
+    case "retention.watchdog_days": return 14;
+    case "retention.usage_samples_days": return 14;
+    case "retention.watchdog_keep_per_job": return 50;
+    case "retention.batch_size": return 500;
+    case "queue.pickup_stall_threshold_minutes": return 3;
+    case "queue.stuck_sweep_interval_seconds": return 300;
+    case "queue.stuck_sweep_unclaimed_age_minutes": return 60;
+    case "queue.wake_retry_interval_seconds": return 300;
+    case "queue.wake_retry_cap": return 3;
+    case "queue.wake_unconfirmed_window_minutes": return 30;
+    case "queue.wake_swap_grace_seconds": return 180;
+    case "queue.wake_human_rung": return "always";
+    default: return "";
+  }
+}
+
+function coerceValue(key: SettingsValidKey, raw: string, workspaceRoot: string): string | number | boolean {
+  const def = getDefaultValue(key, workspaceRoot);
+  if (typeof def === "number") {
+    const n = parseInt(raw, 10);
+    if (isNaN(n)) throw new Error(`Invalid value for ${key}: expected a number, got "${raw}"`);
+    return n;
+  }
+  if (typeof def === "boolean") {
+    if (raw === "true" || raw === "1") return true;
+    if (raw === "false" || raw === "0") return false;
+    throw new Error(`Invalid value for ${key}: expected true/false, got "${raw}"`);
+  }
+  return raw;
+}
+
+// Slice 27 — strict per-key constraint validators applied AFTER coerceValue
+// in `set()`. Lockstep with cli/src/config-store.ts KEY_CONSTRAINTS so the
+// daemon's HTTP write surface (/api/config POST) rejects the same input
+// the CLI rejects.
+function positiveIntegerConstraint(key: string) {
+  return (raw: string, coerced: string | number | boolean): void => {
+    if (!/^\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced <= 0) {
+      throw new Error(`Invalid value for ${key}: must be a positive integer, got "${raw}"`);
+    }
+  };
+}
+
+function wakeHumanRungConstraint(raw: string): void {
+  if (raw !== "always" && raw !== "explicit-only") {
+    throw new Error(`Invalid value for queue.wake_human_rung: must be "always" or "explicit-only", got "${raw}"`);
+  }
+}
+
+function percentageConstraint(key: string) {
+  return (raw: string, coerced: string | number | boolean): void => {
+    if (!/^\d+$/.test((raw ?? "").trim())
+      || typeof coerced !== "number"
+      || !Number.isInteger(coerced)
+      || coerced < 1
+      || coerced > 100) {
+      throw new Error(`Invalid value for ${key}: must be an integer in [1, 100], got "${raw}"`);
+    }
+  };
+}
+
+const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: string | number | boolean) => void>> = {
+  "transcripts.lines": (raw, value) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 1_000_000) {
+      throw new Error("Invalid transcripts.lines: must be an integer in [1, 1000000]");
+    }
+  },
+  "transcripts.poll_interval_seconds": (raw, value) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 3600) {
+      throw new Error("Invalid transcripts.poll_interval_seconds: must be an integer in [1, 3600]");
+    }
+  },
+  "runtime.readiness_timeout_seconds": (raw, coerced) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1 || coerced > 600) {
+      throw new Error(`Invalid value for runtime.readiness_timeout_seconds: must be an integer in [1, 600], got "${raw}"`);
+    }
+  },
+  // Constraint gap fix — lockstep with cli/src/config-store.ts KEY_CONSTRAINTS.
+  // daemon.port had no entry, so `rig config set daemon.port 99999` stored
+  // 99999 and the next daemon start died with a raw ERR_SOCKET_BAD_PORT
+  // from serve(). The check range-validates the value the runtime actually
+  // consumes — the same parseInt the boot path runs on OPENRIG_PORT
+  // (startServer) — rather than the raw input format, so everything that
+  // resolves today keeps resolving: 7433abc, 7433.5 and +7433 resolve to
+  // 7433, 1e4 to 1, 0x1D11 to 0, and a quoted in-range port in config.json
+  // ("7434") stays "7434". Only ports that cannot be bound are refused.
+  // 0 stays legal: checkPort treats port <= 0 as "always available" and the
+  // repo's own preflight tests write daemon.port = 0 on purpose. The
+  // ui.preview.* keys are deliberately unconstrained: their consumers
+  // floor/clamp out-of-range values today (refresh 0 disables polling on
+  // purpose; max_pins floors to 1; the daemon preview route falls back to
+  // 50 lines), so tightening them here would refuse input that works.
+  "daemon.port": (raw, coerced) => {
+    const port = parseInt(String(coerced), 10);
+    if (Number.isNaN(port) || port < 0 || port > 65535) {
+      throw new Error(`Invalid value for daemon.port: must be an integer in [0, 65535], got "${raw}"`);
+    }
+  },
+  "ui.timezone": (_raw, value) => {
+    try {
+      if (typeof value !== "string" || !value || /^[+-]/.test(value)) throw new Error();
+      new Intl.DateTimeFormat("en-US", { timeZone: value });
+    } catch { throw new Error("Invalid ui.timezone: use an IANA timezone such as America/Los_Angeles or Europe/London"); }
+  },
+  "health.context_pressure.warning_percent": percentageConstraint("health.context_pressure.warning_percent"),
+  "health.context_pressure.critical_percent": percentageConstraint("health.context_pressure.critical_percent"),
+  "policies.idle_gate_qitem.scan_interval_seconds": positiveIntegerConstraint("policies.idle_gate_qitem.scan_interval_seconds"),
+  "policies.idle_gate_qitem.active_wake_interval_seconds": positiveIntegerConstraint("policies.idle_gate_qitem.active_wake_interval_seconds"),
+  "policies.idle_gate_qitem.auto_register": (raw) => {
+    const v = (raw ?? "").trim();
+    if (v !== "off" && v !== "all") {
+      throw new Error(`Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`);
+    }
+  },
+  // Policy threshold: integer in [1, 100]. Documented contract from
+  // slice 27 README. parseInt's permissive coercion ("80abc" → 80;
+  // "80.5" → 80) is not safe for a key the daemon's compaction trigger
+  // reads at every poll tick; runtime validator rejects what the
+  // contract forbids per banked feedback_static_gates_mirror_runtime_validators.
+  "policies.claude_compaction.threshold_percent": (raw, coerced) => {
+    const trimmed = (raw ?? "").trim();
+    if (!/^-?\d+$/.test(trimmed)) {
+      throw new Error(
+        `Invalid value for policies.claude_compaction.threshold_percent: expected an integer in [1, 100], got "${raw}"`,
+      );
+    }
+    if (typeof coerced !== "number" || !Number.isInteger(coerced)) {
+      throw new Error(
+        `Invalid value for policies.claude_compaction.threshold_percent: expected an integer in [1, 100], got "${raw}"`,
+      );
+    }
+    if (coerced < 1 || coerced > 100) {
+      throw new Error(
+        `Invalid value for policies.claude_compaction.threshold_percent: must be in [1, 100], got ${coerced}`,
+      );
+    }
+  },
+  "snapshots.periodic.interval_seconds": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim())) {
+      throw new Error(
+        `Invalid value for snapshots.periodic.interval_seconds: expected an integer >= 60, got "${raw}"`,
+      );
+    }
+    if (typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 60) {
+      throw new Error(
+        `Invalid value for snapshots.periodic.interval_seconds: must be >= 60, got ${raw}`,
+      );
+    }
+  },
+  "snapshots.periodic.retention_keep": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim())) {
+      throw new Error(
+        `Invalid value for snapshots.periodic.retention_keep: expected an integer >= 1, got "${raw}"`,
+      );
+    }
+    if (typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(
+        `Invalid value for snapshots.periodic.retention_keep: must be >= 1, got ${raw}`,
+      );
+    }
+  },
+  // OPR.0.4.6.FS-1 W2 — retention numeric bounds (arch D3). Lockstep with the
+  // cli/src/config-store.ts KEY_CONSTRAINTS twin so the daemon HTTP write
+  // surface rejects exactly what the CLI rejects. `retention.enabled` is a
+  // boolean (coerceValue enforces true/false) — no constraint entry needed.
+  // Slice 15 P5 — the whoami peer bound; lockstep with the CLI twin.
+  "output.whoami_peers": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for output.whoami_peers: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "retention.transitions_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.transitions_days: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "retention.watchdog_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.watchdog_days: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "retention.usage_samples_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.usage_samples_days: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "retention.watchdog_keep_per_job": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for retention.watchdog_keep_per_job: must be an integer >= 0, got "${raw}"`);
+    }
+  },
+  "retention.batch_size": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.batch_size: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "queue.pickup_stall_threshold_minutes": positiveIntegerConstraint("queue.pickup_stall_threshold_minutes"),
+  "queue.stuck_sweep_interval_seconds": positiveIntegerConstraint("queue.stuck_sweep_interval_seconds"),
+  "queue.stuck_sweep_unclaimed_age_minutes": positiveIntegerConstraint("queue.stuck_sweep_unclaimed_age_minutes"),
+  // S01 — wake-or-escalate ladder knobs (same positive-integer contract).
+  "queue.wake_retry_interval_seconds": positiveIntegerConstraint("queue.wake_retry_interval_seconds"),
+  "queue.wake_retry_cap": positiveIntegerConstraint("queue.wake_retry_cap"),
+  "queue.wake_unconfirmed_window_minutes": positiveIntegerConstraint("queue.wake_unconfirmed_window_minutes"),
+  "queue.wake_swap_grace_seconds": positiveIntegerConstraint("queue.wake_swap_grace_seconds"),
+  "queue.wake_human_rung": wakeHumanRungConstraint,
+};
+
+function validateKeyConstraints(key: SettingsValidKey, raw: string, coerced: string | number | boolean): void {
+  const check = KEY_CONSTRAINTS[key];
+  if (check) check(raw, coerced);
+}
+
+// Slice 27 BLOCKING-FIX-2 — shared coerce + validate. Used by set()
+// (daemon write path), resolveOne env-source branch, and via
+// validateTypedFileValue by the resolveOne file-source branch. Lockstep
+// with cli/src/config-store.ts so every input layer applies the same
+// contract per banked feedback_audit_every_layer_function_and_module_constants.
+function coerceAndValidate(key: SettingsValidKey, raw: string, workspaceRoot: string): string | number | boolean {
+  const coerced = coerceValue(key, raw, workspaceRoot);
+  validateKeyConstraints(key, raw, coerced);
+  return coerced;
+}
+
+function validateTypedFileValue(key: SettingsValidKey, value: string | number | boolean): void {
+  const check = KEY_CONSTRAINTS[key];
+  if (!check) return;
+  const raw = typeof value === "string" ? value : String(value);
+  check(raw, value);
+}
+
+/**
+ * Slice 27 — projected Claude auto-compaction policy. ContextMonitor
+ * consumes this snapshot per-poll; the PreCompact hook reads the same
+ * shape via direct config.json read (without depending on the daemon).
+ */
+export interface ClaudeCompactionPolicy {
+  enabled: boolean;
+  thresholdPercent: number;
+  preCompactInstruction: string;
+  compactInstruction: string;
+  messageInline: string;
+  messageFilePath: string;
+  postRestoreAuditInstruction: string;
+}
+
+export interface ContextPressurePolicy {
+  warningPercent: number;
+  criticalPercent: number;
+}
+
+export interface ResolvedConfig {
+  skillsRoot: string;
+  contextRoot: string;
+  systemWorld: string;
+  topologyRoot: string;
+  workspaceRoot: string;
+  workspaceSlicesRoot: string;
+  workspaceSteeringPath: string;
+  workspaceSpecsRoot: string;
+  workspaceProjectsRoot: string;
+  workspaceCatalogPath: string;
+  // Explicit operator selection; empty leaves identity discovery to the consumer.
+  workspaceOperatorSeatName: string;
+  filesAllowlistRaw: string;
+  progressScanRootsRaw: string;
+  // Preview Terminal v0 (PL-018) — UI preview preferences.
+  uiPreviewRefreshIntervalSeconds: number;
+  uiPreviewMaxPins: number;
+  uiPreviewDefaultLines: number;
+  recoveryAutoDriveProviderPrompts: boolean;
+  recoveryProviderAuthEnvAllowlistRaw: string;
+}
+
+export class SettingsStore {
+  readonly configPath: string;
+
+  constructor(configPath?: string) {
+    this.configPath = configPath ?? DEFAULT_CONFIG_PATH;
+  }
+
+  resolveOne(key: SettingsValidKey, fileConfig?: Record<string, unknown>, workspaceRoot?: string): ResolvedSetting {
+    const fc = fileConfig ?? this.readConfigFile();
+    assertNoRemovedContextSetting(fc);
+    const wr = workspaceRoot ?? this.resolveWorkspaceRootRaw(fc);
+    if (key === "health.context_pressure.warning_percent" || key === "health.context_pressure.critical_percent") {
+      return this.resolveContextPressurePair(fc, wr)[key];
+    }
+    return this.resolveOneUnpaired(key, fc, wr);
+  }
+
+  private resolveContextPressurePair(
+    fileConfig: Record<string, unknown>,
+    workspaceRoot: string,
+  ): Record<"health.context_pressure.warning_percent" | "health.context_pressure.critical_percent", ResolvedSetting> {
+    const warningKey = "health.context_pressure.warning_percent" as const;
+    const criticalKey = "health.context_pressure.critical_percent" as const;
+    const warning = this.resolveOneUnpaired(warningKey, fileConfig, workspaceRoot);
+    const critical = this.resolveOneUnpaired(criticalKey, fileConfig, workspaceRoot);
+    if ((warning.value as number) < (critical.value as number)) {
+      return { [warningKey]: warning, [criticalKey]: critical };
+    }
+    process.stderr.write(
+      `[openrig-settings] context-pressure policy rejected: warning (${warning.value}) must be less than critical (${critical.value}); falling back to 95/99 defaults\n`,
+    );
+    return {
+      [warningKey]: { value: 95, source: "default", defaultValue: 95 },
+      [criticalKey]: { value: 99, source: "default", defaultValue: 99 },
+    };
+  }
+
+  private resolveOneUnpaired(key: SettingsValidKey, fc: Record<string, unknown>, wr: string): ResolvedSetting {
+    const defaultValue = getDefaultValue(key, wr);
+    // Slice 27 BLOCKING-FIX-2 — env override is validated; on invalid
+    // env, drop the override + warn so the operator sees the
+    // misconfiguration on daemon stderr (which captures-pane / log
+    // surfaces). Bad env never poisons the resolved value.
+    const envVal = readEnv(ENV_MAP[key].primary, ENV_MAP[key].legacy);
+    if (envVal !== undefined && envVal !== "") {
+      try {
+        return { value: coerceAndValidate(key, envVal, wr), source: "env", defaultValue };
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `[openrig-settings] env override for ${key} rejected: ${reason}; falling back to file/default\n`,
+        );
+      }
+    }
+    const fileVal = getNestedValue(fc, KEY_TO_PATH[key]);
+    if (fileVal !== undefined && fileVal !== null && fileVal !== "") {
+      const legacyDefault = deriveLegacyWorkspaceDefault(key, wr);
+      if (legacyDefault !== null && fileVal === legacyDefault) {
+        return { value: defaultValue, source: "default", defaultValue };
+      }
+      // Validate the file-source value too. Hand-edited config.json
+      // with a bad threshold (0, "80abc", 80.5, etc.) falls back to
+      // default rather than poisoning the trigger contract.
+      try {
+        validateTypedFileValue(key, fileVal as string | number | boolean);
+        return { value: fileVal as string | number | boolean, source: "file", defaultValue };
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `[openrig-settings] file value for ${key} rejected: ${reason}; falling back to default\n`,
+        );
+      }
+    }
+    return { value: defaultValue, source: "default", defaultValue };
+  }
+
+  resolveAllWithSource(): Record<SettingsValidKey, ResolvedSetting> {
+    const fc = this.readConfigFile();
+    const wr = this.resolveWorkspaceRootRaw(fc);
+    const out = {} as Record<SettingsValidKey, ResolvedSetting>;
+    for (const key of SETTINGS_VALID_KEYS) {
+      out[key] = this.resolveOne(key, fc, wr);
+    }
+    return out;
+  }
+
+  /** Project the raw resolution into a flattened config structure for daemon consumers. */
+  resolveConfig(): ResolvedConfig {
+    const fc = this.readConfigFile();
+    const wr = this.resolveWorkspaceRootRaw(fc);
+    return {
+      skillsRoot: this.resolveOne("skills.root", fc, wr).value as string,
+      contextRoot: this.resolveOne("context.root", fc, wr).value as string,
+      systemWorld: this.resolveOne("context.system_world", fc, wr).value as string,
+      topologyRoot: this.resolveOne("topology.root", fc, wr).value as string,
+      workspaceRoot: wr,
+      workspaceSlicesRoot: this.resolveOne("workspace.slices_root", fc, wr).value as string,
+      workspaceSteeringPath: this.resolveOne("workspace.steering_path", fc, wr).value as string,
+      workspaceSpecsRoot: this.resolveOne("workspace.specs_root", fc, wr).value as string,
+      workspaceProjectsRoot: this.resolveOne("workspace.projects_root", fc, wr).value as string,
+      workspaceCatalogPath: this.resolveOne("workspace.catalog_path", fc, wr).value as string,
+      workspaceOperatorSeatName: this.resolveOne("workspace.operator_seat_name", fc, wr).value as string,
+      filesAllowlistRaw: this.resolveOne("files.allowlist", fc, wr).value as string,
+      progressScanRootsRaw: this.resolveOne("progress.scan_roots", fc, wr).value as string,
+      uiPreviewRefreshIntervalSeconds: this.resolveOne("ui.preview.refresh_interval_seconds", fc, wr).value as number,
+      uiPreviewMaxPins: this.resolveOne("ui.preview.max_pins", fc, wr).value as number,
+      uiPreviewDefaultLines: this.resolveOne("ui.preview.default_lines", fc, wr).value as number,
+      recoveryAutoDriveProviderPrompts: this.resolveOne("recovery.auto_drive_provider_prompts", fc, wr).value as boolean,
+      recoveryProviderAuthEnvAllowlistRaw: this.resolveOne("recovery.provider_auth_env_allowlist", fc, wr).value as string,
+    };
+  }
+
+  /**
+   * Slice 27 — read the Claude auto-compaction policy as a typed snapshot.
+   * Called per-poll by ContextMonitor so live edits to ~/.openrig/config.json
+   * take effect within one polling interval without daemon restart.
+   */
+  resolveClaudeCompactionPolicy(): ClaudeCompactionPolicy {
+    const fc = this.readConfigFile();
+    const wr = this.resolveWorkspaceRootRaw(fc);
+    return {
+      enabled: this.resolveOne("policies.claude_compaction.enabled", fc, wr).value as boolean,
+      thresholdPercent: this.resolveOne("policies.claude_compaction.threshold_percent", fc, wr).value as number,
+      preCompactInstruction: this.resolveOne("policies.claude_compaction.pre_compact_instruction", fc, wr).value as string,
+      compactInstruction: this.resolveOne("policies.claude_compaction.compact_instruction", fc, wr).value as string,
+      messageInline: this.resolveOne("policies.claude_compaction.message_inline", fc, wr).value as string,
+      messageFilePath: this.resolveOne("policies.claude_compaction.message_file_path", fc, wr).value as string,
+      postRestoreAuditInstruction: this.resolveOne("policies.claude_compaction.post_restore_audit_instruction", fc, wr).value as string,
+    };
+  }
+
+  /** Fresh-read context-pressure detector policy; changes apply to the next projection. */
+  resolveContextPressurePolicy(): ContextPressurePolicy {
+    const fc = this.readConfigFile();
+    const wr = this.resolveWorkspaceRootRaw(fc);
+    const pair = this.resolveContextPressurePair(fc, wr);
+    return {
+      warningPercent: pair["health.context_pressure.warning_percent"].value as number,
+      criticalPercent: pair["health.context_pressure.critical_percent"].value as number,
+    };
+  }
+
+  // GHOST-STAGE (d) twin of the CLI ConfigStore guard: verify-readback + fail-loud. After a write,
+  // re-read this.configPath (the canonical config) and confirm the value persisted; a mismatch means
+  // the write silently did not take, so REFUSE loudly rather than report a phantom success
+  // (config-set-success-without-persist). The daemon already writes canonical (DEFAULT_CONFIG_PATH),
+  // so this is the defense-in-depth half of the paired fix.
+  /** Publish a complete config without truncating the previous usable file. */
+  private writeConfig(content: string): void {
+    let target = this.configPath;
+    // Follow config-file links just as writeFileSync did; rename the target,
+    // never the link. A dangling final target is still created normally.
+    for (let depth = 0; ; depth++) {
+      const entry = lstatSync(target, { throwIfNoEntry: false });
+      if (!entry?.isSymbolicLink()) break;
+      if (depth >= 40) throw Object.assign(new Error("Too many config symlinks"), { code: "ELOOP" });
+      target = path.resolve(path.dirname(target), readlinkSync(target));
+    }
+    const existing = statSync(target, { throwIfNoEntry: false });
+    // Match direct writes: a writable directory must not bypass a read-only
+    // target. Opening without truncation also checks native ACL permissions.
+    if (existing) closeSync(openSync(target, "r+"));
+    const temporary = `${target}.tmp-${randomUUID()}`;
+    let owned = false;
+    let canFallBack = true;
+    try {
+      // Atomic replacement requires directory create/rename permission. Keep
+      // staged bytes private until the original ownership and mode are restored.
+      const fd = openSync(temporary, "wx", 0o600);
+      owned = true;
+      // A failed data write must never retry against the original file.
+      canFallBack = false;
+      try { writeFileSync(fd, content, "utf-8"); } finally { closeSync(fd); }
+      canFallBack = true;
+      if (existing && process.platform !== "win32") {
+        const staged = statSync(temporary);
+        if (staged.uid !== existing.uid || staged.gid !== existing.gid) {
+          try { chownSync(temporary, existing.uid, existing.gid); }
+          catch (error) {
+            throw Object.assign(new Error(`Cannot preserve config ownership at ${target}: ${(error as Error).message}`),
+              { code: (error as NodeJS.ErrnoException).code });
+          }
+        }
+      }
+      // chown may clear permission bits, so apply the final mode afterward.
+      chmodSync(temporary, existing ? existing.mode & 0o777 : 0o666 & ~process.umask());
+      renameSync(temporary, target);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (canFallBack && (code === "EACCES" || code === "EPERM" || code === "EBUSY")) {
+        // Preserve setups that permit writing the file but not replacing it,
+        // such as an unwritable parent or a single-file bind mount.
+        writeFileSync(target, content, "utf-8");
+        return;
+      }
+      throw error;
+    } finally {
+      if (owned) try { unlinkSync(temporary); } catch { /* Renamed or already removed. */ }
+    }
+  }
+
+  private verifyPersisted(keyPath: string[], expected: unknown): void {
+    let reread: Record<string, unknown>;
+    try {
+      reread = JSON.parse(readFileSync(this.configPath, "utf-8")) as Record<string, unknown>;
+    } catch (e) {
+      throw new Error(
+        `config write did NOT persist: could not read it back at ${this.configPath} (${(e as Error).message}). Refusing to report success.`,
+      );
+    }
+    const got = getNestedValue(reread, keyPath);
+    if (JSON.stringify(got) !== JSON.stringify(expected)) {
+      throw new Error(
+        `config write did NOT persist to ${this.configPath}: it still shows ${JSON.stringify(got)} for [${keyPath.join(".")}] (expected ${JSON.stringify(expected)}). Refusing to report a phantom success.`,
+      );
+    }
+  }
+
+  set(key: string, value: string): void {
+    const removedMessage = removedContextSettingMessage(key);
+    if (removedMessage) throw new Error(removedMessage);
+    // OPR.0.4.4.15: the ONE registered dynamic class is accepted here;
+    // every OTHER unknown key keeps the reject-loud behavior below
+    // byte-for-byte.
+    const feedHost = parseFeedHostSubscriptionKey(key);
+    if (feedHost) {
+      const coercedDyn = coerceFeedHostSubscriptionValue(key, value);
+      const fcDyn = this.readConfigFile();
+      setNestedValue(fcDyn, ["feed", "subscriptions", feedHost.hostId, "enabled"], coercedDyn);
+      mkdirSync(path.dirname(this.configPath), { recursive: true });
+      this.writeConfig(JSON.stringify(fcDyn, null, 2) + "\n");
+      this.verifyPersisted(["feed", "subscriptions", feedHost.hostId, "enabled"], coercedDyn);
+      return;
+    }
+    if (!isSettingsValidKey(key)) {
+      throw new Error(`Unknown config key "${key}". Valid keys: ${SETTINGS_VALID_KEYS.join(", ")}`);
+    }
+    const fc = this.readConfigFile();
+    const wr = this.resolveWorkspaceRootRaw(fc);
+    const coerced = coerceAndValidate(key, value, wr);
+    setNestedValue(fc, KEY_TO_PATH[key], coerced);
+    if (key === "health.context_pressure.warning_percent" || key === "health.context_pressure.critical_percent") {
+      const warning = getNestedValue(fc, KEY_TO_PATH["health.context_pressure.warning_percent"])
+        ?? getDefaultValue("health.context_pressure.warning_percent", wr);
+      const critical = getNestedValue(fc, KEY_TO_PATH["health.context_pressure.critical_percent"])
+        ?? getDefaultValue("health.context_pressure.critical_percent", wr);
+      if ((warning as number) >= (critical as number)) {
+        throw new Error(`Invalid context-pressure policy: warning (${warning}) must be less than critical (${critical})`);
+      }
+    }
+    mkdirSync(path.dirname(this.configPath), { recursive: true });
+    this.writeConfig(JSON.stringify(fc, null, 2) + "\n");
+    this.verifyPersisted(KEY_TO_PATH[key], coerced);
+  }
+
+  /** OPR.0.4.4.15 — resolve one dynamic feed-host subscription key.
+   *  File-or-default only (no env mapping for the dynamic class in v1);
+   *  default false = not subscribed. Returns null for keys outside the
+   *  registered class. */
+  resolveFeedHostSubscription(key: string): ResolvedSetting | null {
+    const feedHost = parseFeedHostSubscriptionKey(key);
+    if (!feedHost) return null;
+    const fc = this.readConfigFile();
+    const fileVal = getNestedValue(fc, ["feed", "subscriptions", feedHost.hostId, "enabled"]);
+    if (typeof fileVal === "boolean") return { value: fileVal, source: "file", defaultValue: false };
+    return { value: false, source: "default", defaultValue: false };
+  }
+
+  /** OPR.0.4.4.15 — enumerate persisted per-host subscriptions (the
+   *  aggregator's read). Reserved segments and non-conforming shapes are
+   *  WARNED and IGNORED (the ratified guard: operator error surfaces
+   *  visibly, never misparses, never rejects the whole config). */
+  listFeedHostSubscriptions(): Array<{ hostId: string; enabled: boolean }> {
+    const fc = this.readConfigFile();
+    const subs = getNestedValue(fc, ["feed", "subscriptions"]);
+    if (subs === null || subs === undefined || typeof subs !== "object" || Array.isArray(subs)) return [];
+    const out: Array<{ hostId: string; enabled: boolean }> = [];
+    for (const [segment, node] of Object.entries(subs as Record<string, unknown>)) {
+      if (node === null || typeof node !== "object" || Array.isArray(node)) continue; // flat toggle leaves — not host nodes
+      if (FEED_HOST_RESERVED_SEGMENTS.has(segment) || !/^[A-Za-z0-9_-]+$/.test(segment)) {
+        process.stderr.write(
+          `[openrig-settings] feed.subscriptions.${segment} ignored as a host subscription: segment is ${FEED_HOST_RESERVED_SEGMENTS.has(segment) ? "a reserved toggle name" : "not a valid host id segment ([A-Za-z0-9_-]+)"}\n`,
+        );
+        continue;
+      }
+      const enabled = (node as Record<string, unknown>)["enabled"];
+      if (typeof enabled !== "boolean") {
+        process.stderr.write(`[openrig-settings] feed.subscriptions.${segment}.enabled ignored: expected boolean, got ${JSON.stringify(enabled)}\n`);
+        continue;
+      }
+      out.push({ hostId: segment, enabled });
+    }
+    return out;
+  }
+
+  reset(key?: string): void {
+    if (key === undefined) {
+      try { unlinkSync(this.configPath); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      return;
+    }
+    const removedMessage = removedContextSettingMessage(key);
+    if (removedMessage) throw new Error(removedMessage);
+    // OPR.0.4.4.15: dynamic-class reset removes the whole host node
+    // (unsubscribe leaves no residue).
+    const feedHost = parseFeedHostSubscriptionKey(key);
+    if (feedHost) {
+      if (!existsSync(this.configPath)) return;
+      const fcDyn = this.readConfigFile();
+      const parent = getNestedValue(fcDyn, ["feed", "subscriptions"]) as Record<string, unknown> | undefined;
+      if (parent && feedHost.hostId in parent) delete parent[feedHost.hostId];
+      this.writeConfig(JSON.stringify(fcDyn, null, 2) + "\n");
+      return;
+    }
+    if (!isSettingsValidKey(key)) {
+      throw new Error(`Unknown config key "${key}". Valid keys: ${SETTINGS_VALID_KEYS.join(", ")}`);
+    }
+    if (!existsSync(this.configPath)) return;
+    const fc = this.readConfigFile();
+    const parts = KEY_TO_PATH[key];
+    const parent = getNestedValue(fc, parts.slice(0, -1)) as Record<string, unknown> | undefined;
+    if (parent && parts[parts.length - 1]! in parent) {
+      delete parent[parts[parts.length - 1]!];
+      if (key === "health.context_pressure.warning_percent" || key === "health.context_pressure.critical_percent") {
+        const workspaceRoot = this.resolveWorkspaceRootRaw(fc);
+        const warning = getNestedValue(fc, KEY_TO_PATH["health.context_pressure.warning_percent"])
+          ?? getDefaultValue("health.context_pressure.warning_percent", workspaceRoot);
+        const critical = getNestedValue(fc, KEY_TO_PATH["health.context_pressure.critical_percent"])
+          ?? getDefaultValue("health.context_pressure.critical_percent", workspaceRoot);
+        if ((warning as number) >= (critical as number)) {
+          throw new Error(`Invalid context-pressure policy: warning (${warning}) must be less than critical (${critical})`);
+        }
+      }
+    }
+    this.writeConfig(JSON.stringify(fc, null, 2) + "\n");
+  }
+
+  private resolveWorkspaceRootRaw(fileConfig: Record<string, unknown>): string {
+    const envVal = readEnv(ENV_MAP["workspace.root"].primary, ENV_MAP["workspace.root"].legacy);
+    if (envVal) return envVal;
+    const fileVal = getNestedValue(fileConfig, KEY_TO_PATH["workspace.root"]) as string | undefined;
+    if (fileVal) return fileVal;
+    return DEFAULT_WORKSPACE_ROOT;
+  }
+
+  private readConfigFile(): Record<string, unknown> {
+    let parsed: Record<string, unknown> = {};
+    if (existsSync(this.configPath)) {
+      const raw = readFileSync(this.configPath, "utf-8");
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        throw new Error(
+          `Config file at ${this.configPath} is malformed. Fix the JSON or reset with: rig config reset`,
+        );
+      }
+    }
+    assertNoRemovedContextSetting(parsed);
+    return parsed;
+  }
+}
+
+// --- User Settings v0: shared decoders ---
+
+export interface NamedPair {
+  name: string;
+  path: string;
+}
+
+export function parseNamedPairs(raw: string): NamedPair[] {
+  if (!raw || !raw.trim()) return [];
+  const out = new Map<string, string>();
+  for (const pair of raw.split(",")) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const colon = trimmed.indexOf(":");
+    if (colon === -1) continue;
+    const name = trimmed.slice(0, colon).trim();
+    const rawPath = trimmed.slice(colon + 1).trim();
+    if (!name || !rawPath) continue;
+    out.set(name, rawPath);
+  }
+  return Array.from(out.entries()).map(([name, path]) => ({ name, path }));
+}

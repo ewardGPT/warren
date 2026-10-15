@@ -22,6 +22,7 @@ import { seedBuiltinAgents } from "../registry/builtins/index.ts";
 import { resolveLocalRunBackend } from "../runtime/local/diagnostics/burrow.ts";
 import { runAddProject } from "./commands/add-project.ts";
 import { runConfigMigrate } from "./commands/config-migrate.ts";
+import { registerCoordinationCommands } from "./commands/coordination.ts";
 import { runMigrateToPostgres } from "./commands/db.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInit } from "./commands/init.ts";
@@ -401,6 +402,8 @@ export function buildProgram(context: CliContext): Command {
 			const result = await runServe(context, {}, { noAuth: opts.auth === false });
 			process.exit(result.exitCode);
 		});
+
+	registerCoordinationCommands(program, context);
 
 	return program;
 }

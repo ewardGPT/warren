@@ -1,0 +1,1859 @@
+import { readWorkflowGuidance, type GuidanceInput } from "./workflow-guidance.js";
+// PL-004 Phase D: workflow projector — transactional-scribe contract.
+//
+// LOAD-BEARING. The single most important Phase D contract.
+//
+// Per PRD § L4 + audit row 16: every code path that closes a
+// `workflow_instances.current_frontier` qitem AND every code path that
+// creates the next-step qitem MUST happen inside the SAME daemon-managed
+// transaction. If two separate transactions can be observed, that is a
+// contract violation. Lost handoffs are impossible by design.
+//
+// Composition (one db.transaction):
+//   1. Verify spec + instance + current packet are consistent.
+//   2. Resolve next step from spec (one-hop default per PRD).
+//   3. Update queue_items: close current packet (handoff/waiting/done).
+//   4. Create next-step queue item via QueueRepository.createWithinTransaction.
+//   5. Append workflow_step_trails entry with prior + next ids.
+//   6. Update workflow_instances frontier + status.
+//   7. Persist workflow.* events (step_closed, next_qitem_projected, completed).
+//
+// All in one db.transaction. If any step throws, all rollback. After
+// commit, fan out events to subscribers + nudge next owner.
+
+import { workflowPlanningContext } from "./workflow-planning-context.js";
+import type Database from "better-sqlite3";
+import type { EventBus } from "./event-bus.js";
+import type { QueueRepository } from "./queue-repository.js";
+import type { PersistedEvent } from "./types.js";
+import type { WorkflowInstanceStore } from "./workflow-instance-store.js";
+import type { WorkflowSpecCache } from "./workflow-spec-cache.js";
+import type { WorkflowStepTrailLog } from "./workflow-step-trail-log.js";
+import type {
+  WorkflowExitKind,
+  WorkflowInstance,
+  WorkflowSpec,
+  WorkflowStepSpec,
+} from "./workflow-types.js";
+import { exceedsMaxHops, MAX_HOPS_BASELINE_V1 } from "./workflow-deadline.js";
+import { isHumanSeatSession } from "./human-route-enforcer.js";
+import { selectRoleSeat } from "./workflow-role-resolver.js";
+import {
+  roleResolutionContext,
+  tryResolveRoleByCapability,
+  type RoleResolutionContext,
+} from "./workflow-role-context.js";
+import { classifyFailureOccurrence, classifyGateTrip, workflowExceptionTags } from "./workflow-exception.js";
+import { newQitemId, QueueRepositoryError } from "./queue-repository.js";
+import { resolveExceptionRoute } from "./workflow-exception-router.js";
+import { workflowHumanDestination, type WorkflowHumanDestination } from "./workflow-human-destination.js";
+import type { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
+import {
+  disarmWorkflowKeepalive,
+  ensureWorkflowKeepaliveArmed,
+} from "./workflow-keepalive-arming.js";
+import { requiredLifecycleSteps } from "./lifecycle-obligations.js";
+import { shellQuote } from "../adapters/shell-quote.js";
+
+const WORKFLOW_CONTEXT_SHORTCUT =
+  "Context: this workflow packet is a shortcut, not the whole story; inspect additional project, mission, and receipt evidence before choosing an authored exit.";
+
+/** One occurrence-bound action, shared by packet bodies and authored wait wakes. */
+export function renderWorkflowProjectCommand(input: {
+  instanceId: string;
+  packetId: string;
+  ownerSession: string;
+  step?: Pick<WorkflowStepSpec, "acceptance">;
+}): string {
+  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed> --actor-session ${input.ownerSession}`;
+  const acceptance = input.step?.acceptance;
+  if (!acceptance) return base;
+  const verdict = acceptance.verdicts.length === 1
+    ? acceptance.verdicts[0]!
+    : `<${acceptance.verdicts.join("|")}>`;
+  return `${base} --acceptance-candidate ${shellQuote(acceptance.candidate)} --acceptance-verdict ${shellQuote(verdict)} --acceptance-evidence-ref ${shellQuote(acceptance.evidence_ref)}`;
+}
+
+function workflowMethodLines(input: GuidanceInput): string[] {
+  const guidance = readWorkflowGuidance(input);
+  return guidance.state === "unselected" ? [] : guidance.lines;
+}
+
+/** Refreshes guidance when a packet is recreated (route/resume) instead of
+ * carrying a stale packet id or owner forward in copied body text. */
+export function withWorkflowContinuation(input: {
+  body: string;
+  contextRefs?: string[];
+  binding?: GuidanceInput["binding"];
+  library?: GuidanceInput["library"];
+  instanceId: string;
+  packetId: string;
+  ownerSession: string;
+  step?: Pick<WorkflowStepSpec, "acceptance"> & { id?: string };
+}): string {
+  const lines = input.body
+    .split("\n")
+    .filter((line) => !line.startsWith("Continuation: ") && !line.startsWith("Workflow plan: ") && !line.startsWith("Workflow method: ") && line !== WORKFLOW_CONTEXT_SHORTCUT && !(input.contextRefs && line.startsWith("Context reference: ")));
+  while (lines.at(-1) === "") lines.pop();
+  return [
+    ...lines,
+    "",
+    ...workflowPlanningContext(input.contextRefs, input.instanceId),
+    ...workflowMethodLines({...input, stepId: input.step?.id}),
+    ...(input.contextRefs ?? []).map((ref) => `Context reference: ${ref}`),
+    `Continuation: ${renderWorkflowProjectCommand(input)}`,
+    WORKFLOW_CONTEXT_SHORTCUT,
+  ].join("\n");
+}
+
+export function workflowWaitWakeMessage(input: {
+  spec: WorkflowSpec;
+  instance: WorkflowInstance;
+  step: WorkflowStepSpec;
+  packetId: string;
+  ownerSession: string;
+}): string {
+  return [
+    `Workflow wait re-presentation (blocker progress or reminder): ${input.spec.id}@${input.spec.version} instance ${input.instance.instanceId} step ${input.step.id}.`,
+    `You still own the same frontier packet ${input.packetId}. Read it and inspect current evidence before choosing an authored exit.`,
+    ...(input.step.objective ? [`Objective: ${input.step.objective}`] : []),
+    ...workflowPlanningContext(input.spec.context_refs, input.instance.instanceId),
+    ...(input.spec.context_refs ?? []).map((ref) => `Context reference: ${ref}`),
+    `Continuation: ${renderWorkflowProjectCommand({ ...input, instanceId: input.instance.instanceId })}`,
+    WORKFLOW_CONTEXT_SHORTCUT,
+  ].join("\n");
+}
+
+/**
+ * OPR.0.4.6.WF2 FR-2: canonical-session → node runtime column lookup
+ * (the harness-pin reconciliation source). Latest session row wins
+ * (the node-inventory join discipline). null = not a managed node.
+ * Shared by the projector (projection-time pins) and the runtime
+ * facade (instantiate-time static pin checks).
+ */
+export function nodeRuntimeOf(db: Database.Database, session: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT n.runtime FROM nodes n
+         JOIN sessions s ON s.node_id = n.id
+        WHERE s.session_name = ?
+        ORDER BY s.id DESC LIMIT 1`,
+    )
+    .get(session) as { runtime: string | null } | undefined;
+  return row?.runtime ?? null;
+}
+
+export class WorkflowProjectorError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "WorkflowProjectorError";
+  }
+}
+
+export interface ProjectStepInput {
+  instanceId: string;
+  /** The qitem being closed (must be in instance.currentFrontier). */
+  currentPacketId: string;
+  /** What kind of exit closes this packet. */
+  exit: WorkflowExitKind;
+  /** Free-form closure result text (POC: --result). */
+  resultNote?: string;
+  /** For waiting exits: the blocker reference (qitem id, gate name). */
+  blockedOn?: string;
+  /** Operator-supplied evidence for the closure record (audit). */
+  closureEvidence?: Record<string, unknown>;
+  /** Session that closed the packet (owner-as-author). */
+  actorSession: string;
+  /**
+   * Optional explicit override for the next-step destination session.
+   * When omitted, the projector resolves from the next step's
+   * actor_role + role.preferred_targets[]. Required when no
+   * preferred_targets are declared OR none are operator-resolvable.
+   */
+  nextOwnerSession?: string;
+}
+
+export interface ProjectStepResult {
+  instance: WorkflowInstance;
+  closurePriorPacketId: string;
+  closureReason: WorkflowExitKind;
+  /** null on terminal closures (waiting / done / failed / no-successor). */
+  nextQitemId: string | null;
+  /** null on terminal closures. */
+  nextOwnerSession: string | null;
+  /** null on terminal closures. */
+  nextStepId: string | null;
+  /** All packets/steps projected by a dependency-graph advance. */
+  nextQitemIds?: string[];
+  nextStepIds?: string[];
+  /** Composite fired events (step_closed + optional next_qitem_projected + optional completed). */
+  emittedEventTypes: string[];
+  /**
+   * OPR.0.4.6.WF1 FR-5: true when this call was an ABSORBED
+   * waiting-replay — an exact full-closure-intent duplicate of the
+   * stored decision. Zero writes happened; the stored first outcome is
+   * what this result reflects.
+   */
+  absorbedReplay?: boolean;
+}
+
+export class WorkflowProjector {
+  constructor(
+    private readonly db: Database.Database,
+    private readonly eventBus: EventBus,
+    private readonly queueRepo: QueueRepository,
+    private readonly instanceStore: WorkflowInstanceStore,
+    private readonly trailLog: WorkflowStepTrailLog,
+    private readonly specCache: WorkflowSpecCache,
+    private readonly now: () => Date = () => new Date(),
+    /** OPR.0.4.6.WF1 FR-3: optional — arms/disarms packet or legacy-instance keepalives in-txn. */
+    private readonly watchdogJobsRepo?: WatchdogJobsRepository,
+    /** OPR.0.4.6.WF5 FR-2: the maturity-dial inputs, injected at startup
+     *  (the validateRig precedent — the projector never reads config
+     *  itself). hostDefault is read LIVE per exception (dial flips apply
+     *  to future items only). Absent = engine defaults (orchestrator-
+     *  first chain with registered-human selection). */
+    private readonly exceptionDial?: {
+      hostDefault: () => "orchestrator" | "human_only" | null;
+      humanFallbackSeat: WorkflowHumanDestination;
+    },
+    private readonly guidanceLibrary?: GuidanceInput["library"],
+  ) {}
+
+  private nodeRuntimeOf(session: string): string | null {
+    return nodeRuntimeOf(this.db, session);
+  }
+
+  /**
+   * Close the current packet AND create/project the next-step packet
+   * IN THE SAME TRANSACTION. The load-bearing transactional-scribe
+   * call site.
+   */
+  async project(input: ProjectStepInput): Promise<ProjectStepResult> {
+    const instance = this.instanceStore.getByIdOrThrow(input.instanceId);
+    if (instance.status !== "active" && instance.status !== "waiting") {
+      throw new WorkflowProjectorError(
+        "instance_not_active",
+        `workflow instance ${instance.instanceId} has status ${instance.status}; only active|waiting instances accept project`,
+        { instanceId: instance.instanceId, status: instance.status },
+      );
+    }
+    if (!instance.currentFrontier.includes(input.currentPacketId)) {
+      throw new WorkflowProjectorError(
+        "packet_not_on_frontier",
+        `qitem ${input.currentPacketId} is not in workflow instance ${instance.instanceId} frontier ${JSON.stringify(instance.currentFrontier)}; either the packet is already closed or belongs to a different instance`,
+        { instanceId: instance.instanceId, currentPacketId: input.currentPacketId, frontier: instance.currentFrontier },
+      );
+    }
+    const specRow = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion);
+    if (!specRow) {
+      throw new WorkflowProjectorError(
+        "spec_not_cached",
+        `workflow spec ${instance.workflowName}@${instance.workflowVersion} is not in the spec cache. Re-run validate to refresh the cache.`,
+        { workflowName: instance.workflowName, workflowVersion: instance.workflowVersion },
+      );
+    }
+    const spec = specRow.spec;
+
+    // Look up the qitem being closed to identify the current step.
+    const currentPacket = this.queueRepo.getById(input.currentPacketId);
+    if (!currentPacket) {
+      throw new WorkflowProjectorError(
+        "packet_not_found",
+        `qitem ${input.currentPacketId} not found in queue_items`,
+        { currentPacketId: input.currentPacketId },
+      );
+    }
+    // R2 fix (guard blocker 1): read durable current_step_id from instance
+    // rather than inferring "last_trail_step + 1". Reused-frontier packets
+    // (waiting then resume) now correctly resume the SAME step.
+    const packetBinding = this.instanceStore.getFrontierBinding(instance.instanceId, input.currentPacketId);
+    const currentStep = packetBinding
+      ? spec.steps.find((step) => step.id === packetBinding.stepId) ?? null
+      : instance.currentFrontier.length === 1
+        ? resolveCurrentStep(spec, instance)
+        : null;
+    if (!currentStep) {
+      throw new WorkflowProjectorError(
+        "current_step_unknown",
+        `workflow instance ${instance.instanceId} has no resolvable current step (current_step_id=${JSON.stringify(instance.currentStepId)}). The instance may be in a terminal state, or the spec ${spec.id}@${spec.version} may have changed shape mid-instance.`,
+        { instanceId: instance.instanceId, currentStepId: instance.currentStepId, frontier: instance.currentFrontier },
+      );
+    }
+
+    // R2 fix (guard blocker 2): enforce currentStep.allowed_exits at
+    // projection time. POC contract: an exit not in the step's
+    // allowed_exits is rejected with a structured error and NO state
+    // mutation. Validation happens BEFORE any side effect (queue close,
+    // trail append, frontier update, event persist). When allowed_exits
+    // is omitted on the step, no enforcement (operator opted out at
+    // spec authoring time).
+    if (
+      currentStep.allowed_exits &&
+      currentStep.allowed_exits.length > 0 &&
+      !currentStep.allowed_exits.includes(input.exit)
+    ) {
+      throw new WorkflowProjectorError(
+        "exit_not_allowed",
+        `step "${currentStep.id}" allows exits ${JSON.stringify(currentStep.allowed_exits)}; got "${input.exit}". Either close with a permitted exit, or amend the spec.`,
+        {
+          instanceId: instance.instanceId,
+          stepId: currentStep.id,
+          attemptedExit: input.exit,
+          allowedExits: currentStep.allowed_exits,
+        },
+      );
+    }
+
+    // Project profile receipts are agent-authored references. Presence is mechanical;
+    // the daemon neither reads the referenced prose nor decides its substance.
+    if (requiredLifecycleSteps(instance.lifecycleBinding).includes(currentStep.id) &&
+        (input.exit === "done" || input.exit === "handoff")) {
+      const receipt = input.closureEvidence?.evidence_ref;
+      if (typeof receipt !== "string" || receipt.trim() === "") {
+        throw new WorkflowProjectorError("lifecycle_receipt_required",
+          `Boundary step "${currentStep.id}" needs an agent-judged receipt. Supply --evidence-ref; a terminal queue row is not acceptance.`,
+          { stepId: currentStep.id, instanceId: instance.instanceId });
+      }
+    }
+
+    validateAcceptance(currentStep, input, instance);
+
+    // A declared dependency graph opts into the S06 packet-addressed
+    // executor. Legacy specs keep the mature serial scribe below exactly.
+    if (spec.steps.some((step) => step.depends_on !== undefined)) {
+      if (!packetBinding) {
+        throw new WorkflowProjectorError(
+          "frontier_binding_indeterminate",
+          `workflow instance ${instance.instanceId} has a dependency graph but frontier packet ${input.currentPacketId} has no unique step binding; refusing to infer from current_step_id`,
+          { instanceId: instance.instanceId, currentPacketId: input.currentPacketId },
+        );
+      }
+      return this.projectDependencyGraph({
+        input,
+        instance,
+        spec,
+        currentStep,
+        packetBinding,
+        currentOwnerSession: currentPacket.destinationSession,
+      });
+    }
+
+    // Determine next step (one-hop default; multi-hop is graduation).
+    // OPR.0.4.6.WF2 FR-1: the recorded exit participates — a MAPPED exit
+    // resolves to its branch target (deterministic: same (spec, step,
+    // exit) → same target); unmapped exits fall through to the exact
+    // structural semantics shipped today.
+    const branchTargetId = currentStep.next_hop?.on?.[input.exit];
+    const branchRouted = branchTargetId !== undefined;
+    const nextStep = resolveNextStep(spec, currentStep, input.exit);
+    if (branchRouted && !nextStep) {
+      // Validator guarantees branch targets exist at validate/instantiate;
+      // this guards a stale cached spec drifting under a live instance.
+      throw new WorkflowProjectorError(
+        "branch_target_missing",
+        `step "${currentStep.id}" maps exit "${input.exit}" to step "${branchTargetId}" but the spec ${spec.id}@${spec.version} has no such step. Re-validate the spec file.`,
+        { instanceId: instance.instanceId, stepId: currentStep.id, exit: input.exit, branchTargetId },
+      );
+    }
+    // A route happens on a structural handoff OR any branch-mapped exit
+    // (the ONE WF-2 engine extension: language-driven routing through
+    // the same transactional scribe).
+    const willRoute = branchRouted || input.exit === "handoff";
+
+    // FR-5 (G3): the waiting-replay ABSORPTION check. `waiting`
+    // deliberately KEEPS the closed packet on the frontier, so a replayed waiting
+    // project passes the frontier guard — before this slice it
+    // double-wrote the trail. Absorption closes the hole under the
+    // guard-ratified FULL CLOSURE-INTENT IDENTITY (G-WF1-1): the replay
+    // is absorbed (ZERO writes, the stored first outcome returned) ONLY
+    // when EVERY field that can change observable queue/trail/decision
+    // state matches the stored decision exactly. ANY mismatch is a NEW
+    // legitimate decision (re-park-with-new-reason) recorded honestly
+    // through the normal write path below — never absorbed, never
+    // rejected. Terminal-exit replays stay the distinct frontier 409
+    // above (FR-1c).
+    if (input.exit === "waiting" && instance.status === "waiting") {
+      const absorbed = matchesStoredWaitingDecision(
+        instance,
+        input,
+        currentStep.id,
+        this.trailLog,
+      );
+      if (absorbed) {
+        return {
+          instance,
+          closurePriorPacketId: input.currentPacketId,
+          closureReason: "waiting",
+          nextQitemId: null,
+          nextOwnerSession: null,
+          nextStepId: null,
+          emittedEventTypes: [],
+          absorbedReplay: true,
+        };
+      }
+    }
+
+    // FR-6 (G4): enforce loop_guards.max_hops at projection time — this
+    // makes migration 034's "enforced at projection time" comment TRUE.
+    // A handoff that would exceed the guard is converted into an HONEST
+    // structured failure: the packet still closes (BR-3 shapes), the
+    // instance fails with the guard named in trail + event evidence,
+    // and no next qitem is minted — never an unbounded hop loop, never
+    // a silent stop, never a parked potato. The owner's requested exit
+    // was validated against allowed_exits ABOVE; the conversion below
+    // is engine-authored (guard enforcement), not an owner exit, so it
+    // deliberately bypasses allowed_exits.
+    // The comparison runs against an EFFECTIVE BASELINE (arch N1):
+    // v1 pins baseline = MAX_HOPS_BASELINE_V1 (0); WF-5 FR-4's resume
+    // later amends the baseline so each redrive gets one bounded window.
+    // OPR.0.4.6.WF2: the guard fires on ANY route (structural handoff OR
+    // a branch-mapped exit) — branch edges create the canonical
+    // remediation cycles, and an advance is an advance. Guard precedence
+    // is BEFORE branch resolution takes effect: a tripped guard is a
+    // terminal honest failure, never a routed branch.
+    const maxHops = spec.loop_guards?.max_hops;
+    // OPR.0.4.6.WF5 FR-4 (the livelock rail): the baseline is the
+    // instance's recorded hops_baseline — 0 for never-resumed instances
+    // (byte-identical to the v1 constant), hopCount-at-resume after a
+    // redrive, so each sanctioned drive gets exactly one bounded window.
+    const maxHopsTripped =
+      willRoute &&
+      exceedsMaxHops(instance.hopCount, instance.hopsBaseline ?? MAX_HOPS_BASELINE_V1, maxHops);
+    const effectiveExit: WorkflowExitKind = maxHopsTripped ? "failed" : input.exit;
+    const effectiveResultNote = maxHopsTripped
+      ? `max_hops_exceeded: hop ${instance.hopCount + 1} would exceed loop_guards.max_hops=${maxHops}`
+      : input.resultNote;
+    // The route actually happens only when the guard did not trip.
+    const routes = willRoute && !maxHopsTripped;
+    let effectiveClosureEvidence = maxHopsTripped
+      ? {
+          ...(input.closureEvidence ?? {}),
+          max_hops_guard: {
+            code: "max_hops_exceeded",
+            maxHops,
+            hopCount: instance.hopCount,
+            attemptedHop: instance.hopCount + 1,
+          },
+        }
+      : input.closureEvidence;
+    // OPR.0.4.6.WF2 FR-1 (arch PIN 1): the taken branch is recorded
+    // ADDITIVELY in the trail row's structured evidence JSON (and in
+    // last_continuation_decision below) — NEVER in closure_reason (a
+    // closed Phase-A enum + kept hot-potato contract).
+    if (routes && branchRouted && nextStep) {
+      effectiveClosureEvidence = {
+        ...(effectiveClosureEvidence ?? {}),
+        branch_taken: { exit: input.exit, target: nextStep.id },
+      };
+    }
+
+    const evaluatedAt = this.now().toISOString();
+
+    // OPR.0.4.6.FAC1: the bound-rig resolution context — LAZY (building
+    // it reads nothing; the snapshot materializes only if tier-3 role
+    // resolution actually runs, which is strictly AFTER the frontier +
+    // absorption guards above returned/threw for replays — guard B1's
+    // zero-inventory-reads-on-replays pin holds by construction).
+    // undefined for unbound instances (tier 3 does not exist for them).
+    const roleCtx = roleResolutionContext(this.db, instance.boundRig);
+
+    let nextQitemId: string | null = null;
+    let nextOwnerSession: string | null = null;
+    let nextStepId: string | null = null;
+    type PostCommitNudge = { destinationSession: string; nudge: boolean | undefined };
+    let nextQitemCreatePostCommit: PostCommitNudge | null = null;
+    // OPR.0.4.6.WF5 FR-2 class (a): the exception item's post-commit nudge
+    // (delivery is best-effort; the durable item is the guarantee).
+    let exceptionItemPostCommit: (PostCommitNudge & { qitemId: string }) | null = null;
+    const persistedEvents: PersistedEvent[] = [];
+    this.eventBus.withNotifyEnvelope((register) => {
+      const registerEvent = (event: PersistedEvent): void => {
+        persistedEvents.push(event);
+        register(event);
+      };
+      // 1. Resolve next owner BEFORE closing prior so closure_target is set.
+      // OPR.0.4.6.WF2: owner resolution runs for ANY route (structural
+      // handoff or branch-mapped exit). A gated target step compiles to
+      // the gate destination instead of the step's role owner (FR-5).
+      let resolvedNextOwner: string | null = null;
+      let gateCompile: GateCompileResult | null = null;
+      if (routes) {
+        if (!nextStep) {
+          throw new WorkflowProjectorError(
+            "no_next_step",
+            `workflow instance ${instance.instanceId} reached terminal step "${currentStep.id}" but exit was handoff; use exit=done for terminal steps or extend the spec with a next step`,
+            { instanceId: instance.instanceId, currentStepId: currentStep.id },
+          );
+        }
+        if (nextStep.gate) {
+          gateCompile = compileGate(spec, nextStep, (s) => this.nodeRuntimeOf(s), roleCtx);
+          resolvedNextOwner = gateCompile.destinationSession;
+        } else if (input.nextOwnerSession) {
+          reconcileExplicitOwnerHarness(nextStep, input.nextOwnerSession, (s) =>
+            this.nodeRuntimeOf(s),
+          );
+          resolvedNextOwner = input.nextOwnerSession;
+        } else {
+          const owner = resolveDefaultOwner(spec, nextStep, (s) => this.nodeRuntimeOf(s), roleCtx);
+          if (!owner) {
+            throw new WorkflowProjectorError(
+              "next_owner_unresolved",
+              `cannot resolve next owner for step "${nextStep.id}" (role "${nextStep.actor_role}"); supply nextOwnerSession explicitly or add preferred_targets to the role in the spec`,
+              { instanceId: instance.instanceId, nextStepId: nextStep.id, nextRole: nextStep.actor_role },
+            );
+          }
+          resolvedNextOwner = owner;
+        }
+      }
+
+      // 2. R1 fix (guard blocker 1): close the current packet via Phase A's
+      // QueueRepository.updateWithinTransaction. This validates closure
+      // (Phase A hot-potato strict-rejection invariants), persists closure
+      // metadata (closure_reason, closure_target, handed_off_to / blocked_on),
+      // appends queue_transitions, and emits queue.updated — all inside this
+      // outer transaction. The Phase A closure authority is preserved.
+      const closure = workflowExitToQueueClosure(
+        { ...input, exit: effectiveExit, resultNote: effectiveResultNote },
+        resolvedNextOwner,
+      );
+      const queueUpdate = this.queueRepo.updateWithinTransaction({
+        qitemId: input.currentPacketId,
+        actorSession: input.actorSession,
+        viaWorkflowVerb: true,
+        state: closure.state,
+        closureReason: closure.closureReason,
+        closureTarget: closure.closureTarget ?? undefined,
+        handedOffTo: closure.handedOffTo,
+        blockedOn: closure.blockedOn,
+        transitionNote: closure.transitionNote,
+        wakeMaxSeconds: effectiveExit === "waiting" && !routes ? currentStep.re_present_max_seconds : undefined,
+        wakeProgressEvidence: input.closureEvidence,
+        wakeAfterSeconds:
+          effectiveExit === "waiting" && !routes
+            ? currentStep.re_present_after_seconds
+            : undefined,
+        wakeMessage:
+          effectiveExit === "waiting" && !routes && currentStep.re_present_after_seconds !== undefined
+            ? workflowWaitWakeMessage({
+                spec,
+                instance,
+                step: currentStep,
+                packetId: input.currentPacketId,
+                ownerSession: currentPacket.destinationSession,
+              })
+            : undefined,
+      });
+      registerEvent(queueUpdate.persistedEvent);
+
+      // 3. If this close routes (structural handoff OR branch-mapped
+      // exit): create the next-step qitem in the same txn. A gated
+      // target compiles to the gate item (FR-5) — the SHIPPED write
+      // path (tier/summary/evidence_ref) — instead of an ordinary
+      // step packet; the instance then PARKS (status ladder below).
+      let createdNext: { qitemId: string; persistedEvent: PersistedEvent; destinationSession: string; nudge: boolean | undefined } | null = null;
+      if (routes && nextStep && resolvedNextOwner) {
+        nextOwnerSession = resolvedNextOwner;
+        nextStepId = nextStep.id;
+        // OPR.0.4.6.FAC1 (arch-endorsed): the ADDITIVE owner_resolution
+        // trail evidence — which tier resolved this routing decision
+        // (the branch_taken precedent; structured evidence JSON, NEVER
+        // closure_reason). Makes the determinism proofs readable and
+        // gives trace a rendering cell.
+        effectiveClosureEvidence = {
+          ...(effectiveClosureEvidence ?? {}),
+          owner_resolution: {
+            mode: gateCompile
+              ? "gate"
+              : input.nextOwnerSession
+                ? "explicit"
+                : (spec.roles?.[nextStep.actor_role]?.preferred_targets ?? []).length > 0
+                  ? "preferred_targets"
+                  : "role",
+            role: nextStep.actor_role,
+            ...(instance.boundRig ? { boundRig: instance.boundRig } : {}),
+            seat: resolvedNextOwner,
+          },
+        };
+        // OPR.0.4.6.WF5 FR-1 class (c) (guard code-review fold): a HUMAN
+        // gate reach IS the exception, and the WF-2 compiled item IS the
+        // attention item (no second item ever) — so the class-(c)
+        // exception identity rides THIS packet's tags. The packet id is
+        // PREALLOCATED so occurrence:<gatePacketId> exists at create
+        // (identity queryable from birth — arch cell-2). Handler-role
+        // gates stay negative (deterministic handoffs, not exceptions).
+        const nextPacketId = newQitemId();
+        const gateException =
+          gateCompile
+            ? classifyGateTrip({
+                workflowName: instance.workflowName,
+                instanceId: instance.instanceId,
+                gatedStepId: nextStep.id,
+                gateKind: gateCompile.kind,
+                gatePacketId: nextPacketId,
+                parkOn: gateCompile.parkOn,
+              })
+            : null;
+        // P34 (site :466, the ROUTES branch) — the stage call follows the create
+        // immediately below; see the seam assert at the end of this transaction.
+        createdNext = this.queueRepo.createWithinTransaction({
+          qitemId: nextPacketId,
+          sourceSession: input.actorSession,
+          destinationSession: resolvedNextOwner,
+          body: workflowHandoffBody({
+            library: this.guidanceLibrary,
+            spec,
+            instance,
+            currentStep,
+            nextStep,
+            actorSession: input.actorSession,
+            resultNote: effectiveResultNote,
+            gate: gateCompile,
+            packetId: nextPacketId,
+            ownerSession: resolvedNextOwner,
+          }),
+          priority: "routine",
+          tier: gateCompile?.tier ?? "mode2",
+          tags: [
+            "workflow",
+            gateCompile ? "gate" : "handoff",
+            `workflow:${spec.id}`,
+            `instance:${instance.instanceId}`,
+            ...(gateException ? workflowExceptionTags(gateException.identity).filter((t) => !t.startsWith("workflow:") && !t.startsWith("instance:")) : []),
+          ],
+          summary: gateCompile?.summary ?? undefined,
+          evidenceRef: gateCompile?.evidenceRef ?? undefined,
+          chainOfRecord: [input.currentPacketId],
+        });
+        nextQitemId = createdNext.qitemId;
+        nextQitemCreatePostCommit = {
+          destinationSession: createdNext.destinationSession,
+          nudge: createdNext.nudge,
+        };
+        // P34: stage the next-step packet's wake intent in THIS transaction, so
+        // the close and the durable wake are one act or none.
+        this.queueRepo.stageWakeIntent(
+          createdNext.qitemId,
+          input.actorSession,
+          createdNext.destinationSession,
+          null,
+          createdNext.nudge,
+        );
+        // OPR.0.4.6.WF2 FR-5 (guard blocker 1): a HUMAN gate packet PARKS
+        // in the same txn — state=blocked, blocked_on=<human seat> — the
+        // exact leg-1 shape the shipped `rig queue resolve` verb acts on
+        // (validateHumanPark enforces summary + evidence_ref here, carried
+        // from create). Resolve unparks it for the step owner to resume.
+        if (gateCompile?.parkOn) {
+          const parked = this.queueRepo.updateWithinTransaction({
+            qitemId: createdNext.qitemId,
+            actorSession: input.actorSession,
+            state: "blocked",
+            closureReason: "blocked_on",
+            closureTarget: gateCompile.parkOn,
+            blockedOn: gateCompile.parkOn,
+            transitionNote: `workflow gate: parked on ${gateCompile.parkOn} pending sign-off`,
+          });
+          registerEvent(parked.persistedEvent);
+        }
+      }
+
+      // OPR.0.4.6.WF1 FR-1 proof seam (ACK Rev-2, reviewer-approved
+      // shape): an env-gated hold INSIDE the transaction, between the
+      // queue close / next-qitem create and the trail append, giving
+      // the fr1-midtxn-process-kill VM proof a deterministic window to
+      // SIGKILL the daemon mid-transaction. Default off/absent = zero
+      // effect (test-only; never set in production). Synchronous by
+      // design — better-sqlite3 transactions are sync.
+      const holdMs = Number(process.env.OPENRIG_TEST_WF_TXN_HOLD_MS ?? 0);
+      if (holdMs > 0) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holdMs);
+      }
+
+      // 4. Append step trail entry (prior + next ids).
+      this.trailLog.record({
+        instanceId: instance.instanceId,
+        stepId: currentStep.id,
+        stepRole: currentStep.actor_role,
+        closedAt: evaluatedAt,
+        closureReason: effectiveExit,
+        closureEvidence: effectiveClosureEvidence ?? null,
+        actorSession: input.actorSession,
+        nextQitemId,
+        priorQitemId: input.currentPacketId,
+      });
+
+      // 5. Update instance frontier + status.
+      // R1 fix (guard blocker 2b): on exit=waiting, PRESERVE the closed
+      // packet on the frontier. workflow-keepalive treats waiting as
+      // eligible and resolves owners from current_frontier_json; removing
+      // the packet would leave a single-packet waiting workflow with no
+      // owner to wake.
+      const remainingFrontier = instance.currentFrontier.filter(
+        (id) => id !== input.currentPacketId,
+      );
+      let nextFrontier: string[];
+      if (nextQitemId) {
+        // OPR.0.4.6.WF2: a ROUTED close (structural handoff OR a
+        // branch-mapped exit — including a mapped `waiting`) moves the
+        // frontier to the new packet. Checked FIRST so a mapped waiting
+        // routes instead of re-parking the closed packet.
+        nextFrontier = [...remainingFrontier, nextQitemId];
+      } else if (effectiveExit === "waiting") {
+        // Unrouted waiting: keep the closed packet on frontier; the
+        // watchdog uses it to wake the owner.
+        nextFrontier = [...remainingFrontier, input.currentPacketId];
+      } else {
+        nextFrontier = remainingFrontier;
+      }
+      // R1 fix (guard blocker 2a): exit=failed sets status=failed, NOT
+      // completed. Emits workflow.failed instead of workflow.completed.
+      // OPR.0.4.6.WF2: a ROUTED close keeps the instance ACTIVE bound to
+      // the route target (the branch execution contract) — UNLESS the
+      // target step is GATED, in which case the instance parks honestly
+      // (`waiting`) on the gate item until resolve/close continues it.
+      // Non-routed exits keep today's ladder byte-identically.
+      let nextStatus: WorkflowInstance["status"];
+      let completedAt: string | null = null;
+      if (routes) {
+        nextStatus = gateCompile ? "waiting" : "active";
+      } else if (effectiveExit === "waiting") {
+        nextStatus = "waiting";
+      } else if (effectiveExit === "failed") {
+        nextStatus = "failed";
+        completedAt = evaluatedAt;
+      } else if (nextFrontier.length === 0) {
+        nextStatus = "completed";
+        completedAt = evaluatedAt;
+      } else {
+        nextStatus = "active";
+      }
+      // R2 fix: set durable current_step_id transition.
+      //   routed (handoff or branch) → route target step
+      //   waiting (unrouted)         → preserve (resume on same packet/step)
+      //   done / failed (unrouted)   → clear (terminal)
+      let currentStepIdUpdate: "preserve" | "clear" | string;
+      if (routes && nextStep) {
+        currentStepIdUpdate = nextStep.id;
+      } else if (effectiveExit === "waiting") {
+        currentStepIdUpdate = "preserve";
+      } else {
+        // done or failed
+        currentStepIdUpdate = "clear";
+      }
+      this.instanceStore.updateFrontier(instance.instanceId, nextFrontier, nextStatus, {
+        // A branch route IS an advance (arch PIN 2): it bumps the hop
+        // count and the FR-5 version guard under the identical
+        // discipline as the linear path.
+        bumpHopCount: routes,
+        lastContinuationDecision: {
+          exit: effectiveExit,
+          actorSession: input.actorSession,
+          closedPacket: input.currentPacketId,
+          nextPacket: nextQitemId,
+          resultNote: effectiveResultNote ?? null,
+          blockedOn: input.blockedOn ?? null,
+          currentStep: currentStep.id,
+          // OPR.0.4.6.WF2 FR-1 (arch PIN 1): ADDITIVE branch-taken
+          // record — null on every non-branch close.
+          branchTaken: routes && branchRouted && nextStep ? nextStep.id : null,
+        },
+        completedAt,
+        currentStepId: currentStepIdUpdate,
+        // FR-5: the optimistic-concurrency guard — this write commits
+        // only if no other writer advanced the instance since our read;
+        // a stale writer throws instance_version_conflict and the whole
+        // scribe transaction rolls back.
+        expectedVersion: instance.version,
+      });
+
+      // 5b. OPR.0.4.6.WF1 FR-3: keepalive arm/disarm INSIDE the scribe
+      // txn. A handoff ensures the per-instance job is armed (idempotent
+      // — also heals pre-WF-1 instances on their first post-upgrade
+      // hop); a terminal status disarms it (no orphaned watchdog
+      // noise). Waiting keeps the deadline-gated job armed but quiet while
+      // blocked; an authored re-presentation rule uses the separate one-shot
+      // park timer above. Plain INSERT/UPDATE, verified txn-composable.
+      if (this.watchdogJobsRepo) {
+        if (routes && resolvedNextOwner) {
+          // Any route arms the keepalive for the new owner — including a gate
+          // park, whose delivery attention is handled by the queue wake intent.
+          ensureWorkflowKeepaliveArmed(this.watchdogJobsRepo, {
+            instanceId: instance.instanceId,
+            targetSession: resolvedNextOwner,
+            registeredBySession: input.actorSession,
+          });
+        } else if (nextStatus === "completed" || nextStatus === "failed") {
+          disarmWorkflowKeepalive(
+            this.watchdogJobsRepo,
+            instance.instanceId,
+            `workflow_${nextStatus}`,
+          );
+        }
+      }
+
+      // 6. Persist workflow events within the same txn.
+      registerEvent(
+        this.eventBus.persistWithinTransaction({
+          type: "workflow.step_closed",
+          instanceId: instance.instanceId,
+          stepId: currentStep.id,
+          closureReason: effectiveExit,
+          actorSession: input.actorSession,
+          priorQitemId: input.currentPacketId,
+        }),
+      );
+      if (createdNext && nextStep && resolvedNextOwner) {
+        registerEvent(createdNext.persistedEvent);
+        registerEvent(
+          this.eventBus.persistWithinTransaction({
+            type: "workflow.next_qitem_projected",
+            instanceId: instance.instanceId,
+            nextQitemId: createdNext.qitemId,
+            nextOwner: createdNext.destinationSession,
+            nextStepId: nextStep.id,
+          }),
+        );
+      }
+      if (nextStatus === "completed") {
+        registerEvent(
+          this.eventBus.persistWithinTransaction({
+            type: "workflow.completed",
+            instanceId: instance.instanceId,
+            workflowName: instance.workflowName,
+          }),
+        );
+      } else if (nextStatus === "failed") {
+        registerEvent(
+          this.eventBus.persistWithinTransaction({
+            type: "workflow.failed",
+            instanceId: instance.instanceId,
+            workflowName: instance.workflowName,
+            reason: effectiveResultNote ?? "workflow_step_failed",
+          }),
+        );
+        exceptionItemPostCommit = this.admitFailureException(
+          input, instance, spec, currentStep, effectiveResultNote ?? null, registerEvent,
+        );
+      }
+
+      // P34: the W1 seam, LAST statement of this transaction. The two successor
+      // branches are MUTUALLY EXCLUSIVE — nextStatus==="failed" requires
+      // routes===false (see the status ladder above), so :466 and :729 are
+      // alternatives within one execution, never two successors. Each branch is
+      // therefore asserted on its own. A park (`waiting`) or a no-successor
+      // closure reaches neither arm: the primitive itself returns early on a
+      // non-terminal source, and a closure with no successor has no wake to make
+      // durable.
+      const excStaged = exceptionItemPostCommit as (PostCommitNudge & { qitemId: string }) | null;
+      if (createdNext) {
+        this.queueRepo.assertTerminalClosureHasIntent(
+          input.currentPacketId,
+          createdNext.qitemId,
+          createdNext.nudge,
+        );
+      } else if (excStaged) {
+        this.queueRepo.assertTerminalClosureHasIntent(
+          input.currentPacketId,
+          excStaged.qitemId,
+          excStaged.nudge,
+        );
+      }
+    });
+
+    // OPR.0.4.6.WF5 FR-2: best-effort nudge for the exception item (the
+    // shipped non-fatal delivery pattern — the durable item is the
+    // guarantee, the nudge is a courtesy).
+    // P34: both deliveries go through the SHARED staged-intent path, which claims
+    // and finalizes the row staged in the transaction above. maybeNudge would send
+    // without finalizing, leaving the intent `pending` for the startup recovery
+    // sweep to deliver a SECOND time. With no intent store attached the shared
+    // path falls back to the same best-effort nudge as before.
+    const excPost = exceptionItemPostCommit as (PostCommitNudge & { qitemId: string }) | null;
+    if (excPost) {
+      await this.queueRepo.deliverWakeForSuccessor(
+        excPost.qitemId,
+        excPost.destinationSession,
+        excPost.nudge,
+        input.actorSession,
+      );
+    }
+    const postCommit = nextQitemCreatePostCommit as PostCommitNudge | null;
+    if (nextQitemId && postCommit) {
+      await this.queueRepo.deliverWakeForSuccessor(
+        nextQitemId,
+        postCommit.destinationSession,
+        postCommit.nudge,
+        input.actorSession,
+      );
+    }
+
+    const updatedInstance = this.instanceStore.getByIdOrThrow(instance.instanceId);
+    return {
+      instance: updatedInstance,
+      closurePriorPacketId: input.currentPacketId,
+      closureReason: effectiveExit,
+      nextQitemId,
+      nextOwnerSession,
+      nextStepId,
+      emittedEventTypes: persistedEvents.map((e) => e.type),
+    };
+  }
+
+  /** Failure, owning task and wake commit together on both executor paths.
+   * Caller invokes only for an unhandled failure, never mapped remediation. */
+  private admitFailureException(
+    input: ProjectStepInput,
+    instance: WorkflowInstance,
+    spec: WorkflowSpec,
+    currentStep: WorkflowStepSpec,
+    failureReason: string | null,
+    registerEvent: (event: PersistedEvent) => void,
+    occurrenceId?: string,
+  ): { qitemId: string; destinationSession: string; nudge: boolean | undefined } {
+    const exception = classifyFailureOccurrence({
+      instance, failedStepId: currentStep.id, failedPacketId: input.currentPacketId, failureReason,
+    });
+    const route = resolveExceptionRoute({
+      exceptionClass: exception.identity.exceptionClass,
+      spec,
+      hostDialDefault: this.exceptionDial?.hostDefault() ?? null,
+      // FAC-1 (arch Q3 — routing uniformity, bounded): declared
+      // preferred_targets stay the override; a bound instance's
+      // orchestrator-role dial position falls through to a
+      // capability pick on the bound rig (evidenced no-match →
+      // registered-human selection, with an explicit error if no
+      // human can be selected). Evidence-read failures propagate
+      // and roll back the close. Fresh decision per episode.
+      resolveRoleTarget: (role) =>
+        spec.roles?.[role]?.preferred_targets?.[0] ??
+        tryResolveRoleByCapability(roleResolutionContext(this.db, instance.boundRig), role),
+      humanFallbackSeat: this.exceptionDial?.humanFallbackSeat,
+    });
+    const evidenceRef = `rig workflow trace ${instance.instanceId}`;
+    const itemBody =
+      `WORKFLOW EXCEPTION (${exception.identity.exceptionClass})\n` +
+      `workflow: ${instance.workflowName} v${instance.workflowVersion}\n` +
+      `instance: ${instance.instanceId}\n` +
+      `step: ${currentStep.id} (role ${currentStep.actor_role})\n` +
+      `occurrence: ${input.currentPacketId}\n` +
+      `reason: ${exception.reason}\n` +
+      `evidence: ${evidenceRef}\n` +
+      `resolve: diagnose via the trace above, then \`rig workflow resume ${instance.instanceId}${occurrenceId ? ` --occurrence ${occurrenceId}` : ""} [--decision <text>]\` re-drives from this step (completed steps never re-run).`;
+    const createExceptionItem = (destination: string, tier: string) =>
+      this.queueRepo.createWithinTransaction({
+        sourceSession: input.actorSession,
+        destinationSession: destination,
+        body: itemBody,
+        priority: "urgent",
+        tier,
+        tags: workflowExceptionTags(exception.identity),
+        summary: exception.reason,
+        evidenceRef,
+        chainOfRecord: [input.currentPacketId],
+      });
+    let createdException;
+    try {
+      createdException = createExceptionItem(route.destinationSession, route.tier);
+    } catch (error) {
+      if (!(error instanceof QueueRepositoryError) || error.code !== "unknown_destination_rig" || route.humanRouted) throw error;
+      // Only an unavailable agent rig invokes human selection. Other
+      // admission/storage failures propagate unchanged and roll back the
+      // close, retaining the failure+attention-item atomic contract.
+      createdException = createExceptionItem(
+        workflowHumanDestination(this.exceptionDial?.humanFallbackSeat),
+        "human-gate",
+      );
+    }
+    registerEvent(createdException.persistedEvent);
+    this.queueRepo.stageWakeIntent(createdException.qitemId, input.actorSession,
+      createdException.destinationSession, null, createdException.nudge);
+    return { qitemId: createdException.qitemId, destinationSession: createdException.destinationSession, nudge: createdException.nudge };
+  }
+
+  private async projectDependencyGraph(args: {
+    input: ProjectStepInput;
+    instance: WorkflowInstance;
+    spec: WorkflowSpec;
+    currentStep: WorkflowStepSpec;
+    packetBinding: import("./workflow-types.js").WorkflowFrontierBinding;
+    currentOwnerSession: string;
+  }): Promise<ProjectStepResult> {
+    const { input, instance, spec, currentStep, packetBinding, currentOwnerSession } = args;
+    if (input.exit === "waiting" && instance.status === "waiting" && matchesStoredWaitingDecision(instance, input, currentStep.id, this.trailLog)) {
+      return {
+        instance,
+        closurePriorPacketId: input.currentPacketId,
+        closureReason: "waiting",
+        nextQitemId: null,
+        nextOwnerSession: null,
+        nextStepId: null,
+        nextQitemIds: [],
+        nextStepIds: [],
+        emittedEventTypes: [],
+        absorbedReplay: true,
+      };
+    }
+
+    const mappedTarget = currentStep.next_hop?.on?.[input.exit];
+    const completesPrerequisite = input.exit === "done" || input.exit === "handoff";
+    // Rank by append order, not closed_at, so a clock step-back cannot reorder completions.
+    // A higher rank is a later done or handoff closure.
+    const trail = this.trailLog.listForInstanceInAppendOrder(instance.instanceId);
+    const latestCompletion = new Map<string, number>();
+    trail.forEach((entry, index) => {
+      if (entry.closureReason === "done" || entry.closureReason === "handoff") latestCompletion.set(entry.stepId, index + 1);
+    });
+    if (completesPrerequisite) latestCompletion.set(currentStep.id, trail.length + 1);
+    // A completion older than a prerequisite's latest completion no longer counts, so a step
+    // re-run through a routed exit sends the steps that depend on it round again.
+    const completed = new Set(
+      [...latestCompletion]
+        .filter(([stepId, rank]) => (spec.steps.find((step) => step.id === stepId)?.depends_on ?? [])
+          .every((dependency) => (latestCompletion.get(dependency) ?? 0) < rank))
+        .map(([stepId]) => stepId),
+    );
+
+    const liveBindings = this.instanceStore.listFrontierBindings(instance.instanceId);
+    const liveStepIds = new Set(liveBindings.map((binding) => binding.stepId));
+    const unresolved = this.instanceStore.listFailureOccurrences(instance.instanceId, "unresolved");
+    const unresolvedStepIds = new Set(unresolved.map((occurrence) => occurrence.stepId));
+    let nextSteps: WorkflowStepSpec[] = [];
+    if (mappedTarget) {
+      const target = spec.steps.find((step) => step.id === mappedTarget);
+      if (!target) {
+        throw new WorkflowProjectorError("branch_target_missing", `step "${currentStep.id}" maps ${input.exit} to missing step "${mappedTarget}"`, { instanceId: instance.instanceId, stepId: currentStep.id, mappedTarget });
+      }
+      nextSteps = [target];
+    } else if (completesPrerequisite) {
+      nextSteps = spec.steps.filter((candidate) => {
+        const dependencies = candidate.depends_on;
+        if (!dependencies || dependencies.length === 0) return false;
+        if (!dependencies.includes(currentStep.id)) return false;
+        if (!dependencies.every((dependency) => completed.has(dependency))) return false;
+        if (completed.has(candidate.id) || liveStepIds.has(candidate.id) || unresolvedStepIds.has(candidate.id)) return false;
+        return true;
+      });
+    }
+
+    // A dependency graph advances each branch from its own durable binding,
+    // so the livelock window must be evaluated from that binding too. The
+    // serial path performs the same comparison against instance-level fields.
+    // Convert a tripped advance into the ordinary branch-local failure shape:
+    // close this packet honestly, record one resumable occurrence, create no
+    // successor, and leave unrelated frontier packets untouched.
+    const maxHops = spec.loop_guards?.max_hops;
+    const maxHopsTripped =
+      nextSteps.length > 0 &&
+      exceedsMaxHops(packetBinding.hopCount, packetBinding.hopsBaseline, maxHops);
+    const effectiveExit: WorkflowExitKind = maxHopsTripped ? "failed" : input.exit;
+    const effectiveResultNote = maxHopsTripped
+      ? `max_hops_exceeded: hop ${packetBinding.hopCount + 1} would exceed loop_guards.max_hops=${maxHops}`
+      : input.resultNote;
+    const effectiveClosureEvidence = maxHopsTripped
+      ? {
+          ...(input.closureEvidence ?? {}),
+          max_hops_guard: {
+            code: "max_hops_exceeded",
+            maxHops,
+            hopCount: packetBinding.hopCount,
+            attemptedHop: packetBinding.hopCount + 1,
+          },
+        }
+      : input.closureEvidence;
+    if (maxHopsTripped) nextSteps = [];
+    const isFailureOccurrence = effectiveExit === "failed" && (!mappedTarget || maxHopsTripped);
+
+    const evaluatedAt = this.now().toISOString();
+    const emitted: PersistedEvent[] = [];
+    let exceptionWake: ReturnType<WorkflowProjector["admitFailureException"]> | null = null;
+    const createdPackets: Array<{ qitemId: string; step: WorkflowStepSpec; owner: string; nudge: boolean | undefined; blocked: boolean }> = [];
+    this.eventBus.withNotifyEnvelope((register) => {
+      const addEvent = (event: PersistedEvent): void => { emitted.push(event); register(event); };
+      const ownerPlans = nextSteps.map((step) => {
+        const gate = step.gate
+          ? compileGate(spec, step, (session) => this.nodeRuntimeOf(session), roleResolutionContext(this.db, instance.boundRig))
+          : null;
+        const owner = gate?.destinationSession ?? resolveDefaultOwner(spec, step, (session) => this.nodeRuntimeOf(session), roleResolutionContext(this.db, instance.boundRig));
+        if (!owner) {
+          throw new WorkflowProjectorError("next_owner_unresolved", `cannot resolve next owner for dependency step "${step.id}"`, { instanceId: instance.instanceId, stepId: step.id });
+        }
+        return { step, gate, owner, packetId: newQitemId() };
+      });
+
+      const closureOwner = ownerPlans.length === 1 ? ownerPlans[0]!.owner : null;
+      const closure = effectiveExit === "handoff" && ownerPlans.length !== 1
+        ? {
+            state: "done" as const,
+            closureReason: "no-follow-on",
+            closureTarget: null,
+            transitionNote: `workflow graph: ${input.actorSession} completed ${currentStep.id}; ${ownerPlans.length} successors projected transactionally`,
+          }
+        : workflowExitToQueueClosure(
+            { ...input, exit: effectiveExit, resultNote: effectiveResultNote },
+            closureOwner,
+          );
+      const updated = this.queueRepo.updateWithinTransaction({
+        qitemId: input.currentPacketId,
+        actorSession: input.actorSession,
+        viaWorkflowVerb: true,
+        state: closure.state,
+        closureReason: closure.closureReason,
+        closureTarget: closure.closureTarget ?? undefined,
+        handedOffTo: closure.handedOffTo,
+        blockedOn: closure.blockedOn,
+        transitionNote: closure.transitionNote,
+        wakeMaxSeconds: effectiveExit === "waiting" && ownerPlans.length === 0 ? currentStep.re_present_max_seconds : undefined,
+        wakeProgressEvidence: input.closureEvidence,
+        wakeAfterSeconds:
+          effectiveExit === "waiting" && ownerPlans.length === 0
+            ? currentStep.re_present_after_seconds
+            : undefined,
+        wakeMessage:
+          effectiveExit === "waiting" && ownerPlans.length === 0 && currentStep.re_present_after_seconds !== undefined
+            ? workflowWaitWakeMessage({
+                spec,
+                instance,
+                step: currentStep,
+                packetId: input.currentPacketId,
+                ownerSession: currentOwnerSession,
+              })
+            : undefined,
+      });
+      addEvent(updated.persistedEvent);
+
+      if (effectiveExit !== "waiting") {
+        this.instanceStore.removeFrontierBinding(instance.instanceId, input.currentPacketId);
+        if (this.watchdogJobsRepo) {
+          disarmWorkflowKeepalive(
+            this.watchdogJobsRepo,
+            instance.instanceId,
+            `workflow_packet_${effectiveExit}`,
+            input.currentPacketId,
+          );
+        }
+      }
+
+      for (const plan of ownerPlans) {
+        const created = this.queueRepo.createWithinTransaction({
+          qitemId: plan.packetId,
+          sourceSession: input.actorSession,
+          destinationSession: plan.owner,
+          body: workflowHandoffBody({
+            library: this.guidanceLibrary,
+            spec,
+            instance,
+            currentStep,
+            nextStep: plan.step,
+            actorSession: input.actorSession,
+            resultNote: effectiveResultNote,
+            gate: plan.gate,
+            packetId: plan.packetId,
+            ownerSession: plan.owner,
+          }),
+          priority: "routine",
+          tier: plan.gate?.tier ?? "mode2",
+          tags: ["workflow", plan.gate ? "gate" : "handoff", `workflow:${spec.id}`, `instance:${instance.instanceId}`, `step:${plan.step.id}`],
+          summary: plan.gate?.summary ?? undefined,
+          evidenceRef: plan.gate?.evidenceRef ?? undefined,
+          chainOfRecord: [input.currentPacketId],
+        });
+        addEvent(created.persistedEvent);
+        this.queueRepo.stageWakeIntent(created.qitemId, input.actorSession, created.destinationSession, null, created.nudge);
+        if (plan.gate?.parkOn) {
+          const parked = this.queueRepo.updateWithinTransaction({
+            qitemId: created.qitemId,
+            actorSession: input.actorSession,
+            state: "blocked",
+            closureReason: "blocked_on",
+            closureTarget: plan.gate.parkOn,
+            blockedOn: plan.gate.parkOn,
+            transitionNote: `workflow gate: parked on ${plan.gate.parkOn} pending sign-off`,
+          });
+          addEvent(parked.persistedEvent);
+        }
+        this.instanceStore.bindFrontierPacket({
+          instanceId: instance.instanceId,
+          packetId: created.qitemId,
+          stepId: plan.step.id,
+          branchDrive: packetBinding.branchDrive + (ownerPlans.length > 1 ? 1 : 0),
+          hopCount: packetBinding.hopCount + 1,
+          hopsBaseline: packetBinding.hopsBaseline,
+        });
+        if (this.watchdogJobsRepo) {
+          ensureWorkflowKeepaliveArmed(this.watchdogJobsRepo, {
+            instanceId: instance.instanceId,
+            packetId: created.qitemId,
+            targetSession: plan.owner,
+            registeredBySession: input.actorSession,
+          });
+        }
+        createdPackets.push({ qitemId: created.qitemId, step: plan.step, owner: plan.owner, nudge: created.nudge, blocked: Boolean(plan.gate?.parkOn) });
+        addEvent(this.eventBus.persistWithinTransaction({ type: "workflow.next_qitem_projected", instanceId: instance.instanceId, nextQitemId: created.qitemId, nextOwner: plan.owner, nextStepId: plan.step.id }));
+      }
+
+      if (isFailureOccurrence) {
+        this.instanceStore.recordFailureOccurrence({
+          instanceId: instance.instanceId,
+          failedPacketId: input.currentPacketId,
+          stepId: currentStep.id,
+          branchDrive: packetBinding.branchDrive,
+          hopCount: packetBinding.hopCount,
+          hopsBaseline: packetBinding.hopsBaseline,
+          failureReason: effectiveResultNote ?? null,
+        });
+        exceptionWake = this.admitFailureException(
+          input, instance, spec, currentStep, effectiveResultNote ?? null, addEvent, input.currentPacketId,
+        );
+      }
+
+      const remainingFrontier = instance.currentFrontier.filter((packetId) => packetId !== input.currentPacketId);
+      const nextFrontier = effectiveExit === "waiting"
+        ? [...remainingFrontier, input.currentPacketId]
+        : [...remainingFrontier, ...createdPackets.map((packet) => packet.qitemId)];
+      const unresolvedCount = this.instanceStore.listFailureOccurrences(instance.instanceId, "unresolved").length;
+      const packetRows = nextFrontier.map((packetId) => this.queueRepo.getById(packetId));
+      const nextStatus: WorkflowInstance["status"] = nextFrontier.length > 0
+        ? packetRows.every((packet) => packet?.state === "blocked") ? "waiting" : "active"
+        : unresolvedCount > 0 ? "failed" : "completed";
+      const nextBindings = this.instanceStore.listFrontierBindings(instance.instanceId);
+      const singletonStep = nextBindings.length === 1 ? nextBindings[0]!.stepId : null;
+      this.instanceStore.updateFrontier(instance.instanceId, nextFrontier, nextStatus, {
+        bumpHopCount: createdPackets.length > 0,
+        currentStepId: singletonStep ?? "clear",
+        expectedVersion: instance.version,
+        completedAt: nextStatus === "completed" || nextStatus === "failed" ? evaluatedAt : null,
+        lastContinuationDecision: {
+          exit: effectiveExit,
+          actorSession: input.actorSession,
+          closedPacket: input.currentPacketId,
+          currentStep: currentStep.id,
+          nextPackets: createdPackets.map((packet) => packet.qitemId),
+        },
+      });
+      this.trailLog.record({
+        instanceId: instance.instanceId,
+        stepId: currentStep.id,
+        stepRole: currentStep.actor_role,
+        closedAt: evaluatedAt,
+        closureReason: effectiveExit,
+        closureEvidence: { ...(effectiveClosureEvidence ?? {}), next_qitem_ids: createdPackets.map((packet) => packet.qitemId) },
+        actorSession: input.actorSession,
+        nextQitemId: createdPackets[0]?.qitemId ?? null,
+        priorQitemId: input.currentPacketId,
+      });
+      addEvent(this.eventBus.persistWithinTransaction({ type: "workflow.step_closed", instanceId: instance.instanceId, stepId: currentStep.id, closureReason: effectiveExit, actorSession: input.actorSession, priorQitemId: input.currentPacketId }));
+      if (nextStatus === "completed") {
+        addEvent(this.eventBus.persistWithinTransaction({ type: "workflow.completed", instanceId: instance.instanceId, workflowName: instance.workflowName }));
+      } else if (nextStatus === "failed") {
+        addEvent(this.eventBus.persistWithinTransaction({ type: "workflow.failed", instanceId: instance.instanceId, workflowName: instance.workflowName, reason: effectiveResultNote ?? "workflow_step_failed" }));
+      }
+      if (exceptionWake) this.queueRepo.assertTerminalClosureHasIntent(
+        input.currentPacketId, exceptionWake.qitemId, exceptionWake.nudge,
+      );
+    });
+
+    const failureWake = exceptionWake as ReturnType<WorkflowProjector["admitFailureException"]> | null;
+    if (failureWake) await this.queueRepo.deliverWakeForSuccessor(
+      failureWake.qitemId, failureWake.destinationSession, failureWake.nudge, input.actorSession,
+    );
+    for (const created of createdPackets) {
+      await this.queueRepo.deliverWakeForSuccessor(created.qitemId, created.owner, created.nudge, input.actorSession);
+    }
+    return {
+      instance: this.instanceStore.getByIdOrThrow(instance.instanceId),
+      closurePriorPacketId: input.currentPacketId,
+      closureReason: effectiveExit,
+      nextQitemId: createdPackets[0]?.qitemId ?? null,
+      nextOwnerSession: createdPackets[0]?.owner ?? null,
+      nextStepId: createdPackets[0]?.step.id ?? null,
+      nextQitemIds: createdPackets.map((packet) => packet.qitemId),
+      nextStepIds: createdPackets.map((packet) => packet.step.id),
+      emittedEventTypes: emitted.map((event) => event.type),
+    };
+  }
+}
+
+/**
+ * OPR.0.4.6.WF1 FR-5 (G-WF1-1, guard-ratified): the FULL
+ * CLOSURE-INTENT IDENTITY predicate for waiting-replay absorption.
+ * Every field that can change observable queue/trail/decision state
+ * must match the stored decision exactly:
+ *   exit=waiting · closedPacket · currentStep · actorSession ·
+ *   resultNote (null ≡ absent) · blockedOn (normalized to the
+ *   EFFECTIVE blocker — the shipped `external-gate` default applied
+ *   before comparison, workflowExitToQueueClosure:waiting) ·
+ *   closureEvidence (deep-equal against the stored TRAIL row's
+ *   evidence, since that is where evidence lands).
+ * Plus instance.status === waiting (checked by the caller).
+ */
+function matchesStoredWaitingDecision(
+  instance: WorkflowInstance,
+  input: ProjectStepInput,
+  currentStepId: string,
+  trailLog: WorkflowStepTrailLog,
+): boolean {
+  const stored = instance.lastContinuationDecision;
+  if (!stored) return false;
+  if (stored.exit !== "waiting") return false;
+  if (stored.closedPacket !== input.currentPacketId) return false;
+  if (stored.currentStep !== currentStepId) return false;
+  if (stored.actorSession !== input.actorSession) return false;
+  const storedNote = (stored.resultNote as string | null | undefined) ?? null;
+  const inputNote = input.resultNote ?? null;
+  if (storedNote !== inputNote) return false;
+  const storedBlocker =
+    ((stored.blockedOn as string | null | undefined) ?? null) ?? "external-gate";
+  const inputBlocker = input.blockedOn ?? "external-gate";
+  if (storedBlocker !== inputBlocker) return false;
+  // closureEvidence lands in the trail row, not the decision — compare
+  // against the most recent waiting close of this exact packet.
+  const trail = trailLog.listForInstance(instance.instanceId);
+  const storedRow = trail.find(
+    (t) => t.priorQitemId === input.currentPacketId && t.closureReason === "waiting",
+  );
+  if (!storedRow) return false;
+  return isDeepEqual(storedRow.closureEvidence ?? null, input.closureEvidence ?? null);
+}
+
+function isDeepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+    return false;
+  }
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const aKeys = Object.keys(a as Record<string, unknown>);
+  const bKeys = Object.keys(b as Record<string, unknown>);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((k) =>
+    isDeepEqual(
+      (a as Record<string, unknown>)[k],
+      (b as Record<string, unknown>)[k],
+    ),
+  );
+}
+
+/**
+ * R2 fix (guard blocker 1): resolve the current step from durable
+ * instance.currentStepId, NOT from trail order. The previous trail-based
+ * inference produced wrong results for reused-frontier packets:
+ * waiting → resume on same packet would skip a step, because the
+ * waiting close wrote a trail row that the next inference treated as
+ * "last step + 1".
+ *
+ * Falls back to the entry step ONLY when current_step_id is null
+ * (instantiate didn't set it; defense-in-depth, not the production
+ * path).
+ *
+ * Multi-active-frontier instances (parallel steps) remain a graduation;
+ * v1 supports a single active frontier packet, so a single
+ * current_step_id column suffices.
+ */
+function resolveCurrentStep(
+  spec: WorkflowSpec,
+  instance: WorkflowInstance,
+): WorkflowStepSpec | null {
+  if (instance.currentStepId) {
+    return spec.steps.find((s) => s.id === instance.currentStepId) ?? null;
+  }
+  // Defense-in-depth: instance lacks current_step_id. Fall back to
+  // entry step (matches behavior of pre-R2 instances if any survive).
+  const entryRole = spec.entry?.role;
+  return (
+    spec.steps[0] ??
+    (entryRole ? spec.steps.find((s) => s.actor_role === entryRole) ?? null : null) ??
+    null
+  );
+}
+
+/**
+ * Resolve the next step. OPR.0.4.6.WF2 FR-1: when a `recordedExit` is
+ * supplied AND the step's `next_hop.on` maps it, the MAPPED target wins
+ * (the deterministic branch — same (spec, step, exit) → same target,
+ * every time). Otherwise the structural default: the spec-authored
+ * `next_hop.suggested_roles` edge, then declaration order.
+ *
+ * EXPORTED (OPR.0.4.6.WF1 FR-7): this is THE single routing seam —
+ * the validator's reachability/cycle analysis runs over these exact
+ * semantics (never a parallel re-implementation). The validator calls
+ * it WITHOUT an exit for the structural default path and unions the
+ * branch edges explicitly — one routing truth, no semantic fork.
+ */
+export function resolveNextStep(
+  spec: WorkflowSpec,
+  currentStep: WorkflowStepSpec,
+  recordedExit?: WorkflowExitKind,
+): WorkflowStepSpec | null {
+  const mappedTargetId = recordedExit
+    ? currentStep.next_hop?.on?.[recordedExit]
+    : undefined;
+  if (mappedTargetId !== undefined) {
+    return spec.steps.find((s) => s.id === mappedTargetId) ?? null;
+  }
+  if (currentStep.next_hop?.mode === "forbid") return null;
+  for (const role of currentStep.next_hop?.suggested_roles ?? []) {
+    const target = spec.steps.find((s) => s.actor_role === role);
+    if (target) return target;
+  }
+  if (currentStep.next_hop?.mode === "require") return null;
+  const idx = spec.steps.findIndex((s) => s.id === currentStep.id);
+  if (idx === -1) return null;
+  return spec.steps[idx + 1] ?? null;
+}
+
+/**
+ * OPR.0.4.6.FAC1 — resolve a ROLE to a live capable seat on the bound
+ * rig, or throw LOUD-WITH-CANDIDATES (BR-5). The structured details
+ * carry every evaluated candidate with its named disqualifier
+ * (`not_live(lifecycleState=x)` / `runtime_mismatch(has≠needs)` /
+ * `role_not_declared` / `adopted_seat_not_role_resolvable_v1`) so the
+ * operator OR the WF-5 exception orchestrator can act; the
+ * zero-candidate case gets its own named message. Thrown BEFORE any
+ * side effect (the :199-221 validation-before-mutation discipline);
+ * never a spawn, never auto-add_member, never a dead-seat route.
+ */
+function resolveRoleOnBoundRig(
+  roleName: string,
+  harness: string | undefined,
+  roleCtx: RoleResolutionContext,
+  stepId: string,
+): string {
+  const candidates = roleCtx.candidatesForRig();
+  if (candidates === null) {
+    throw new WorkflowProjectorError(
+      "bound_rig_not_found",
+      `cannot resolve role "${roleName}" for step "${stepId}": the instance's bound rig "${roleCtx.boundRig}" no longer resolves to a registered rig (torn down mid-run?). Recreate/import the rig under the same name, or instantiate a fresh run bound elsewhere.`,
+      { stepId, role: roleName, boundRig: roleCtx.boundRig },
+    );
+  }
+  const result = selectRoleSeat({ role: roleName, harness, candidates });
+  if (result.seat) return result.seat;
+  const declaring = result.disqualified.filter((c) => c.facts.role === roleName);
+  if (declaring.length === 0) {
+    throw new WorkflowProjectorError(
+      "next_owner_unresolved",
+      `cannot resolve role "${roleName}" for step "${stepId}" (no seats on rig "${roleCtx.boundRig}" declare role "${roleName}"). Add a member with role ${roleName} to rig ${roleCtx.boundRig} via rig add, declare role on an existing member, or add preferred_targets to the role in the spec.`,
+      {
+        stepId,
+        role: roleName,
+        boundRig: roleCtx.boundRig,
+        candidates: result.disqualified,
+      },
+    );
+  }
+  throw new WorkflowProjectorError(
+    "next_owner_unresolved",
+    `cannot resolve a live capable seat for role "${roleName}" for step "${stepId}" on rig "${roleCtx.boundRig}". Candidates: ${declaring
+      .map((c) => `${c.coordinate ?? c.logicalId} → ${c.disqualifier}`)
+      .join(", ")}. Start/repair a role seat (see rig ps), add a member with role ${roleName} via rig add, or add preferred_targets to the role.`,
+    {
+      stepId,
+      role: roleName,
+      boundRig: roleCtx.boundRig,
+      candidates: result.disqualified,
+    },
+  );
+}
+
+/**
+ * Resolve a default owner for a step. v1 picks the first declared
+ * preferred_target. OPR.0.4.6.WF2 FR-2: a step with a `harness:` pin
+ * picks the first preferred_target whose node runtime matches the pin
+ * instead; no match is a STRUCTURED routing failure naming the pin and
+ * each candidate's actual runtime — never a silent mis-route to the
+ * wrong harness. `runtimeOf` resolves a canonical session name to its
+ * node's runtime column (null = not a managed node / unknown).
+ *
+ * OPR.0.4.6.FAC1: gains the optional bound-rig context — see the tier
+ * comment in the body. Tier order (P2-6, guard-BLOCKING on deviation):
+ *   1. explicit input.nextOwnerSession (caller-reconciled)
+ *   2. gate compile (the caller branches there first)
+ *   3. declared preferred_targets — TODAY'S path byte-for-byte
+ *   4. NEW: role capability on the bound rig (no targets + bound only)
+ *   5. null → the shipped next_owner_unresolved at the caller.
+ *
+ * Returns null only for the unpinned no-targets UNBOUND case (caller
+ * must supply nextOwnerSession explicitly — unchanged v1 behavior).
+ */
+export function resolveDefaultOwner(
+  spec: WorkflowSpec,
+  step: WorkflowStepSpec,
+  runtimeOf?: (session: string) => string | null,
+  /** OPR.0.4.6.FAC1: the bound-rig resolution context. Present only for
+   *  BOUND instances at LIVE resolution sites (projection next-step,
+   *  gate compile, entry, resume) — never at the eager instantiate loop
+   *  (guard B1: no eager live resolution of future steps). */
+  roleCtx?: RoleResolutionContext,
+): string | null {
+  const role = spec.roles?.[step.actor_role];
+  const targets = role?.preferred_targets ?? [];
+  // OPR.0.4.6.FAC1 TIER 3 (the ONLY new tier; order is sacred — P2-6):
+  // declared preferred_targets above stay TODAY'S code path
+  // byte-for-byte and are NEVER liveness/inventory-filtered. Capability
+  // resolution activates exclusively when the role declares ZERO
+  // targets AND the instance is bound to a rig. Unbound no-target
+  // behavior below stays byte-identical (null / "(none declared)").
+  if (targets.length === 0 && roleCtx) {
+    return resolveRoleOnBoundRig(step.actor_role, step.harness, roleCtx, step.id);
+  }
+  if (!step.harness) return targets[0] ?? null;
+  if (!runtimeOf) {
+    // Defense-in-depth: a pinned step must never resolve without
+    // runtime awareness (that would be exactly the silent mis-route
+    // FR-2 forbids). Production call sites always supply runtimeOf.
+    throw new WorkflowProjectorError(
+      "harness_pin_unverifiable",
+      `step "${step.id}" pins harness "${step.harness}" but no runtime lookup is available to reconcile it — refusing to resolve an owner blind.`,
+      { stepId: step.id, harness: step.harness },
+    );
+  }
+  const candidates = targets.map((t) => ({ session: t, runtime: runtimeOf(t) }));
+  const match = candidates.find((c) => c.runtime === step.harness);
+  if (match) return match.session;
+  throw new WorkflowProjectorError(
+    "harness_pin_unsatisfied",
+    `step "${step.id}" pins harness "${step.harness}" but no preferred_target of role "${step.actor_role}" runs it. Candidates: ${
+      candidates.length === 0
+        ? "(none declared)"
+        : candidates.map((c) => `${c.session} → ${c.runtime ?? "unknown"}`).join(", ")
+    }. Add a ${step.harness} seat to the role's preferred_targets, or change/remove the pin.`,
+    {
+      stepId: step.id,
+      harness: step.harness,
+      candidates: candidates.map((c) => ({ session: c.session, runtime: c.runtime })),
+    },
+  );
+}
+
+/**
+ * OPR.0.4.6.WF2 FR-2: reconcile an EXPLICIT owner override against a
+ * step's harness pin. An operator-supplied owner whose runtime does not
+ * match the pin is rejected loud — an explicit override must never
+ * silently defeat a declared pin.
+ */
+export function reconcileExplicitOwnerHarness(
+  step: WorkflowStepSpec,
+  explicitOwner: string,
+  runtimeOf: (session: string) => string | null,
+): void {
+  if (!step.harness) return;
+  const actual = runtimeOf(explicitOwner);
+  if (actual !== step.harness) {
+    throw new WorkflowProjectorError(
+      "harness_pin_unsatisfied",
+      `step "${step.id}" pins harness "${step.harness}" but the explicitly supplied owner ${explicitOwner} runs ${actual ?? "unknown (not a managed node)"}. Supply a ${step.harness} seat or change/remove the pin.`,
+      { stepId: step.id, harness: step.harness, explicitOwner, actualRuntime: actual },
+    );
+  }
+}
+
+/**
+ * R1 fix (guard blocker 1): translate a workflow exit into the Phase A
+ * queue closure shape (state + closure_reason + closure_target +
+ * handed_off_to / blocked_on metadata). Phase A's hot-potato closure
+ * validation enforces the rules:
+ *   - state=done requires closure_reason from CLOSURE_REASONS
+ *   - handed_off_to / blocked_on / escalation also require closure_target
+ *
+ * Mappings:
+ *   handoff → state=handed-off, closure_reason=handed_off_to,
+ *             closure_target+handed_off_to=<next-owner>
+ *   waiting → state=blocked, closure_reason=blocked_on,
+ *             closure_target+blocked_on=<blocker>
+ *   done    → state=done, closure_reason=no-follow-on
+ *   failed  → state=done, closure_reason=denied (workflow status=failed
+ *             is set separately on the instance row)
+ */
+function workflowExitToQueueClosure(
+  input: ProjectStepInput,
+  resolvedNextOwner: string | null,
+): {
+  state: "handed-off" | "blocked" | "done";
+  closureReason: string;
+  closureTarget: string | null;
+  handedOffTo?: string;
+  blockedOn?: string;
+  transitionNote: string;
+} {
+  switch (input.exit) {
+    case "handoff": {
+      if (!resolvedNextOwner) {
+        // Defense-in-depth — projector validates this earlier and throws
+        // next_owner_unresolved, so this branch is unreachable in practice.
+        throw new WorkflowProjectorError(
+          "next_owner_unresolved",
+          "handoff exit requires a resolved next owner before queue closure",
+        );
+      }
+      return {
+        state: "handed-off",
+        closureReason: "handed_off_to",
+        closureTarget: resolvedNextOwner,
+        handedOffTo: resolvedNextOwner,
+        transitionNote: `workflow handoff to ${resolvedNextOwner}`,
+      };
+    }
+    case "waiting": {
+      const blocker = input.blockedOn ?? "external-gate";
+      return {
+        state: "blocked",
+        closureReason: "blocked_on",
+        closureTarget: blocker,
+        blockedOn: blocker,
+        transitionNote: `workflow waiting on ${blocker}`,
+      };
+    }
+    case "done": {
+      return {
+        state: "done",
+        closureReason: "no-follow-on",
+        closureTarget: null,
+        transitionNote: input.resultNote
+          ? `workflow done: ${input.resultNote}`
+          : "workflow done",
+      };
+    }
+    case "failed": {
+      return {
+        state: "done",
+        closureReason: "denied",
+        closureTarget: input.resultNote ?? "workflow_step_failed",
+        transitionNote: input.resultNote
+          ? `workflow failed: ${input.resultNote}`
+          : "workflow failed",
+      };
+    }
+  }
+}
+
+/**
+ * OPR.0.4.6.WF2 FR-5: the gate compiler — a declared step-level gate
+ * resolves to LIVE 0.4.4 machinery by target kind. HUMAN target (the
+ * shipped human-seat predicate) → a human-routed item (tier
+ * `human-gate`) carrying the summary + evidence_ref the shipped write
+ * path enforces, resolved by the shipped `resolve` verb. HANDLER-ROLE
+ * target → an ordinary agent-routed item to the declared role's
+ * resolved seat (no human-only enforcement fields forced on it). WF-2
+ * builds the socket; WF-5 owns gate SEMANTICS.
+ */
+export interface GateCompileResult {
+  destinationSession: string;
+  /** Reserved for a future tier override; undefined = caller's default tier. */
+  tier: string | undefined;
+  summary: string | null;
+  evidenceRef: string | null;
+  kind: "human" | "handler-role";
+  /** HUMAN targets: the human seat the packet parks blocked_on (the leg-1
+   *  park the shipped `rig queue resolve` verb acts on — guard blocker 1:
+   *  resolve requires state=blocked + human-seat blocked_on, so the gate
+   *  item is created for the STEP OWNER and parked on the human, never
+   *  minted as an unresolvable pending human-destined item). null for
+   *  handler-role gates (ordinary agent routing, no park-on-human). */
+  parkOn: string | null;
+}
+
+export function compileGate(
+  spec: WorkflowSpec,
+  gatedStep: WorkflowStepSpec,
+  runtimeOf: (session: string) => string | null,
+  /** OPR.0.4.6.FAC1: bound-rig context — threads capability resolution
+   *  into BOTH gate paths (guard B3: the human-gate OWNER path and the
+   *  handler-role DESTINATION branch are different code paths and each
+   *  must carry it). Absent = shipped behavior byte-identical. */
+  roleCtx?: RoleResolutionContext,
+): GateCompileResult {
+  const gate = gatedStep.gate;
+  if (!gate) {
+    throw new WorkflowProjectorError(
+      "gate_missing",
+      `compileGate called for step "${gatedStep.id}" which declares no gate`,
+      { stepId: gatedStep.id },
+    );
+  }
+  if (isHumanSeatSession(gate.target)) {
+    // Defense-in-depth: the validator requires these at validate time;
+    // the shipped human-park write path (validateHumanPark at the
+    // blocked_on transition) enforces them again at park.
+    if (!gate.summary || !gate.evidence_ref) {
+      throw new WorkflowProjectorError(
+        "gate_human_fields_missing",
+        `step "${gatedStep.id}" gates on human seat ${gate.target} but is missing ${!gate.summary ? "summary" : "evidence_ref"} — a human-parked item requires both (the shipped human-route contract).`,
+        { stepId: gatedStep.id, target: gate.target },
+      );
+    }
+    // The packet belongs to the gated step's ROLE OWNER (the seat that
+    // does the work once the human signs off) and PARKS blocked_on the
+    // human seat — the exact leg-1 shape `rig queue resolve` unparks.
+    // FAC-1 (guard B3 row 2a): the owner resolves through the full tier
+    // stack — a bound instance's role-only gated step gets a rig-local
+    // owner by capability.
+    const owner = resolveDefaultOwner(spec, gatedStep, runtimeOf, roleCtx);
+    if (!owner) {
+      throw new WorkflowProjectorError(
+        "gate_owner_unresolved",
+        `step "${gatedStep.id}" gates on human seat ${gate.target} but its role "${gatedStep.actor_role}" declares no preferred_targets — the parked packet has no owner to resume after resolve. Add preferred_targets to the role.`,
+        { stepId: gatedStep.id, target: gate.target, role: gatedStep.actor_role },
+      );
+    }
+    return {
+      destinationSession: owner,
+      tier: undefined,
+      summary: gate.summary,
+      evidenceRef: gate.evidence_ref,
+      kind: "human",
+      parkOn: gate.target,
+    };
+  }
+  const role = spec.roles?.[gate.target];
+  if (!role) {
+    throw new WorkflowProjectorError(
+      "gate_target_unresolved",
+      `step "${gatedStep.id}" gates on "${gate.target}" which is neither a human seat session nor a role declared in workflow.roles. Declare the role or use a human seat session (human@kernel form).`,
+      { stepId: gatedStep.id, target: gate.target },
+    );
+  }
+  const handlerTargets = role.preferred_targets ?? [];
+  if (handlerTargets.length === 0) {
+    // OPR.0.4.6.FAC1 (guard B3 row 2b — the branch that would silently
+    // stay old-style if unthreaded): declared preferred_targets remain
+    // the override tier byte-identically; when the handler role has NO
+    // targets AND the instance is bound, the handler seat resolves by
+    // capability on the bound rig (the step's harness pin binds the
+    // ACTUAL routed destination — the WF-2 rev1-r2 contract); otherwise
+    // the shipped loud failure stands.
+    if (roleCtx) {
+      const seat = resolveRoleOnBoundRig(gate.target, gatedStep.harness, roleCtx, gatedStep.id);
+      return {
+        destinationSession: seat,
+        tier: undefined,
+        summary: gate.summary ?? null,
+        evidenceRef: gate.evidence_ref ?? null,
+        kind: "handler-role",
+        parkOn: null,
+      };
+    }
+    throw new WorkflowProjectorError(
+      "gate_handler_unresolved",
+      `step "${gatedStep.id}" gates on handler role "${gate.target}" but that role declares no preferred_targets — the gate item has no seat to route to. Add preferred_targets to the role.`,
+      { stepId: gatedStep.id, target: gate.target },
+    );
+  }
+  // OPR.0.4.6.WF2 (rev1-r2 blocker): the step's harness pin binds the
+  // packet's ACTUAL routed destination — for a handler gate, the handler
+  // seat. FR-2's contract ("never a silent mis-route to the wrong
+  // harness") admits no gated bypass: a pinned gated step routes to the
+  // first handler preferred_target whose node runtime matches, or fails
+  // structured naming the pin and every candidate's runtime.
+  let seat: string;
+  if (gatedStep.harness) {
+    const candidates = handlerTargets.map((t) => ({ session: t, runtime: runtimeOf(t) }));
+    const match = candidates.find((c) => c.runtime === gatedStep.harness);
+    if (!match) {
+      throw new WorkflowProjectorError(
+        "harness_pin_unsatisfied",
+        `step "${gatedStep.id}" pins harness "${gatedStep.harness}" and gates on handler role "${gate.target}", but no preferred_target of that role runs it. Candidates: ${candidates.map((c) => `${c.session} → ${c.runtime ?? "unknown"}`).join(", ")}. Add a ${gatedStep.harness} seat to the handler role's preferred_targets, or change/remove the pin.`,
+        {
+          stepId: gatedStep.id,
+          harness: gatedStep.harness,
+          gateTarget: gate.target,
+          candidates: candidates.map((c) => ({ session: c.session, runtime: c.runtime })),
+        },
+      );
+    }
+    seat = match.session;
+  } else {
+    seat = handlerTargets[0]!;
+  }
+  return {
+    destinationSession: seat,
+    tier: undefined,
+    summary: gate.summary ?? null,
+    evidenceRef: gate.evidence_ref ?? null,
+    kind: "handler-role",
+    parkOn: null,
+  };
+}
+
+function workflowHandoffBody(input: {
+  library?: GuidanceInput["library"];
+  spec: WorkflowSpec;
+  instance: WorkflowInstance;
+  currentStep: WorkflowStepSpec;
+  nextStep: WorkflowStepSpec;
+  actorSession: string;
+  resultNote: string | undefined;
+  gate?: GateCompileResult | null;
+  packetId: string;
+  ownerSession: string;
+}): string {
+  const lines = [
+    input.gate
+      ? `### Workflow gate: ${input.spec.id}@${input.spec.version} step ${input.nextStep.id}`
+      : `### Workflow handoff: ${input.spec.id}@${input.spec.version} step ${input.nextStep.id}`,
+    "",
+    `Workflow instance: ${input.instance.instanceId}`,
+    `Prior step: ${input.currentStep.id} (${input.currentStep.actor_role}) closed by ${input.actorSession}`,
+    `This step: ${input.nextStep.id} (${input.nextStep.actor_role})`,
+  ];
+  if (input.gate) {
+    lines.push(
+      `Gate: ${input.gate.kind === "human" ? "human sign-off" : "handler-role check"} — the workflow is PARKED (waiting) until this item is resolved/closed; the flow then continues from this step.`,
+    );
+    if (input.gate.summary) lines.push(`Ask: ${input.gate.summary}`);
+    if (input.gate.evidenceRef) lines.push(`Evidence: ${input.gate.evidenceRef}`);
+  }
+  if (input.nextStep.objective) {
+    lines.push(`Objective: ${input.nextStep.objective}`);
+  }
+  if (input.resultNote) {
+    lines.push("", `Prior step note: ${input.resultNote}`);
+  }
+  return withWorkflowContinuation({
+    body: lines.join("\n"),
+    contextRefs: input.spec.context_refs,
+    binding: input.instance.lifecycleBinding,
+    library: input.library,
+    instanceId: input.instance.instanceId,
+    packetId: input.packetId,
+    ownerSession: input.ownerSession,
+    step: input.nextStep,
+  });
+}
+
+function validateAcceptance(
+  step: WorkflowStepSpec,
+  input: ProjectStepInput,
+  instance: WorkflowInstance,
+): void {
+  if (!step.acceptance || input.exit === "waiting") return;
+  const raw = input.closureEvidence?.acceptance;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new WorkflowProjectorError(
+      "acceptance_payload_required",
+      `step "${step.id}" is an acceptance gate; delivery, a terminal producer row, or a liveness wake cannot advance it. Supply closureEvidence.acceptance with candidate, verdict, and evidence_ref.`,
+      { instanceId: instance.instanceId, stepId: step.id },
+    );
+  }
+  const payload = raw as Record<string, unknown>;
+  const mismatches: Record<string, { expected: unknown; actual: unknown }> = {};
+  if (payload.candidate !== step.acceptance.candidate) {
+    mismatches.candidate = { expected: step.acceptance.candidate, actual: payload.candidate ?? null };
+  }
+  if (typeof payload.verdict !== "string" || !step.acceptance.verdicts.includes(payload.verdict)) {
+    mismatches.verdict = { expected: step.acceptance.verdicts, actual: payload.verdict ?? null };
+  }
+  if (payload.evidence_ref !== step.acceptance.evidence_ref) {
+    mismatches.evidence_ref = { expected: step.acceptance.evidence_ref, actual: payload.evidence_ref ?? null };
+  }
+  if (Object.keys(mismatches).length > 0) {
+    throw new WorkflowProjectorError(
+      "acceptance_payload_mismatch",
+      `step "${step.id}" acceptance payload does not match its declared candidate/verdict/evidence contract`,
+      { instanceId: instance.instanceId, stepId: step.id, mismatches },
+    );
+  }
+}

@@ -1,0 +1,46 @@
+release_from: v0.3.1
+release_to: v0.3.2
+added_commands:
+  - name: policy
+    subcommands:
+      - cite
+      - defaults
+      - effective
+      - set
+      - show
+      - unset
+  - name: scope
+    subcommands:
+      - mission
+      - mission create
+      - mission ls
+      - mission show
+      - slice
+      - slice close
+      - slice create
+      - slice ls
+      - slice move
+      - slice ship
+      - slice show
+added_flags:
+  - command: bundle
+    subcommands:
+      - history
+  - command: bundle create
+    flags:
+      - --min-cli-version
+      - --min-daemon-version
+      - --notes
+  - command: bundle install
+    flags:
+      - --force
+      - --skip-version-check
+  - command: queue create
+    flags:
+      - --body-file
+      - --mission
+      - --slice
+  - command: workspace
+    subcommands:
+      - doctor
+removed_or_renamed: []

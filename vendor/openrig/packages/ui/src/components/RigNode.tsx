@@ -1,0 +1,414 @@
+import { useRef, useEffect, useState } from "react";
+import { Handle, Position } from "@xyflow/react";
+import { displayAgentName } from "../lib/display-name.js";
+import { cn } from "../lib/utils.js";
+import {
+  getActivityStateWithSource,
+  getActivityLabel,
+  getActivityBgClass,
+  getActivityAnimationClass,
+  isActivityStale,
+  getTimeInState,
+  shortQitemTail,
+} from "../lib/activity-visuals.js";
+import type { AgentActivitySummary, CurrentQitemSummary, SeatIdentityVerdictSummary } from "../hooks/useNodeInventory.js";
+import { ContextUsageRing } from "./ContextUsageRing.js";
+import { ActivityRing } from "./topology/ActivityRing.js";
+import { getActivityCardClasses, getActivityCardSignal } from "./topology/activity-card-visuals.js";
+import { TerminalPreviewPopover } from "./topology/TerminalPreviewPopover.js";
+import type { TopologyActivityVisual } from "../lib/topology-activity.js";
+import { formatCompactTokenCount, formatTokenTotalTitle, sumTokenCounts } from "../lib/token-format.js";
+import { formatRuntimeModel } from "../lib/runtime-brand.js";
+import { postOpenCmux } from "../hooks/useCmuxLaunch.js";
+import { RuntimeBadge, ToolMark } from "./graphics/RuntimeMark.js";
+
+interface RigNodeData {
+  logicalId: string;
+  rigId?: string;
+  role: string | null;
+  runtime: string | null;
+  model: string | null;
+  status: string | null;
+  packageRefs?: string[];
+  nodeKind?: "agent" | "infrastructure";
+  startupStatus?: "pending" | "ready" | "attention_required" | "failed" | null;
+  canonicalSessionName?: string | null;
+  podId?: string | null;
+  restoreOutcome?: string;
+  // OPR.0.4.3.06 — challenge-verified orientation verdict, surfaced BESIDE
+  // startupStatus (never folds into / down-ranks the node health color).
+  oriented?: string;
+  resumeToken?: string | null;
+  resolvedSpecName?: string | null;
+  profile?: string | null;
+  edgeCount?: number;
+  binding: {
+    tmuxSession?: string | null;
+    cmuxSurface?: string | null;
+  } | null;
+  contextUsedPercentage?: number | null;
+  contextFresh?: boolean;
+  contextAvailability?: string;
+  contextTotalInputTokens?: number | null;
+  contextTotalOutputTokens?: number | null;
+  placementState?: "available" | "selected" | null;
+  // PL-019: agent activity drives the node's primary "is this agent
+  // working?" dot color (replacing the previous startup-status color).
+  // currentQitems surfaces in the hover hint when the agent is running.
+  agentActivity?: AgentActivitySummary | null;
+  terminalActive?: boolean | null;
+  // OPR.0.4.3.19 — liveness identity verdict; a mismatch/pane_missing verdict
+  // overrides terminalActive so the dot never renders active/running green.
+  identityVerdict?: SeatIdentityVerdictSummary | null;
+  currentQitems?: CurrentQitemSummary[];
+  activityRing?: TopologyActivityVisual;
+  reducedMotion?: boolean;
+  // OPR.0.4.6.MH2 rev1-r2 B1: set by RigGraph's enrichment (the same channel
+  // as reducedMotion) when a REMOTE host is selected — the hover toolbar's
+  // cmux-open POST + terminal preview are LOCAL actions and never mount on
+  // remote data. A data prop (not a hook) so standalone RigNode harnesses
+  // need no QueryClientProvider.
+  remoteReadonly?: boolean;
+}
+
+/** Core roles get dark header stripe, workers get light */
+function isCore(role: string | null): boolean {
+  return role === "architect" || role === "lead" || role === "orchestrator";
+}
+
+export function RigNode({ data }: { data: RigNodeData }) {
+  const prevStatusRef = useRef(data.startupStatus);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [statusChanged, setStatusChanged] = useState(false);
+  const [actionFeedback, setActionFeedback] = useState<"cmux" | null>(null);
+  const core = isCore(data.role);
+  const isInfra = data.nodeKind === "infrastructure";
+
+  useEffect(() => {
+    if (prevStatusRef.current !== data.startupStatus && prevStatusRef.current !== null) {
+      setStatusChanged(true);
+      const timer = setTimeout(() => setStatusChanged(false), 600);
+      prevStatusRef.current = data.startupStatus;
+      return () => clearTimeout(timer);
+    }
+    prevStatusRef.current = data.startupStatus;
+  }, [data.startupStatus]);
+
+  useEffect(() => {
+    return () => {
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+      }
+    };
+  }, []);
+
+  const runtimeTitle = data.runtime || data.model ? formatRuntimeModel(data.runtime, data.model) : null;
+  const agentName = displayAgentName(data.logicalId);
+
+  // PL-019: dot color is now driven by agentActivity.state, not startupStatus.
+  // startupStatus retains its independent surface via the ATTN/FAILED badges
+  // below \u2014 activity answers "is this agent working?", startup answers "did
+  // this agent boot?". Two different questions, two different surfaces.
+  const { state: activityState, source: activitySource } = getActivityStateWithSource(data.agentActivity, data.terminalActive, data.identityVerdict);
+  const activityLabel = getActivityLabel(activityState, data.agentActivity);
+  const activityBgClass = getActivityBgClass(activityState);
+  const activityAnimClass = getActivityAnimationClass(activityState);
+  const activityIsStale = isActivityStale(data.agentActivity);
+  const timeInState = getTimeInState(data.agentActivity);
+  const activityCard = getActivityCardSignal({ activityRing: data.activityRing, activityState });
+  const tokenTotal = sumTokenCounts(data.contextTotalInputTokens, data.contextTotalOutputTokens);
+  const tokenLabel = formatCompactTokenCount(tokenTotal);
+  const tokenTitle = formatTokenTotalTitle(data.contextTotalInputTokens, data.contextTotalOutputTokens);
+
+  const placementChipLabel = data.placementState === "selected" ? "target" : data.placementState === "available" ? "avail" : null;
+
+  // PL-019 item 5: include active-qitem summary in the hover hint when the
+  // agent is currently running and the daemon attached one or more qitems.
+  // Short ULID tail for hover; full id is in the drawer (separate surface).
+  const currentQitems = data.currentQitems ?? [];
+  const qitemHoverLines = currentQitems.length > 0
+    ? currentQitems.map((q) => `On: ${shortQitemTail(q.qitemId)} \u2014 ${q.bodyExcerpt}`)
+    : [];
+
+  const hoverHintLines = [
+    `Activity: ${activityLabel}${activityIsStale ? " (stale sample)" : ""}`,
+    data.canonicalSessionName ? `Session: ${data.canonicalSessionName}` : null,
+    runtimeTitle ? `Runtime: ${runtimeTitle}` : null,
+    data.resolvedSpecName ? `Spec: ${data.resolvedSpecName}` : null,
+    data.profile ? `Profile: ${data.profile}` : null,
+    typeof data.edgeCount === "number" ? `Edges: ${data.edgeCount}` : null,
+    tokenTitle,
+    ...qitemHoverLines,
+  ].filter((line): line is string => Boolean(line));
+  const hoverHint = hoverHintLines.join("\n");
+
+  const flashFeedback = (kind: "cmux") => {
+    if (feedbackTimerRef.current) {
+      clearTimeout(feedbackTimerRef.current);
+    }
+    setActionFeedback(kind);
+    feedbackTimerRef.current = setTimeout(() => {
+      setActionFeedback((current) => (current === kind ? null : current));
+      feedbackTimerRef.current = null;
+    }, 900);
+  };
+
+  const handleOpenCmux = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!data.rigId) return;
+    try {
+      const result = await postOpenCmux({ rigId: data.rigId, logicalId: data.logicalId });
+      if (result.ok) flashFeedback("cmux");
+    } catch { /* best-effort */ }
+  };
+
+  const buttonClass = (kind: "cmux") =>
+    `inline-flex items-center gap-1 px-1.5 py-0.5 border font-mono text-[7px] uppercase transition-colors ${
+      actionFeedback === kind
+        ? "bg-inverse-surface text-background border-on-surface"
+        : "bg-surface-lowest text-on-surface border-outline-variant hover:bg-surface-low"
+    }`;
+  const toolbarIconButtonClass = "border font-mono text-[7px] uppercase transition-colors bg-surface-lowest text-on-surface border-outline-variant hover:bg-surface-low inline-flex h-6 w-6 items-center justify-center px-0 py-0";
+  const terminalSessionName = data.canonicalSessionName ?? data.binding?.tmuxSession ?? null;
+
+  const card = (
+    <div
+      className={cn(
+        "group relative min-w-[200px] border hard-shadow transition-[background-color,border-color,box-shadow] duration-300",
+        getActivityCardClasses({
+          state: activityCard.state,
+          flash: activityCard.flash,
+          reducedMotion: data.reducedMotion,
+        }),
+        data.placementState === "selected"
+          ? "border-emerald-600 ring-2 ring-emerald-400/70 shadow-[0_0_0_3px_rgba(52,211,153,0.12)]"
+          : data.placementState === "available"
+            ? "border-emerald-500 ring-1 ring-emerald-300/70"
+            : "border-on-surface",
+      )}
+      data-activity-card-state={activityCard.state}
+      data-activity-card-flash={activityCard.flash ?? "none"}
+      data-testid="rig-node"
+      title={hoverHint || undefined}
+    >
+      <Handle type="target" position={Position.Top} />
+
+      {/* Header stripe — dark for core, muted for infra, light for workers */}
+      <div className={`px-3 py-1 font-mono text-[10px] flex justify-between items-center ${
+        isInfra
+          ? "bg-outline text-white border-b border-on-surface"
+          : core
+            ? "bg-inverse-surface text-background"
+            : "bg-surface-high text-on-surface border-b border-on-surface"
+      }`}>
+        <span className="font-bold truncate">
+          {agentName}
+        </span>
+        <span className="inline-flex items-center gap-1">
+          {activityIsStale && (
+            <span
+              data-testid={`activity-staleness-${data.logicalId}`}
+              className="font-mono text-[7px] uppercase tracking-[0.10em] text-on-surface-variant"
+              title={`Activity sample is older than threshold; daemon may not be probing this seat`}
+            >
+              stale
+            </span>
+          )}
+          <span
+            className={`inline-flex h-2.5 w-2.5 rounded-full border border-white/50 ${activityBgClass} ${activityAnimClass} ${statusChanged ? "status-changed" : ""}`}
+            data-testid={`activity-dot-${data.logicalId}`}
+            data-activity-state={activityState}
+            data-activity-source={activitySource}
+            aria-label={`activity: ${activityLabel}${timeInState ? ` ${timeInState.label}` : ""}${activitySource !== "hook" && activitySource !== "none" ? " (activity-grade)" : ""}`}
+            title={`activity: ${activityLabel}${timeInState ? ` ${timeInState.label}` : ""}${activitySource !== "hook" && activitySource !== "none" ? " (activity-grade)" : ""}`}
+          />
+          {/* PL-012: context-usage tier ring parallel to PL-019 activity
+              dot. Two signals at the same scale: "is this agent working?"
+              (left dot, filled) vs "is this agent close to context
+              exhaustion?" (right ring, hollow). */}
+          <ContextUsageRing
+            percent={data.contextUsedPercentage}
+            fresh={data.contextFresh}
+            availability={data.contextAvailability}
+            testIdSuffix={data.logicalId}
+          />
+        </span>
+      </div>
+
+      {/* Body */}
+      <div className="space-y-1 px-2 py-1.5">
+        <div className="truncate font-mono text-[8px] leading-tight text-on-surface-variant">
+          {data.canonicalSessionName ?? data.logicalId}
+        </div>
+
+        <div className="min-w-0">
+          <RuntimeBadge
+            runtime={data.runtime}
+            model={data.model}
+            size="xs"
+            compact
+            variant="inline"
+            className="max-w-full"
+          />
+          {!runtimeTitle && data.profile ? (
+            <span className="ml-1 font-mono text-[8px] uppercase tracking-[0.12em] text-on-surface-variant">
+              {data.profile}
+            </span>
+          ) : null}
+        </div>
+
+        {/* Spec hint */}
+        {data.resolvedSpecName && (
+          <div className="font-mono text-[8px] text-on-surface-variant" data-testid="spec-hint">
+            {data.resolvedSpecName}{data.profile ? ` · ${data.profile}` : ""}
+          </div>
+        )}
+
+        {/* Context usage — prominent big number */}
+        <div className="flex items-end justify-between gap-3 pt-0.5">
+          {data.contextAvailability === "known" && typeof data.contextUsedPercentage === "number" ? (
+            <div
+              className={`font-mono text-base font-bold leading-none ${
+                data.contextUsedPercentage >= 80 ? "text-red-600" :
+                data.contextUsedPercentage >= 60 ? "text-amber-600" :
+                "text-green-700"
+              }${!data.contextFresh ? " opacity-50" : ""}`}
+              data-testid="context-badge"
+              title={data.contextFresh ? "Context usage (fresh)" : "Context usage (stale sample)"}
+            >
+              {data.contextUsedPercentage}%
+            </div>
+          ) : (
+            <div className="font-mono text-xs text-on-surface-variant" data-testid="context-badge-unknown">
+              ?
+            </div>
+          )}
+          <div
+            className={`font-mono text-base font-bold leading-none tracking-[0.02em] ${tokenLabel ? "text-on-surface-variant" : "text-on-surface-variant"}`}
+            data-testid="token-total"
+            title={tokenTitle ?? "Token sample unavailable"}
+          >
+            {tokenLabel ?? "--"}
+          </div>
+        </div>
+
+        {/* Restore outcome */}
+        {data.restoreOutcome && data.restoreOutcome !== "n-a" && (
+          <div className="font-mono text-[8px] text-on-surface-variant">
+            RESTORE: {data.restoreOutcome}
+          </div>
+        )}
+
+        {/* OPR.0.4.3.06 startup-proof orientation — a verdict distinct from
+            startupStatus/health. `verified` = proved it read its contract;
+            `missing`/`rejected` are shown as their own labels so a seat is never
+            silently "green + oriented" without a proof. `n-a` (resumed /
+            non-agent) is hidden, mirroring the RESTORE badge. */}
+        {data.oriented && data.oriented !== "n-a" && (
+          <div className="font-mono text-[8px] text-on-surface-variant" data-testid="orientation-badge">
+            ORIENT: {data.oriented}
+          </div>
+        )}
+
+        {/* Package badge (legacy) */}
+        {data.packageRefs && data.packageRefs.length > 0 && (
+          <div
+            data-testid="package-badge"
+            title={data.packageRefs.join(", ")}
+            className="font-mono text-[8px] text-on-surface-variant"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            PKG {data.packageRefs.length}
+          </div>
+        )}
+
+        {/* Alert state for blocked/failed startup */}
+        {data.startupStatus === "attention_required" && (
+          <div className="stamp-badge">
+            <div className="w-2 h-2 rounded-full bg-orange-500" />
+            <span className="text-orange-600">ATTN</span>
+          </div>
+        )}
+        {data.startupStatus === "failed" && (
+          <div className="stamp-badge">
+            <div className="w-2 h-2 rounded-full bg-red-500" />
+            <span className="text-red-600">FAILED</span>
+          </div>
+        )}
+
+        {!data.remoteReadonly && (terminalSessionName ?? data.rigId) && (
+          <div
+            data-testid="node-toolbar"
+            className="absolute right-2 top-8 z-20 flex flex-wrap justify-end gap-1 opacity-0 transition-opacity group-hover:!opacity-100 group-hover:opacity-100 group-focus-within:!opacity-100 group-focus-within:opacity-100"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            {data.rigId && (
+              <button
+                onClick={handleOpenCmux}
+                data-testid="toolbar-cmux-open"
+                className={`${buttonClass("cmux")} inline-flex h-6 w-6 items-center justify-center px-0 py-0`}
+                aria-label="Open in cmux"
+                title="Open in cmux"
+              >
+                <ToolMark tool="cmux" size="sm" />
+                <span className="sr-only">{actionFeedback === "cmux" ? "opened" : "cmux"}</span>
+              </button>
+            )}
+            {data.rigId && terminalSessionName && (
+              <TerminalPreviewPopover
+                rigId={data.rigId}
+                logicalId={data.logicalId}
+                sessionName={terminalSessionName}
+                reducedMotion={data.reducedMotion}
+                testIdPrefix={`rig-node-${data.logicalId}`}
+                buttonClassName={toolbarIconButtonClass}
+                progressive
+              />
+            )}
+          </div>
+        )}
+
+        {placementChipLabel && (
+          <div className="pt-1">
+            <span
+              data-testid={`placement-chip-${data.logicalId}`}
+              className={`inline-flex items-center border px-1.5 py-0.5 font-mono text-[7px] uppercase tracking-[0.12em] ${
+                data.placementState === "selected"
+                  ? "border-emerald-700 bg-emerald-700 text-white"
+                  : "border-emerald-300 bg-emerald-50 text-emerald-800"
+              }`}
+            >
+              {placementChipLabel}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {hoverHintLines.length > 0 && (
+        <div
+          data-testid="node-hover-hint"
+          className="pointer-events-none absolute left-2 top-full z-20 mt-2 hidden min-w-[180px] border border-on-surface bg-surface-lowest px-2 py-1 font-mono text-[8px] text-on-surface shadow-[4px_4px_0_rgba(28,25,23,0.14)] group-hover:block"
+        >
+          {hoverHintLines.map((line) => (
+            <div key={line}>{line}</div>
+          ))}
+        </div>
+      )}
+
+      <Handle type="source" position={Position.Bottom} />
+    </div>
+  );
+  return (
+    <ActivityRing
+      state={data.activityRing?.state ?? "idle"}
+      flash={data.activityRing?.flash ?? null}
+      reducedMotion={data.reducedMotion}
+      testId={`rig-node-activity-ring-${data.logicalId}`}
+      className="rounded-none"
+    >
+      {card}
+    </ActivityRing>
+  );
+}

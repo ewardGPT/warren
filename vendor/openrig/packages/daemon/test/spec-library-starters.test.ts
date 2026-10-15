@@ -1,0 +1,781 @@
+import { describe, it, expect } from "vitest";
+import { readFileSync, existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
+import { SpecReviewService } from "../src/domain/spec-review-service.js";
+import { SpecLibraryService } from "../src/domain/spec-library-service.js";
+import { rigPreflight, type RigPreflightInput } from "../src/domain/rigspec-preflight.js";
+import { parseAgentSpec, validateAgentSpec } from "../src/domain/agent-manifest.js";
+
+const SPECS_ROOT = resolve(import.meta.dirname, "../specs");
+
+const RIG_SPECS = [
+  "rigs/launch/starter/rig.yaml",
+  "rigs/launch/factory/rig.yaml",
+  "rigs/focused/code-review/rig.yaml",
+  "rigs/focused/research/rig.yaml",
+  "rigs/focused/pm/rig.yaml",
+  "rigs/launch/kernel/rig.yaml",
+  "rigs/launch/kernel/rig-claude-only.yaml",
+  "rigs/launch/kernel/rig-codex-only.yaml",
+  "rigs/launch/secrets-manager/rig.yaml",
+  // Retained for the world migration, deliberately absent from the built-in shelf.
+  "rigs/launch/factory-rsi/world-bundle.yaml",
+];
+const PROOF_RIG_SPECS: string[] = [];
+
+const AGENT_SPECS = [
+  "agents/conveyor/lead/agent.yaml",
+  "agents/conveyor/planner/agent.yaml",
+  "agents/conveyor/builder/agent.yaml",
+  "agents/conveyor/reviewer/agent.yaml",
+  "agents/design/product-designer/agent.yaml",
+  "agents/development/implementer/agent.yaml",
+  "agents/development/qa/agent.yaml",
+  "agents/review/independent-reviewer/agent.yaml",
+  "agents/orchestration/orchestrator/agent.yaml",
+  "agents/research/analyst/agent.yaml",
+  "agents/research/synthesizer/agent.yaml",
+  "agents/apps/vault-specialist/agent.yaml",
+];
+
+const SHARED_AGENT_SPEC = "agents/shared/agent.yaml";
+
+const OBSOLETE_OBRA_SKILLS = [
+  "using-superpowers",
+  "brainstorming",
+  "writing-plans",
+  "executing-plans",
+];
+
+// V0.3.1 slice 05 kernel-rig-as-default + bug-fix slice
+// deprecation-check-keys-widening: kernel agents are built-in product
+// surface and pass through the same deprecation regression gates as
+// starter agents. Hoisted from the prior inline declaration so the
+// new key-path check (below) can walk both lists from a single source.
+const KERNEL_AGENT_SPECS = [
+  "rigs/launch/kernel/agents/advisor/lead/agent.yaml",
+  "rigs/launch/kernel/agents/operator/agent/agent.yaml",
+  "rigs/launch/kernel/agents/queue/worker/agent.yaml",
+];
+
+const RUNNABLE_SHIPPED_AGENT_SPECS = [
+  ...AGENT_SPECS,
+  "agents/factory-rsi/dogfood/agent.yaml",
+  "agents/factory-rsi/release-manager/agent.yaml",
+  "agents/product-management/pm/agent.yaml",
+  ...KERNEL_AGENT_SPECS,
+];
+
+// bug-fix slice deprecation-check-keys-widening — IMPL-PRD §1.2 + §3.
+// Allowlist of removed/deprecated KEY paths the spec library MUST NOT
+// carry. Each entry uses dot-path notation with `*` as a profile-name
+// wildcard. New deprecations append; commit message references this
+// slice's IMPL-PRD as the authoritative taxonomy.
+//
+// v0 seed: the two keys the strict validator (agent-manifest.ts
+// validateAgentSpec lines 191 + 240) already rejects with explicit
+// plugin-primitive Phase 3a migration errors. The widening here is
+// the regression gate — the validator's rejection is the runtime fix;
+// this allowlist guarantees a static fail if a future contributor
+// reintroduces the placeholder pattern that the e3bfc08 hotfix had
+// to scrub from kernel agent.yaml files.
+const DEPRECATED_KEY_PATHS: string[] = [
+  "resources.hooks",
+  "profiles.*.uses.hooks",
+];
+// These roles resolve the work's selection instead of preloading a pipeline.
+const SELECTION_DRIVEN_AGENT_SPECS = [
+  "agents/development/implementer/agent.yaml",
+  "agents/development/qa/agent.yaml",
+  "agents/review/independent-reviewer/agent.yaml",
+  "agents/orchestration/orchestrator/agent.yaml",
+];
+
+function expectSelectedWorkEntry(content: string): void {
+  const text = content.replace(/\s+/g, " ");
+  expect(text).toMatch(/project\.yaml -> mission\.yaml -> active slice\.yaml -> selected component or wave map -> addressed context/);
+  expect(text).toContain("product-journey-sdlc.md#resolve-the-selected-path");
+  expect(text).toMatch(/No (?:composition|selection) means light Part A/);
+}
+
+
+function assertAcyclicLaunchDependencyGraph(file: string, parsed: Record<string, unknown>): void {
+  const pods = (parsed["pods"] as Array<Record<string, unknown>> | undefined) ?? [];
+  const allIds: string[] = [];
+  const inDegree: Record<string, number> = {};
+  const adjacency: Record<string, string[]> = {};
+
+  for (const pod of pods) {
+    const podId = String(pod["id"]);
+    const members = (pod["members"] as Array<Record<string, unknown>> | undefined) ?? [];
+    for (const member of members) {
+      const qid = `${podId}.${String(member["id"])}`;
+      allIds.push(qid);
+      inDegree[qid] = 0;
+      adjacency[qid] = [];
+    }
+  }
+
+  const addDependency = (from: string, to: string) => {
+    if (!adjacency[from] || !adjacency[to]) return;
+    adjacency[from]!.push(to);
+    inDegree[to] = (inDegree[to] ?? 0) + 1;
+  };
+
+  const addEdge = (edge: Record<string, unknown>, qualify?: (id: string) => string) => {
+    const kind = String(edge["kind"]);
+    if (kind !== "delegates_to" && kind !== "spawned_by") return;
+    const rawFrom = String(edge["from"]);
+    const rawTo = String(edge["to"]);
+    const from = qualify ? qualify(rawFrom) : rawFrom;
+    const to = qualify ? qualify(rawTo) : rawTo;
+    if (kind === "delegates_to") {
+      addDependency(from, to);
+    } else {
+      addDependency(to, from);
+    }
+  };
+
+  for (const pod of pods) {
+    const podId = String(pod["id"]);
+    const edges = (pod["edges"] as Array<Record<string, unknown>> | undefined) ?? [];
+    for (const edge of edges) {
+      addEdge(edge, (id) => `${podId}.${id}`);
+    }
+  }
+
+  const edges = (parsed["edges"] as Array<Record<string, unknown>> | undefined) ?? [];
+  for (const edge of edges) {
+    addEdge(edge);
+  }
+
+  const queue = allIds.filter((id) => inDegree[id] === 0).sort();
+  const visited: string[] = [];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    visited.push(current);
+    for (const next of (adjacency[current] ?? []).sort()) {
+      inDegree[next] = (inDegree[next] ?? 1) - 1;
+      if (inDegree[next] === 0) queue.push(next);
+      queue.sort();
+    }
+  }
+
+  if (visited.length !== allIds.length) {
+    const cycled = allIds.filter((id) => !visited.includes(id));
+    throw new Error(`${file} has a launch dependency cycle among: ${cycled.join(", ")}`);
+  }
+}
+
+describe("Starter specs", () => {
+  const specReviewService = new SpecReviewService();
+
+  it("all rig specs pass SpecReviewService validation", () => {
+    for (const file of RIG_SPECS) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const review = specReviewService.reviewRigSpec(yaml, "library_item");
+      expect(review.kind).toBe("rig");
+      expect(review.format).toBe("pod_aware");
+      expect(review.name).toBeTruthy();
+    }
+  });
+
+  it("all agent specs pass validation", () => {
+    for (const file of [...AGENT_SPECS, SHARED_AGENT_SPEC]) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const raw = parseAgentSpec(yaml);
+      const result = validateAgentSpec(raw);
+      expect(result.valid).toBe(true);
+    }
+  });
+
+  it("built-in library scan discovers all bundled rig specs", () => {
+    const lib = new SpecLibraryService({
+      roots: [{ path: SPECS_ROOT, sourceType: "builtin" }],
+      specReviewService,
+    });
+    lib.scan();
+
+    const rigs = lib.list({ kind: "rig" });
+    expect(rigs.map((entry) => entry.name).sort()).toEqual([
+      "code-review", "factory", "kernel", "pm", "research", "secrets-manager", "starter",
+    ]);
+  });
+
+  it("service-backed rigs expose hasServices, non-service rigs do not", () => {
+    const lib = new SpecLibraryService({
+      roots: [{ path: SPECS_ROOT, sourceType: "builtin" }],
+      specReviewService,
+    });
+    lib.scan();
+
+    const rigs = lib.list({ kind: "rig" });
+    const secretsManager = rigs.find((entry) => entry.name === "secrets-manager");
+    const starter = rigs.find((entry) => entry.name === "starter");
+
+    expect(secretsManager).toBeDefined();
+    expect(secretsManager!.hasServices).toBe(true);
+    expect(starter).toBeDefined();
+    expect(starter!.hasServices).toBeFalsy();
+  });
+
+  it("secrets-manager rig uses canonical vault.specialist topology", () => {
+    const yaml = readFileSync(join(SPECS_ROOT, "rigs/launch/secrets-manager/rig.yaml"), "utf-8");
+    const parsed = parseYaml(yaml) as Record<string, unknown>;
+    const pods = parsed["pods"] as Array<Record<string, unknown>>;
+    expect(pods).toHaveLength(1);
+
+    const pod = pods[0]!;
+    expect(pod["id"]).toBe("vault");
+    expect(pod["label"]).toBeDefined();
+
+    const members = pod["members"] as Array<Record<string, unknown>>;
+    expect(members).toHaveLength(1);
+    expect(members[0]!["id"]).toBe("specialist");
+    expect(members[0]!["agent_ref"]).toContain("vault-specialist");
+
+    // Summary must explicitly mention the specialist
+    const summary = (parsed["summary"] as string).toLowerCase();
+    expect(summary).toContain("specialist");
+  });
+
+  it("starter and factory summaries describe their different team sizes", () => {
+    const lib = new SpecLibraryService({ roots: [{ path: SPECS_ROOT, sourceType: "builtin" }], specReviewService });
+    lib.scan();
+    const rigs = lib.list({ kind: "rig" });
+    expect(rigs.find((entry) => entry.name === "starter")?.summary).toContain("Claude Code builder and a Codex reviewer");
+    expect(rigs.find((entry) => entry.name === "factory")?.summary).toContain("PM advisor");
+  });
+
+  it("all rig specs pass canonical rigPreflight with explicit cwdOverride", async () => {
+    const fsOps = {
+      readFile: (p: string) => readFileSync(p, "utf-8"),
+      exists: (p: string) => existsSync(p),
+    };
+
+    for (const file of RIG_SPECS) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const input: RigPreflightInput = {
+        rigSpecYaml: yaml,
+        rigRoot: dirname(join(SPECS_ROOT, file)),
+        cwdOverride: "/workspace/project",
+        fsOps,
+      };
+
+      const result = await rigPreflight(input);
+      // Should be ready with no blocking errors (warnings are acceptable)
+      expect(result.ready).toBe(true);
+      if (result.errors.length > 0) {
+        throw new Error(`Preflight failed for ${file}: ${result.errors.join("; ")}`);
+      }
+    }
+  });
+
+  it("all rig specs have acyclic launch-dependency edges", () => {
+    for (const file of RIG_SPECS) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const parsed = parseYaml(yaml) as Record<string, unknown>;
+      assertAcyclicLaunchDependencyGraph(file, parsed);
+    }
+  });
+
+  it("service-backed proof rigs pass canonical rigPreflight with explicit cwdOverride", async () => {
+    const fsOps = {
+      readFile: (p: string) => readFileSync(p, "utf-8"),
+      exists: (p: string) => existsSync(p),
+    };
+
+    for (const file of PROOF_RIG_SPECS) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const input: RigPreflightInput = {
+        rigSpecYaml: yaml,
+        rigRoot: dirname(join(SPECS_ROOT, file)),
+        cwdOverride: "/workspace/project",
+        fsOps,
+      };
+
+      const result = await rigPreflight(input);
+      expect(result.ready).toBe(true);
+      if (result.errors.length > 0) {
+        throw new Error(`Preflight failed for ${file}: ${result.errors.join("; ")}`);
+      }
+    }
+  });
+
+  it("every agent spec references guidance/role.md that exists on disk", () => {
+    for (const file of AGENT_SPECS) {
+      const agentDir = join(SPECS_ROOT, file.replace("/agent.yaml", ""));
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+
+      // Check resources.guidance has a role entry
+      const resources = (raw["resources"] ?? {}) as Record<string, unknown>;
+      const guidance = resources["guidance"] as Array<{ path: string }> | undefined;
+      expect(guidance).toBeDefined();
+      expect(guidance!.length).toBeGreaterThan(0);
+
+      const roleEntry = guidance!.find((g) => g.path.includes("role.md"));
+      expect(roleEntry).toBeDefined();
+
+      // Check the file exists on disk
+      const rolePath = join(agentDir, roleEntry!.path);
+      expect(existsSync(rolePath)).toBe(true);
+
+      // Check guidance/role.md is also wired through startup.files as required
+      const startup = (raw["startup"] ?? {}) as Record<string, unknown>;
+      const startupFiles = (startup["files"] as Array<{ path: string; required?: boolean; delivery_hint?: string }>) ?? [];
+      const startupRoleEntry = startupFiles.find((f) => f.path.includes("role.md"));
+      expect(startupRoleEntry).toBeDefined();
+      expect(startupRoleEntry!.required).toBe(true);
+      expect(startupRoleEntry!.delivery_hint).toBe("send_text");
+    }
+  });
+
+  it("every guidance/role.md contains substantive role content", () => {
+    for (const file of AGENT_SPECS) {
+      const agentDir = join(SPECS_ROOT, file.replace("/agent.yaml", ""));
+      const rolePath = join(agentDir, "guidance/role.md");
+      const content = readFileSync(rolePath, "utf-8");
+
+      // Must have a heading
+      expect(content).toContain("# Role:");
+      // Must have substantive content (at least 200 chars)
+      expect(content.length).toBeGreaterThan(200);
+      // Section titles are editorial; the four selection-driven entry contracts
+      // are checked below rather than requiring retired literal headings.
+      expect(content).toMatch(/^## .+/m);
+    }
+  });
+
+  it("vault-specialist startup context grounds identity before topology claims", () => {
+    const context = readFileSync(join(SPECS_ROOT, "agents/apps/vault-specialist/startup/context.md"), "utf-8").toLowerCase();
+
+    expect(context).toContain("rig whoami --json");
+    expect(context).toContain("before making topology or registration claims");
+  });
+
+  it("openrig-user documents agent-managed apps and current cwd/env operation", () => {
+    const content = readFileSync(join(import.meta.dirname, "../assets/plugins/openrig-core/skills/openrig-user/SKILL.md"), "utf-8");
+
+    expect(content).toContain("agent-managed app");
+    expect(content).toContain("rig up secrets-manager");
+    expect(content).toContain("vault.specialist");
+    expect(content).toContain("rig send vault-specialist@secrets-manager");
+    expect(content).toContain("rig env status secrets-manager");
+    expect(content).toContain("rig env logs secrets-manager");
+    expect(content).toContain("`rig up --cwd`");
+    expect(content).not.toContain("there is no shipped `rig up --cwd` override yet");
+  });
+
+  it("shared packaged starter skills exist and builtin agents opt into the right ones", () => {
+    const sharedYaml = readFileSync(join(SPECS_ROOT, SHARED_AGENT_SPEC), "utf-8");
+    const sharedRaw = parseAgentSpec(sharedYaml) as Record<string, unknown>;
+    const sharedResources = (sharedRaw["resources"] ?? {}) as Record<string, unknown>;
+    const sharedSkills = (sharedResources["skills"] as Array<{ id: string; path: string }>) ?? [];
+    const expectedSharedSkills = [
+      // Slice 29 deletions removed: claude-compact-in-place,
+      // containerized-e2e, control-plane-queue, intake-routing,
+      // local-sysadmin (mis-imports or internal-only doctrine).
+      "agent-browser",
+      "dogfood",
+      "frontend-design",
+      "orchestration-team",
+      "development-team",
+      "review-team",
+      "test-driven-development",
+      "systematic-debugging",
+      "verification-before-completion",
+    ];
+
+    for (const skillId of expectedSharedSkills) {
+      const skill = sharedSkills.find((entry) => entry.id === skillId);
+      expect(skill).toBeDefined();
+      expect(existsSync(join(SPECS_ROOT, "agents/shared", skill!.path, "SKILL.md"))).toBe(true);
+    }
+    const deprecatedHaSkill = ["mental", "model", "ha"].join("-");
+    expect(sharedSkills.map((entry) => entry.id)).not.toContain(deprecatedHaSkill);
+    expect(sharedSkills.map((entry) => entry.id)).not.toContain("openrig-operator");
+    expect(sharedSkills.map((entry) => entry.id)).not.toContain("openrig-user");
+    expect(sharedSkills.map((entry) => entry.id)).not.toContain("mission-slice-sop");
+    for (const skillId of OBSOLETE_OBRA_SKILLS) {
+      expect(sharedSkills.map((entry) => entry.id)).not.toContain(skillId);
+    }
+    for (const skill of sharedSkills) {
+      expect(
+        existsSync(join(SPECS_ROOT, "agents/shared", skill.path, "SKILL.md")),
+        `missing shared skill resource ${skill.id} at ${skill.path}`,
+      ).toBe(true);
+    }
+
+    const sharedRuntimeResources = (sharedResources["runtime_resources"] as Array<{ id: string; path: string; type: string }>) ?? [];
+    for (const resourceId of ["claude-default-settings", "claude-default-mcp", "codex-default-config"]) {
+      const resource = sharedRuntimeResources.find((entry) => entry.id === resourceId);
+      expect(resource).toBeDefined();
+      expect(existsSync(join(SPECS_ROOT, "agents/shared", resource!.path))).toBe(true);
+    }
+    const claudeSettingsResource = sharedRuntimeResources.find((entry) => entry.id === "claude-default-settings");
+    const claudeSettings = JSON.parse(readFileSync(join(SPECS_ROOT, "agents/shared", claudeSettingsResource!.path), "utf-8"));
+    // OPR.0.4.8.2 agnostic rip-out: the fragment's 13-entry allow-list (assessment C1b) and the
+    // rig up/down ask gates (C1c) are RIPPED. OpenRig bakes NO config-file permission policy
+    // beyond the acceptEdits floor — post-rip the fragment carries only defaultMode.
+    expect(claudeSettings.permissions.allow).toBeUndefined();
+    expect(claudeSettings.permissions.ask).toBeUndefined();
+    expect(claudeSettings.permissions.deny).toBeUndefined();
+    expect(claudeSettings.permissions.defaultMode).toBe("acceptEdits");
+
+    // Slice 29: claude-compact-in-place skill DELETED (was mis-imported as a
+    // skill; its content remains in skill-spec docs not under skills/).
+
+    const expectedAgentSkills = new Map<string, string[]>([
+      [
+        "agents/conveyor/lead/agent.yaml",
+        ["orchestration-team", "backlog-capture", "verification-before-completion"],
+      ],
+      [
+        "agents/conveyor/planner/agent.yaml",
+        ["requirements-writer", "context-builder", "verification-before-completion"],
+      ],
+      [
+        "agents/conveyor/builder/agent.yaml",
+        ["development-team", "test-driven-development", "systematic-debugging", "verification-before-completion"],
+      ],
+      [
+        "agents/conveyor/reviewer/agent.yaml",
+        ["review-team", "plan-review", "systematic-debugging", "verification-before-completion"],
+      ],
+      [
+        "agents/design/product-designer/agent.yaml",
+        ["development-team", "frontend-design", "verification-before-completion"],
+      ],
+      [
+        "agents/development/implementer/agent.yaml",
+        ["development-team", "systematic-debugging", "verification-before-completion"],
+      ],
+      [
+        "agents/development/qa/agent.yaml",
+        ["development-team", "systematic-debugging", "verification-before-completion", "agent-browser", "dogfood"],
+      ],
+      [
+        "agents/review/independent-reviewer/agent.yaml",
+        ["review-team", "systematic-debugging", "verification-before-completion"],
+      ],
+      [
+        "agents/orchestration/orchestrator/agent.yaml",
+        ["orchestration-team", "systematic-debugging", "verification-before-completion"],
+      ],
+    ]);
+
+    for (const file of AGENT_SPECS) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+      const imports = (raw["imports"] as Array<{ ref: string }> | undefined) ?? [];
+      expect(imports.some((imp) => imp.ref === "local:../../shared")).toBe(true);
+
+      const profiles = (raw["profiles"] as Record<string, Record<string, unknown>> | undefined) ?? {};
+      const defaultProfile = profiles["default"] ?? {};
+      const uses = (defaultProfile["uses"] as Record<string, unknown> | undefined) ?? {};
+      const skills = (uses["skills"] as string[] | undefined) ?? [];
+      for (const skillId of expectedAgentSkills.get(file) ?? []) {
+        expect(skills).toContain(skillId);
+      }
+      for (const skillId of OBSOLETE_OBRA_SKILLS) {
+        expect(skills).not.toContain(skillId);
+      }
+    }
+
+    for (const file of RUNNABLE_SHIPPED_AGENT_SPECS) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+      const profiles = (raw["profiles"] as Record<string, Record<string, unknown>> | undefined) ?? {};
+      for (const profile of Object.values(profiles)) {
+        const uses = (profile["uses"] as Record<string, unknown> | undefined) ?? {};
+        const skills = (uses["skills"] as string[] | undefined) ?? [];
+        for (const skillId of OBSOLETE_OBRA_SKILLS) {
+          expect(skills).not.toContain(skillId);
+        }
+      }
+    }
+  });
+
+  it("declares the vendored openrig-core plugin once in the shared resource pool", () => {
+    const shared = parseYaml(
+      readFileSync(join(SPECS_ROOT, SHARED_AGENT_SPEC), "utf-8"),
+    ) as {
+      resources?: {
+        plugins?: Array<{
+          id: string;
+          source: { kind: string; path: string };
+        }>;
+      };
+    };
+
+    expect(shared.resources?.plugins ?? []).toContainEqual({
+      id: "openrig-core",
+      source: {
+        kind: "local",
+        path: "openrig-home:plugins/openrig-core",
+      },
+    });
+  });
+
+  it("all 18 runnable shipped default profiles explicitly select openrig-core", () => {
+    expect(RUNNABLE_SHIPPED_AGENT_SPECS).toHaveLength(18);
+
+    const missing = RUNNABLE_SHIPPED_AGENT_SPECS.filter((file) => {
+      const raw = parseYaml(readFileSync(join(SPECS_ROOT, file), "utf-8")) as {
+        profiles?: Record<string, { uses?: { plugins?: string[] } }>;
+      };
+      return !raw.profiles?.default?.uses?.plugins?.includes(
+        "shared:openrig-core",
+      );
+    });
+
+    expect(missing).toEqual([]);
+  });
+
+  it("SDLC role guidance resolves selected work without treating profile skills as a reading list", () => {
+    for (const file of SELECTION_DRIVEN_AGENT_SPECS) {
+      const rolePath = join(SPECS_ROOT, file.replace("/agent.yaml", ""), "guidance/role.md");
+      const content = readFileSync(rolePath, "utf-8").replace(/\s+/g, " ");
+      expectSelectedWorkEntry(content);
+      expect(content).toMatch(/capabilities, not a mandatory reading list/);
+      expect(content).toMatch(/Role names and idle seats add no gates/);
+      expect(content).toMatch(/Explicit rigor and authored wave boundaries retain their named checks/);
+    }
+
+    // Check the address actually leads to the authority it promises. Selection
+    // preserves explicit exceptions and does not silently downgrade missing refs.
+    const authority = readFileSync(resolve(SPECS_ROOT, "../../../docs/reference/product-journey-sdlc.md"), "utf8")
+      .split("## Resolve the selected path\n")[1]?.split("\n## ")[0]?.replace(/\s+/g, " ");
+    expect(authority).toBeDefined();
+    expect(authority).toMatch(/project defaults, mission defaults, then the active slice's explicit selection/);
+    expect(authority).toMatch(/narrower explicit selection replaces the broader component list/);
+    expect(authority).toMatch(/wave map for its membership, review model and boundary/);
+    expect(authority).toMatch(/named-slice exception applies only to that slice/);
+    expect(authority).toContain("sdlc-conventions.md#a1-the-flow-in-one-pass");
+    expect(authority).toMatch(/do not silently fall back from an explicitly selected rigorous path/);
+  });
+
+  it("public builtin agent profiles do not reference deprecated HA skill", () => {
+    const deprecatedHaSkill = ["mental", "model", "ha"].join("-");
+    // V0.3.1 slice 05 kernel-rig-as-default: kernel agents are now
+    // built-in product surface and must respect the same deprecation
+    // curation as starter agents. Caught at Phase 05d forward-fix #2
+    // when advisor.lead reintroduced the deprecated skill reference.
+    for (const file of [...AGENT_SPECS, ...KERNEL_AGENT_SPECS]) {
+      const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+      const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+      const profiles = (raw["profiles"] as Record<string, Record<string, unknown>> | undefined) ?? {};
+      const defaultProfile = profiles["default"] ?? {};
+      const uses = (defaultProfile["uses"] as Record<string, unknown> | undefined) ?? {};
+      const skills = (uses["skills"] as string[] | undefined) ?? [];
+      expect(skills).not.toContain(deprecatedHaSkill);
+    }
+  });
+
+  // bug-fix slice deprecation-check-keys-widening — IMPL-PRD §4 +
+  // §5. The deprecation-check pattern previously only enforced
+  // against deprecated SKILL refs in profile.uses.skills. After the
+  // 2026-05-10 hotfix at e3bfc08 (which had to scrub `hooks: []`
+  // placeholders from kernel agent.yaml because the strict validator
+  // rejected them), the regression class is open — a future
+  // contributor can reintroduce that placeholder pattern or add a
+  // newly-deprecated KEY path and the test won't catch it. The block
+  // below widens to two new check categories: KEY-path allowlist +
+  // strict-validator inline invocation.
+  describe("deprecated KEY path + strict-validator gate", () => {
+    function hasDeprecatedKeyPath(obj: Record<string, unknown>, path: string): boolean {
+      // path uses dot-notation with `*` as a profile-name wildcard.
+      // Walk the object honoring the wildcard at the matching segment.
+      const segments = path.split(".");
+      function walk(node: unknown, idx: number): boolean {
+        if (idx >= segments.length) return node !== undefined;
+        if (!node || typeof node !== "object" || Array.isArray(node)) return false;
+        const seg = segments[idx]!;
+        const map = node as Record<string, unknown>;
+        if (seg === "*") {
+          for (const v of Object.values(map)) {
+            if (walk(v, idx + 1)) return true;
+          }
+          return false;
+        }
+        if (!(seg in map)) return false;
+        return walk(map[seg], idx + 1);
+      }
+      return walk(obj, 0);
+    }
+
+    it("DEPRECATED_KEY_PATHS is non-empty + references the IMPL-PRD", () => {
+      // T1: documentation gate — the allowlist must be discoverable
+      // (greppable) and must point at this slice's IMPL-PRD so future
+      // contributors know where to append.
+      expect(DEPRECATED_KEY_PATHS.length).toBeGreaterThan(0);
+      const fileText = readFileSync(__filename, "utf-8");
+      expect(fileText).toContain("deprecation-check-keys-widening");
+    });
+
+    it("AGENT_SPECS + kernel agent.yaml carry no deprecated KEY paths", () => {
+      // T2 + T3: every shipped agent spec is scanned against the
+      // DEPRECATED_KEY_PATHS allowlist. A hit fails the test with the
+      // file + path so the operator can locate and remove it.
+      const offenders: string[] = [];
+      for (const file of [...AGENT_SPECS, ...KERNEL_AGENT_SPECS]) {
+        const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+        const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+        for (const path of DEPRECATED_KEY_PATHS) {
+          if (hasDeprecatedKeyPath(raw, path)) {
+            offenders.push(`${file}: ${path}`);
+          }
+        }
+      }
+      if (offenders.length > 0) {
+        throw new Error(
+          `Deprecated KEY paths found in shipped agent specs:\n  - ${offenders.join("\n  - ")}\n` +
+            `These keys are listed in DEPRECATED_KEY_PATHS at the top of this test file. Remove them from the spec or — if the key is no longer deprecated — drop the entry from the allowlist.`,
+        );
+      }
+    });
+
+    it("AGENT_SPECS + kernel agent.yaml pass validateAgentSpec strict validator", () => {
+      // T4: the strict validator is the authoritative runtime gate.
+      // Running it inline at test time catches empty-array
+      // placeholders (e.g., resources.hooks: [] / profiles.*.uses.hooks: [])
+      // the moment they appear in a shipped spec — without waiting
+      // for kernel auto-boot to surface them via daemon start failure
+      // (which is exactly how e3bfc08 was discovered).
+      const offenders: string[] = [];
+      for (const file of [...AGENT_SPECS, ...KERNEL_AGENT_SPECS]) {
+        const yaml = readFileSync(join(SPECS_ROOT, file), "utf-8");
+        const raw = parseAgentSpec(yaml);
+        const result = validateAgentSpec(raw);
+        if (!result.valid) {
+          offenders.push(`${file}:\n    - ${result.errors.join("\n    - ")}`);
+        }
+      }
+      if (offenders.length > 0) {
+        throw new Error(`validateAgentSpec rejected shipped specs:\n  - ${offenders.join("\n  - ")}`);
+      }
+    });
+
+    const FIXTURE_DIR = join(__dirname, "fixtures", "deprecation-check");
+
+    it("regression fixture with empty-hooks placeholder is rejected by strict validator (T5: e3bfc08 coverage)", () => {
+      // T5: discriminator for the empty-array-placeholder failure
+      // class. If this fixture starts passing the validator (e.g.,
+      // someone loosens the strict check), the regression coverage
+      // for the hotfix scenario is gone — the test will flag it.
+      const yaml = readFileSync(join(FIXTURE_DIR, "agent-with-empty-hooks.yaml"), "utf-8");
+      const result = validateAgentSpec(parseAgentSpec(yaml));
+      expect(result.valid).toBe(false);
+      // Specifically the profiles.<name>.uses.hooks error message
+      // from agent-manifest.ts line 240 — anchors the discrimination
+      // to the same code path that the runtime invokes.
+      expect(result.errors.some((e) => /uses\.hooks/.test(e))).toBe(true);
+    });
+
+    it("regression fixture with deprecated KEY path is flagged by the allowlist (T6)", () => {
+      // T6: discriminator for the KEY-path allowlist. The fixture
+      // carries resources.hooks (a removed key per plugin-primitive
+      // Phase 3a). The allowlist walker must report this entry as
+      // an offender even if validateAgentSpec is not invoked.
+      const yaml = readFileSync(join(FIXTURE_DIR, "agent-with-removed-key.yaml"), "utf-8");
+      const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+      const hits = DEPRECATED_KEY_PATHS.filter((p) => hasDeprecatedKeyPath(raw, p));
+      expect(hits).toContain("resources.hooks");
+    });
+
+    it("clean fixture passes both checks (T7: no false positives)", () => {
+      // T7: baseline. A minimal valid agent.yaml must clear both the
+      // allowlist scan and the strict validator. Guards against the
+      // allowlist or the validator drifting too aggressive.
+      const yaml = readFileSync(join(FIXTURE_DIR, "agent-clean.yaml"), "utf-8");
+      const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+      const hits = DEPRECATED_KEY_PATHS.filter((p) => hasDeprecatedKeyPath(raw, p));
+      expect(hits).toEqual([]);
+      const result = validateAgentSpec(raw);
+      if (!result.valid) {
+        throw new Error(`clean fixture failed strict validator:\n  - ${result.errors.join("\n  - ")}`);
+      }
+    });
+  });
+
+  it("built-in library scan discovers vault-specialist agent", () => {
+    const lib = new SpecLibraryService({
+      roots: [{ path: SPECS_ROOT, sourceType: "builtin" }],
+      specReviewService,
+    });
+    lib.scan();
+
+    const agents = lib.list({ kind: "agent" });
+    const names = agents.map((e) => e.name);
+    expect(names).toContain("vault-specialist");
+  });
+
+  it("vault-specialist agent has correct profile, startup, guidance, and skill files", () => {
+    const specPath = "agents/apps/vault-specialist/agent.yaml";
+    const agentDir = join(SPECS_ROOT, "agents/apps/vault-specialist");
+    const yaml = readFileSync(join(SPECS_ROOT, specPath), "utf-8");
+    const raw = parseAgentSpec(yaml) as Record<string, unknown>;
+    const result = validateAgentSpec(raw);
+    expect(result.valid).toBe(true);
+
+    // Default profile includes vault-user skill
+    const profiles = (raw["profiles"] as Record<string, Record<string, unknown>>) ?? {};
+    const defaultProfile = profiles["default"] ?? {};
+    const uses = (defaultProfile["uses"] as Record<string, unknown>) ?? {};
+    const skills = (uses["skills"] as string[]) ?? [];
+    expect(skills).toContain("vault-user");
+
+    // Startup includes guidance/role.md and startup/context.md
+    const startup = (raw["startup"] ?? {}) as Record<string, unknown>;
+    const startupFiles = (startup["files"] as Array<{ path: string; required?: boolean; delivery_hint?: string }>) ?? [];
+    const roleStartup = startupFiles.find((f) => f.path.includes("role.md"));
+    expect(roleStartup).toBeDefined();
+    expect(roleStartup!.required).toBe(true);
+    expect(roleStartup!.delivery_hint).toBe("send_text");
+    const contextStartup = startupFiles.find((f) => f.path.includes("context.md"));
+    expect(contextStartup).toBeDefined();
+    expect(contextStartup!.required).toBe(true);
+    expect(contextStartup!.delivery_hint).toBe("send_text");
+
+    // Guidance references role.md
+    const resources = (raw["resources"] ?? {}) as Record<string, unknown>;
+    const guidance = resources["guidance"] as Array<{ path: string }> | undefined;
+    expect(guidance).toBeDefined();
+    const roleGuidance = guidance!.find((g) => g.path.includes("role.md"));
+    expect(roleGuidance).toBeDefined();
+
+    // Files exist on disk
+    expect(existsSync(join(agentDir, "guidance/role.md"))).toBe(true);
+    expect(existsSync(join(agentDir, "startup/context.md"))).toBe(true);
+    expect(existsSync(join(agentDir, "skills/vault-user/SKILL.md"))).toBe(true);
+
+    // Role guidance is substantive
+    const roleContent = readFileSync(join(agentDir, "guidance/role.md"), "utf-8");
+    expect(roleContent).toContain("# Role:");
+    expect(roleContent.length).toBeGreaterThan(200);
+    expect(roleContent.toLowerCase()).toContain("responsibilities");
+    expect(roleContent.toLowerCase()).toContain("principles");
+  });
+
+  it("factory and orchestration enter selected work without waiting for unneeded seats", () => {
+    const demoCulture = readFileSync(join(SPECS_ROOT, "rigs/launch/factory/CULTURE.md"), "utf-8").replace(/\s+/g, " ");
+    const orchestrationSkill = readFileSync(
+      join(SPECS_ROOT, "agents/shared/skills/pods/orchestration-team/SKILL.md"),
+      "utf-8",
+    ).replace(/\s+/g, " ");
+
+    for (const content of [demoCulture, orchestrationSkill]) expectSelectedWorkEntry(content);
+    expect(demoCulture).toMatch(/Only the selected work's required capabilities need to be ready/);
+    expect(demoCulture).toMatch(/independent review fires once over the accumulated wave/);
+    expect(demoCulture).toMatch(/named rigorous slice retains its selected checks/);
+    expect(orchestrationSkill).toMatch(/Do not wait for an entire starter topology or assign extra reviews/);
+    expect(orchestrationSkill).toMatch(/Independent review fires once at the authored wave boundary/);
+    expect(orchestrationSkill).toMatch(/Preserve separately named rigorous-slice exceptions/);
+    expect(orchestrationSkill).not.toMatch(/wait for the expected topology to settle|Do not silently shrink the team model/);
+    for (const demoSeat of ["orch1.lead", "dev1.qa", "rev1.r1", "rev1.r2"]) {
+      expect(orchestrationSkill).not.toContain(demoSeat);
+    }
+  });
+});

@@ -1,0 +1,1340 @@
+import type {
+  LegacyRigSpec,
+  LegacyRigSpecNode,
+  LegacyRigSpecEdge,
+  RigSpec,
+  RigSpecPod,
+  RigServicesSpec,
+  RigServicesWaitTarget,
+  RigServicesSurface,
+  RigServicesCheckpointHook,
+  ValidationResult,
+  WorkspaceSpec,
+  WorkspaceRepoSpec,
+} from "./types.js";
+import { WORKSPACE_KINDS } from "./types.js";
+import { validateSafePath } from "./path-safety.js";
+import { CLAUDE_MANAGED_BLOCK_FILES } from "./managed-blocks.js";
+import { canonicalCompactionStrategy, canonicalContinuityMechanic } from "./agent-manifest.js";
+import { aliasModelPinAdvisory } from "./spec-validation-advisory.js";
+import { validatePermissionPolicyRef } from "./permission-policy/policy-ref.js";
+import { validateStartupBlock, normalizeStartupBlock } from "./startup-validation.js";
+import { COMPOSE_PROJECT_NAME_PATTERN, deriveComposeProjectName } from "./compose-project-name.js";
+import * as path from "node:path";
+
+// -- Canonical pod-aware RigSpec validation (AgentSpec reboot) --
+
+// OPR.0.3.3.24: exported so the add_member converge op validates pod-local edge
+// kinds against the SAME canonical set as a rigspec pod-local edge (no second,
+// looser edge input path).
+export const VALID_EDGE_KINDS = new Set(["delegates_to", "spawned_by", "can_observe", "collaborates_with", "escalates_to"]);
+
+/** SPEC-VALIDATION CAPABILITY REGISTRY (B8-family, r2-ruled expiry coupling). Behavioral sentinel,
+ *  not a filename: a validation feature that other code must react to REGISTERS itself here, and
+ *  consumers gate on the capability. Current contract (desk ruling 05:03Z): the 5.3
+ *  spec-validation ADVISORY, when it lands model-pin canonicalization, MUST add
+ *  "model-pin-canonicalization" — that single line mechanically kills the claude alias migration
+ *  bridge at runtime AND turns its pin test red until the bridge constant is deleted. */
+export const SPEC_VALIDATION_CAPABILITIES: ReadonlySet<string> = new Set(["model-pin-canonicalization"]);
+const VALID_SYNC_TRIGGERS = new Set(["pre_compaction", "pre_shutdown", "manual", "milestone"]);
+const VALID_RESTORE_POLICIES = new Set(["resume_if_possible", "relaunch_fresh", "checkpoint_only"]);
+const VALID_IMPORT_PREFIXES = ["local:", "path:"];
+const VALID_SERVICES_KIND = new Set(["compose"]);
+const VALID_DOWN_POLICIES = new Set(["leave_running", "down", "down_and_volumes"]);
+const VALID_WAIT_TARGET_CONDITIONS = new Set(["healthy"]);
+const VALID_WORKSPACE_KINDS = new Set<string>(WORKSPACE_KINDS as readonly string[]);
+
+const RIG_KEYS = new Set([
+  "version", "name", "summary", "culture_file", "permission_policy", "managed_blocks", "docs",
+  "startup", "services", "workspace", "pods", "edges", "non_interruptive",
+]);
+const POD_KEYS = new Set(["id", "label", "summary", "continuity_policy", "startup", "members", "edges"]);
+const MEMBER_KEYS = new Set([
+  "id", "label", "agent_ref", "profile", "runtime", "codex_config_profile",
+  "model", "effort", "role", "permission_policy", "cwd", "restore_policy",
+  "compaction_strategy", "mechanic", "startup", "session_source", "starter_ref",
+]);
+const EDGE_KEYS = new Set(["kind", "from", "to"]);
+
+/** OPR.0.5.8.7 — the topology normalizer is an explicit literal. Reject an
+ * unknown structural key before that literal can make accepted input vanish.
+ * This stays deliberately small: one check over the four topology object
+ * levels, not a second schema framework. */
+function validateManagedBlocks(raw: unknown): string[] {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return ['managed_blocks: must be a mapping such as { claude-code: CLAUDE.local.md }'];
+  }
+  const errors: string[] = [];
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key !== "claude-code") {
+      errors.push(`managed_blocks.${key}: unsupported runtime "${key}"; only "claude-code" is configurable`);
+    } else if (!(CLAUDE_MANAGED_BLOCK_FILES as readonly unknown[]).includes(value)) {
+      errors.push(`managed_blocks.claude-code: must be one of ${CLAUDE_MANAGED_BLOCK_FILES.join(", ")} (got ${JSON.stringify(value)})`);
+    }
+  }
+  return errors;
+}
+
+function rejectUnknownTopologyKeys(
+  raw: unknown,
+  allowed: ReadonlySet<string>,
+  prefix: string,
+): string[] {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return [];
+  return Object.keys(raw as Record<string, unknown>)
+    .filter((key) => !allowed.has(key))
+    .map((key) => {
+      const path = prefix ? `${prefix}.${key}` : key;
+      return `${path}: unknown key "${key}"; refusing the spec because normalization would otherwise discard it and alter the requested topology`;
+    });
+}
+
+function isMapping(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Pod-aware RigSpec validator. Canonical contract for the AgentSpec reboot.
+ */
+export class RigSpecSchema {
+  /**
+   * Validate a parsed rig spec object. Collects all errors.
+   * @param raw - parsed YAML object
+   * @returns validation result
+   */
+  static validate(raw: unknown, opts?: { externalQualifiedIds?: Iterable<string> }): ValidationResult {
+    const errors: string[] = [];
+    // OPR.0.5.3.3 — fail-open advisories (never affect `valid`); e.g. alias-form model pins.
+    const advisories: string[] = [];
+
+    if (!isMapping(raw)) {
+      return { valid: false, errors: ["rig spec must be an object"] };
+    }
+
+    const obj = raw as Record<string, unknown>;
+    errors.push(...rejectUnknownTopologyKeys(obj, RIG_KEYS, ""));
+
+    // Required fields
+    if (!obj["name"] || typeof obj["name"] !== "string") errors.push("name: required non-empty string");
+    if (!obj["version"] || typeof obj["version"] !== "string") errors.push("version: required non-empty string");
+
+    // culture_file path safety
+    if (obj["culture_file"] !== undefined && obj["culture_file"] !== null) {
+      if (typeof obj["culture_file"] !== "string") {
+        errors.push("culture_file: must be a string");
+      } else {
+        const pathErr = validateSafePath(obj["culture_file"] as string, "culture_file");
+        if (pathErr) errors.push(pathErr);
+      }
+    }
+
+    // docs: optional array of documentation file paths
+    if (obj["docs"] !== undefined) {
+      if (!Array.isArray(obj["docs"])) {
+        errors.push("docs: must be an array");
+      } else {
+        for (let i = 0; i < (obj["docs"] as unknown[]).length; i++) {
+          const entry = (obj["docs"] as unknown[])[i];
+          if (!entry || typeof entry !== "object") {
+            errors.push(`docs[${i}]: must be an object with a path field`);
+            continue;
+          }
+          const doc = entry as Record<string, unknown>;
+          if (!doc["path"] || typeof doc["path"] !== "string") {
+            errors.push(`docs[${i}].path: required non-empty string`);
+          } else {
+            const pathErr = validateSafePath(doc["path"] as string, `docs[${i}].path`);
+            if (pathErr) errors.push(pathErr);
+          }
+        }
+      }
+    }
+
+    // rig-level startup
+    if (obj["startup"] !== undefined) {
+      errors.push(...validateStartupBlock(obj["startup"], "startup"));
+    }
+
+    // services: optional top-level sibling of pods
+    if (obj["services"] !== undefined) {
+      errors.push(...validateServicesBlock(obj["services"], "services"));
+    }
+
+    // PL-007: optional workspace block (typed primitive). Rigs without it
+    // stay valid for back-compat; whoami/node-inventory return null
+    // workspace when not declared.
+    if (obj["workspace"] !== undefined && obj["workspace"] !== null) {
+      errors.push(...this.validateWorkspace(obj["workspace"]).errors);
+    }
+
+    // OPR.0.4.8.3 Seam B: optional rig-level permission_policy REF (builtin:<name> or a
+    // spec-relative custom path). ABSENT = the floor (honest absence). An explicitly PRESENT
+    // value — including null (R2 HIGH-3) — must validate: present-invalid is a STRUCTURED
+    // spec error, never silently collapsed to absence/floor. Mirrors the member level.
+    if (obj["permission_policy"] !== undefined) {
+      const refErr = validatePermissionPolicyRef(obj["permission_policy"], "permission_policy");
+      if (refErr) errors.push(refErr);
+    }
+
+    if (obj["non_interruptive"] !== undefined && typeof obj["non_interruptive"] !== "boolean") {
+      errors.push("non_interruptive: must be a boolean");
+    }
+
+    // #25: optional per-runtime managed-block destination. Only claude-code is
+    // configurable in this release; Codex stays on AGENTS.md.
+    if (obj["managed_blocks"] !== undefined) {
+      errors.push(...validateManagedBlocks(obj["managed_blocks"]));
+    }
+
+    // pods: required array
+    if (!obj["pods"] || !Array.isArray(obj["pods"])) {
+      errors.push("pods: required non-empty array");
+    } else {
+      const pods = obj["pods"] as Record<string, unknown>[];
+      if (pods.length === 0) errors.push("pods: must contain at least one pod");
+
+      const podIds = new Set<string>();
+      for (let pi = 0; pi < pods.length; pi++) {
+        const pod = pods[pi]!;
+        errors.push(...validatePod(pod, pi, podIds, advisories));
+      }
+
+      // Cross-pod edge validation
+      const allQualifiedIds = new Set<string>(opts?.externalQualifiedIds ?? []);
+      for (const pod of pods) {
+        if (!isMapping(pod)) continue; // Its indexed validation error was recorded above.
+        const podId = pod["id"] as string;
+        const members = pod["members"] as Record<string, unknown>[] | undefined;
+        if (typeof podId === "string" && podId.length > 0 && Array.isArray(members)) {
+          for (const m of members) {
+            if (!isMapping(m)) continue;
+            if (typeof m["id"] === "string") allQualifiedIds.add(`${podId}.${m["id"]}`);
+            const pinAdvisory = aliasModelPinAdvisory(m["model"], `pods.${podId}.members.${m["id"] ?? "?"}`);
+            if (pinAdvisory) advisories.push(pinAdvisory);
+          }
+        }
+      }
+
+      if (obj["edges"] !== undefined) {
+        if (!Array.isArray(obj["edges"])) {
+          errors.push("edges: must be an array");
+        } else {
+          for (let ei = 0; ei < (obj["edges"] as unknown[]).length; ei++) {
+            const edge = (obj["edges"] as Record<string, unknown>[])[ei]!;
+            errors.push(...validateCrossPodEdge(edge, ei, allQualifiedIds));
+          }
+        }
+      }
+    }
+
+    return { valid: errors.length === 0, errors, ...(advisories.length ? { advisories } : {}) };
+  }
+
+  /**
+   * Normalize a validated rig spec into the canonical typed shape.
+   * @param raw - parsed YAML object (must pass validation first)
+   * @returns normalized RigSpec
+   */
+  static normalize(raw: Record<string, unknown>): RigSpec {
+    const pods = (raw["pods"] as Record<string, unknown>[]).map(normalizePod);
+    const edges = Array.isArray(raw["edges"])
+      ? (raw["edges"] as Record<string, unknown>[]).map((e) => ({
+          kind: e["kind"] as string,
+          from: e["from"] as string,
+          to: e["to"] as string,
+        }))
+      : [];
+
+    const docs = Array.isArray(raw["docs"])
+      ? (raw["docs"] as Record<string, unknown>[]).map((d) => ({ path: d["path"] as string }))
+      : undefined;
+
+    return {
+      version: raw["version"] as string,
+      name: raw["name"] as string,
+      summary: raw["summary"] as string | undefined,
+      cultureFile: raw["culture_file"] as string | undefined,
+      permissionPolicy: raw["permission_policy"] as string | undefined,
+      nonInterruptive: raw["non_interruptive"] as boolean | undefined,
+      managedBlocks: raw["managed_blocks"] as RigSpec["managedBlocks"],
+      docs,
+      startup: raw["startup"] ? normalizeStartupBlock(raw["startup"]) : undefined,
+      services: raw["services"] ? normalizeServicesBlock(raw["services"], raw["name"] as string) : undefined,
+      workspace: raw["workspace"] ? this.normalizeWorkspace(raw["workspace"]) : undefined,
+      pods,
+      edges,
+    };
+  }
+
+  /** Validate only a RigSpec workspace block through the canonical schema. */
+  static validateWorkspace(raw: unknown): ValidationResult {
+    const errors = validateWorkspaceBlock(raw, "workspace");
+    return { valid: errors.length === 0, errors };
+  }
+
+  /** Normalize only a validated RigSpec workspace block. */
+  static normalizeWorkspace(raw: unknown): WorkspaceSpec | undefined {
+    return normalizeWorkspaceBlock(raw);
+  }
+}
+
+/** PL-007 Workspace Primitive — validate the optional rig-level workspace
+ *  block. Required: workspace_root (non-empty string), repos (array of
+ *  {name, path, kind}). Optional: default_repo, knowledge_root.
+ *  Constraints: kinds restricted to the reserved 5; repo names unique;
+ *  default_repo must reference a declared repo; paths must be non-empty
+ *  strings (existence is NOT enforced at validate time per PL-007 PRD —
+ *  schema is paper-only; live filesystem checks happen at preflight). */
+function validateWorkspaceBlock(raw: unknown, prefix: string): string[] {
+  if (typeof raw !== "object" || Array.isArray(raw)) return [`${prefix}: must be an object`];
+  const obj = raw as Record<string, unknown>;
+  const errors: string[] = [];
+
+  const wr = obj["workspace_root"];
+  if (typeof wr !== "string" || wr.trim() === "") {
+    errors.push(`${prefix}.workspace_root: required non-empty string`);
+  }
+
+  const rawRepos = obj["repos"];
+  const repoNames = new Set<string>();
+  if (!Array.isArray(rawRepos)) {
+    errors.push(`${prefix}.repos: required array`);
+  } else {
+    for (let i = 0; i < rawRepos.length; i++) {
+      const repo = rawRepos[i];
+      const repoPrefix = `${prefix}.repos[${i}]`;
+      if (typeof repo !== "object" || repo === null || Array.isArray(repo)) {
+        errors.push(`${repoPrefix}: must be an object with name, path, kind`);
+        continue;
+      }
+      const r = repo as Record<string, unknown>;
+      const name = r["name"];
+      if (typeof name !== "string" || name.trim() === "") {
+        errors.push(`${repoPrefix}.name: required non-empty string`);
+      } else if (repoNames.has(name)) {
+        errors.push(`${repoPrefix}.name: duplicate repo name "${name}"`);
+      } else {
+        repoNames.add(name);
+      }
+      const repoPath = r["path"];
+      if (typeof repoPath !== "string" || repoPath.trim() === "") {
+        errors.push(`${repoPrefix}.path: required non-empty string`);
+      }
+      const kind = r["kind"];
+      if (typeof kind !== "string" || !VALID_WORKSPACE_KINDS.has(kind)) {
+        errors.push(`${repoPrefix}.kind: must be one of ${[...VALID_WORKSPACE_KINDS].join(", ")} (got ${JSON.stringify(kind)})`);
+      }
+    }
+  }
+
+  const defaultRepo = obj["default_repo"];
+  if (defaultRepo !== undefined && defaultRepo !== null) {
+    if (typeof defaultRepo !== "string" || defaultRepo.trim() === "") {
+      errors.push(`${prefix}.default_repo: must be a non-empty string when present`);
+    } else if (repoNames.size > 0 && !repoNames.has(defaultRepo)) {
+      errors.push(`${prefix}.default_repo: "${defaultRepo}" does not match any repo in repos[]`);
+    }
+  }
+
+  const knowledgeRoot = obj["knowledge_root"];
+  if (knowledgeRoot !== undefined && knowledgeRoot !== null) {
+    if (typeof knowledgeRoot !== "string" || knowledgeRoot.trim() === "") {
+      errors.push(`${prefix}.knowledge_root: must be a non-empty string when present`);
+    }
+  }
+
+  return errors;
+}
+
+/** PL-007 — normalize the YAML workspace block into typed WorkspaceSpec.
+ *  Resolves relative repo paths against workspace_root (per the convention
+ *  worked example where authors write `path: openrig` relative to the hub). */
+function normalizeWorkspaceBlock(raw: unknown): WorkspaceSpec | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const workspaceRoot = obj["workspace_root"] as string;
+  const rawRepos = obj["repos"];
+  const repos: WorkspaceRepoSpec[] = [];
+  if (Array.isArray(rawRepos)) {
+    for (const r of rawRepos as Record<string, unknown>[]) {
+      const declaredPath = r["path"] as string;
+      const absolute = path.isAbsolute(declaredPath)
+        ? declaredPath
+        : path.resolve(workspaceRoot, declaredPath);
+      repos.push({
+        name: r["name"] as string,
+        path: absolute,
+        kind: r["kind"] as WorkspaceRepoSpec["kind"],
+      });
+    }
+  }
+  return {
+    workspaceRoot,
+    repos,
+    defaultRepo: typeof obj["default_repo"] === "string" ? (obj["default_repo"] as string) : undefined,
+    knowledgeRoot: typeof obj["knowledge_root"] === "string" ? (obj["knowledge_root"] as string) : undefined,
+  };
+}
+
+// -- Pod validation --
+
+function validatePod(pod: Record<string, unknown>, index: number, podIds: Set<string>, advisories: string[]): string[] {
+  const errors: string[] = [];
+  const prefix = `pods[${index}]`;
+  if (!isMapping(pod)) return [`${prefix}: must be an object`];
+  errors.push(...rejectUnknownTopologyKeys(pod, POD_KEYS, prefix));
+
+  // id
+  if (!pod["id"] || typeof pod["id"] !== "string") {
+    errors.push(`${prefix}.id: required non-empty string`);
+  } else {
+    const id = pod["id"] as string;
+    if (id.includes(".")) errors.push(`${prefix}.id: must not contain dots (got "${id}")`);
+    if (podIds.has(id)) errors.push(`${prefix}.id: duplicate pod id "${id}"`);
+    podIds.add(id);
+  }
+
+  // label
+  if (!pod["label"] || typeof pod["label"] !== "string") {
+    errors.push(`${prefix}.label: required non-empty string`);
+  }
+
+  // continuity_policy
+  if (pod["continuity_policy"] !== undefined) {
+    errors.push(...validateContinuityPolicy(pod["continuity_policy"], `${prefix}.continuity_policy`));
+  }
+
+  // pod startup
+  if (pod["startup"] !== undefined) {
+    errors.push(...validateStartupBlock(pod["startup"], `${prefix}.startup`));
+  }
+
+  // members
+  if (!pod["members"] || !Array.isArray(pod["members"])) {
+    errors.push(`${prefix}.members: required array`);
+  } else {
+    const members = pod["members"] as Record<string, unknown>[];
+    const memberIds = new Set<string>();
+    for (let mi = 0; mi < members.length; mi++) {
+      errors.push(...validateMember(members[mi]!, mi, `${prefix}`, memberIds, advisories));
+    }
+
+    // Pod-local edges
+    if (pod["edges"] !== undefined) {
+      if (!Array.isArray(pod["edges"])) {
+        errors.push(`${prefix}.edges: must be an array`);
+      } else {
+        for (let ei = 0; ei < (pod["edges"] as unknown[]).length; ei++) {
+          const edge = (pod["edges"] as Record<string, unknown>[])[ei]!;
+          errors.push(...validatePodLocalEdge(edge, ei, `${prefix}`, memberIds));
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+function validateMember(member: Record<string, unknown>, index: number, podPrefix: string, memberIds: Set<string>, advisories: string[]): string[] {
+  const errors: string[] = [];
+  const prefix = `${podPrefix}.members[${index}]`;
+  if (!isMapping(member)) return [`${prefix}: must be an object`];
+  errors.push(...rejectUnknownTopologyKeys(member, MEMBER_KEYS, prefix));
+
+  // OPR.0.5.6.20 A5 — member-level compaction_strategy: all vocabulary decisions go
+  // through the manifest's one canonical site; this leg only classifies the answer.
+  if (member["compaction_strategy"] !== undefined) {
+    const strategyValue = member["compaction_strategy"] as string;
+    const canonical = typeof strategyValue === "string" ? canonicalCompactionStrategy(strategyValue) : null;
+    if (strategyValue === "custom_prompt") {
+      errors.push(`${prefix}.compaction_strategy: "custom_prompt" is not supported in v1; use "harness_native" or "pod_continuity"`);
+    } else if (canonical === null) {
+      errors.push(`${prefix}.compaction_strategy: not a valid compaction strategy (got "${strategyValue}") — see the agent-spec compaction_strategy vocabulary`);
+    } else if (canonical !== strategyValue) {
+      advisories.push(`${prefix}.compaction_strategy: "${strategyValue}" is deprecated and now normalizes to "${canonical}" — update to the current vocabulary`);
+    }
+  }
+  if (
+    member["mechanic"] !== undefined &&
+    canonicalContinuityMechanic(member["mechanic"]) === null
+  ) {
+    errors.push(`${prefix}.mechanic: must be a canonical seat@rig session address`);
+  }
+
+  if (!member["id"] || typeof member["id"] !== "string") {
+    errors.push(`${prefix}.id: required non-empty string`);
+  } else {
+    const id = member["id"] as string;
+    if (id.includes(".")) errors.push(`${prefix}.id: must not contain dots (got "${id}")`);
+    if (memberIds.has(id)) errors.push(`${prefix}.id: duplicate member id "${id}"`);
+    memberIds.add(id);
+  }
+
+  if (!member["agent_ref"] || typeof member["agent_ref"] !== "string") {
+    errors.push(`${prefix}.agent_ref: required non-empty string`);
+  }
+  if (!member["profile"] || typeof member["profile"] !== "string") {
+    errors.push(`${prefix}.profile: required non-empty string`);
+  }
+  if (!member["runtime"] || typeof member["runtime"] !== "string") {
+    errors.push(`${prefix}.runtime: required non-empty string`);
+  }
+  if (member["codex_config_profile"] !== undefined) {
+    if (typeof member["codex_config_profile"] !== "string" || !member["codex_config_profile"].trim()) {
+      errors.push(`${prefix}.codex_config_profile: must be a non-empty string`);
+    } else if (!/^[A-Za-z0-9_.-]+$/.test(member["codex_config_profile"])) {
+      errors.push(`${prefix}.codex_config_profile: must contain only letters, numbers, underscores, dots, or hyphens`);
+    } else if (member["runtime"] !== "codex") {
+      errors.push(`${prefix}.codex_config_profile: only valid when runtime is "codex"`);
+    }
+  }
+  if (member["effort"] !== undefined) {
+    if (typeof member["effort"] !== "string" || !member["effort"].trim()) {
+      advisories.push(`${prefix}.effort: non-string value "${member["effort"]}" ignored; effort must be a text value`);
+    }
+  }
+  if (!member["cwd"] || typeof member["cwd"] !== "string") {
+    errors.push(`${prefix}.cwd: required non-empty string`);
+  }
+
+  // OPR.0.4.6.FAC1: optional seat-side role declaration — the workflow
+  // binding layer's candidate dimension (roles bind to SEATS; a member
+  // without a role is never role-resolved, only explicitly addressable).
+  // Opt-in per seat: absent is fully legal everywhere. A PROVIDED role
+  // must validate — never silently dropped. Rejected on terminal
+  // runtime: a terminal node is not an agent seat (mirrors the
+  // session_source/starter_ref terminal rejections).
+  if (member["role"] !== undefined) {
+    if (typeof member["role"] !== "string" || !member["role"].trim()) {
+      errors.push(`${prefix}.role: must be a non-empty string`);
+    } else if (!/^[A-Za-z0-9_.-]+$/.test(member["role"])) {
+      errors.push(`${prefix}.role: must contain only letters, numbers, underscores, dots, or hyphens`);
+    } else if (member["runtime"] === "terminal") {
+      errors.push(`${prefix}.role: not valid on terminal members (a terminal node is not an agent seat and cannot be role-resolved)`);
+    }
+  }
+
+  // OPR.0.4.8.3 Seam B: optional per-seat permission_policy REF (builtin:<name> or a spec-relative
+  // custom path; validated per README v4 A1/A2/A3 — NOT the role charset, since a ref carries ':'
+  // and '/'). Opt-in per seat; absent = the floor. Rejected on terminal runtime (a terminal node is
+  // not an agent seat — mirrors the role rejection). A per-member ref overrides the rig-level ref.
+  if (member["permission_policy"] !== undefined) {
+    const refErr = validatePermissionPolicyRef(member["permission_policy"], `${prefix}.permission_policy`);
+    if (refErr) {
+      errors.push(refErr);
+    } else if (member["runtime"] === "terminal") {
+      errors.push(`${prefix}.permission_policy: not valid on terminal members (a terminal node is not an agent seat)`);
+    }
+  }
+
+  // Terminal sentinel validation: exact triple required
+  const isTerminalRuntime = member["runtime"] === "terminal";
+  const isTerminalRef = member["agent_ref"] === "builtin:terminal";
+  const isNoneProfile = member["profile"] === "none";
+
+  if (isTerminalRuntime) {
+    if (!isTerminalRef) {
+      errors.push(`${prefix}: terminal runtime requires agent_ref "builtin:terminal" (got "${member["agent_ref"]}")`);
+    }
+    if (!isNoneProfile) {
+      errors.push(`${prefix}: terminal runtime requires profile "none" (got "${member["profile"]}")`);
+    }
+  } else {
+    if (isTerminalRef) {
+      errors.push(`${prefix}: agent_ref "builtin:terminal" is only valid with runtime "terminal" (got runtime "${member["runtime"]}")`);
+    }
+    if (isNoneProfile && typeof member["profile"] === "string") {
+      errors.push(`${prefix}: profile "none" is only valid with runtime "terminal" (got runtime "${member["runtime"]}")`);
+    }
+  }
+
+  // restore_policy: closed set
+  if (member["restore_policy"] !== undefined && member["restore_policy"] !== null) {
+    if (!VALID_RESTORE_POLICIES.has(member["restore_policy"] as string)) {
+      errors.push(`${prefix}.restore_policy: must be one of ${[...VALID_RESTORE_POLICIES].join(", ")} (got "${member["restore_policy"]}")`);
+    }
+  }
+
+  // agent_ref: must be local: or path: with correct shape (skip for terminal sentinel)
+  if (typeof member["agent_ref"] === "string" && !isTerminalRef) {
+    const ref = member["agent_ref"] as string;
+    const hasValidPrefix = VALID_IMPORT_PREFIXES.some((p) => ref.startsWith(p));
+    if (!hasValidPrefix) {
+      errors.push(`${prefix}.agent_ref: must start with "local:" or "path:" (got "${ref}")`);
+    } else if (ref.startsWith("local:")) {
+      const path = ref.slice("local:".length);
+      if (!path) errors.push(`${prefix}.agent_ref: local: ref must have a path`);
+      else if (path.startsWith("/")) errors.push(`${prefix}.agent_ref: local: ref must be a relative path (got "${ref}")`);
+    } else if (ref.startsWith("path:")) {
+      const path = ref.slice("path:".length);
+      if (!path) errors.push(`${prefix}.agent_ref: path: ref must have a path`);
+      else if (!path.startsWith("/")) errors.push(`${prefix}.agent_ref: path: ref must be an absolute path (got "${ref}")`);
+    }
+  }
+
+  // Member startup block validation
+  if (member["startup"] !== undefined) {
+    errors.push(...validateStartupBlock(member["startup"], `${prefix}.startup`));
+  }
+
+  // session_source validation (v1 narrow MVP: mode=fork + ref.kind=native_id)
+  if (member["session_source"] !== undefined) {
+    errors.push(...validateSessionSource(member["session_source"], `${prefix}.session_source`, isTerminalRuntime));
+  }
+
+  // starter_ref validation (Agent Starter v1 vertical M1).
+  // - Rejects malformed name.
+  // - Rejects terminal runtime (analogous to terminal session_source rejection;
+  //   terminal `deliverStartup` is a no-op so a starter has nothing to seed).
+  // - Rejects starter_ref + session_source.mode=fork composition; the v1+
+  //   "Real native-fork-from-registered-thread-id starter proof" trigger
+  //   covers that case.
+  // - Accepts starter_ref + session_source.mode=rebuild (additive: both
+  //   apply on fresh_start; rebuild artifacts and starter artifacts compose
+  //   independently in the launch pipeline).
+  // - Accepts starter_ref alone.
+  if (member["starter_ref"] !== undefined) {
+    errors.push(...validateStarterRef(
+      member["starter_ref"],
+      member["session_source"],
+      isTerminalRuntime,
+      `${prefix}.starter_ref`,
+    ));
+  }
+
+  return errors;
+}
+
+function validateStarterRef(
+  raw: unknown,
+  sessionSourceRaw: unknown,
+  isTerminalRuntime: boolean,
+  prefix: string,
+): string[] {
+  const errors: string[] = [];
+  if (raw === null || typeof raw !== "object") {
+    errors.push(`${prefix}: must be an object with a non-empty "name" string`);
+    return errors;
+  }
+  if (isTerminalRuntime) {
+    errors.push(`${prefix}: terminal runtime has no agent context to seed; starter_ref is meaningless on terminal members and is rejected (analogous to existing terminal session_source rejection)`);
+    return errors;
+  }
+  const sr = raw as Record<string, unknown>;
+  const name = sr["name"];
+  if (typeof name !== "string" || name.trim() === "") {
+    errors.push(`${prefix}.name: required non-empty string`);
+    return errors;
+  }
+  // Allowed character set: registry keys are lowercase alphanumeric plus
+  // hyphen + underscore + double-hyphen-as-separator. Reject anything that
+  // would create an unsafe filesystem path (no `/`, no `..`, no leading dot).
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(name)) {
+    errors.push(`${prefix}.name: must be alphanumeric with optional "_" or "-" (got ${JSON.stringify(name)})`);
+    return errors;
+  }
+  // Cross-field rejection: starter_ref + session_source.mode=fork is the
+  // v1+ named trigger ("Real native-fork-from-registered-thread-id starter
+  // proof"). v0 schema refuses the composition rather than silently mixing
+  // the two semantics. Rebuild composition is allowed and lands additively.
+  if (sessionSourceRaw !== null && typeof sessionSourceRaw === "object") {
+    const ssRec = sessionSourceRaw as Record<string, unknown>;
+    if (ssRec["mode"] === "fork") {
+      errors.push(`${prefix}: starter_ref + session_source.mode="fork" composition is rejected in v0 (the v1+ "Real native-fork-from-registered-thread-id starter proof" trigger covers that combination); use either starter_ref alone or session_source.mode="rebuild" for artifact-additive composition`);
+    }
+  }
+  return errors;
+}
+
+function validateSessionSource(raw: unknown, prefix: string, isTerminalRuntime: boolean): string[] {
+  const errors: string[] = [];
+  if (raw === null || typeof raw !== "object") {
+    errors.push(`${prefix}: must be an object`);
+    return errors;
+  }
+  if (isTerminalRuntime) {
+    errors.push(`${prefix}: terminal runtime has no native fork primitive and no agent context to rebuild; remove session_source for terminal members`);
+    return errors;
+  }
+  const ss = raw as Record<string, unknown>;
+  const mode = ss["mode"];
+  if (mode === "fork") {
+    return validateForkSessionSource(ss, prefix);
+  }
+  if (mode === "rebuild") {
+    return validateRebuildSessionSource(ss, prefix);
+  }
+  // PL-016 Item 4: agent_image session source — references a named
+  // image in the AgentImageLibraryService. The instantiator dispatches
+  // through the fork code path with the image's resume token.
+  if (mode === "agent_image") {
+    return validateAgentImageSessionSource(ss, prefix);
+  }
+  errors.push(`${prefix}.mode: supports "fork", "rebuild", or "agent_image" (got ${JSON.stringify(mode)})`);
+  return errors;
+}
+
+/** PL-016 Item 4 — validate session_source: mode: agent_image. */
+function validateAgentImageSessionSource(ss: Record<string, unknown>, prefix: string): string[] {
+  const errors: string[] = [];
+  const ref = ss["ref"];
+  if (ref === null || typeof ref !== "object") {
+    errors.push(`${prefix}.ref: required object with "kind: image_name" and "value: <name>" for agent_image mode`);
+    return errors;
+  }
+  const refRec = ref as Record<string, unknown>;
+  const kind = refRec["kind"];
+  if (kind !== "image_name") {
+    errors.push(`${prefix}.ref.kind: agent_image mode supports "image_name" only at v0 (got ${JSON.stringify(kind)})`);
+    return errors;
+  }
+  const value = refRec["value"];
+  if (typeof value !== "string" || value.trim() === "") {
+    errors.push(`${prefix}.ref.value: required non-empty string when ref.kind is "image_name"`);
+  }
+  // Optional version: string or number coerces to string at parse time.
+  const version = refRec["version"];
+  if (version !== undefined && typeof version !== "string" && typeof version !== "number") {
+    errors.push(`${prefix}.ref.version: optional; must be a string or number when present`);
+  }
+  return errors;
+}
+
+function validateForkSessionSource(ss: Record<string, unknown>, prefix: string): string[] {
+  const errors: string[] = [];
+  const ref = ss["ref"];
+  if (ref === null || typeof ref !== "object") {
+    errors.push(`${prefix}.ref: required object with "kind" and (when kind=native_id) "value"`);
+    return errors;
+  }
+  const refRec = ref as Record<string, unknown>;
+  const kind = refRec["kind"];
+  if (kind !== "native_id") {
+    if (kind === "artifact_path") {
+      errors.push(`${prefix}.ref.kind: "artifact_path" deferred to follow-up slice; v1 fork mode supports "native_id" only`);
+    } else if (kind === "name" || kind === "last") {
+      errors.push(`${prefix}.ref.kind: "${kind}" is weaker than "native_id"; v1 fork mode supports "native_id" only`);
+    } else if (kind === "artifact_set") {
+      errors.push(`${prefix}.ref.kind: "artifact_set" belongs to mode "rebuild"; for fork mode use ref.kind: "native_id"`);
+    } else {
+      errors.push(`${prefix}.ref.kind: required; v1 fork mode supports "native_id" only (got ${JSON.stringify(kind)})`);
+    }
+    return errors;
+  }
+  const value = refRec["value"];
+  if (typeof value !== "string" || value.trim() === "") {
+    errors.push(`${prefix}.ref.value: required non-empty string when ref.kind is "native_id"`);
+  }
+  return errors;
+}
+
+function validateRebuildSessionSource(ss: Record<string, unknown>, prefix: string): string[] {
+  const errors: string[] = [];
+  const ref = ss["ref"];
+  if (ref === null || typeof ref !== "object") {
+    errors.push(`${prefix}.ref: required object with "kind: artifact_set" and "value: [paths...]" for rebuild mode`);
+    return errors;
+  }
+  const refRec = ref as Record<string, unknown>;
+  const kind = refRec["kind"];
+  if (kind !== "artifact_set") {
+    if (kind === "native_id" || kind === "artifact_path" || kind === "name" || kind === "last") {
+      errors.push(`${prefix}.ref.kind: rebuild mode requires ref.kind: "artifact_set"; the named kinds (${JSON.stringify(kind)}) belong to mode: "fork"`);
+    } else {
+      errors.push(`${prefix}.ref.kind: required; v1 rebuild mode supports "artifact_set" only (got ${JSON.stringify(kind)})`);
+    }
+    return errors;
+  }
+  const value = refRec["value"];
+  if (!Array.isArray(value)) {
+    errors.push(`${prefix}.ref.value: required non-empty array of artifact paths in trust-precedence order (highest-trust first: rig CULTURE, role doc, handover packet, queue file, pod shared session log, member session log)`);
+    return errors;
+  }
+  if (value.length === 0) {
+    errors.push(`${prefix}.ref.value: rebuild requires at least one artifact path; declare paths in trust-precedence order (highest-trust first)`);
+    return errors;
+  }
+  for (let i = 0; i < value.length; i++) {
+    const p = value[i];
+    if (typeof p !== "string" || p.trim() === "") {
+      errors.push(`${prefix}.ref.value[${i}]: each entry must be a non-empty string (file path)`);
+    }
+  }
+  return errors;
+}
+
+function validatePodLocalEdge(edge: Record<string, unknown>, index: number, podPrefix: string, memberIds: Set<string>): string[] {
+  const errors: string[] = [];
+  const prefix = `${podPrefix}.edges[${index}]`;
+  if (!isMapping(edge)) return [`${prefix}: must be an object`];
+  errors.push(...rejectUnknownTopologyKeys(edge, EDGE_KEYS, prefix));
+  const from = edge["from"] as string;
+  const to = edge["to"] as string;
+  const kind = edge["kind"] as string;
+
+  if (!kind || !VALID_EDGE_KINDS.has(kind)) {
+    errors.push(`${prefix}.kind: must be one of ${[...VALID_EDGE_KINDS].join(", ")} (got "${kind}")`);
+  }
+  if (!from || typeof from !== "string") {
+    errors.push(`${prefix}.from: required string`);
+  } else if (from.includes(".")) {
+    errors.push(`${prefix}.from: pod-local edge must use unqualified member id, not fully-qualified (got "${from}")`);
+  } else if (!memberIds.has(from)) {
+    errors.push(`${prefix}.from: member "${from}" not found in pod`);
+  }
+  if (!to || typeof to !== "string") {
+    errors.push(`${prefix}.to: required string`);
+  } else if (to.includes(".")) {
+    errors.push(`${prefix}.to: pod-local edge must use unqualified member id, not fully-qualified (got "${to}")`);
+  } else if (!memberIds.has(to)) {
+    errors.push(`${prefix}.to: member "${to}" not found in pod`);
+  }
+
+  return errors;
+}
+
+function validateCrossPodEdge(edge: Record<string, unknown>, index: number, allQualifiedIds: Set<string>): string[] {
+  const errors: string[] = [];
+  const prefix = `edges[${index}]`;
+  if (!isMapping(edge)) return [`${prefix}: must be an object`];
+  errors.push(...rejectUnknownTopologyKeys(edge, EDGE_KEYS, prefix));
+  const from = edge["from"] as string;
+  const to = edge["to"] as string;
+  const kind = edge["kind"] as string;
+
+  if (!kind || !VALID_EDGE_KINDS.has(kind)) {
+    errors.push(`${prefix}.kind: must be one of ${[...VALID_EDGE_KINDS].join(", ")} (got "${kind}")`);
+  }
+  if (!from || typeof from !== "string") {
+    errors.push(`${prefix}.from: required string`);
+  } else if (!from.includes(".")) {
+    errors.push(`${prefix}.from: cross-pod edge must use fully-qualified pod.member id (got "${from}")`);
+  } else if (!allQualifiedIds.has(from)) {
+    errors.push(`${prefix}.from: "${from}" does not resolve to a pod member`);
+  }
+  if (!to || typeof to !== "string") {
+    errors.push(`${prefix}.to: required string`);
+  } else if (!to.includes(".")) {
+    errors.push(`${prefix}.to: cross-pod edge must use fully-qualified pod.member id (got "${to}")`);
+  } else if (!allQualifiedIds.has(to)) {
+    errors.push(`${prefix}.to: "${to}" does not resolve to a pod member`);
+  }
+
+  // Same-pod check: cross-pod edges must reference different pods
+  if (typeof from === "string" && typeof to === "string" && from.includes(".") && to.includes(".")) {
+    const fromPod = from.split(".")[0];
+    const toPod = to.split(".")[0];
+    if (fromPod === toPod) {
+      errors.push(`${prefix}: cross-pod edge must reference different pods (both reference "${fromPod}"); use pod-local edges instead`);
+    }
+  }
+
+  return errors;
+}
+
+function validateServicesBlock(raw: unknown, prefix: string): string[] {
+  if (!raw || typeof raw !== "object") return [`${prefix}: must be an object`];
+
+  const obj = raw as Record<string, unknown>;
+  const errors: string[] = [];
+
+  if (!obj["kind"] || typeof obj["kind"] !== "string" || !VALID_SERVICES_KIND.has(obj["kind"] as string)) {
+    errors.push(`${prefix}.kind: must be one of ${[...VALID_SERVICES_KIND].join(", ")} (got "${obj["kind"]}")`);
+  }
+
+  if (!obj["compose_file"] || typeof obj["compose_file"] !== "string") {
+    errors.push(`${prefix}.compose_file: required non-empty string`);
+  } else {
+    const pathErr = validateSafePath(obj["compose_file"] as string, `${prefix}.compose_file`);
+    if (pathErr) errors.push(pathErr);
+  }
+
+  if (obj["project_name"] !== undefined) {
+    if (typeof obj["project_name"] !== "string") {
+      errors.push(`${prefix}.project_name: must be a string`);
+    } else if (!COMPOSE_PROJECT_NAME_PATTERN.test(obj["project_name"] as string)) {
+      errors.push(`${prefix}.project_name: must match ${COMPOSE_PROJECT_NAME_PATTERN.source} (got "${obj["project_name"]}")`);
+    }
+  }
+
+  if (obj["profiles"] !== undefined) {
+    if (!Array.isArray(obj["profiles"])) {
+      errors.push(`${prefix}.profiles: must be an array`);
+    } else {
+      obj["profiles"].forEach((p, index) => {
+        if (typeof p !== "string" || !p) errors.push(`${prefix}.profiles[${index}]: must be a non-empty string`);
+      });
+    }
+  }
+
+  if (obj["down_policy"] !== undefined && !VALID_DOWN_POLICIES.has(obj["down_policy"] as string)) {
+    errors.push(`${prefix}.down_policy: must be one of ${[...VALID_DOWN_POLICIES].join(", ")} (got "${obj["down_policy"]}")`);
+  }
+
+  if (obj["wait_for"] !== undefined) {
+    if (!Array.isArray(obj["wait_for"])) {
+      errors.push(`${prefix}.wait_for: must be an array`);
+    } else {
+      for (let i = 0; i < (obj["wait_for"] as unknown[]).length; i++) {
+        errors.push(...validateWaitTarget((obj["wait_for"] as Record<string, unknown>[])[i]!, i, prefix));
+      }
+    }
+  }
+
+  if (obj["surfaces"] !== undefined) {
+    errors.push(...validateSurfaces(obj["surfaces"], prefix));
+  }
+
+  if (obj["checkpoints"] !== undefined) {
+    errors.push(...validateCheckpointHooks(obj["checkpoints"], prefix));
+  }
+
+  return errors;
+}
+
+function validateWaitTarget(raw: Record<string, unknown>, index: number, prefix: string): string[] {
+  const errors: string[] = [];
+  const targetPrefix = `${prefix}.wait_for[${index}]`;
+  const hasService = typeof raw["service"] === "string" && raw["service"];
+  const hasUrl = typeof raw["url"] === "string" && raw["url"];
+  const hasTcp = typeof raw["tcp"] === "string" && raw["tcp"];
+  const targetCount = [hasService, hasUrl, hasTcp].filter(Boolean).length;
+
+  if (targetCount === 0) {
+    errors.push(`${targetPrefix}: must define exactly one of service, url, or tcp`);
+  } else if (targetCount > 1) {
+    errors.push(`${targetPrefix}: must define exactly one of service, url, or tcp`);
+  }
+
+  if (hasService) {
+    if (!raw["condition"] || raw["condition"] !== "healthy") {
+      errors.push(`${targetPrefix}.condition: service targets must use condition "healthy"`);
+    }
+  }
+
+  if (raw["condition"] !== undefined && !VALID_WAIT_TARGET_CONDITIONS.has(raw["condition"] as string)) {
+    errors.push(`${targetPrefix}.condition: must be one of ${[...VALID_WAIT_TARGET_CONDITIONS].join(", ")} (got "${raw["condition"]}")`);
+  } else if (!hasService && raw["condition"] !== undefined) {
+    errors.push(`${targetPrefix}.condition: only service targets may specify condition`);
+  }
+
+  return errors;
+}
+
+function validateSurfaces(raw: unknown, prefix: string): string[] {
+  if (!raw || typeof raw !== "object") return [`${prefix}.surfaces: must be an object`];
+  const obj = raw as Record<string, unknown>;
+  const errors: string[] = [];
+
+  if (obj["urls"] !== undefined) {
+    if (!Array.isArray(obj["urls"])) {
+      errors.push(`${prefix}.surfaces.urls: must be an array`);
+    } else {
+      for (let i = 0; i < (obj["urls"] as unknown[]).length; i++) {
+        const url = (obj["urls"] as Record<string, unknown>[])[i]!;
+        if (!url["name"] || typeof url["name"] !== "string") {
+          errors.push(`${prefix}.surfaces.urls[${i}].name: required non-empty string`);
+        }
+        if (!url["url"] || typeof url["url"] !== "string") {
+          errors.push(`${prefix}.surfaces.urls[${i}].url: required non-empty string`);
+        }
+      }
+    }
+  }
+
+  if (obj["commands"] !== undefined) {
+    if (!Array.isArray(obj["commands"])) {
+      errors.push(`${prefix}.surfaces.commands: must be an array`);
+    } else {
+      for (let i = 0; i < (obj["commands"] as unknown[]).length; i++) {
+        const command = (obj["commands"] as Record<string, unknown>[])[i]!;
+        if (!command["name"] || typeof command["name"] !== "string") {
+          errors.push(`${prefix}.surfaces.commands[${i}].name: required non-empty string`);
+        }
+        if (!command["command"] || typeof command["command"] !== "string") {
+          errors.push(`${prefix}.surfaces.commands[${i}].command: required non-empty string`);
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+function validateCheckpointHooks(raw: unknown, prefix: string): string[] {
+  if (!raw || typeof raw !== "object") return [`${prefix}.checkpoints: must be an array`];
+  if (!Array.isArray(raw)) return [`${prefix}.checkpoints: must be an array`];
+
+  const errors: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const hook = raw[i] as Record<string, unknown>;
+    if (!hook["id"] || typeof hook["id"] !== "string") {
+      errors.push(`${prefix}.checkpoints[${i}].id: required non-empty string`);
+    }
+    if (!hook["export"] || typeof hook["export"] !== "string") {
+      errors.push(`${prefix}.checkpoints[${i}].export: required non-empty string`);
+    }
+    if (hook["import"] !== undefined && typeof hook["import"] !== "string") {
+      errors.push(`${prefix}.checkpoints[${i}].import: must be a string`);
+    }
+  }
+
+  return errors;
+}
+
+function normalizeServicesBlock(raw: unknown, rigName: string): RigServicesSpec | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  const waitFor = Array.isArray(obj["wait_for"])
+    ? (obj["wait_for"] as Record<string, unknown>[]).map((target) => normalizeWaitTarget(target))
+    : undefined;
+  const surfaces = obj["surfaces"] ? normalizeSurfaces(obj["surfaces"]) : undefined;
+  const checkpoints = Array.isArray(obj["checkpoints"])
+    ? (obj["checkpoints"] as Record<string, unknown>[]).map((hook) => normalizeCheckpointHook(hook))
+    : undefined;
+
+  return {
+    kind: obj["kind"] as "compose",
+    composeFile: obj["compose_file"] as string,
+    projectName: obj["project_name"] as string | undefined ?? deriveComposeProjectName(rigName),
+    profiles: Array.isArray(obj["profiles"]) ? (obj["profiles"] as string[]) : undefined,
+    downPolicy: obj["down_policy"] as RigServicesSpec["downPolicy"] | undefined,
+    waitFor,
+    surfaces,
+    checkpoints,
+  };
+}
+
+function normalizeWaitTarget(raw: Record<string, unknown>): RigServicesWaitTarget {
+  return {
+    service: raw["service"] as string | undefined,
+    condition: raw["condition"] as RigServicesWaitTarget["condition"] | undefined,
+    url: raw["url"] as string | undefined,
+    tcp: raw["tcp"] as string | undefined,
+  };
+}
+
+function normalizeSurfaces(raw: unknown): RigServicesSurface | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  return {
+    urls: Array.isArray(obj["urls"])
+      ? (obj["urls"] as Record<string, unknown>[]).map((u) => ({ name: u["name"] as string, url: u["url"] as string }))
+      : undefined,
+    commands: Array.isArray(obj["commands"])
+      ? (obj["commands"] as Record<string, unknown>[]).map((c) => ({ name: c["name"] as string, command: c["command"] as string }))
+      : undefined,
+  };
+}
+
+function normalizeCheckpointHook(raw: Record<string, unknown>): RigServicesCheckpointHook {
+  return {
+    id: raw["id"] as string,
+    exportCommand: raw["export"] as string,
+    importCommand: raw["import"] as string | undefined,
+  };
+}
+
+function validateContinuityPolicy(raw: unknown, prefix: string): string[] {
+  if (typeof raw !== "object" || raw === null) return [`${prefix}: must be an object`];
+  const obj = raw as Record<string, unknown>;
+  const errors: string[] = [];
+
+  if (typeof obj["enabled"] !== "boolean") {
+    errors.push(`${prefix}.enabled: required boolean`);
+  }
+  if (obj["sync_triggers"] !== undefined) {
+    if (!Array.isArray(obj["sync_triggers"])) {
+      errors.push(`${prefix}.sync_triggers: must be an array`);
+    } else {
+      for (const t of obj["sync_triggers"] as string[]) {
+        if (!VALID_SYNC_TRIGGERS.has(t)) {
+          errors.push(`${prefix}.sync_triggers: invalid trigger "${t}"; must be one of ${[...VALID_SYNC_TRIGGERS].join(", ")}`);
+        }
+      }
+    }
+  }
+
+  if (obj["artifacts"] !== undefined) {
+    if (typeof obj["artifacts"] !== "object" || obj["artifacts"] === null || Array.isArray(obj["artifacts"])) {
+      errors.push(`${prefix}.artifacts: must be an object`);
+    } else {
+      const art = obj["artifacts"] as Record<string, unknown>;
+      for (const key of ["session_log", "restore_brief", "quiz"]) {
+        if (art[key] !== undefined && typeof art[key] !== "boolean") {
+          errors.push(`${prefix}.artifacts.${key}: must be a boolean`);
+        }
+      }
+    }
+  }
+
+  if (obj["restore_protocol"] !== undefined) {
+    if (typeof obj["restore_protocol"] !== "object" || obj["restore_protocol"] === null || Array.isArray(obj["restore_protocol"])) {
+      errors.push(`${prefix}.restore_protocol: must be an object`);
+    } else {
+      const rp = obj["restore_protocol"] as Record<string, unknown>;
+      for (const key of ["peer_driven", "verify_via_quiz"]) {
+        if (rp[key] !== undefined && typeof rp[key] !== "boolean") {
+          errors.push(`${prefix}.restore_protocol.${key}: must be a boolean`);
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+// -- Normalization helpers --
+
+function normalizeStarterRef(raw: unknown): import("./types.js").StarterRefSpec | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const sr = raw as Record<string, unknown>;
+  const name = sr["name"];
+  if (typeof name !== "string" || name.trim() === "") return undefined;
+  return { name };
+}
+
+function normalizeSessionSource(raw: unknown): import("./types.js").SessionSourceSpec | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const ss = raw as Record<string, unknown>;
+  const mode = ss["mode"];
+  const ref = ss["ref"];
+  if (ref === null || typeof ref !== "object") return undefined;
+  const refRec = ref as Record<string, unknown>;
+  if (mode === "fork") {
+    const kind = refRec["kind"];
+    if (kind !== "native_id" && kind !== "artifact_path" && kind !== "name" && kind !== "last") return undefined;
+    const value = typeof refRec["value"] === "string" ? (refRec["value"] as string) : undefined;
+    return { mode: "fork", ref: { kind, ...(value !== undefined ? { value } : {}) } };
+  }
+  if (mode === "rebuild") {
+    const kind = refRec["kind"];
+    if (kind !== "artifact_set") return undefined;
+    const value = refRec["value"];
+    if (!Array.isArray(value)) return undefined;
+    const paths: string[] = [];
+    for (const p of value) {
+      if (typeof p === "string" && p.trim() !== "") paths.push(p);
+    }
+    if (paths.length === 0) return undefined;
+    return { mode: "rebuild", ref: { kind: "artifact_set", value: paths } };
+  }
+  // PL-016 Item 4: agent_image session source.
+  if (mode === "agent_image") {
+    const kind = refRec["kind"];
+    if (kind !== "image_name") return undefined;
+    const value = refRec["value"];
+    if (typeof value !== "string" || value.trim() === "") return undefined;
+    const versionRaw = refRec["version"];
+    const version = versionRaw === undefined ? undefined : String(versionRaw);
+    return {
+      mode: "agent_image",
+      ref: { kind: "image_name", value, ...(version !== undefined ? { version } : {}) },
+    };
+  }
+  return undefined;
+}
+
+function normalizePod(raw: Record<string, unknown>): RigSpecPod {
+  const members = (raw["members"] as Record<string, unknown>[]).map((m) => ({
+    id: m["id"] as string,
+    label: m["label"] as string | undefined,
+    agentRef: m["agent_ref"] as string,
+    profile: m["profile"] as string,
+    runtime: m["runtime"] as string,
+    codexConfigProfile: m["codex_config_profile"] as string | undefined,
+    model: m["model"] as string | undefined,
+    effort: typeof m["effort"] === "string" && m["effort"].trim() ? m["effort"].trim() : undefined,
+    role: m["role"] as string | undefined,
+    permissionPolicy: m["permission_policy"] as string | undefined,
+    cwd: m["cwd"] as string,
+    restorePolicy: m["restore_policy"] as string | undefined,
+    // OPR.0.5.6.20 A5 — aliases normalize at ingestion; absent stays undefined so the
+    // resolver's F-6 default remains the one authority for absence.
+    compactionStrategy: m["compaction_strategy"] !== undefined
+      ? (canonicalCompactionStrategy(m["compaction_strategy"] as string) ?? undefined)
+      : undefined,
+    mechanic: m["mechanic"] !== undefined
+      ? (canonicalContinuityMechanic(m["mechanic"]) ?? undefined)
+      : undefined,
+    startup: m["startup"] ? normalizeStartupBlock(m["startup"]) : undefined,
+    sessionSource: normalizeSessionSource(m["session_source"]),
+    starterRef: normalizeStarterRef(m["starter_ref"]),
+  }));
+
+  const edges = Array.isArray(raw["edges"])
+    ? (raw["edges"] as Record<string, unknown>[]).map((e) => ({
+        kind: e["kind"] as string,
+        from: e["from"] as string,
+        to: e["to"] as string,
+      }))
+    : [];
+
+  const cp = raw["continuity_policy"] as Record<string, unknown> | undefined;
+
+  return {
+    id: raw["id"] as string,
+    label: raw["label"] as string,
+    summary: raw["summary"] as string | undefined,
+    continuityPolicy: cp ? {
+      enabled: cp["enabled"] as boolean,
+      syncTriggers: cp["sync_triggers"] as string[] | undefined,
+      artifacts: cp["artifacts"] && typeof cp["artifacts"] === "object" ? {
+        sessionLog: (cp["artifacts"] as Record<string, unknown>)["session_log"] as boolean | undefined,
+        restoreBrief: (cp["artifacts"] as Record<string, unknown>)["restore_brief"] as boolean | undefined,
+        quiz: (cp["artifacts"] as Record<string, unknown>)["quiz"] as boolean | undefined,
+      } : undefined,
+      restoreProtocol: cp["restore_protocol"] && typeof cp["restore_protocol"] === "object" ? {
+        peerDriven: (cp["restore_protocol"] as Record<string, unknown>)["peer_driven"] as boolean | undefined,
+        verifyViaQuiz: (cp["restore_protocol"] as Record<string, unknown>)["verify_via_quiz"] as boolean | undefined,
+      } : undefined,
+    } : undefined,
+    startup: raw["startup"] ? normalizeStartupBlock(raw["startup"]) : undefined,
+    members,
+    edges,
+  };
+}
+
+// -- Legacy flat-node RigSpec validation (pre-reboot) --
+// TODO: Remove when AS-T08b/AS-T12 migrate all consumers
+
+const LEGACY_KNOWN_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp"]);
+const LEGACY_KNOWN_RESTORE_POLICIES = new Set(["resume_if_possible", "relaunch_fresh", "checkpoint_only"]);
+const LEGACY_KNOWN_EDGE_KINDS = new Set(["delegates_to", "spawned_by", "can_observe"]);
+
+export class LegacyRigSpecSchema {
+  static validate(raw: unknown): ValidationResult {
+    const errors: string[] = [];
+    // OPR.0.5.3.3 (r2 HIGH-1): the legacy auto-detected path must ALSO surface alias-pin
+    // advisories — fail-open, never affecting valid/errors (the pod-aware path already does).
+    const advisories: string[] = [];
+
+    if (!raw || typeof raw !== "object") {
+      return { valid: false, errors: ["spec must be an object"] };
+    }
+
+    const obj = raw as Record<string, unknown>;
+
+    if (obj["schema_version"] != null && obj["schema_version"] !== 1) {
+      errors.push(`schema_version must be 1, got ${obj["schema_version"]}`);
+    }
+
+    if (!obj["name"] || typeof obj["name"] !== "string") {
+      errors.push("name is required and must be a string");
+    }
+    if (!obj["version"] || typeof obj["version"] !== "string") {
+      errors.push("version is required and must be a string");
+    }
+
+    if (!obj["nodes"] || !Array.isArray(obj["nodes"])) {
+      errors.push("nodes is required and must be an array");
+    }
+
+    if (obj["edges"] !== undefined && !Array.isArray(obj["edges"])) {
+      errors.push("edges must be an array if present");
+    }
+
+    const nodeIds = new Set<string>();
+    if (Array.isArray(obj["nodes"])) {
+      for (const node of obj["nodes"] as Record<string, unknown>[]) {
+        // OPR.0.5.3.3 (r2 HIGH-1, round 2): the alias advisory is INDEPENDENT of id validity — a
+        // fable-pinned node still needs the migration nudge even when it fails the id guard below.
+        // Collect it BEFORE the early continue, with a `?` fallback location (mirrors the pod-aware path).
+        const nodeWhere = typeof node["id"] === "string" && node["id"] ? (node["id"] as string) : "?";
+        const pinAdvisory = aliasModelPinAdvisory(node["model"], `nodes.${nodeWhere}`);
+        if (pinAdvisory) advisories.push(pinAdvisory);
+
+        if (!node["id"] || typeof node["id"] !== "string") {
+          errors.push("each node must have a string id");
+          continue;
+        }
+
+        if (nodeIds.has(node["id"] as string)) {
+          errors.push(`duplicate node id: ${node["id"]}`);
+        }
+        nodeIds.add(node["id"] as string);
+
+        if (!node["runtime"] || typeof node["runtime"] !== "string") {
+          errors.push(`node ${node["id"]}: runtime is required`);
+        } else if (!LEGACY_KNOWN_RUNTIMES.has(node["runtime"] as string)) {
+          errors.push(`node ${node["id"]}: unknown runtime '${node["runtime"]}'`);
+        }
+
+        if (node["effort"] !== undefined) {
+          if (typeof node["effort"] !== "string" || !node["effort"].trim()) {
+            advisories.push(`nodes.${nodeWhere}.effort: non-string value "${node["effort"]}" ignored; effort must be a text value`);
+          }
+        }
+
+        if (node["restore_policy"] != null && !LEGACY_KNOWN_RESTORE_POLICIES.has(node["restore_policy"] as string)) {
+          errors.push(`node ${node["id"]}: unknown restorePolicy '${node["restore_policy"]}'`);
+        }
+
+        if (node["package_refs"] != null) {
+          if (!Array.isArray(node["package_refs"])) {
+            errors.push(`node ${node["id"]}: package_refs must be an array`);
+          } else if (!(node["package_refs"] as unknown[]).every((r) => typeof r === "string")) {
+            errors.push(`node ${node["id"]}: package_refs must contain only strings`);
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(obj["edges"])) {
+      for (const edge of obj["edges"] as Record<string, unknown>[]) {
+        const from = edge["from"] as string | undefined;
+        const to = edge["to"] as string | undefined;
+        const kind = edge["kind"] as string | undefined;
+
+        if (!from || typeof from !== "string") { errors.push("each edge must have a string 'from' field"); continue; }
+        if (!to || typeof to !== "string") { errors.push("each edge must have a string 'to' field"); continue; }
+        if (!kind || typeof kind !== "string") { errors.push("each edge must have a string 'kind' field"); continue; }
+
+        if (from === to) errors.push(`self-edge not allowed: ${from} -> ${to}`);
+        if (from && !nodeIds.has(from)) errors.push(`edge references nonexistent node: '${from}'`);
+        if (to && !nodeIds.has(to)) errors.push(`edge references nonexistent node: '${to}'`);
+        if (kind && !LEGACY_KNOWN_EDGE_KINDS.has(kind)) errors.push(`unknown edge kind: '${kind}'`);
+      }
+    }
+
+    return { valid: errors.length === 0, errors, ...(advisories.length ? { advisories } : {}) };
+  }
+
+  static normalize(raw: unknown): LegacyRigSpec {
+    const result = this.validate(raw);
+    if (!result.valid) {
+      throw new Error(`RigSpec validation failed: ${result.errors.join("; ")}`);
+    }
+
+    const obj = raw as Record<string, unknown>;
+    const rawNodes = obj["nodes"] as Record<string, unknown>[];
+    const rawEdges = (obj["edges"] as Record<string, unknown>[] | undefined) ?? [];
+
+    const nodes: LegacyRigSpecNode[] = rawNodes.map((n) => ({
+      id: n["id"] as string,
+      runtime: n["runtime"] as string,
+      role: (n["role"] as string) ?? undefined,
+      model: (n["model"] as string) ?? undefined,
+      effort: typeof n["effort"] === "string" && n["effort"].trim() ? n["effort"].trim() : undefined,
+      cwd: (n["cwd"] as string) ?? undefined,
+      surfaceHint: (n["surface_hint"] as string) ?? undefined,
+      workspace: (n["workspace"] as string) ?? undefined,
+      restorePolicy: (n["restore_policy"] as string) ?? "resume_if_possible",
+      packageRefs: (n["package_refs"] as string[]) ?? [],
+    }));
+
+    const edges: LegacyRigSpecEdge[] = rawEdges.map((e) => ({
+      from: e["from"] as string,
+      to: e["to"] as string,
+      kind: e["kind"] as string,
+    }));
+
+    return {
+      schemaVersion: (obj["schema_version"] as number) ?? 1,
+      name: obj["name"] as string,
+      version: obj["version"] as string,
+      nodes,
+      edges,
+    };
+  }
+}

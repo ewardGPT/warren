@@ -1,0 +1,7 @@
+# Build artifacts assembled by scripts/build-package.sh
+daemon/
+ui/
+
+# Root license and README copied by the CLI build
+/LICENSE
+/README.md

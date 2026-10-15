@@ -1,0 +1,73 @@
+#!/usr/bin/env -S node --import tsx
+/*
+ * Slice 51-02 - the STANDALONE scenario runner entry (config-wrapper-code; NOT a
+ * rig-test verb). Runs one or more scenario YAML files against a forced-local,
+ * hermetic scenario-local daemon and prints a PASS/FAIL results ledger.
+ *
+ * Usage (the tsx loader is needed for the TS pipeline import; the shebang wires it
+ * when the file is executed directly, otherwise invoke via node --import tsx):
+ *   packages/daemon/scripts/run-scenarios.mjs [scenario.yaml ...]
+ *   node --import tsx packages/daemon/scripts/run-scenarios.mjs [scenario.yaml ...]
+ *
+ * With no args it runs the committed evidence scenarios under
+ * test/fixtures/scenarios/. Prerequisite: the built rig bin (npm run build -w
+ * packages/cli and -w packages/daemon). The up step stands up real tmux seats on a
+ * server the hermetic scaffold OWNS (it sets TMUX_TMPDIR itself), so a run cannot
+ * reach the operator/fleet server. This runner passes the scaffold only HOME, PATH
+ * and TERM, so an ambient TMUX (and any daemon variable) is dropped rather than
+ * refused, and running from inside tmux is safe.
+ *
+ * The equals mode uses the runner-internal normalizer seam (lock amendment A-N1)
+ * with an IDENTITY placeholder here; the DECLARATIVE mapping is the scenario-facing
+ * form, its shape rides 51-03, and it lowers to this seam when it lands. So a
+ * cross-surface scenario exercises the equals path but is not expected green until
+ * 51-03 supplies the real mapping.
+ */
+import { readdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { runScenarioFile } from "../test/helpers/scenario-pipeline.ts";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DAEMON_ROOT = resolve(HERE, "..");
+const RIG_BIN = resolve(DAEMON_ROOT, "..", "cli", "dist", "bin-wrapper.js");
+const FIXTURES = join(DAEMON_ROOT, "test", "fixtures", "scenarios");
+
+const argv = process.argv.slice(2);
+
+// B12-S safety refusal (ruled). This runner takes scenario YAML paths ONLY. Before this
+// guard, a dash-prefixed arg was resolve()'d into a bogus path that threw mid-loop and was
+// counted as one failed "scenario" WHILE the remaining files still ran in host-mode — so
+// `run-scenarios.mjs --container x.yaml` printed one [ERROR] plus a partial-success summary
+// that a reader could mistake for container mode having run. Refuse BEFORE anything executes
+// so an unknown flag runs ZERO scenarios (no PASS/FAIL lines, no partial summary). A flagless
+// invocation is byte-identical to before.
+const flagArg = argv.find((a) => a.startsWith("-"));
+if (flagArg) {
+  console.error(`[REFUSED] unknown flag '${flagArg}' — this runner takes scenario YAML paths only; container mode is not a flag (see slice 15).`);
+  process.exit(2);
+}
+
+const files = argv.length > 0
+  ? argv.map((a) => resolve(a))
+  : readdirSync(FIXTURES).filter((f) => /^scenario-.*\.ya?ml$/.test(f)).sort().map((f) => join(FIXTURES, f));
+
+const baseEnv = { HOME: process.env.HOME, PATH: process.env.PATH, TERM: "xterm" };
+const deps = { normalizer: (_surface, value) => value }; // v1 identity placeholder (rides 51-03)
+
+let failures = 0;
+for (const file of files) {
+  try {
+    const result = await runScenarioFile(file, { rigBin: RIG_BIN, baseEnv, deps });
+    const tag = result.verdict === "PASS" ? "PASS" : "FAIL";
+    let line = `[${tag}] ${result.scenario}`;
+    if (result.verdict === "FAIL") line += `\n  step ${result.failedStep}: ${result.diff}`;
+    console.log(line);
+    if (result.verdict !== "PASS") failures++;
+  } catch (err) {
+    failures++;
+    console.log(`[ERROR] ${file}\n  ${(err && err.message) || err}`);
+  }
+}
+console.log(`\n${files.length - failures}/${files.length} scenarios passed`);
+process.exit(failures > 0 ? 1 : 0);

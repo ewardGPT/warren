@@ -1,0 +1,215 @@
+{
+  "schema": "openrig.health-replay/v0alpha1",
+  "sourceCut": "dbf05f9d59ef3b0ae14fc00174c643df4858d45a",
+  "cases": {
+    "staleConductor": {
+      "origin": "release-0.5.9-recorded-incident",
+      "productOutcomeCensus": { "availability": "unavailable", "reason": "This full-day window includes real slice advances but retains no sourced product-outcome census. Transition and auto-unpark identity do not establish a ceremony ratio." },
+      "scope": { "type": "mission", "projectId": "openrig", "missionId": "release-0.5.9" },
+      "lineage": "qitem-r059-mission-conductor-20260903",
+      "window": {
+        "startedAt": "2026-09-03T05:31:55.887Z",
+        "endedAt": "2026-09-04T04:51:31.138Z"
+      },
+      "priority": "urgent",
+      "tier": "deep",
+      "transitionIds": [
+        71520, 71523, 71524, 71526, 71527, 71531, 71532, 71533, 71534, 71548,
+        71549, 71550, 71551, 71554, 71555, 71557, 71558, 71573, 71580, 71581,
+        71582, 71583, 71593, 71594, 71595, 71596, 71611, 71617, 71618, 71619,
+        71620, 71623, 71624, 71631, 71632, 71654, 71673, 71674, 71675, 71687,
+        71688, 71689, 71692, 71693, 71694, 71695, 71700, 71701, 71702, 71708,
+        71711, 71712, 71715, 71716, 71719, 71721, 71722, 71729, 71730, 71733,
+        71734, 71737, 71749, 71750, 71751, 71752, 71758, 71759, 71760, 71761,
+        71775, 71776, 71785, 71786, 71797, 71798, 71799, 71800, 71814, 71815,
+        71818, 71819, 71827, 71828, 71829, 71830, 71835, 71843, 71844, 71849,
+        71852, 71977, 71986, 71990, 71992, 71997, 71998, 71999, 72006, 72010,
+        72011, 72015, 72023, 72024, 72029, 72032, 72036, 72039, 72040, 72044,
+        72045, 72046, 72049, 72053, 72054, 72055, 72059, 72062, 72063, 72069,
+        72070, 72082, 72083, 72087, 72088, 72094, 72095, 72103, 72104, 72109,
+        72110, 72114, 72115, 72119, 72120, 72121, 72122, 72126, 72127, 72131,
+        72132, 72138, 72139, 72141, 72142, 72146, 72147, 72151, 72152, 72156,
+        72157, 72158, 72159, 72163, 72164, 72170, 72171, 72179, 72180, 72181,
+        72182, 72192, 72193, 72197, 72198, 72211, 72212, 72213, 72225, 72235,
+        72236, 72242, 72261, 72306, 72345, 72346, 72348, 72357, 72358, 72360,
+        72370, 72451, 72621, 72622, 72623, 72650, 72651, 72658, 72659, 72678,
+        72679, 72686, 72759, 72820, 72826, 72855, 72873, 72874, 72875, 72877,
+        72886, 72894, 72913, 72935, 72938, 72939, 72941, 72950, 72963, 72970,
+        72973, 72975, 72981, 72983, 72988, 72997, 72998, 73001, 73002, 73008,
+        73009, 73013, 73014, 73025, 73026, 73029, 73030, 73035, 73036, 73038,
+        73039, 73042, 73043, 73045, 73046, 73052, 73053, 73055, 73056, 73062,
+        73063, 73069, 73070, 73075, 73076, 73081, 73082, 73210, 73219, 73222,
+        73233, 73242, 73252, 73257, 73264, 73275, 73306
+      ],
+      "clearingTransition": {
+        "transitionId": 73306,
+        "observedAt": "2026-09-04T04:51:31.138Z",
+        "state": "done",
+        "closureReason": "no-follow-on"
+      },
+      "autoUnparks": [
+        { "transitionId": 71531, "observedAt": "2026-09-03T05:40:38.998Z", "blockerId": "qitem-20260903052145-052abfb3" },
+        { "transitionId": 71554, "observedAt": "2026-09-03T05:53:09.806Z", "blockerId": "qitem-20260903054038-984a6542" },
+        { "transitionId": 71580, "observedAt": "2026-09-03T06:04:30.354Z", "blockerId": "qitem-20260903055309-92ee2d64" },
+        { "transitionId": 71593, "observedAt": "2026-09-03T06:12:29.386Z", "blockerId": "qitem-20260903060430-968946a4" },
+        { "transitionId": 71623, "observedAt": "2026-09-03T06:21:09.086Z", "blockerId": "qitem-20260903061229-04c4feaa" },
+        { "transitionId": 71673, "observedAt": "2026-09-03T06:48:02.286Z", "blockerId": "qitem-20260903062109-e34ff43f" },
+        { "transitionId": 71687, "observedAt": "2026-09-03T07:00:44.603Z", "blockerId": "qitem-20260903064802-b7b4ea31" },
+        { "transitionId": 71700, "observedAt": "2026-09-03T07:10:09.990Z", "blockerId": "qitem-20260903070044-a3b8b6eb" },
+        { "transitionId": 71715, "observedAt": "2026-09-03T07:19:25.071Z", "blockerId": "qitem-20260903071009-cd4d02eb" },
+        { "transitionId": 71729, "observedAt": "2026-09-03T07:30:21.428Z", "blockerId": "qitem-20260903071925-191e4270" },
+        { "transitionId": 71749, "observedAt": "2026-09-03T07:44:16.375Z", "blockerId": "qitem-20260903073021-75d1d2cd" },
+        { "transitionId": 71758, "observedAt": "2026-09-03T07:51:26.828Z", "blockerId": "qitem-20260903074416-4aab49b7" },
+        { "transitionId": 71775, "observedAt": "2026-09-03T07:59:27.905Z", "blockerId": "qitem-20260903075126-78e60683" },
+        { "transitionId": 71797, "observedAt": "2026-09-03T08:17:06.213Z", "blockerId": "qitem-20260903075927-5f340237" },
+        { "transitionId": 71814, "observedAt": "2026-09-03T08:27:02.031Z", "blockerId": "qitem-r059-s07-mission-page-reset-20260903" },
+        { "transitionId": 71827, "observedAt": "2026-09-03T08:35:07.340Z", "blockerId": "qitem-20260903082702-1d9577b3" },
+        { "transitionId": 71843, "observedAt": "2026-09-03T08:42:03.242Z", "blockerId": "qitem-r059-s07-table-diagram-audition-20260903" },
+        { "transitionId": 71997, "observedAt": "2026-09-03T11:07:35.866Z", "blockerId": "qitem-20260903105334-8d361315" },
+        { "transitionId": 72010, "observedAt": "2026-09-03T11:18:46.864Z", "blockerId": "qitem-20260903110735-d02348c9" },
+        { "transitionId": 72023, "observedAt": "2026-09-03T11:29:40.908Z", "blockerId": "qitem-20260903111846-8dd4d2bf" },
+        { "transitionId": 72044, "observedAt": "2026-09-03T11:48:44.818Z", "blockerId": "qitem-20260903113018-27eb901d" },
+        { "transitionId": 72053, "observedAt": "2026-09-03T12:11:08.137Z", "blockerId": "qitem-20260903114844-0f20e318" },
+        { "transitionId": 72062, "observedAt": "2026-09-03T12:17:27.160Z", "blockerId": "qitem-20260903121108-7993dbc8" },
+        { "transitionId": 72082, "observedAt": "2026-09-03T12:42:02.367Z", "blockerId": "qitem-20260903122203-dc00a57a" },
+        { "transitionId": 72094, "observedAt": "2026-09-03T12:56:39.469Z", "blockerId": "qitem-20260903124321-41ea3fab" },
+        { "transitionId": 72109, "observedAt": "2026-09-03T13:04:00.013Z", "blockerId": "qitem-20260903125639-d5921e14" },
+        { "transitionId": 72119, "observedAt": "2026-09-03T13:14:47.212Z", "blockerId": "qitem-20260903130400-fbd0c353" },
+        { "transitionId": 72126, "observedAt": "2026-09-03T13:20:06.916Z", "blockerId": "qitem-20260903131447-e1606abb" },
+        { "transitionId": 72138, "observedAt": "2026-09-03T13:27:11.617Z", "blockerId": "qitem-20260903132102-70e765e7" },
+        { "transitionId": 72146, "observedAt": "2026-09-03T13:32:44.917Z", "blockerId": "qitem-20260903132711-ee3ccdfe" },
+        { "transitionId": 72156, "observedAt": "2026-09-03T13:40:40.387Z", "blockerId": "qitem-20260903133522-e7699e91" },
+        { "transitionId": 72163, "observedAt": "2026-09-03T13:48:36.474Z", "blockerId": "qitem-20260903134040-f4ef85dc" },
+        { "transitionId": 72179, "observedAt": "2026-09-03T14:01:25.620Z", "blockerId": "qitem-20260903135123-e10e19c0" },
+        { "transitionId": 72192, "observedAt": "2026-09-03T14:08:28.378Z", "blockerId": "qitem-20260903140125-7025a032" },
+        { "transitionId": 72211, "observedAt": "2026-09-03T14:29:07.935Z", "blockerId": "qitem-20260903141003-b7c79780" },
+        { "transitionId": 72235, "observedAt": "2026-09-03T14:41:11.061Z", "blockerId": "qitem-20260903142907-b3bbe81f" },
+        { "transitionId": 72345, "observedAt": "2026-09-03T16:43:46.474Z", "blockerId": "qitem-20260903144417-dd3d4091" },
+        { "transitionId": 72357, "observedAt": "2026-09-03T16:58:17.561Z", "blockerId": "qitem-20260903164346-e7f1612d" },
+        { "transitionId": 72621, "observedAt": "2026-09-03T20:08:40.234Z", "blockerId": "qitem-20260903170234-49322bb2" },
+        { "transitionId": 72650, "observedAt": "2026-09-03T20:21:27.472Z", "blockerId": "qitem-20260903200840-135b2e74" },
+        { "transitionId": 72678, "observedAt": "2026-09-03T20:28:30.436Z", "blockerId": "qitem-20260903202210-5e723814" },
+        { "transitionId": 72886, "observedAt": "2026-09-03T21:44:57.344Z", "blockerId": "qitem-20260903205701-ee667a3d" },
+        { "transitionId": 72970, "observedAt": "2026-09-03T23:05:51.558Z", "blockerId": "qitem-r059-s11-live-qa-visual-interaction-correction-20260903" },
+        { "transitionId": 72981, "observedAt": "2026-09-03T23:16:22.872Z", "blockerId": "qitem-20260903230551-77de6597" },
+        { "transitionId": 72997, "observedAt": "2026-09-03T23:33:59.279Z", "blockerId": "qitem-20260903214840-84d4b1ef" },
+        { "transitionId": 73008, "observedAt": "2026-09-03T23:51:28.315Z", "blockerId": "qitem-20260903233359-6edc8c17" },
+        { "transitionId": 73025, "observedAt": "2026-09-04T00:03:00.733Z", "blockerId": "qitem-r059-s12-instance-mission-control-builder-20260903" },
+        { "transitionId": 73035, "observedAt": "2026-09-04T00:11:59.598Z", "blockerId": "qitem-20260904000300-5c1c6832" },
+        { "transitionId": 73042, "observedAt": "2026-09-04T00:16:33.937Z", "blockerId": "qitem-20260904001159-47095832" },
+        { "transitionId": 73052, "observedAt": "2026-09-04T00:30:46.595Z", "blockerId": "qitem-20260904001633-fc3b5d71" },
+        { "transitionId": 73062, "observedAt": "2026-09-04T00:46:53.894Z", "blockerId": "qitem-20260904003046-9a3bddb2" },
+        { "transitionId": 73075, "observedAt": "2026-09-04T00:59:47.904Z", "blockerId": "qitem-20260904005155-43ec6a81" }
+      ],
+      "watchdog": {
+        "jobId": "01M1JW1Q2K0XRE2HNHPH68P1QH",
+        "policy": "periodic-reminder",
+        "registeredAt": "2026-09-03T05:32:13.267Z",
+        "intervalSeconds": 900,
+        "stateAtEnd": "stopped",
+        "directiveScope": "universal-builder-return",
+        "requiredSequence": ["builder", "qa", "r2"]
+      }
+    },
+    "signedQuiescence": {
+      "origin": "release-0.5.9-recorded-counterexample",
+      "scope": { "type": "instance", "instanceId": "openrig-build-vm" },
+      "window": { "startedAt": "2026-09-04T05:10:58Z", "endedAt": null },
+      "authority": {
+        "receiptId": "r059-s05-f82397698-signed-quiescence",
+        "state": "clear",
+        "candidate": "f82397698a41c984d1471104bc1cece5586b0467",
+        "executor": "single-bounded-operator",
+        "effectCount": 1,
+        "stopOnMismatch": true
+      },
+      "protectedSeats": [
+        "seat-01", "seat-02", "seat-03", "seat-04", "seat-05", "seat-06", "seat-07", "seat-08",
+        "seat-09", "seat-10", "seat-11", "seat-12", "seat-13", "seat-14", "seat-15", "seat-16"
+      ],
+      "inFlightHeavyProcesses": [],
+      "independentEffects": []
+    },
+    "scopeAdmissionCandidate": {
+      "origin": "release-0.5.9-s13-reviewed-technical-subject",
+      "scope": { "type": "slice", "projectId": "openrig", "missionId": "release-0.5.9", "sliceId": "OPR.0.5.9.13" },
+      "technicalReview": {
+        "candidate": "857d05a0dc91b0eb0793a475820b55255783ed48",
+        "base": "128e87deb9121e0bc038747f3b50a798c50186f2",
+        "reviewedAt": "2026-09-04T03:31:00Z",
+        "outcome": "CLEAR",
+        "source": {
+          "artifact": "state/review50/r059-s13-effective-model-identity-r2-CLEAR-857d05a0d-20260904.md",
+          "sha256": "c84a013b72a98d75249972b3a78e3e2a366a718d2488269c1da9e7f72de5d0ed"
+        }
+      },
+      "governingAuthorityEvidence": {
+        "availability": "unavailable",
+        "reason": "release policy and admission authority were not available as one structured record"
+      }
+    },
+    "naturalContextClear": {
+      "origin": "release-0.5.10-refresh-observation",
+      "scope": { "type": "seat", "rigId": "build-rig", "seatId": "stable-seat-a" },
+      "reportedAt": "2026-09-05T07:40:00Z",
+      "nativeResumeIdentity": "same-native-continuation-a",
+      "observations": [
+        { "sourceOrder": 0, "state": "pressure", "usedPercentageRange": [83, 85] },
+        { "sourceOrder": 1, "state": "naturally-cleared", "usedPercentageRange": [29, 31] }
+      ],
+      "stableSeatIdentity": true,
+      "inheritedQueueCustody": 0,
+      "intervention": null
+    },
+    "ordinaryControls": [
+      {
+        "id": "single-proportional-review",
+        "kind": "queue-transition",
+        "events": [
+          { "sourceOrder": 0, "observedAt": "2026-08-01T10:00:00Z", "state": "in-progress" },
+          { "sourceOrder": 1, "observedAt": "2026-08-01T10:30:00Z", "state": "handed-off" },
+          { "sourceOrder": 2, "observedAt": "2026-08-01T10:45:00Z", "state": "done" }
+        ]
+      },
+      {
+        "id": "one-recovery-wake",
+        "kind": "watchdog-history",
+        "events": [
+          { "sourceOrder": 0, "observedAt": "2026-08-01T11:00:00Z", "outcome": "sent" },
+          { "sourceOrder": 1, "observedAt": "2026-08-01T11:01:00Z", "outcome": "owner-resumed" }
+        ]
+      },
+      {
+        "id": "native-blocker-wake",
+        "kind": "queue-transition",
+        "events": [
+          { "sourceOrder": 0, "observedAt": "2026-08-01T12:00:00Z", "state": "blocked" },
+          { "sourceOrder": 1, "observedAt": "2026-08-01T12:30:00Z", "state": "auto-unparked" }
+        ]
+      },
+      {
+        "id": "productive-volume",
+        "kind": "work-graph",
+        "events": [
+          { "sourceOrder": 0, "observedAt": "2026-08-01T13:00:00Z", "candidate": "candidate-a" },
+          { "sourceOrder": 1, "observedAt": "2026-08-01T13:15:00Z", "candidate": "candidate-b" },
+          { "sourceOrder": 2, "observedAt": "2026-08-01T13:30:00Z", "candidate": "candidate-c" }
+        ]
+      },
+      {
+        "id": "stale-context",
+        "kind": "context-usage",
+        "events": [
+          { "sourceOrder": 0, "observedAt": "2026-08-01T10:00:00Z", "usedPercentage": 96, "fresh": false }
+        ]
+      },
+      {
+        "id": "unavailable-context",
+        "kind": "context-usage",
+        "events": [
+          { "sourceOrder": 0, "observedAt": null, "usedPercentage": null, "fresh": false }
+        ]
+      }
+    ]
+  }
+}

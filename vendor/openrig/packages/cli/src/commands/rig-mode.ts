@@ -1,0 +1,634 @@
+// Slice 09 (OPR.0.3.2.9) — `rig mode` CLI (renamed from `rig policy`, 0.5.2 B7 — clean rename, zero adoption; `rig policy` is now the permission-policy verb): operator-context-mode
+// surface. Pairs with the daemon's typed-primitive store.
+//
+// Subcommands:
+//   rig mode set <mode> [--scope ...] [--qualifier ...] [--<field> ...]
+//                         [--evidence ...] [--confirm]
+//                         → restate-and-confirm; PUT only when --confirm
+//   rig mode show       → list all bindings (defaults to JSON-when-piped)
+//   rig mode effective  → resolve effective for a read context
+//   rig mode cite       → emit the citation line per convention §Component 5
+//   rig mode unset <scope> [qualifier]
+//                         → DELETE one binding (operator-only)
+//   rig mode defaults   → recommended 8×7 + per-mode scope + stale rule
+//
+// HG-4 / HG-7 anchored here:
+//   - `set` never silently applies. Without `--confirm` it echoes the
+//     proposed binding (mode + scope + key settings) and exits with
+//     `exit 2` so scripts cannot accidentally apply. `--confirm` is the
+//     explicit operator action.
+//   - Mode invocation: bare word OR `mode:<mode>` prefix; both normalize
+//     via disambiguateModeInvocation().
+//   - Citation format: short-prose per convention §Component 5 +
+//     §Citation Rules.
+
+import { Command } from "commander";
+import { DaemonClient, DaemonResponseError } from "../client.js";
+import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
+import { realDeps } from "./daemon.js";
+import type { StatusDeps } from "./status.js";
+import type { OperatingPosture } from "@openrig/daemon/health-projection";
+
+export interface RigModeDeps extends StatusDeps {}
+
+// Mirror of daemon enums + structure. We keep these inline so the CLI
+// doesn't grow a build-time dep on the daemon package; the validator
+// at the daemon edge is the source of truth, and the CLI sends the
+// record through unchanged.
+const MODES = ["sleep", "desk", "mobile", "away", "focus", "debug", "human-led", "delegated"] as const;
+type Mode = (typeof MODES)[number];
+
+const SCOPES = ["global_host", "rig", "project", "mission", "workstream", "qitem"] as const;
+type Scope = (typeof SCOPES)[number];
+
+// Convention §Component 4 — bare-word disambiguation. A bare reserved
+// mode word, or `mode:<word>`, becomes an invocation; embedded-in-
+// sentence does not (the latter is a CLI input error here since the
+// CLI takes a single-positional <mode> argument).
+function disambiguateModeInvocation(raw: string): Mode | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  const stripped = trimmed.startsWith("mode:") ? trimmed.slice("mode:".length).trim() : trimmed;
+  if (stripped.split(/\s+/).length !== 1) return null;
+  return (MODES as readonly string[]).includes(stripped) ? (stripped as Mode) : null;
+}
+
+interface RecommendedDefaultsResponse {
+  recommendedModeDefaults: Record<Mode, {
+    autonomy_scope: string;
+    heartbeat_cadence: string;
+    inspection_depth: string;
+    update_detail: string;
+    escalation_threshold: string;
+    concurrency_limit: string;
+    permission_prompt_posture: string;
+  }>;
+  recommendedDefaultScope: Record<Mode, Scope>;
+  defaultStaleRule: string;
+}
+
+interface BindingResponse {
+  binding: {
+    id: string;
+    mode: Mode;
+    record: Record<string, string>;
+    qualifier: string | null;
+    setAt: string;
+    setBy: string;
+  };
+}
+
+interface ListResponse {
+  bindings: Array<BindingResponse["binding"]>;
+}
+
+interface EffectiveResponse {
+  operatingPosture?: OperatingPosture;
+  effective: { binding: BindingResponse["binding"]; resolvedScope: Scope } | null;
+  categories?: { mode: BindingResponse["binding"] | null; posture: BindingResponse["binding"] | null };
+  posture: "known" | "unknown_posture";
+  hint?: string;
+}
+
+async function withClient<T>(
+  deps: RigModeDeps,
+  fn: (client: DaemonClient) => Promise<T>,
+): Promise<T | undefined> {
+  const status = await getDaemonStatus(deps.lifecycleDeps);
+  if (!daemonStatusGuard(status)) return undefined;
+  const client = deps.clientFactory(getDaemonUrl(status));
+  return fn(client);
+}
+
+type Binding = BindingResponse["binding"];
+type Category = "mode" | "posture";
+/** A saved legacy mode and an operating posture are kept separately at one target. */
+function categoryOf(mode: string): Category {
+  return mode === "human-led" || mode === "delegated" ? "posture" : "mode";
+}
+
+type WriteTargetState =
+  | { known: true; writeTarget: string; mode: Binding | null; posture: Binding | null }
+  | { known: false; reason: string };
+
+/** A binding as stored: an id, and one of the supported mode names (the store accepts no other). */
+const isBinding = (b: unknown): b is Binding =>
+  typeof b === "object" && b !== null && typeof (b as { id?: unknown }).id === "string"
+  && (MODES as readonly unknown[]).includes((b as { mode?: unknown }).mode);
+
+/** What is stored where a write of this category would land, as the daemon resolves that target (a posture through
+ *  its canonicalisation, a saved mode as given). Anything the daemon doesn't establish is unknown: a failed read, a
+ *  refusal, a malformed answer, or a daemon that doesn't name the write target (one that predates categories, where a
+ *  write replaces whatever binding is stored there). */
+async function writeTargetState(client: DaemonClient, scope: string, qualifier: string | null, category: Category): Promise<WriteTargetState> {
+  try {
+    const res = await client.get<Record<string, unknown>>(`/api/rig-mode/bindings/${scope}${qualifier ? `/${encodeURIComponent(qualifier)}` : ""}?for=${category}`);
+    const data = res.data;
+    if (res.status !== 200) {
+      const error = typeof data?.["error"] === "string" ? data["error"] : `HTTP ${res.status}`;
+      return { known: false, reason: res.status === 404 ? "this daemon doesn't report where this write lands" : error };
+    }
+    if (typeof data !== "object" || data === null || typeof data["writeTarget"] !== "string") {
+      return { known: false, reason: "this daemon doesn't report where this write lands" };
+    }
+    const bindings = data["bindings"];
+    // A successful answer is used only when it's usable: a named target, and bindings as stored.
+    if (data["writeTarget"] === "" || !Array.isArray(bindings) || !bindings.every(isBinding)) {
+      return { known: false, reason: "the daemon's answer was malformed" };
+    }
+    return { known: true, writeTarget: data["writeTarget"], mode: bindings.find((b) => categoryOf(b.mode) === "mode") ?? null,
+      posture: bindings.find((b) => categoryOf(b.mode) === "posture") ?? null };
+  } catch {
+    return { known: false, reason: "the read failed" };
+  }
+}
+
+/** Record fields OpenRig stores, validates and shows, but that nothing in OpenRig acts on yet. (`scope` is the
+ *  binding's key, and the operating-posture reader uses `evidence_citation`.) */
+const NOT_APPLIED_FIELDS = new Set([
+  "autonomy_scope", "heartbeat_cadence", "inspection_depth", "update_detail",
+  "escalation_threshold", "concurrency_limit", "permission_prompt_posture", "expiry_or_stale_rule",
+]);
+const NOT_APPLIED = "(stored; not applied)";
+const NOT_APPLIED_LEGEND = "fields marked (stored; not applied) are saved and shown, but nothing in OpenRig acts on them yet";
+
+function emitRecord(label: string, record: Record<string, string>, legend = true): void {
+  console.log(label);
+  for (const [k, v] of Object.entries(record)) {
+    console.log(`  ${k}: ${v}${NOT_APPLIED_FIELDS.has(k) ? `  ${NOT_APPLIED}` : ""}`);
+  }
+  if (legend && Object.keys(record).some((k) => NOT_APPLIED_FIELDS.has(k))) console.log(`  ${NOT_APPLIED_LEGEND}`);
+}
+
+function emitOperatingPosture(value: OperatingPosture | undefined): void {
+  if (!value) {
+    console.log("Operating posture: unknown (not reported by this daemon).");
+    return;
+  }
+  console.log(`Operating posture: ${value.posture} (source: ${value.source}${value.binding ? ", " + value.binding.id : ""})`);
+  if (value.context) {
+    const { phase, sources: _sources, ...scope } = value.context;
+    console.log(`  Scope: ${JSON.stringify(scope)}`);
+    console.log(`  Phase: ${phase.value ?? "unknown"} (source: ${phase.source ?? "unavailable"})`);
+  }
+  console.log(`  ${value.reason} Recorded preference grants no execution authority.`);
+}
+
+/**
+ * Mirror of the daemon route's parseScopeAndQualifier semantics on the
+ * CLI side. The CLI is the operator's authoring surface; the convention's
+ * scope rule applies at invocation, NOT only at raw HTTP URL parsing.
+ *
+ * Reject:
+ *   - explicit qualifier with global_host (BLOCKING re-verify finding from
+ *     guard qitem-20260518044650): operators who type
+ *     `--scope global_host --qualifier <id>` get an error and the daemon
+ *     is never contacted. The CLI does NOT silently drop the qualifier.
+ *   - missing qualifier for any non-global scope.
+ */
+type NormalizedScope = { ok: true; qualifier: string | null } | { ok: false; message: string };
+function normalizeScopeQualifier(scope: Scope, explicitQualifier: string | undefined): NormalizedScope {
+  if (scope === "global_host") {
+    if (explicitQualifier !== undefined && explicitQualifier !== "") {
+      return {
+        ok: false,
+        message: `Global-host bindings cannot carry a qualifier (got "${explicitQualifier}"). Either drop --qualifier OR change --scope to rig / workstream / qitem.`,
+      };
+    }
+    return { ok: true, qualifier: null };
+  }
+  if (explicitQualifier === undefined || explicitQualifier === "") {
+    return {
+      ok: false,
+      message: `Scope ${scope} requires a qualifier (rigId / workstreamId / qitemId). Pass --qualifier <id>.`,
+    };
+  }
+  return { ok: true, qualifier: explicitQualifier };
+}
+
+function formatCitation(b: BindingResponse["binding"]): string {
+  const qualifierPart = b.qualifier ? `:${b.qualifier}` : "";
+  const scope = b.record.scope as Scope;
+  return `Operating in \`${b.mode}\` mode at \`${scope}${qualifierPart}\` per operator (set_at ${b.setAt})`;
+}
+
+export function rigModeCommand(depsOverride?: RigModeDeps): Command {
+  const cmd = new Command("mode").description(
+    "Inspect and explicitly set scoped operating posture (human-led/delegated) and operator-context modes.",
+  );
+
+  const getDeps = (): RigModeDeps =>
+    depsOverride ?? {
+      lifecycleDeps: realDeps(),
+      clientFactory: (url: string) => new DaemonClient(url),
+    };
+
+  // -- set ---------------------------------------------------------------
+  cmd
+    .command("set <mode>")
+    .description(
+      "Propose a mode binding. Without --confirm, restates the proposed binding and exits 2 (no daemon write). With --confirm, sets it.",
+    )
+    .option("--scope <scope>", `Scope: ${SCOPES.join(" | ")} (default: per-mode recommendation)`)
+    .option("--qualifier <id>", "Rig/project/qitem ID; mission: project/mission; workstream: project/mission/slice-id; omit for global_host")
+    .option("--autonomy-scope <v>", `Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet.`)
+    .option("--heartbeat-cadence <v>", `Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet.`)
+    .option("--inspection-depth <v>", `Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet.`)
+    .option("--update-detail <v>", `Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet.`)
+    .option("--escalation-threshold <v>", `Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet.`)
+    .option("--concurrency-limit <v>", `Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet.`)
+    .option("--permission-prompt-posture <v>", `One of: normal | batch_for_human | do_not_prompt_unless_blocked (auto_accept is FORBIDDEN by convention). Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet, and it doesn't change any native permission prompt.`)
+    .option("--expiry-or-stale-rule <v>", `Saved with the mode ${NOT_APPLIED}: nothing in OpenRig acts on it yet.`)
+    .option("--evidence <citation>", "Free-text citation (operator message id, file pointer, chatroom topic, etc.).")
+    .option("--confirm", "Confirm the proposed binding and apply it. Without this flag, set is restate-only.")
+    .option("--bearer <token>", "Operator bearer token (or set OPENRIG_AUTH_BEARER_TOKEN env).")
+    .option("--json", "JSON output for agents")
+    .action(async (
+      modeArg: string,
+      opts: {
+        scope?: string;
+        qualifier?: string;
+        autonomyScope?: string;
+        heartbeatCadence?: string;
+        inspectionDepth?: string;
+        updateDetail?: string;
+        escalationThreshold?: string;
+        concurrencyLimit?: string;
+        permissionPromptPosture?: string;
+        expiryOrStaleRule?: string;
+        evidence?: string;
+        confirm?: boolean;
+        bearer?: string;
+        json?: boolean;
+      },
+    ) => {
+      const mode = disambiguateModeInvocation(modeArg);
+      if (!mode) {
+        console.error(`Unknown mode '${modeArg}'. Allowed: ${MODES.join(", ")} (or 'mode:<name>' prefix).`);
+        process.exitCode = 1;
+        return;
+      }
+
+      // BLOCKING re-verify-2 (qitem-20260518045300): when --scope is
+      // explicit, validate scope + qualifier LOCALLY before touching
+      // the daemon. Otherwise an invalid operator invocation
+      // (e.g. `--scope global_host --qualifier X`) surfaces as
+      // "Daemon not running" when the daemon is down, instead of the
+      // proper local input error. Convention's scope rule applies at
+      // operator invocation, not at daemon HTTP parsing.
+      let explicitScope: Scope | null = null;
+      if (opts.scope !== undefined) {
+        if (!(SCOPES as readonly string[]).includes(opts.scope)) {
+          console.error(`Unknown scope '${opts.scope}'. Allowed: ${SCOPES.join(", ")}.`);
+          process.exitCode = 1;
+          return;
+        }
+        explicitScope = opts.scope as Scope;
+        const preflight = normalizeScopeQualifier(explicitScope, opts.qualifier);
+        if (!preflight.ok) {
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, error: "qualifier_invalid", hint: preflight.message }, null, 2));
+          } else {
+            console.error(preflight.message);
+          }
+          process.exitCode = 1;
+          return;
+        }
+      }
+
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const defaultsRes = await client.get<RecommendedDefaultsResponse>("/api/rig-mode/defaults");
+        if (defaultsRes.status >= 400) {
+          console.error(JSON.stringify(defaultsRes.data, null, 2));
+          process.exitCode = 1;
+          return;
+        }
+        const defaults = defaultsRes.data;
+        const scope = explicitScope ?? defaults.recommendedDefaultScope[mode];
+        // Defensive — the defaults map is from the daemon, so its scope
+        // values are trusted; keep the assertion shape lean.
+        if (!(SCOPES as readonly string[]).includes(scope)) {
+          console.error(`Unknown scope '${scope}'. Allowed: ${SCOPES.join(", ")}.`);
+          process.exitCode = 1;
+          return;
+        }
+        // Re-run normalization for the implicit-default-scope case.
+        // (Explicit scope was already preflighted above; this branch is
+        // a no-op for explicit-scope inputs but is needed when the
+        // default scope is e.g. `qitem`/`workstream` and the operator
+        // forgot --qualifier.)
+        const normalized = normalizeScopeQualifier(scope, opts.qualifier);
+        if (!normalized.ok) {
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, error: "qualifier_invalid", hint: normalized.message }, null, 2));
+          } else {
+            console.error(normalized.message);
+          }
+          process.exitCode = 1;
+          return;
+        }
+        const qualifier = normalized.qualifier;
+        const perMode = defaults.recommendedModeDefaults[mode];
+        // Component 3 — exactly the 10 settings fields. `mode` is the
+        // binding's identity (Component 2) and lives at the top level
+        // of the PUT body, NOT inside the record.
+        const record = {
+          autonomy_scope: opts.autonomyScope ?? perMode.autonomy_scope,
+          heartbeat_cadence: opts.heartbeatCadence ?? perMode.heartbeat_cadence,
+          inspection_depth: opts.inspectionDepth ?? perMode.inspection_depth,
+          update_detail: opts.updateDetail ?? perMode.update_detail,
+          escalation_threshold: opts.escalationThreshold ?? perMode.escalation_threshold,
+          concurrency_limit: opts.concurrencyLimit ?? perMode.concurrency_limit,
+          permission_prompt_posture: opts.permissionPromptPosture ?? perMode.permission_prompt_posture,
+          scope,
+          expiry_or_stale_rule: opts.expiryOrStaleRule ?? defaults.defaultStaleRule,
+          evidence_citation: opts.evidence ?? `operator confirmed ${mode}`,
+        };
+
+        if (!opts.confirm) {
+          // Restate-and-confirm (HG-7). No daemon write. What's stored where this write would land is read on a
+          // best-effort basis: anything not established leaves the preview as it was, with the current state UNKNOWN.
+          const category = categoryOf(mode);
+          const current = await writeTargetState(client, scope, qualifier, category);
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, proposed: { mode, scope, qualifier, record }, confirm_required: true,
+              ...(!current.known ? { current: "unknown", displaces: "unknown", currentReason: current.reason }
+                : { current: { writeTarget: current.writeTarget, mode: current.mode, posture: current.posture }, displaces: current[category] }) }, null, 2));
+          } else {
+            console.log(`Proposed binding (restate-and-confirm — NOT applied):`);
+            console.log(`  mode:      ${mode}`);
+            console.log(`  scope:     ${scope}${qualifier ? ` (${qualifier})` : ""}`);
+            emitRecord(`  record:`, record);
+            if (!current.known) {
+              console.log(`  currently: UNKNOWN (${current.reason}); what this write replaces is unknown`);
+            } else {
+              const displaced = current[category];
+              console.log(`  currently at ${current.writeTarget}, where this write lands: mode=${current.mode?.mode ?? "none"}, posture=${current.posture?.mode ?? "none"}`);
+              console.log(`  this write replaces: ${displaced ? `${displaced.mode} (${category}, ${displaced.id})` : `no ${category} binding`}; any ${category === "mode" ? "posture" : "saved mode"} there is kept`);
+            }
+            console.log(`\nRe-run with --confirm to apply.`);
+          }
+          process.exitCode = 2;
+          return;
+        }
+
+        const headers: Record<string, string> = {};
+        const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
+        if (bearer) headers.Authorization = `Bearer ${bearer}`;
+        const qualifierPath = qualifier ? `/${encodeURIComponent(qualifier)}` : "";
+        const res = await client.put<BindingResponse | { error: string; errors?: string[] }>(
+          `/api/rig-mode/bindings/${scope}${qualifierPath}`,
+          { mode, record },
+          { headers },
+        );
+        if (res.status === 401) {
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, error: "unauthorized", hint: "Daemon requires operator bearer. Pass --bearer <token> or set OPENRIG_AUTH_BEARER_TOKEN." }, null, 2));
+          } else {
+            console.error("Unauthorized. Daemon requires an operator bearer token.");
+            console.error("Pass --bearer <token> or export OPENRIG_AUTH_BEARER_TOKEN before re-running.");
+          }
+          process.exitCode = 1;
+          return;
+        }
+        if (res.status >= 400) {
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, ...(res.data as object) }, null, 2));
+          } else {
+            console.error(`Error setting binding (HTTP ${res.status}):`);
+            console.error(JSON.stringify(res.data, null, 2));
+          }
+          process.exitCode = 1;
+          return;
+        }
+        const body = res.data as BindingResponse;
+        if (opts.json) {
+          console.log(JSON.stringify({ ok: true, binding: body.binding }, null, 2));
+        } else {
+          console.log(`Set: ${body.binding.id}`);
+          console.log(`  mode:    ${body.binding.mode}`);
+          emitRecord(`  record:`, body.binding.record);
+          console.log(`  set_by:  ${body.binding.setBy}`);
+          console.log(`  set_at:  ${body.binding.setAt}`);
+          console.log(`\n${formatCitation(body.binding)}`);
+        }
+      });
+    });
+
+  // -- show --------------------------------------------------------------
+  cmd
+    .command("show")
+    .description("List all operator-context-mode bindings.")
+    .option("--json", "JSON output for agents")
+    .action(async (opts: { json?: boolean }) => {
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const res = await client.get<ListResponse>("/api/rig-mode/bindings");
+        if (res.status >= 400) {
+          console.error(JSON.stringify(res.data, null, 2));
+          process.exitCode = 1;
+          return;
+        }
+        if (opts.json) {
+          console.log(JSON.stringify(res.data, null, 2));
+          return;
+        }
+        if (res.data.bindings.length === 0) {
+          console.log("No operator-context-mode bindings set.");
+          return;
+        }
+        for (const b of res.data.bindings) {
+          console.log(`${b.id}  [${b.mode}]  set_at=${b.setAt}`);
+        }
+      });
+    });
+
+  // -- effective ---------------------------------------------------------
+  cmd
+    .command("effective")
+    .description("Inspect effective operating posture, scope, phase and source. Resolved unset scopes default to human-led; unreadable or ambiguous identity stays unknown.")
+    .option("--rig <id>")
+    .option("--project <id>")
+    .option("--mission <id>")
+    .option("--workstream <id>")
+    .option("--qitem <id>")
+    .option("--json", "JSON output for agents")
+    .action(async (opts: { rig?: string; project?: string; mission?: string; workstream?: string; qitem?: string; json?: boolean }) => {
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const qs = new URLSearchParams();
+        if (opts.rig) qs.set("rig", opts.rig);
+        if (opts.project) qs.set("project", opts.project);
+        if (opts.mission) qs.set("mission", opts.mission);
+        if (opts.workstream) qs.set("workstream", opts.workstream);
+        if (opts.qitem) qs.set("qitem", opts.qitem);
+        const path = qs.toString() ? `/api/rig-mode/effective?${qs.toString()}` : "/api/rig-mode/effective";
+        const res = await client.get<EffectiveResponse>(path);
+        if (res.status >= 400) {
+          console.error(JSON.stringify(res.data, null, 2));
+          process.exitCode = 1;
+          return;
+        }
+        if (opts.json) {
+          console.log(JSON.stringify(res.data, null, 2));
+          return;
+        }
+        emitOperatingPosture(res.data.operatingPosture);
+        if (res.data.posture === "unknown_posture" || !res.data.effective) {
+          console.log("Operator-context mode: unset (legacy unknown_posture).");
+          return;
+        }
+        const b = res.data.effective.binding;
+        console.log(`Effective: ${b.mode} (resolved scope: ${res.data.effective.resolvedScope})`);
+        // A saved mode and a posture can be kept side by side; name the other one when both apply here.
+        const other = categoryOf(b.mode) === "mode" ? res.data.categories?.posture : res.data.categories?.mode;
+        if (other && other.id !== b.id) console.log(`  also kept: ${other.mode} (${categoryOf(other.mode)}, ${other.id}, set_at=${other.setAt})`);
+        emitRecord(`  record:`, b.record);
+        console.log(`  set_by:  ${b.setBy}`);
+        console.log(`  set_at:  ${b.setAt}`);
+      });
+    });
+
+  // -- cite --------------------------------------------------------------
+  cmd
+    .command("cite")
+    .description("Emit a citation line for the effective mode at a read context. Per convention §Citation Rules.")
+    .option("--rig <id>")
+    .option("--project <id>")
+    .option("--mission <id>")
+    .option("--workstream <id>")
+    .option("--qitem <id>")
+    .action(async (opts: { rig?: string; project?: string; mission?: string; workstream?: string; qitem?: string }) => {
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const qs = new URLSearchParams();
+        if (opts.rig) qs.set("rig", opts.rig);
+        if (opts.project) qs.set("project", opts.project);
+        if (opts.mission) qs.set("mission", opts.mission);
+        if (opts.workstream) qs.set("workstream", opts.workstream);
+        if (opts.qitem) qs.set("qitem", opts.qitem);
+        const path = qs.toString() ? `/api/rig-mode/effective?${qs.toString()}` : "/api/rig-mode/effective";
+        const res = await client.get<EffectiveResponse>(path);
+        if (res.status >= 400) {
+          console.error(JSON.stringify(res.data, null, 2));
+          process.exitCode = 1;
+          return;
+        }
+        emitOperatingPosture(res.data.operatingPosture);
+        if (!res.data.effective) {
+          console.log("Operating without an explicit operator-context-mode binding (unknown_posture).");
+          return;
+        }
+        console.log(formatCitation(res.data.effective.binding));
+      });
+    });
+
+  // -- unset -------------------------------------------------------------
+  cmd
+    .command("unset <scope> [qualifier]")
+    .description("Delete one binding (operator-only). Scope: global_host | rig | project | mission | workstream | qitem. Where a saved mode and a posture are both kept, this removes the latest set one, or the one --category names.")
+    .option("--bearer <token>")
+    .option("--category <category>", "mode or posture: which binding to remove where both are kept")
+    .option("--json", "JSON output for agents")
+    .action(async (
+      scopeArg: string,
+      qualifierArg: string | undefined,
+      opts: { bearer?: string; category?: string; json?: boolean },
+    ) => {
+      if (!(SCOPES as readonly string[]).includes(scopeArg)) {
+        console.error(`Unknown scope '${scopeArg}'. Allowed: ${SCOPES.join(", ")}.`);
+        process.exitCode = 1;
+        return;
+      }
+      const scope = scopeArg as Scope;
+      // BLOCKING re-verify (qitem-20260518044650): never silently drop
+      // an explicit operator-supplied qualifier on global_host on unset.
+      // Same hazard class as set; same shared helper.
+      const normalized = normalizeScopeQualifier(scope, qualifierArg);
+      if (!normalized.ok) {
+        if (opts.json) {
+          console.log(JSON.stringify({ ok: false, error: "qualifier_invalid", hint: normalized.message }, null, 2));
+        } else {
+          console.error(normalized.message);
+        }
+        process.exitCode = 1;
+        return;
+      }
+      const qualifier = normalized.qualifier;
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const qualifierPath = qualifier ? `/${encodeURIComponent(qualifier)}` : "";
+        const headers: Record<string, string> = {};
+        const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
+        if (bearer) headers.Authorization = `Bearer ${bearer}`;
+        // One category is removed through its own path: a daemon that predates categories has no such route, so it
+        // answers 404 and removes nothing (its plain DELETE would remove whatever binding is stored there).
+        const categoryPath = opts.category !== undefined ? `/categories/${encodeURIComponent(opts.category)}` : "";
+        let res: Awaited<ReturnType<typeof client.delete<{ removed: boolean; category?: Category; remaining?: Binding | null }>>>;
+        try {
+          res = await client.delete(`/api/rig-mode/bindings/${scope}${qualifierPath}${categoryPath}`, { headers });
+        } catch (error) {
+          if (!(categoryPath && error instanceof DaemonResponseError && error.status === 404)) throw error;
+          res = { status: 404, data: { removed: false } };
+        }
+        if (categoryPath && res.status === 404) {
+          const message = "This daemon can't remove a binding by category (it predates categories); nothing was removed.";
+          if (opts.json) console.log(JSON.stringify({ ok: false, error: "category_unsupported", removed: false, hint: message }, null, 2));
+          else console.error(message);
+          process.exitCode = 1;
+          return;
+        }
+        if (res.status >= 400) {
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, ...(res.data as object) }, null, 2));
+          } else {
+            console.error(JSON.stringify(res.data, null, 2));
+          }
+          process.exitCode = 1;
+          return;
+        }
+        if (opts.json) {
+          console.log(JSON.stringify({ ok: true, removed: res.data.removed,
+            ...(res.data.category ? { category: res.data.category, remaining: res.data.remaining ?? null } : {}) }, null, 2));
+        } else {
+          console.log(res.data.removed ? `Removed ${scope}${qualifier ? `:${qualifier}` : ""}` : "Nothing to remove.");
+          // The other category kept at this target, if any.
+          if (res.data.remaining) console.log(`  still kept: ${res.data.remaining.mode} (${categoryOf(res.data.remaining.mode)}, ${res.data.remaining.id})`);
+        }
+      });
+    });
+
+  // -- defaults ----------------------------------------------------------
+  cmd
+    .command("defaults")
+    .description("Print the recommended per-mode 8×7 + default-scope + stale rule.")
+    .option("--json", "JSON output for agents")
+    .action(async (opts: { json?: boolean }) => {
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const res = await client.get<RecommendedDefaultsResponse>("/api/rig-mode/defaults");
+        if (res.status >= 400) {
+          console.error(JSON.stringify(res.data, null, 2));
+          process.exitCode = 1;
+          return;
+        }
+        if (opts.json) {
+          console.log(JSON.stringify(res.data, null, 2));
+          return;
+        }
+        for (const mode of MODES) {
+          console.log(`${mode}  (default scope: ${res.data.recommendedDefaultScope[mode]})`);
+          emitRecord("  ", res.data.recommendedModeDefaults[mode] as unknown as Record<string, string>, false);
+        }
+        // The served default, not a stored field: nothing applies it, but it isn't stored either.
+        console.log(`\ndefault stale rule: ${res.data.defaultStaleRule}  (not applied)`);
+        console.log(NOT_APPLIED_LEGEND);
+      });
+    });
+
+  return cmd;
+}
+
+// Re-export for unit-testability of pure helpers.
+export const __test__ = { disambiguateModeInvocation, formatCitation, normalizeScopeQualifier };

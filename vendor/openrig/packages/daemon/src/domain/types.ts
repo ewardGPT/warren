@@ -1,0 +1,1482 @@
+import type { StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
+
+export interface Rig {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Pod {
+  id: string;
+  rigId: string;
+  namespace: string;
+  label: string;
+  summary: string | null;
+  continuityPolicyJson: string | null;
+  createdAt: string;
+}
+
+export interface ContinuityState {
+  podId: string;
+  nodeId: string;
+  status: "healthy" | "degraded" | "restoring";
+  artifactsJson: string | null;
+  lastSyncAt: string | null;
+  updatedAt: string;
+}
+
+export interface Node {
+  id: string;
+  rigId: string;
+  logicalId: string;
+  role: string | null;
+  runtime: string | null;
+  model: string | null;
+  effort?: string | null;
+  /** OPR.0.7.0.7: the seat's explicit effort choice (rig seat set-effort); null = none. */
+  effortChoice?: string | null;
+  codexConfigProfile?: string | null;
+  /** OPR.0.4.8.3 Seam B: attached permission_policy REF (builtin:<name> or spec-relative custom
+   *  path), or null when none is attached (= the floor). */
+  permissionPolicy?: string | null;
+  cwd: string | null;
+  surfaceHint: string | null;
+  workspace: string | null;
+  restorePolicy: string | null;
+  packageRefs: string[];
+  podId: string | null;
+  agentRef: string | null;
+  profile: string | null;
+  label: string | null;
+  /** Exact validated RigSpec declaration retained for export/recreate fidelity. */
+  sessionSource?: SessionSourceSpec | null;
+  resolvedSpecName: string | null;
+  resolvedSpecVersion: string | null;
+  resolvedSpecHash: string | null;
+  occupantLifecycle: OccupantLifecycle | null;
+  continuityOutcome: ContinuityOutcome | null;
+  handoverResult: HandoverResult;
+  previousOccupant: string | null;
+  handoverAt: string | null;
+  createdAt: string;
+}
+
+export interface Edge {
+  id: string;
+  rigId: string;
+  sourceId: string;
+  targetId: string;
+  kind: string;
+  createdAt: string;
+}
+
+export interface Binding {
+  id: string;
+  nodeId: string;
+  attachmentType?: "tmux" | "external_cli";
+  tmuxSession: string | null;
+  tmuxWindow: string | null;
+  tmuxPane: string | null;
+  externalSessionName?: string | null;
+  cmuxWorkspace: string | null;
+  cmuxSurface: string | null;
+  updatedAt: string;
+}
+
+export interface Session {
+  id: string;
+  nodeId: string;
+  sessionName: string;
+  status: string;
+  resumeType: string | null;
+  resumeToken: string | null;
+  // OPR.0.4.3.20 FR-3/FR-6 — resume ledger provenance + verification freshness.
+  // Optional so pre-45 rows and old serialized snapshots degrade (undefined →
+  // treated as missing/unverified in the restore plan), never a crash.
+  resumeProvenance?: string | null;
+  resumeLastVerified?: string | null;
+  resumeLastProbeStatus?: string | null;
+  restorePolicy: string;
+  lastSeenAt: string | null;
+  createdAt: string;
+  origin: "launched" | "claimed";
+  startupStatus: "pending" | "ready" | "attention_required" | "failed";
+  startupCompletedAt: string | null;
+}
+
+// -- Event types --
+
+export type RigEvent =
+  | { type: "proof.judged" | "proof.sources_changed"; scope: string; revision: string }
+  | { type: "event.delivery_poisoned"; poisonedSeq: number; error: string; payloadSha: string }
+  | { type: "rig.created"; rigId: string }
+  // B8 / slice-07 A3 — the durable model-divergence proclamation record: effective vs pinned at the
+  // earliest reliable read, with every channel's delivery outcome (delivered/failed/deferred) named.
+  | {
+      type: "seat.model_divergence";
+      rigId: string;
+      nodeId: string;
+      sessionName: string;
+      runtime: string | null;
+      pinnedModel: string;
+      effectiveModel: string;
+      diagnosis: string | null;
+      channels: Array<{ channel: string; target: string | null; status: string; detail?: string }>;
+    }
+  | { type: "rig.deleted"; rigId: string }
+  | { type: "node.added"; rigId: string; nodeId: string; logicalId: string }
+  | { type: "node.removed"; rigId: string; nodeId: string }
+  | { type: "binding.updated"; rigId: string; nodeId: string }
+  | { type: "session.status_changed"; rigId: string; nodeId: string; status: string }
+  | { type: "session.detached"; rigId: string; nodeId: string; sessionName: string }
+  // S5 (OPR.0.5.4.7) — seat-lifecycle audit trail: the three supported seat verbs each persist
+  // their mutation with actor + reason in the same transaction as the mutation itself.
+  | { type: "node.model_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string | null }
+  | { type: "node.effort_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string | null; reason: string; operator: string | null }
+  | { type: "node.permissions_changed"; rigId: string; nodeId: string; from: unknown; to: unknown; actor: string; reason: string; source: "seat_selection"; effect: "future_launches_only" }
+  | { type: "session.stopped"; rigId: string; nodeId: string; sessionName: string; reason: string; operator: string | null }
+  | { type: "session.cleaned"; rigId: string; nodeId: string; sessionName: string | null; reason: string; operator: string | null; actions: { sessionsExited: string[]; bindingCleared: boolean } }
+  | { type: "node.launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string }
+  | { type: "topology.roster_recorded"; rigId: string; intendedNodeIds: string[]; source: "materialized_topology" }
+  // OPR.0.7.0.5 — in-place restart (same conversation, same pane). Started is persisted before any signal, so
+  // a request that waited behind it, or a restart that never recorded a result, is refused rather than repeated.
+  | { type: "seat.restart_in_place_started"; rigId: string; nodeId: string; logicalId: string; sessionName: string; pane: string; paneShape: "shell_backed" | "direct_native"; oldPid: number; oldStartedAt: string | null; codexHome: string; reason: string; operator: string | null }
+  | { type: "seat.restart_in_place_finished"; rigId: string; nodeId: string; logicalId: string; sessionName: string; outcome: "restarted_account_unverified" | "not_started" | "incomplete" | "native_unknown"; newPid: number | null; newStartedAt: string | null; codexHome: string; paneHeld: boolean; accountLinesAtRestart: Record<string, number> | null; finishedAt: string }
+  | { type: "seat.fresh_launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string; nativeSessionId: string | null; nativeSessionIdReason?: string; model: string | null; effort?: string | null; startupPolicyHash: string; reason: string; operator: string | null; status: "ready" | "attention_required" }
+  | { type: "seat.fresh_launch_failed"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string | null; model: string | null; effort?: string | null; startupPolicyHash: string; reason: string; operator: string | null; errors: string[] }
+  | { type: "snapshot.created"; rigId: string; snapshotId: string; kind: string }
+  | { type: "restore.started"; rigId: string; snapshotId: string; snapshotSelection?: RestoreSnapshotSelection; intendedRoster?: Array<{ nodeId: string; logicalId: string }>; excludedNodes?: RestoreExcludedNode[] }
+  | { type: "restore.completed"; rigId: string; snapshotId: string; result: RestoreResult }
+  | { type: "restore.subset_completed"; rigId: string; snapshotId: string; result: RestoreResult }
+  | { type: "node.held"; rigId: string; nodeId: string; logicalId: string; reason: string }
+  // L3: appended (never replaces) when reconcileNodeRuntimeTruth upgrades a
+  // failed/attention_required restoreOutcome to operator_recovered after
+  // visible-runtime-evidence preconditions hold. The original failure event
+  // is preserved in the log; this event records the audit trail of the upgrade.
+  | { type: "restore.outcome_reconciled"; rigId: string; nodeId: string; attemptId: number; from: "failed" | "attention_required"; to: "operator_recovered"; evidence: { tmux: boolean; fgProcess: "claude" | "codex" | string; resumeTokenUsed: boolean; paneState: "usable" } | { source: string; reason?: string; kind?: string; state?: string; runtimeCwdVerified?: boolean } }
+  | { type: "agent.activity"; rigId: string; nodeId: string; sessionName: string; runtime: string | null; activity: AgentActivity }
+  // OPR.0.4.1.10 — audit record for a --dangerously-interact send that drove a target's interactive
+  // prompt / permission block. overrideReason = caller's --reason; detectedReason/evidenceSource =
+  // what the classifier saw (kept distinct so permission_prompt vs selection_prompt vs unknown stays visible).
+  | { type: "transport.prompt_override"; rigId: string; nodeId: string; sessionName: string; actorSession: string | null; detectedState: string; detectedReason: string; evidenceSource: string; overrideReason: string | null }
+  // OPR.0.4.6.PI1 FR-5 — "rpc" provenance is ADDITIVE: Pi session identity comes
+  // from the pi-runner's RPC get_state / typed events, never pane scraping.
+  | { type: "agent.session_identity"; rigId: string; nodeId: string; sessionName: string; runtime: string; sessionId: string; provenance: "hook" | "scrape" | "rpc" }
+  // OPR.0.4.0.22 — append-only audit of a managed resume-token write. Emitted
+  // on an operator set (`operator_set`) and on reconcile capture-on-adopt
+  // (`reconcile_capture`). NEVER carries the raw token (credential-class);
+  // `redacted: true` marks that the token value is intentionally omitted.
+  | { type: "session.resume_token_set"; rigId: string; nodeId: string; sessionName: string; sessionId: string; resumeType: string; previousProvenance: "hook" | "scrape" | "operator" | null; newProvenance: "operator" | "scrape"; source: "operator_set" | "reconcile_capture"; reason?: string; operator?: string; redacted: true }
+  // OPR.0.4.3.20 FR-3 — append-only observability of an adoption-boundary
+  // resume-token capture (reconcile / adopt / bind). `captured` records a
+  // successful persist (provenance "adoption"); `preserved` records that a valid
+  // token WAS derived but the provenance guard refused the write because a
+  // higher-rank token (hook/operator) already exists — the ledger is correctly
+  // kept and the event must NOT falsely claim a captured adoption write;
+  // `skipped` records an honest failure (the seat SHOULD have resumed but the
+  // token was not derivable) with a stated reason — the "surfaced loudly, no
+  // silent gap" AC. Terminal/unknown runtimes are exempt and emit NO event.
+  // Carries resumeType/provenance, never the raw token (`redacted: true` = the
+  // token value is intentionally omitted; this is observability, NOT a
+  // secret-boundary control — resume tokens are not treated as secret per the
+  // 2026-07-02 founder ruling).
+  | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token" | "stale_sidecar" | "higher_rank_present"; redacted: true }
+  | { type: "seat.attention_cleared"; rigId: string; nodeId: string; sessionName: string; from: string; to: "ready"; clearedBy: "evidence" | "operator_attestation"; evidence?: { kind: string; state?: string; reason?: string }; reason?: string; previousError: string | null }
+  | { type: "rig.imported"; rigId: string; specName: string; specVersion: string }
+  // Package events (cross-rig, no rigId)
+  | { type: "package.validated"; packageName: string; valid: boolean }
+  | { type: "package.planned"; packageName: string; actionable: number; deferred: number; conflicts: number }
+  | { type: "package.installed"; packageName: string; packageVersion: string; installId: string; applied: number; deferred: number }
+  | { type: "package.rolledback"; installId: string; restored: number }
+  | { type: "package.install_failed"; packageName: string; code: string; message: string }
+  // Bootstrap events (cross-rig, no rigId)
+  | { type: "bootstrap.planned"; runId: string; sourceRef: string; stages: number }
+  | { type: "bootstrap.started"; runId: string; sourceRef: string }
+  | { type: "bootstrap.completed"; runId: string; rigId: string; sourceRef: string }
+  | { type: "bootstrap.partial"; runId: string; sourceRef: string; rigId?: string; completed: number; failed: number }
+  | { type: "bootstrap.failed"; runId: string; sourceRef: string; error: string }
+  // Discovery events (cross-rig, no rigId)
+  | { type: "session.discovered"; discoveredId: string; tmuxSession: string; tmuxPane: string; runtimeHint: string; confidence: string }
+  | { type: "session.vanished"; tmuxSession: string; tmuxPane: string }
+  | { type: "node.claimed"; rigId: string; nodeId: string; logicalId: string; discoveredId: string }
+  // OPR.0.3.4.3 — a live (hand-resumed) canonical session adopted back into its
+  // persisted node WITHOUT launch/relaunch/input. Distinct from node.claimed so
+  // the operator is never misled about which op happened.
+  | { type: "node.reconciled"; rigId: string; nodeId: string; logicalId: string; sessionName: string }
+  | { type: "seat.handover_completed"; rigId: string; nodeId: string; logicalId: string; previousOccupant: string; currentOccupant: string; source: string; reason: string; operator: string | null;
+      /** OPR.0.5.5.5 (fix B2) — the executed source outcome, persisted so the DURABLE
+       *  record (not just the command response) carries what primed the successor:
+       *  fork provenance, or rebuild's exact primed set / gaps / empty-chain reason. */
+      sourceOutcome?:
+        | { mode: "fork"; forkedFrom: string; forkId?: "captured" | "pending"; limit?: string }
+        | { mode: "rebuild"; primedArtifacts: Array<{ address: string; label: string }>; gaps: string[]; emptyChainReason?: string } }
+  // Bundle events (cross-rig)
+  | { type: "bundle.created"; bundleName: string; bundleVersion: string; archiveHash: string }
+  // Teardown events
+  | { type: "rig.stopped"; rigId: string }
+  // OPR.0.3.3.19 - rig archive affordance (soft, reversible; NOT a delete)
+  | { type: "rig.archived"; rigId: string }
+  | { type: "rig.unarchived"; rigId: string }
+  // AgentSpec reboot events — pods + startup + continuity
+  | { type: "pod.created"; rigId: string; podId: string; namespace: string; label: string }
+  | { type: "pod.deleted"; rigId: string; podId: string }
+  | { type: "node.startup_pending"; rigId: string; nodeId: string; startupProof?: StartupProofSelection }
+  | { type: "node.startup_ready"; rigId: string; nodeId: string; previousStatus?: "failed" | "attention_required"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
+  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; submissionDiagnostics?: StartupSubmissionDiagnostic[]; stage?: StartupFailureStage; hasPendingWork?: boolean; requestedResumeToken?: string | null; requestedResumeType?: string | null }
+  // OPR.0.4.3.06 — startup proof (challenge-verified orientation). Append-only.
+  // `node.startup_challenged` freezes this launch's challenge ground truth
+  // (challengeId + contractHash; the expected answer is recomputed, never
+  // stored). `node.startup_proof_verified`/`_rejected` are the verified/rejected
+  // evidence; `node.startup_proof_skipped` retires a previous challenge on a
+  // lean launch. None route through updateStartupStatus; `ready` never means oriented.
+  | { type: "node.startup_challenged"; rigId: string; nodeId: string; challengeId: string; contractHash: string }
+  | { type: "node.startup_proof_skipped"; rigId: string; nodeId: string; reason: "not_selected" | "terminal" }
+  | { type: "node.startup_proof_verified"; rigId: string; nodeId: string; sessionId: string; challengeId: string; contractHash: string }
+  | { type: "node.startup_proof_rejected"; rigId: string; nodeId: string; challengeId: string | null; reason: "identity_unbound" | "identity_mismatch" | "challenge_stale" | "contract_mismatch" | "bare_ack" }
+  | { type: "continuity.sync"; rigId: string; podId: string; nodeId: string }
+  | { type: "continuity.degraded"; rigId: string; podId: string; nodeId: string; reason: string }
+  // V0.3.1 slice 05 kernel-rig-as-default — forward-fix #3 architectural.
+  // Emitted exactly once by KernelBootTracker when the kernel rig fails to
+  // reach ready / partial_ready within the configurable degraded-timer
+  // window (default 90s). Observability signal that healthz bound cleanly
+  // but the kernel itself is stuck — operator triage with `rig ps --rig kernel`.
+  | { type: "kernel.agent.degraded"; agents: Array<{ sessionName: string; runtime: string; startupStatus: string }>; firstUnreadySince: string | null; detail: string | null }
+  // Chat events
+  | { type: "chat.message"; rigId: string; messageId: string; sender: string; kind: string; body: string; topic?: string }
+  // Expansion events
+  | { type: "rig.expanded"; rigId: string; podId: string; podNamespace: string; nodes: Array<{ logicalId: string; status: string }>; status: string }
+  // Coordination primitive (PL-004 Phase A) — stream / queue / inbox.
+  // Host-scoped; rigId is left null because items reference seats by string
+  // (`<member>@<rig>`) and can cross rigs.
+  | { type: "stream.emitted"; streamItemId: string; sourceSession: string; hintDestination: string | null; hintType: string | null; hintUrgency: string | null; interrupt: boolean }
+  // OPR.0.4.4.19 FR-1: every queue.* payload carries the qitem's summary
+  // (null for legacy/omitted — always present, never absent, so consumers
+  // can title feed cards without a second fetch).
+  | { type: "queue.created"; qitemId: string; sourceSession: string; destinationSession: string; priority: string; tier: string | null; summary: string | null }
+  | { type: "queue.handed_off"; qitemId: string; fromSession: string; toSession: string; closureReason: "handed_off_to"; summary: string | null }
+  | { type: "queue.claimed"; qitemId: string; destinationSession: string; claimedAt: string; closureRequiredAt: string | null; summary: string | null }
+  | { type: "queue.unclaimed"; qitemId: string; destinationSession: string; reason: string; summary: string | null }
+  | { type: "qitem.fallback_routed"; qitemId: string; originalDestination: string; rerouteDestination: string; reason: string }
+  | { type: "qitem.closure_overdue"; qitemId: string; destinationSession: string; closureRequiredAt: string; overdueSince: string }
+  | { type: "inbox.absorbed"; inboxId: string; destinationSession: string; senderSession: string; promotedQitemId: string }
+  | { type: "inbox.denied"; inboxId: string; destinationSession: string; senderSession: string; reason: string }
+  // PL-004 Phase B R2: queue.updated emitted from QueueRepository.update()
+  // for general state mutations (pending → blocked, in-progress → done,
+  // closure transitions, etc.). Lets the view-event-bridge wake SSE
+  // consumers on /api/views/:name/sse when ANY queue state mutation
+  // changes a view result-set, not just create/handoff/claim/unclaim.
+  | { type: "queue.updated"; qitemId: string; fromState: string; toState: string; closureReason: string | null; closureTarget: string | null; actorSession: string; summary: string | null }
+  // Coordination primitive (PL-004 Phase B) — project (classifier) / view.
+  // project.classified: emitted when a stream item is successfully projected.
+  // classifier.lease_*: lifecycle of the daemon-enforced single-writer lease.
+  // classifier.dead: heartbeat absence past TTL detected (deadness inference).
+  // classifier.reclaimed: operator-verb reclaim took the lease.
+  // view.changed: a view's projection result-set changed (SSE consumers see deltas).
+  | { type: "project.classified"; projectId: string; streamItemId: string; classifierSession: string; classificationType: string | null; classificationDestination: string | null }
+  | { type: "classifier.lease_acquired"; leaseId: string; classifierSession: string; acquiredAt: string; expiresAt: string }
+  | { type: "classifier.lease_expired"; leaseId: string; classifierSession: string; expiredAt: string }
+  | { type: "classifier.dead"; leaseId: string; classifierSession: string; lastHeartbeat: string; detectedAt: string }
+  | { type: "classifier.reclaimed"; leaseId: string; previousClassifierSession: string; reclaimedBySession: string; reason: string; reclaimedAt: string }
+  | { type: "view.changed"; viewName: string; cause: string }
+  // PL-004 Phase C: daemon-native Watchdog supervision tree events.
+  // Three policies in scope (periodic-reminder, artifact-pool-ready,
+  // edge-artifact-required); workflow-keepalive deferred to Phase D.
+  // Pure `not_due` polls are NOT recorded in history and NOT emitted
+  // as events; only meaningful evaluations + lifecycle transitions are.
+  | { type: "watchdog.evaluation_fired"; jobId: string; policy: string; targetSession: string; deliveryStatus: string }
+  | { type: "watchdog.evaluation_skipped"; jobId: string; policy: string; skipReason: string }
+  | { type: "watchdog.evaluation_terminal"; jobId: string; policy: string; terminalReason: string }
+  | { type: "watchdog.job_registered"; jobId: string; policy: string; targetSession: string; registeredBy: string }
+  | { type: "watchdog.job_stopped"; jobId: string; reason: string }
+  // PL-004 Phase D: daemon-native Workflow Runtime events. Step closure
+  // and next-qitem projection are emitted within the SAME daemon
+  // transaction (transactional-scribe contract). Subscribers see the
+  // pair atomically.
+  | { type: "workflow.revised"; instanceId: string; workflowName: string; operationKey: string; compiledInputDigest: string; revisedBy: string }
+  | { type: "workflow.instantiated"; instanceId: string; workflowName: string; workflowVersion: string; createdBy: string }
+  | { type: "workflow.step_closed"; instanceId: string; stepId: string; closureReason: string; actorSession: string; priorQitemId: string }
+  | { type: "workflow.next_qitem_projected"; instanceId: string; nextQitemId: string; nextOwner: string; nextStepId: string }
+  | { type: "workflow.completed"; instanceId: string; workflowName: string }
+  | { type: "workflow.failed"; instanceId: string; workflowName: string; reason: string }
+  | { type: "workflow.resumed"; instanceId: string; workflowName: string; stepId: string; occurrenceId?: string; resumedBy: string; decision: string | null; resumeCount: number }
+  // OPR.0.4.6.WF3 FR-4 (arch R1): extended ADDITIVELY for the route
+  // verb — the shipped {rigName, cause} consumers are untouched; route
+  // emissions carry the re-route detail in the optional fields.
+  | { type: "workflow.routing_table_changed"; rigName: string; cause: string; instanceId?: string; stepId?: string | null; from?: string; to?: string }
+  // Slice 11 (release-0.3.1 workflow-spec-folder-discovery): folder-scan
+  // deletion path. Emitted once per workflow_specs cache row removed
+  // because its source file disappeared from the scanned workflows folder.
+  // Provides a traceable audit-log entry for OQ-4 ("Remove cache row when
+  // file disappears + audit-log entry. Clean Library + traceable.").
+  | { type: "workflow_spec.removed"; sourcePath: string; specId: string | null; specName: string | null; specVersion: string | null; reason: "file_disappeared" }
+  // PL-005 Phase A: Mission Control / Queue Observability events.
+  // Action audit + cross-CLI-version drift detection.
+  | { type: "mission_control.action_executed"; actionId: string; actionVerb: string; qitemId: string | null; actorSession: string }
+  | { type: "mission_control.cli_drift_detected"; rigName: string; missingField: string; observedAt: string }
+  // PL-005 Phase B: notification dispatch events. Best-effort delivery;
+  // failure does NOT interrupt the underlying action being notified about.
+  | { type: "mission_control.notification_sent"; mechanism: string; target: string; qitemId: string | null; sentAt: string }
+  | { type: "mission_control.notification_failed"; mechanism: string; target: string; qitemId: string | null; error: string; failedAt: string };
+
+export type PersistedEvent = RigEvent & {
+  seq: number;
+  createdAt: string;
+};
+
+// -- Composite types --
+
+export interface NodeWithBinding extends Node {
+  binding: Binding | null;
+}
+
+export interface RigWithRelations {
+  rig: Rig;
+  nodes: NodeWithBinding[];
+  edges: Edge[];
+}
+
+export interface PersistedProjectionEntry {
+  category: string;
+  effectiveId: string;
+  sourceSpec: string;
+  sourcePath: string;
+  resourcePath: string;
+  absolutePath: string;
+  resourceType?: string;
+  mergeStrategy?: string;
+  target?: string;
+}
+
+export interface NodeStartupSnapshot {
+  projectionEntries: PersistedProjectionEntry[];
+  resolvedStartupFiles: import("./runtime-adapter.js").ResolvedStartupFile[];
+  startupActions: StartupAction[];
+  runtime: string;
+}
+
+export interface SnapshotData {
+  rig: Rig;
+  nodes: NodeWithBinding[];
+  edges: Edge[];
+  sessions: Session[];
+  /** OPR.0.5.7.1 D1 — the ACTIVE-OCCUPANT relation, captured explicitly at
+   *  snapshot time: nodeId -> the session row id that was the node's live
+   *  occupant, or null when no single occupant existed at capture (zero or
+   *  several running rows). Restore consumes this directly; it never infers
+   *  the occupant from row ordering. Absent on legacy snapshots — restore
+   *  then falls back to the uniquely-running invariant, and ambiguity makes
+   *  the seat unrecoverable-until-resolved, never newest-row-wins. */
+  activeSessionIdByNode?: Record<string, string | null>;
+  /** OPR.0.5.9.14 — explicit occupant truth. Unlike the legacy relation map,
+   *  this never overloads null: zero candidates is absent, one live candidate
+   *  is resolved, and multiple candidates retain their exact ids. */
+  activeOccupantsByNode?: Record<string, SnapshotOccupantState>;
+  /** The immutable intended membership for this snapshot's restore attempt.
+   *  Historical node records remain in `nodes` but are not in this roster. */
+  topologyRoster?: SnapshotTopologyRoster;
+  checkpoints: Record<string, Checkpoint | null>;
+  pods?: Pod[];
+  continuityStates?: ContinuityState[];
+  nodeStartupContext?: Record<string, NodeStartupSnapshot | null>;
+  envReceipt?: EnvReceipt | null;
+}
+
+export type SnapshotOccupantState =
+  | { kind: "resolved"; sessionId: string }
+  | { kind: "absent" }
+  | { kind: "ambiguous"; candidateIds: string[] };
+
+export interface SnapshotTopologyRoster {
+  version: 1;
+  source: "materialized_topology" | "operator_explicit" | "legacy_current_nodes";
+  intendedNodeIds: string[];
+}
+
+export interface RestoreSnapshotSummary {
+  snapshotId: string;
+  kind: string;
+  createdAt: string;
+  ageMs: number;
+}
+
+export interface RestoreSnapshotSelection extends RestoreSnapshotSummary {
+  mode: "explicit" | "automatic";
+  rationale: string;
+  newerUsableAlternative: RestoreSnapshotSummary | null;
+}
+
+export interface RestoreExcludedNode {
+  nodeId: string;
+  logicalId: string;
+  reason: "historical_not_in_intended_roster";
+}
+
+export interface Snapshot {
+  id: string;
+  rigId: string;
+  kind: string;
+  status: string;
+  data: SnapshotData;
+  createdAt: string;
+}
+
+export interface Checkpoint {
+  id: string;
+  nodeId: string;
+  summary: string;
+  currentTask: string | null;
+  nextStep: string | null;
+  blockedOn: string | null;
+  keyArtifacts: string[];
+  confidence: string | null;
+  podId: string | null;
+  continuitySource: string | null;
+  continuityArtifactsJson: string | null;
+  createdAt: string;
+}
+
+export interface RestoreResult {
+  snapshotId: string;
+  preRestoreSnapshotId: string | null;
+  rigResult: RestoreRigResult;
+  nodes: RestoreNodeResult[];
+  warnings: string[];
+  blockers?: RestoreValidationBlocker[];
+  snapshotSelection?: RestoreSnapshotSelection;
+  intendedRoster?: Array<{ nodeId: string; logicalId: string }>;
+  excludedNodes?: RestoreExcludedNode[];
+}
+
+export type RestoreRigResult = "fully_restored" | "partially_restored" | "failed" | "not_attempted";
+
+export interface RestoreValidationBlocker {
+  code: string;
+  severity: "critical";
+  nodeId?: string;
+  logicalId?: string;
+  target?: string;
+  path?: string;
+  message: string;
+  remediation: string;
+}
+
+export interface RestoreNodeResult {
+  nodeId: string;
+  logicalId: string;
+  // L3: `attention_required` is set when the post-launch probe detects a
+  // Claude resume-selection prompt. `operator_recovered` is the terminal
+  // outcome after `restore.outcome_reconciled`; never produced directly by
+  // the orchestrator's restore pipeline (only by reconcileNodeRuntimeTruth).
+  //
+  // OPR.0.3.4.2 — the ratified five-term restore vocabulary:
+  // `resumed` (original session resumed) / `fresh-primed` (deliberate
+  // blank-slate launch, policy- or --fresh-driven; replaces the old `fresh`
+  // for launches) / `awaiting-decision` (original unresumable + no --fresh:
+  // STOPPED with ZERO session running — operator must choose) /
+  // `attention_required` (a LIVE session parked on a runtime prompt) /
+  // `failed` (genuine harness error only). `awaiting-decision` is never
+  // emitted while a session is live. (`fresh` is retained for the legacy
+  // continuity-restoring skip path only; `rebuilt`/`operator_recovered` sit
+  // outside the five-term split.)
+  status: "resumed" | "rebuilt" | "fresh" | "fresh-primed" | "awaiting-decision" | "failed" | "attention_required" | "operator_recovered";
+  error?: string;
+  /** Pane evidence captured when status is `attention_required` (L3, optional). */
+  attentionEvidence?: string | null;
+  /** Managed guidance block ids the seat's guidance file still lacks after restore. The seat keeps
+   *  its own status (a resumed session is still running); this only discloses the gap. */
+  guidanceGaps?: string[];
+}
+
+export type RestoreOutcome =
+  | { ok: true; result: RestoreResult }
+  | { ok: false; code: "snapshot_not_found"; message: string }
+  | { ok: false; code: "snapshot_wrong_rig"; message: string }
+  | { ok: false; code: "snapshot_unusable"; message: string }
+  | { ok: false; code: "no_usable_snapshot"; message: string }
+  | { ok: false; code: "rig_not_found"; message: string }
+  | { ok: false; code: "rig_not_stopped"; message: string }
+  | { ok: false; code: "restore_error"; message: string }
+  | { ok: false; code: "restore_in_progress"; message: string }
+  | { ok: false; code: "service_boot_failed"; message: string }
+  | { ok: false; code: "pre_restore_validation_failed"; message: string; result: RestoreResult };
+
+// -- Node inventory projection (NS-T02) --
+
+// L3 extends with `attention_required` (Claude resume-selection prompt proxy)
+// and `operator_recovered` (terminal post-reconciliation outcome — never produced
+// directly by restore, only emitted via `restore.outcome_reconciled`).
+// OPR.0.3.4.2 - carries the five-term restore vocabulary into `rig ps`.
+export type NodeRestoreOutcome = "resumed" | "rebuilt" | "fresh" | "fresh-primed" | "awaiting-decision" | "failed" | "attention_required" | "operator_recovered" | "n-a";
+
+// OPR.0.4.3.06 — challenge-verified startup orientation, DISTINCT from
+// startupStatus (`ready` = delivered/interactive only). `verified` = a proof
+// answering this launch's challenge was accepted; `missing` = challenged, not
+// yet proven; `rejected` = the latest proof for this challenge was rejected;
+// `n-a` = never challenged (resumed restore / non-agent / skip-harness).
+export type NodeOriented = "verified" | "missing" | "rejected" | "n-a";
+export type OccupantLifecycle = "active" | "retiring" | "retired" | "context_walled" | "compacted" | "crashed" | "unknown";
+export type ContinuityOutcome = "resumed" | "rebuilt" | "forked" | "fresh" | "failed";
+export type HandoverResult = "complete" | "unchanged" | "partial" | "failed" | null;
+export type AgentActivityState = "running" | "needs_input" | "idle" | "unknown";
+export type AgentActivityEvidenceSource =
+  | "runtime_hook"
+  | "pane_heuristic"
+  /** ACTIVITY D1+D2 — tmux `#{window_activity}` motion (SeatActivityService). A fact about BYTES on
+   *  the pane, so it is runtime-AGNOSTIC: it sees a generating Codex seat and a generating Claude
+   *  seat identically, where a TUI-string matcher has to be re-taught on every provider reskin. The
+   *  UI has called this source `terminal_activity` since slice 15 (activity-visuals.ts); the daemon
+   *  reports under the SAME name rather than minting a second word for one signal. */
+  | "terminal_activity"
+  | "tmux_session"
+  | "external_cli"
+  | "session_registry";
+
+export interface AgentActivity {
+  turnId?: string | null;
+
+  state: AgentActivityState;
+  reason: string;
+  evidenceSource: AgentActivityEvidenceSource;
+  sampledAt: string;
+  evidence: string | null;
+  eventAt?: string | null;
+  rawEvent?: string | null;
+  rawSubtype?: string | null;
+  runtime?: string | null;
+  fallback?: boolean;
+  stale?: boolean;
+  /** W2a-1 — the occupant-tenure generation_uuid in force when this claim was recorded — the per-tenure
+   *  occupant identity that CHANGES for a new occupant (a handover/swap to a different occupant mints a
+   *  new generation) and persists only WITHIN a single tenure (a same-native-session relaunch is a
+   *  continuation, same generation); null = UNKNOWN at record time. node_id, NOT this, is what is stable
+   *  across handover — that is exactly why comparing generation detects a dead tenure. */
+  generation?: string | null;
+  /** W2a-1 — the read-side provenance verdict for the occupant generation (present only when the
+   *  read resolved through an injected generation resolver): `resolved` = both the recorded and the
+   *  live generation were known (equal here; a KNOWN mismatch returns state:"unknown" instead);
+   *  `unresolved` = null on either side, so the claim is DELIVERED carrying this honest label rather
+   *  than dropped or bare-attributed (pm ruling 2026-08-08, the P21 claimed-era pattern). Absent when
+   *  no resolver is wired (legacy clock-only path). */
+  generationProvenance?: "resolved" | "unresolved";
+}
+
+export interface NodeRecoveryGuidance {
+  summary: string;
+  commands: string[];
+  notes: string[];
+}
+
+// Per-node lifecycle projection derived from session/restore state plus snapshot resume metadata.
+// L2 cold-start truth model: distinguishes a recoverable detached node from a node that would
+// fresh-launch, and surfaces "attention required" for the post-L3 Claude resume-prompt proxy.
+export type NodeLifecycleState = "running" | "detached" | "recoverable" | "attention_required";
+
+/**
+ * OPR.0.4.3.19 — the liveness identity verdict for a managed seat.
+ *
+ * A THIRD axis, orthogonal to slice-15's `terminalActive` (tmux output
+ * recency) and `hasAssignedWork` (queue-derived). It answers: does the process
+ * currently in the seat's registered tmux pane match the seat we are reporting?
+ * Computed by the periodic SeatIdentityReconciler from the pane PID/command vs
+ * the registered `bindings.tmux_pane`, NEVER from queue/classifier/hook
+ * heartbeats. Only `mismatch` and `pane_missing` down-rank a `running`
+ * projection; `verified`, `binding_absent`, and `tmux_unavailable` (and an
+ * absent verdict) leave it unchanged.
+ */
+export type SeatIdentityVerdictKind = "verified" | "mismatch" | "pane_missing" | "binding_absent" | "tmux_unavailable";
+
+export interface SeatIdentityVerdict {
+  nodeId: string;
+  verdict: SeatIdentityVerdictKind;
+  /** Which observation axis produced the verdict. Null for `verified`. */
+  evidenceSource: "pane_process" | "tmux_session" | null;
+  /** The specific reason for a non-verified verdict. Null for `verified`. */
+  reason:
+    | "process_identity_mismatch"
+    | "process_identity_ambiguous"
+    | "pane_ambiguous"
+    | "pane_pid_gone"
+    | "binding_pane_missing"
+    | "session_missing"
+    | "tmux_unavailable"
+    | null;
+  evidence: {
+    registeredPane: string | null;
+    observedPid: number | null;
+    observedCommand: string | null;
+    matchedLayer: number | null;
+  };
+  sessionName: string | null;
+  observedAt: string;
+}
+
+/** Only a confirmed missing session proves the seat is no longer running.
+ * Callers must first gate the verdict to the current session and binding. */
+export function identityVerdictConfirmsSessionMissing(verdict: SeatIdentityVerdict | null | undefined): boolean {
+  return verdict?.reason === "session_missing";
+}
+
+/**
+ * OPR.0.4.3.19 — the two verdict kinds that down-rank a `running`/`active`
+ * projection to a non-green state. `verified`, `tmux_unavailable`, and an
+ * ABSENT verdict all leave the projection unchanged (fail-open on unknown).
+ */
+export function identityVerdictDownranksRunning(
+  verdict: SeatIdentityVerdictKind | null | undefined,
+): boolean {
+  return verdict === "mismatch" || verdict === "pane_missing";
+}
+
+// Per-rig lifecycle aggregate folded from per-node states.
+//   running           — every node is running.
+//   recoverable       — every node is non-running and at least one node has a usable snapshot token.
+//   stopped           — every node is non-running and no node has a usable snapshot token.
+//   degraded          — mixed running + non-running on the same rig.
+//   attention_required — any node is attention_required (priority over above).
+export type RigLifecycleState = "running" | "recoverable" | "stopped" | "degraded" | "attention_required";
+
+export interface NodeInventoryEntry {
+  /** Stable daemon node identity. Health scopes and other canonical records
+   * key seats by this value; logicalId remains the human-facing address. */
+  nodeId: string;
+  rigId: string;
+  rigName: string;
+  logicalId: string;
+  podId: string | null;
+  podNamespace?: string | null;
+  /**
+   * OPR.0.4.6.FAC1: the seat's declared role (`nodes.role`, written by
+   * the pod-member path). The workflow binding layer's role→seat
+   * candidate filter reads exactly this. null = role-less.
+   */
+  role: string | null;
+  canonicalSessionName: string | null;
+  attachmentType?: "tmux" | "external_cli" | null;
+  nodeKind: "agent" | "infrastructure";
+  runtime: string | null;
+  /** Effective current status; confirmed session absence projects as detached. */
+  sessionStatus: string | null;
+  /** Persisted session status, retained for history and registry-based rollups. */
+  storedSessionStatus?: string | null;
+  /** The latest session was explicitly stopped and has no replacement binding.
+   * It remains non-running, but is not a missing member in the rig lifecycle. */
+  intentionallyStopped?: boolean;
+  // Current projection: an applicable identity failure down-ranks a running
+  // session to attention_required; the stored startup result stays unchanged.
+  startupStatus: "pending" | "ready" | "attention_required" | "failed" | null;
+  /** Persisted startup outcome, before current identity projection. */
+  storedStartupStatus?: "pending" | "ready" | "attention_required" | "failed" | null;
+  restoreOutcome: NodeRestoreOutcome;
+  // OPR.0.4.3.06 — challenge-verified orientation, surfaced beside (never
+  // folded into) startupStatus.
+  oriented: NodeOriented;
+  lifecycleState: NodeLifecycleState;
+  occupantLifecycle: OccupantLifecycle;
+  continuityOutcome: ContinuityOutcome | null;
+  handoverResult: HandoverResult;
+  previousOccupant: string | null;
+  handoverAt: string | null;
+  tmuxAttachCommand: string | null;
+  resumeCommand: string | null;
+  recoveryGuidance: NodeRecoveryGuidance | null;
+  latestError: string | null;
+  // Extended fields
+  model: string | null;
+  agentRef: string | null;
+  profile: string | null;
+  codexConfigProfile?: string | null;
+  /** OPR.0.4.8.3 Seam B: attached permission_policy REF, or null when none is attached. */
+  permissionPolicy?: string | null;
+  resolvedSpecName: string | null;
+  resolvedSpecVersion: string | null;
+  resolvedSpecHash: string | null;
+  cwd: string | null;
+  restorePolicy: string | null;
+  resumeType: string | null;
+  resumeToken: string | null;
+  startupCompletedAt: string | null;
+  agentActivity?: AgentActivity;
+  contextUsage?: ContextUsage;
+  /** Health of the daemon-owned transcript capture for this seat. */
+  transcriptIngest?: import("./transcript-store.js").TranscriptIngestHealth & {
+    runtime: string | null;
+  };
+  /**
+   * Slice 15 — `terminal-active` primitive (tmux byte-stream).
+   *
+   *   true  → seat is currently producing tmux output (window_activity
+   *           timestamp within the silence window)
+   *   false → seat is silent past the threshold
+   *   null  → no signal (not tmux-bound, or transient read error).
+   *           Distinct from `false`: consumers
+   *           treat `null` as "no observation right now", not "definitely
+   *           idle".
+   *
+   * MUST NOT be derived from `hasAssignedWork` or queue/assignment state.
+   * The non-inference contract (slice 15 README + IMPL-PRD §2.3) is the
+   * core correctness item: this field is computed independently from
+   * `hasAssignedWork`.
+   */
+  terminalActive?: boolean | null;
+  /** S19 — the arbitrated three-axis taxonomy state served from the ONE oracle
+   *  (SeatActivityService ladder). `display` is computed server-side via the single
+   *  deriveDisplayActivity bridge so no consumer re-derives vocabulary. Absent = old
+   *  enrichment path; null = oracle has no state for this seat (honest). */
+  activityState?: {
+    activity: string;
+    display: string;
+    needsInput: { count: number; reason: string | null };
+    decidedBy: string | null;
+    seq: number;
+    lastSwap: { generation: string; at: string } | null;
+  } | null;
+  /**
+   * ARCH RULING 3a947fb1 (FR-7 additive) — the seat's RAW `lastActivityAt`
+   * fact (SeatActivity.lastActivityAt), projected per-seat alongside
+   * `terminalActive`. ISO string when an observation exists; `null` when
+   * the seat has no observation (never polled / non-tmux); `undefined`
+   * when no SeatActivityService is wired — exactly the honest-absence
+   * ladder `terminalActive` uses. NO `ageSeconds` sibling: age is a VIEW
+   * derived at the renderer from this fact + a reader clock (C3).
+   */
+  lastActivityAt?: string | null;
+  /**
+   * Slice 15 — `has-work-to-do` primitive. Derived from queue/assignment
+   * projection (pending, in-progress, or blocked qitems whose
+   * `destination_session` matches this seat's canonical coordinate).
+   *
+   * MUST NOT be derived from `terminalActive` or tmux output. Two
+   * orthogonal primitives, never one inferred from the other.
+   */
+  hasAssignedWork?: boolean;
+  /** Total active qitems assigned to this seat (pending + in-progress + blocked). */
+  assignedWorkCount?: number;
+  /** Optional count of pending qitems assigned to this seat (cheap aggregate). */
+  pendingWorkCount?: number;
+  /** Optional count of claimed in-progress qitems assigned to this seat. */
+  inProgressWorkCount?: number;
+  /** Optional count of blocked qitems still assigned to this seat. */
+  blockedWorkCount?: number;
+  /**
+   * OPR.0.4.3.19 — liveness identity verdict (the THIRD axis). Present when
+   * the SeatIdentityReconciler has recorded a verdict for this node; absent
+   * (undefined) when never polled. A `mismatch`/`pane_missing` verdict
+   * down-ranks the node's `lifecycleState`/`occupantLifecycle` away from
+   * running/active and carries the evidence. MUST NOT be derived from
+   * `terminalActive`, `hasAssignedWork`, or any queue/classifier/hook
+   * heartbeat — process identity only.
+   */
+  identityVerdict?: SeatIdentityVerdict | null;
+  /** OPR.0.3.4.11 — held reason derived from the latest `node.held` event.
+   *  Null when no held event, or superseded by a running session / later launch. */
+  heldReason?: string | null;
+  /** PL-007: per-node workspace block when the rig declares a workspace.
+   *  workspaceRoot mirrors RigSpec.workspace.workspaceRoot. activeRepo is
+   *  the repo whose path contains the node's cwd, or RigSpec.workspace.
+   *  defaultRepo when no containing repo is found. kind is the kind of
+   *  the active repo, or `knowledge` when cwd is under knowledgeRoot.
+   *  null when the rig does not declare a workspace. */
+  workspace?: NodeWorkspaceInfo | null;
+}
+
+/**
+ * Slice 15 — `terminal-active` observation for a single seat's pane.
+ *
+ * Sourced from tmux's `#{window_activity}` format (Unix-epoch-seconds
+ * timestamp of the last output on the window). The producing service
+ * polls the timestamp at a configurable cadence and compares it
+ * against the silence window threshold; `isActiveWithinWindow` is true
+ * when the most recent activity is within that window. The
+ * The daemon no longer configures tmux's `monitor-silence` option at
+ * launch (removed OPR.0.4.0.18); `window_activity` is the sole source.
+ */
+export interface SeatActivity {
+  /** tmux pane id OR canonical session name — whatever the daemon binds. */
+  paneId: string;
+  /** True ⟺ pane has produced output within `silenceWindowSeconds`. */
+  isActiveWithinWindow: boolean;
+  /** Configured threshold at observation time. */
+  silenceWindowSeconds: number;
+  /** ISO timestamp of the most recent observation. */
+  lastObservedAt: string;
+  /**
+   * ARCH RULING 3a947fb1 (FR-7 additive) — the RAW `window_activity`
+   * timestamp (last output on the pane), as ISO. This is the input the
+   * service already reads to derive active/idle; surfaced verbatim so
+   * consumers can compute a fresh idle-age = f(fact, reader-clock).
+   *
+   * RAW FACT, never clamped: clock skew can put this slightly AHEAD of
+   * `lastObservedAt` (the service reads negative age as active); the
+   * value is stored as observed and renderers clamp for display only.
+   * Distinct from `lastObservedAt` (when WE looked) — this is when the
+   * pane last produced output. A record only exists when tmux returned a
+   * signal, so this is always present on a record (absence = no record).
+   */
+  lastActivityAt: string;
+}
+
+export interface NodeWorkspaceInfo {
+  workspaceRoot: string;
+  activeRepo: string | null;
+  kind: WorkspaceKind | null;
+}
+
+export interface NodeDetailPeer {
+  logicalId: string;
+  canonicalSessionName: string | null;
+  attachmentType?: "tmux" | "external_cli" | null;
+  runtime: string | null;
+}
+
+export interface NodeDetailEdge {
+  kind: string;
+  to?: { logicalId: string; sessionName: string | null };
+  from?: { logicalId: string; sessionName: string | null };
+}
+
+export interface NodeDetailTranscript {
+  enabled: boolean;
+  path: string | null;
+  tailCommand: string | null;
+}
+
+export interface NodeDetailCompactSpec {
+  name: string | null;
+  version: string | null;
+  profile: string | null;
+  skillCount: number;
+  guidanceCount: number;
+}
+
+export interface NodeDetailEntry extends NodeInventoryEntry {
+  /** W3 opt-in single-seat diagnostic; never populated on inventory lists. */
+  permissionDrift?: import("./permission-drift.js").PermissionDriftDiagnostic | null;
+  binding: Binding | null;
+  startupFiles: Array<{ path: string; deliveryHint: string; required: boolean }>;
+  startupActions: Array<{ type: string; value: string }>;
+  installedResources: Array<{ id: string; category: string; targetPath: string }>;
+  recentEvents: Array<{ type: string; createdAt: string; payload: Record<string, unknown> }>;
+  infrastructureStartupCommand: string | null;
+  peers: NodeDetailPeer[];
+  edges: { outgoing: NodeDetailEdge[]; incoming: NodeDetailEdge[] };
+  transcript: NodeDetailTranscript;
+  compactSpec: NodeDetailCompactSpec;
+}
+
+// -- AgentSpec types (AgentSpec reboot) --
+
+export interface ImportSpec {
+  ref: string;
+  version?: string;
+}
+
+export interface StartupFile {
+  /** Explicit per-seat role orientation; never inferred from the filename. */
+  orientation?: "role";
+  /** Startup artifacts are files; context packs are composed separately. */
+  kind?: "file";
+  path: string;
+  deliveryHint: "auto" | "guidance_merge" | "skill_install" | "send_text";
+  required: boolean;
+  appliesOn: ("fresh_start" | "restore")[];
+}
+
+export interface StartupProofSelection {
+  mode: "authenticated" | "none";
+  source: "authored" | "default";
+  /** Index in the composed startup action sequence. */
+  actionIndex?: number;
+}
+
+export interface StartupAction {
+  type: "slash_command" | "send_text" | "startup_proof";
+  value: string;
+  phase: "after_files" | "after_ready";
+  appliesOn: ("fresh_start" | "restore")[];
+  idempotent: boolean;
+  builtin?: "session_identity";
+}
+
+export interface StartupBlock {
+  files: StartupFile[];
+  actions: StartupAction[];
+}
+
+export type StartupFailureStage =
+  | "permission_selection"
+  | "proof_selection"
+  | "projection"
+  | "pre_launch_files"
+  | "persistence"
+  | "harness_launch"
+  | "readiness_check"
+  | "initial_prompt"
+  | "restore_preload"
+  | "post_launch_files"
+  | "after_files"
+  | "after_ready"
+  | "post_delivery_readiness"
+  | "identity_verification";
+
+export interface LifecycleDefaults {
+  executionMode: "interactive_resident";
+  // OPR.0.5.6.20 B-3/B-4: optional so a lifecycle block that omits a field preserves
+  // ABSENCE through normalization — a level that does not specify does not
+  // participate in precedence. The defaults level materializes the defaults
+  // (default-compaction per F-6; resume_if_possible for restore).
+  compactionStrategy?: "default-compaction" | "managed-compaction" | "handover" | "apprentice-handover";
+  /** Canonical seat@rig address that executes an apprentice cutover. No default: absence
+   *  is a materialization-time refusal for apprentice-handover. */
+  mechanic?: string;
+  restorePolicy?: "resume_if_possible" | "relaunch_fresh" | "checkpoint_only";
+}
+
+export interface SkillResource { id: string; path: string; }
+export interface GuidanceResource { id: string; path: string; target: string; merge: "managed_block" | "append"; }
+export interface SubagentResource { id: string; path: string; }
+export interface RuntimeResource { id: string; path: string; runtime: string; type: string; }
+
+export type PluginSource =
+  | { kind: "local"; path: string };
+
+export interface PluginResource {
+  id: string;
+  source: PluginSource;
+  pluginType?: "claude" | "codex" | "auto";
+}
+
+export interface AgentResources {
+  skills: SkillResource[];
+  guidance: GuidanceResource[];
+  subagents: SubagentResource[];
+  plugins: PluginResource[];
+  runtimeResources: RuntimeResource[];
+}
+
+export interface ProfileSpec {
+  summary?: string;
+  preferences?: { runtime?: string; model?: string; effort?: string };
+  startup?: StartupBlock;
+  lifecycle?: LifecycleDefaults;
+  uses: {
+    skills: string[];
+    guidance: string[];
+    subagents: string[];
+    plugins: string[];
+    runtimeResources: string[];
+  };
+  /**
+   * Per-seat activity-detection tuning. `silenceWindowSeconds` is the
+   * threshold below which terminal output reads as "terminal-active".
+   * Currently inert: the live SeatActivityService poller uses the global
+   * 3s default and does not read per-seat windows. Retained for a future
+   * per-seat-poller decision. Invalid values are dropped at normalize time.
+   */
+  activity?: {
+    silenceWindowSeconds?: number;
+  };
+}
+
+export interface AgentSpec {
+  version: string;
+  name: string;
+  summary?: string;
+  imports: ImportSpec[];
+  defaults?: {
+    runtime?: string;
+    model?: string;
+    effort?: string;
+    lifecycle?: LifecycleDefaults;
+  };
+  startup: StartupBlock;
+  resources: AgentResources;
+  profiles: Record<string, ProfileSpec>;
+}
+
+// -- Legacy RigSpec types (Phase 3, pre-reboot flat contract) --
+// TODO: Remove when AS-T08b/AS-T12 migrate all consumers to pod-aware RigSpec
+
+export interface LegacyRigSpec {
+  schemaVersion: number;
+  name: string;
+  version: string;
+  nodes: LegacyRigSpecNode[];
+  edges: LegacyRigSpecEdge[];
+}
+
+export interface LegacyRigSpecNode {
+  id: string;
+  runtime: string;
+  role?: string;
+  model?: string;
+  effort?: string;
+  cwd?: string;
+  surfaceHint?: string;
+  workspace?: string;
+  restorePolicy?: string;
+  packageRefs?: string[];
+}
+
+export interface LegacyRigSpecEdge {
+  from: string;
+  to: string;
+  kind: string;
+}
+
+// -- RigSpec types (pod-aware, AgentSpec reboot) --
+
+export interface ContinuityPolicySpec {
+  enabled: boolean;
+  syncTriggers?: string[];
+  artifacts?: { sessionLog?: boolean; restoreBrief?: boolean; quiz?: boolean };
+  restoreProtocol?: { peerDriven?: boolean; verifyViaQuiz?: boolean };
+}
+
+/**
+ * Member-level launch input for declaring how a new managed seat should
+ * derive its starting context. Discriminated union over `mode`:
+ *
+ * - `fork` — start from a prior native runtime conversation source
+ *   (Claude `--fork-session` / Codex `fork`); persists a NEW post-fork
+ *   token; identity-honest (parent token is NEVER persisted onto the
+ *   new seat). v1 supports `ref.kind: "native_id"` only.
+ *
+ * - `rebuild` — fresh-launch a new seat seeded with operator-declared
+ *   artifacts (CULTURE, role doc, handover packet, queue files, session
+ *   logs). NO native-runtime resume or fork; NO `resumeToken` on the
+ *   resulting seat; `continuityOutcome` is `"rebuilt"` (NEVER `"fresh"`,
+ *   `"resumed"`, or `"forked"`). v1 supports `ref.kind: "artifact_set"`
+ *   only, with `ref.value` as a non-empty array of file paths in
+ *   operator-declared trust-precedence order.
+ */
+export type SessionSourceSpec =
+  | SessionSourceForkSpec
+  | SessionSourceRebuildSpec
+  | SessionSourceAgentImageSpec;
+
+export interface SessionSourceForkSpec {
+  mode: "fork";
+  ref: {
+    kind: "native_id" | "artifact_path" | "name" | "last";
+    value?: string;
+  };
+}
+
+export interface SessionSourceRebuildSpec {
+  mode: "rebuild";
+  ref: {
+    kind: "artifact_set";
+    value: string[];
+  };
+}
+
+/**
+ * PL-016 Item 4 — agent_image session source.
+ * The instantiator looks up the named image in the
+ * AgentImageLibraryService, captures the runtime resume token from the
+ * manifest, and dispatches the launch through the existing fork code
+ * path (forkSource: { kind: "native_id", value: <resumeToken> }) so
+ * `nativeResumeProbe` semantics are preserved.
+ *
+ * v0 supports `ref.kind: "image_name"` only; `image_id` and
+ * `image_hash` are NAMED v1+ triggers per PRD § v0 Out.
+ */
+export interface SessionSourceAgentImageSpec {
+  mode: "agent_image";
+  ref: {
+    kind: "image_name";
+    value: string;
+    /** Optional version selector; defaults to "1" at consumption
+     *  time (matches the manifest convention). */
+    version?: string;
+  };
+}
+
+/**
+ * Reference to a named agent-starter registry entry. Artifact-seeded
+ * fresh-launch context: the starter's curated artifacts are added to the
+ * member's startup-file chain at launch time. Composes additively with
+ * `sessionSource` (independent semantics: starter_ref seeds context;
+ * session_source declares the runtime-source mode). v0 schema constraint:
+ * `starter_ref` MAY combine with `session_source.mode: "rebuild"` (both
+ * apply on `fresh_start`) but MAY NOT combine with `session_source.mode:
+ * "fork"` (the v1+ "Real native-fork-from-registered-thread-id starter
+ * proof" trigger covers that composition).
+ */
+export interface StarterRefSpec {
+  /** Registry key. Matches an entry at `<registryRoot>/<name>.yaml`. */
+  name: string;
+}
+
+export interface RigSpecPodMember {
+  id: string;
+  label?: string;
+  agentRef: string;
+  profile: string;
+  runtime: string;
+  codexConfigProfile?: string;
+  model?: string;
+  effort?: string;
+  /**
+   * OPR.0.4.6.FAC1: optional seat-side role declaration (writes the
+   * existing `nodes.role` column via createMemberNode → addNode). The
+   * workflow binding layer resolves workflow roles to seats by this
+   * dimension. Opt-in: a role-less member is never role-resolved and
+   * stays reachable only via explicit preferred_targets.
+   */
+  role?: string;
+  /** OPR.0.4.8.3 Seam B: optional per-seat permission_policy REF (builtin:<name> or a spec-relative
+   *  custom path). Absent = the floor. Overrides the rig-level ref. */
+  permissionPolicy?: string;
+  cwd: string;
+  restorePolicy?: string;
+  /** OPR.0.5.6.20 — per-member continuity override (most-specific-wins; canonical or
+   *  deprecated-alias spelling, normalized at resolution). Absent = inherit. */
+  compactionStrategy?: string;
+  /** Per-member continuity mechanic override; resolves beside compactionStrategy. */
+  mechanic?: string;
+  startup?: StartupBlock;
+  /**
+   * Optional fork source declaration. v1 MVP: mode="fork" with
+   * ref.kind="native_id". Validated by `rigspec-schema.ts` and translated
+   * to the runtime adapter's `forkSource` opt at launch time.
+   */
+  sessionSource?: SessionSourceSpec;
+  /**
+   * Optional reference to a named starter registry entry.
+   * See {@link StarterRefSpec}. Resolved by `AgentStarterResolver` at
+   * launch time; resolved artifacts seed the STARTER layer of the
+   * member's startup-file chain. Mutually exclusive with
+   * `sessionSource.mode: "fork"` per v0 schema (validateStarterRef).
+   */
+  starterRef?: StarterRefSpec;
+}
+
+export interface RigSpecPodEdge {
+  kind: string;
+  from: string;
+  to: string;
+}
+
+export interface RigSpecCrossPodEdge {
+  kind: string;
+  from: string;
+  to: string;
+}
+
+export interface RigSpecPod {
+  id: string;
+  label: string;
+  summary?: string;
+  continuityPolicy?: ContinuityPolicySpec;
+  startup?: StartupBlock;
+  members: RigSpecPodMember[];
+  edges: RigSpecPodEdge[];
+}
+
+export interface RigSpecDoc {
+  path: string;
+}
+
+/**
+ * PL-007 Workspace Primitive — typed workspace kinds enum. Reserved set
+ * at v0; adding a sixth kind is a v1+ amendment per the PL-007 product
+ * spec. Each kind has folder shape + frontmatter contract + ownership
+ * rules (see `frontmatter-validator.ts` for the per-kind required-field
+ * map).
+ */
+export const WORKSPACE_KINDS = ["user", "project", "knowledge", "lab", "delivery"] as const;
+export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];
+
+/** PL-007 — RigSpec.workspace.repos[] entry (typed). */
+export interface WorkspaceRepoSpec {
+  name: string;
+  /** Absolute path after normalization. Authors may declare a path relative to
+   *  `workspaceRoot` in YAML; the codec resolves to absolute at parse time. */
+  path: string;
+  kind: WorkspaceKind;
+}
+
+/** PL-007 — Optional RigSpec.workspace block. Rigs without it stay valid;
+ *  whoami / node-inventory return a null workspace block in that case. */
+export interface WorkspaceSpec {
+  workspaceRoot: string;
+  repos: WorkspaceRepoSpec[];
+  defaultRepo?: string;
+  /** Optional knowledge-canon root (e.g., a shared docs repo path).
+   *  Treated as kind=knowledge when surfaced through whoami / UI. */
+  knowledgeRoot?: string;
+}
+
+export interface RigSpec {
+  /** Authored launch-warning choice; an explicit launch option takes precedence. */
+  nonInterruptive?: boolean;
+  version: string;
+  name: string;
+  summary?: string;
+  cultureFile?: string;
+  /** OPR.0.4.8.3 Seam B: optional rig-level permission_policy REF (builtin:<name> or a
+   *  spec-relative custom path). Absent = the floor. A per-member ref overrides this. */
+  permissionPolicy?: string;
+  /** #25: per-runtime managed-block destination. Absent = CLAUDE.md. */
+  managedBlocks?: { "claude-code"?: import("./managed-blocks.js").ClaudeManagedBlockFile };
+  docs?: RigSpecDoc[];
+  startup?: StartupBlock;
+  services?: RigServicesSpec;
+  /** PL-007 Workspace Primitive — optional typed workspace declaration. */
+  workspace?: WorkspaceSpec;
+  pods: RigSpecPod[];
+  edges: RigSpecCrossPodEdge[];
+}
+
+export interface RigServicesWaitTarget {
+  service?: string;
+  condition?: "healthy";
+  url?: string;
+  tcp?: string;
+}
+
+export interface RigServicesSurfaceUrl {
+  name: string;
+  url: string;
+}
+
+export interface RigServicesSurfaceCommand {
+  name: string;
+  command: string;
+}
+
+export interface RigServicesSurface {
+  urls?: RigServicesSurfaceUrl[];
+  commands?: RigServicesSurfaceCommand[];
+}
+
+export interface RigServicesCheckpointHook {
+  id: string;
+  exportCommand: string;
+  importCommand?: string;
+}
+
+export interface RigServicesSpec {
+  kind: "compose";
+  composeFile: string;
+  projectName?: string;
+  profiles?: string[];
+  downPolicy?: "leave_running" | "down" | "down_and_volumes";
+  waitFor?: RigServicesWaitTarget[];
+  surfaces?: RigServicesSurface;
+  checkpoints?: RigServicesCheckpointHook[];
+}
+
+export interface EnvReceipt {
+  kind: "compose";
+  composeFile: string;
+  projectName: string;
+  services: Array<{ name: string; status: string; health?: string | null }>;
+  waitFor: Array<{ target: RigServicesWaitTarget; status: "healthy" | "unhealthy" | "pending"; detail?: string | null }>;
+  capturedAt: string;
+}
+
+export interface EnvCheckpoint {
+  kind: "compose";
+  capturedAt: string;
+  artifactsJson: string;
+}
+
+export interface RigServicesRecordInput {
+  kind: "compose";
+  specJson: string;
+  rigRoot: string;
+  composeFile: string;
+  projectName?: string;
+  latestReceiptJson?: string | null;
+}
+
+export interface RigServicesRecord {
+  rigId: string;
+  kind: "compose";
+  specJson: string;
+  rigRoot: string;
+  composeFile: string;
+  projectName: string;
+  latestReceiptJson: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ValidationResult {
+  valid: boolean;
+  errors: string[];
+  /** OPR.0.5.3.3 — non-blocking advisories (e.g. alias-form model pins). Fail-open: advisories
+   *  never affect `valid`. Absent/empty when there is nothing to advise. */
+  advisories?: string[];
+}
+
+export interface PreflightResult {
+  ready: boolean;
+  warnings: string[];
+  errors: string[];
+}
+
+export type InstantiateOutcome =
+  | { ok: true; result: InstantiateResult }
+  | { ok: false; code: "validation_failed"; errors: string[] }
+  | { ok: false; code: "preflight_failed"; errors: string[]; warnings: string[] }
+  | { ok: false; code: "instantiate_error"; message: string }
+  | { ok: false; code: "cycle_error"; message: string }
+  | { ok: false; code: "service_boot_failed"; message: string }
+  | { ok: false; code: "compose_project_conflict"; message: string }
+  // S5b (OPR.0.5.4.11) — the running-name guard refusal: a same-name rig is
+  // RUNNING, so instantiation refuses before any create/launch. The message
+  // teaches the running rig's identity and the supported alternatives.
+  // (Additive variant per orch-lead territory ruling on row r054-s5b-build.)
+  | { ok: false; code: "rig_name_running"; message: string; runningRig: { id: string; name: string; runningSessionCount: number } }
+  // #141: an unarchived same-name rig exists but could not be confirmed stopped, so the YAML import
+  // neither archives it nor creates another same-name generation beside it.
+  | { ok: false; code: "generation_unconfirmed"; message: string }
+  // OPR.0.3.2.CT (conveyor-trust-minimal-fix):
+  // When every launched node reaches a recoverable attention_required
+  // state (e.g., workspace-trust prompt), do NOT tear the rig down.
+  // The rig + sessions are preserved, listable, and approvable; the
+  // operator's path is "approve trust → resume". `attentionNodes`
+  // carries the actionable per-node detail for the route's 3-part
+  // error response.
+  | {
+      ok: false;
+      code: "attention_required";
+      message: string;
+      rigId: string;
+      attentionNodes: AttentionNode[];
+      /** #141: notices that must reach the user even though the import stopped for attention. */
+      warnings?: string[];
+    };
+
+export interface AttentionNode {
+  logicalId: string;
+  sessionName: string;
+  evidence?: string;
+  reason: string;
+}
+
+export interface InstantiateResult {
+  rigId: string;
+  specName: string;
+  specVersion: string;
+  // Per-node startup status — `launched` and `failed` are the legacy
+  // terminal states; `attention_required` (OPR.0.3.2.CT) marks a
+  // recoverable parked node awaiting operator action (e.g., trust
+  // approval). The session row's startup_status carries the same
+  // signal so `rig ps` surfaces it.
+  //
+  // `sessionName` + `evidence` carry runtime detail needed by
+  // BootstrapOrchestrator to construct AttentionNode[] for the mixed
+  // launched+attention_required path (the route's 3-part error
+  // response needs sessionName for the tmux-attach hint). Optional
+  // because legacy callers don't supply them on terminal-only paths.
+  nodes: {
+    logicalId: string;
+    status: "launched" | "failed" | "attention_required";
+    error?: string;
+    sessionName?: string;
+    evidence?: string;
+  }[];
+  warnings?: string[];
+}
+
+// -- Expansion types --
+
+export interface ExpansionPodFragment {
+  id: string;
+  label: string;
+  summary?: string;
+  members: Array<{
+    id: string;
+    runtime: string;
+    agentRef?: string;
+    profile?: string;
+    cwd?: string;
+    model?: string;
+    codexConfigProfile?: string;
+    /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF — threaded through the
+     *  expansion ingress exactly like role (never silently dropped). Typed UNKNOWN
+     *  (R2 at 4ac243c3): the ingress preserves RAW presence — including null and other
+     *  invalid shapes — so the ONE canonical RigSpec validator rejects present-invalid
+     *  values; the normalizer must never erase presence into absence/floor. */
+    permissionPolicy?: unknown;
+    restorePolicy?: string;
+    label?: string;
+    /**
+     * OPR.0.4.6.FAC1: optional seat-side role; threaded through
+     * buildExpansionSpecObject → the pod-member schema → nodes.role
+     * (a provided role is never silently dropped — the sibling-layer
+     * rule).
+     */
+    role?: string;
+    /** Optional session source declaration; threaded through to launch. */
+    sessionSource?: SessionSourceSpec;
+    /**
+     * Optional reference to a named starter registry entry; threaded
+     * through expansion → buildSyntheticSpec → daemon instantiation,
+     * matching the pass-through shape of `sessionSource`.
+     */
+    starterRef?: StarterRefSpec;
+  }>;
+  edges: Array<{ from: string; to: string; kind: string }>;
+}
+
+export interface ExpansionRequest {
+  rigId: string;
+  pod: ExpansionPodFragment;
+  crossPodEdges?: Array<{ from: string; to: string; kind: string }>;
+  rigRoot?: string;
+}
+
+export interface ExpansionNodeOutcome {
+  logicalId: string;
+  nodeId: string;
+  // OPR.0.3.2.CT — `attention_required` is a recoverable parked state
+  // (e.g., workspace-trust prompt awaiting operator action). The
+  // session row's startup_status carries the same signal so `rig ps`
+  // surfaces it. Distinct from `failed` (terminal).
+  status: "launched" | "failed" | "attention_required";
+  error?: string;
+  sessionName?: string;
+}
+
+export type ExpansionResult =
+  | { ok: true; status: "ok" | "partial" | "failed"; podId: string; podNamespace: string; nodes: ExpansionNodeOutcome[]; warnings: string[]; retryTargets: string[] }
+  | { ok: false; code: string; error: string };
+
+// -- Context usage types --
+
+export type ContextAvailability = "known" | "unknown";
+
+export type ContextUnknownReason =
+  | "unsupported_runtime"
+  | "not_managed"
+  | "missing_sidecar"
+  | "parse_error"
+  | "stale"
+  | "session_mismatch"
+  | "stale_generation"
+  | "no_data";
+
+export interface ContextUsage {
+  availability: ContextAvailability;
+  reason: ContextUnknownReason | null;
+  source: "claude_statusline_json" | "codex_token_count_jsonl" | null;
+  usedPercentage: number | null;
+  remainingPercentage: number | null;
+  contextWindowSize: number | null;
+  totalInputTokens: number | null;
+  totalOutputTokens: number | null;
+  currentUsage: string | null;
+  transcriptPath: string | null;
+  sessionId: string | null;
+  sessionName: string | null;
+  sampledAt: string | null;
+  fresh: boolean;
+  /** Claude only: the statusline's cumulative client-side cost estimate for `sessionId` (USD); null when not reported. */
+  clientCostEstimateUsd?: number | null;
+}

@@ -1,0 +1,163 @@
+import { describe, it, expect } from "vitest";
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import nodePath from "node:path";
+
+// 0.5.2-07 A2-3 — the ENUMERATION GUARD (anti-increment fence).
+//
+// The bug this slice kills is reasoning from the increment: OPR.0.4.6.PI1 fixed the model-drop at ONE
+// restore site, 51-07 A1 threaded -m/--model on the FRESH branches only, and both left the sibling
+// launch branches (codex fork/resume) silently reverting a spec-pinned seat to the runtime default.
+// This guard pins the CLASS: every seat-launch command template threads the SPEC model, and the one
+// command builder that is NOT a seat launch (buildNativeResumeCommand — metadata/inventory display)
+// is enumerated as such. A NEW launch branch that drops the model fails HERE, loudly.
+
+const SRC = nodePath.resolve(fileURLToPath(import.meta.url), "../../src");
+const read = (rel: string): string => readFileSync(nodePath.join(SRC, rel), "utf-8");
+
+function allSrcFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = nodePath.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...allSrcFiles(full));
+    else if (entry.name.endsWith(".ts")) out.push(full);
+  }
+  return out;
+}
+
+describe("0.5.2-07 A2-3 — model-fidelity enumeration guard", () => {
+  it("codex adapter: fresh + fork command templates thread modelArg", () => {
+    const src = read("adapters/codex-runtime-adapter.ts");
+    const templates = [...src.matchAll(/`codex\$\{[^`]*`/g)].map((m) => m[0]);
+    const seatLaunches = templates.filter((t) => / fork| -C /.test(t));
+    // fresh (-C) + fork are the two inline templates; resume goes via buildCodexResumeCore (below).
+    expect(seatLaunches.length).toBeGreaterThanOrEqual(2);
+    for (const t of seatLaunches) {
+      expect(t, `codex seat-launch template must thread modelArg:\n${t}`).toContain("modelArg");
+    }
+  });
+
+  it("codex adapter: the resume branch passes the model into buildCodexResumeCore", () => {
+    const src = read("adapters/codex-runtime-adapter.ts");
+    // The LAUNCH resume call threads binding.launchPosture, model, then the exact precomputed
+    // posture segment (followed by #275's network segment). The latter prevents W3 observation
+    // from re-deciding policy.
+    expect(src).toMatch(/buildCodexResumeCore\([^;]*binding\.launchPosture,\s*model,\s*(?:postureArg|`\$\{postureArg\}\$\{networkArg\}`)(?:,\s*daemonOptOut)?(?:,\s*effort)?\)/);
+  });
+
+  it("claude adapter: every claude seat-launch template threads modelArg", () => {
+    const src = read("adapters/claude-code-adapter.ts");
+    const templates = [...src.matchAll(/`(?:\$\{claudeResumeLaunchPrefix\([^)]*\)\})?(?:\$\{rendererPrefix\})?claude \$\{[^`]*`/g)].map((m) => m[0]);
+    const seatLaunches = templates.filter((t) => /--resume|--session-id|--fork-session/.test(t));
+    // fresh (--session-id), resume (--resume … --name), fork (--resume … --fork-session).
+    expect(seatLaunches.length).toBeGreaterThanOrEqual(3);
+    for (const t of seatLaunches) {
+      expect(t, `claude seat-launch template must thread modelArg:\n${t}`).toContain("modelArg");
+    }
+  });
+
+  it("legacy resume builders (claude-resume + codex-resume) thread the model", () => {
+    const claudeResume = read("adapters/claude-resume.ts");
+    expect(claudeResume).toMatch(/const modelArg = model \?/);
+    expect(claudeResume).toMatch(/\$\{modelArg\}.*--resume/);
+    const codexResume = read("adapters/codex-resume.ts");
+    // codex-resume threads `model` into buildCodexResumeCore's model param.
+    expect(codexResume).toMatch(/buildCodexResumeCore\([\s\S]*?\n\s*model,\n/);
+  });
+
+  it("shared buildCodexResumeCore accepts a model param and emits -m before the resume subcommand", () => {
+    const src = read("domain/native-resume-probe.ts");
+    expect(src).toMatch(/model\?: string \| null,\n\s*\/\*\*[^]*?\*\/\n\s*precomputedPostureArg\?: string,\n(?:\s*\/\*\*[^]*?\*\/\n\s*daemonOptOut\?: boolean,\n)?(?:\s*\/\*\*[^]*?\*\/\n\s*effort\?: string \| null,\n)?\): string/);
+    expect(src).toMatch(/const modelArg = model \? ` -m \$\{shellQuote\(model\)\}`/);
+    expect(src).toContain("`codex${daemonArg}${profileOrPosture}${modelArg}${effortArg} resume ");
+  });
+
+  it("#75: seat-launch command templates thread reasoning effort", () => {
+    const codexSrc = read("adapters/codex-runtime-adapter.ts");
+    const codexTemplates = [...codexSrc.matchAll(/`codex\$\{[^`]*`/g)].map((m) => m[0]);
+    const codexSeatLaunches = codexTemplates.filter((t) => / fork| -C /.test(t));
+    expect(codexSeatLaunches.length).toBeGreaterThanOrEqual(2);
+    for (const t of codexSeatLaunches) {
+      expect(t, `codex seat-launch template must thread effortArg:\n${t}`).toContain("effortArg");
+    }
+
+    const claudeSrc = read("adapters/claude-code-adapter.ts");
+    const claudeTemplates = [...claudeSrc.matchAll(/`(?:\$\{claudeResumeLaunchPrefix\([^)]*\)\})?(?:\$\{rendererPrefix\})?claude \$\{[^`]*`/g)].map((m) => m[0]);
+    const claudeSeatLaunches = claudeTemplates.filter((t) => /--resume|--session-id|--fork-session/.test(t));
+    expect(claudeSeatLaunches.length).toBeGreaterThanOrEqual(3);
+    for (const t of claudeSeatLaunches) {
+      expect(t, `claude seat-launch template must thread effortArg:\n${t}`).toContain("effortArg");
+    }
+
+    const claudeResume = read("adapters/claude-resume.ts");
+    expect(claudeResume).toMatch(/const effortArg = effort \?/);
+    expect(claudeResume).toMatch(/\$\{effortArg\}.*--resume/);
+
+    const codexResume = read("adapters/codex-resume.ts");
+    expect(codexResume).toMatch(/buildCodexResumeCore\([\s\S]*?\n\s*effort,\n/);
+  });
+
+  it("buildNativeResumeCommand is classified NOT-A-SEAT-LAUNCH: every caller is metadata/inventory, none is a launch module", () => {
+    const LAUNCH_MODULES = new Set([
+      "codex-runtime-adapter.ts",
+      "claude-code-adapter.ts",
+      "pi-runner-protocol.ts",
+      "successor-session-launcher.ts",
+      "restore-orchestrator.ts",
+      "startup-orchestrator.ts",
+      "claude-resume.ts",
+      "codex-resume.ts",
+    ]);
+    // Enumerate every file that references buildNativeResumeCommand, excluding its own definition file.
+    const callers = allSrcFiles(SRC)
+      .filter((f) => nodePath.basename(f) !== "native-resume-probe.ts")
+      .filter((f) => readFileSync(f, "utf-8").includes("buildNativeResumeCommand"))
+      .map((f) => nodePath.basename(f));
+    // It is a display/metadata builder — no live-pane launch module may call it. If a launch module
+    // starts calling it, this fence fails and buildNativeResumeCommand must then thread the model.
+    const launchCallers = callers.filter((c) => LAUNCH_MODULES.has(c));
+    expect(launchCallers, `buildNativeResumeCommand must not be called from a seat-launch module: ${launchCallers}`).toEqual([]);
+    // And it IS still used by the metadata/inventory surface (classification is live, not dead).
+    expect(callers.sort()).toEqual(["node-inventory.ts", "resume-metadata-refresher.ts"]);
+  });
+
+  // 0.5.2-07 A4-profile — extend the fence to the codex_config_profile field. The codex adapter already
+  // emits `-p` from binding.codexConfigProfile; the HANDOVER path (the A2-1 fix's sibling) must SELECT
+  // the column at lookupNode AND carry it onto the successor binding, exactly as it now does for model.
+  // A future edit that threads the profile into the binding but forgets the SELECT (or vice-versa) fails HERE.
+  it("handover threads codex_config_profile: lookupNode SELECTs it AND the successor binding carries it", () => {
+    const handover = read("domain/seat-handover-service.ts");
+    // The lookupNode query must SELECT the column (mirrors the A2-1 model SELECT, one field over).
+    expect(handover, "seat-handover-service lookupNode must SELECT codex_config_profile").toMatch(
+      /SELECT id, runtime, cwd, model, codex_config_profile(?:, effort)? FROM nodes/,
+    );
+    // The NodeRow shape must carry it, and createSuccessor must forward it onto the successor node.
+    expect(handover, "NodeRow must carry codex_config_profile").toMatch(/codex_config_profile: string \| null/);
+    expect(handover, "createSuccessor must forward the profile onto the successor node").toMatch(
+      /codexConfigProfile: node\.codex_config_profile/,
+    );
+    // The launcher must thread it from the successor node onto the transient binding the adapter reads.
+    const launcher = read("domain/successor-session-launcher.ts");
+    expect(launcher, "SuccessorNode must declare codexConfigProfile").toMatch(/codexConfigProfile\?: string \| null/);
+    expect(launcher, "the transient binding must thread codexConfigProfile").toMatch(
+      /codexConfigProfile: node\.codexConfigProfile/,
+    );
+  });
+
+  it("#75: handover threads effort: lookupNode SELECTs it AND the successor binding carries it", () => {
+    const handover = read("domain/seat-handover-service.ts");
+    expect(handover, "seat-handover-service lookupNode must SELECT effort").toMatch(
+      /SELECT id, runtime, cwd, model, codex_config_profile, effort FROM nodes/,
+    );
+    expect(handover, "NodeRow must carry effort").toMatch(/effort: string \| null/);
+    // OPR.0.7.0.7: the successor carries the shared resolver's effort (saved seat choice, else authored).
+    expect(handover, "createSuccessor must forward the resolved effort onto the successor node").toMatch(
+      /effort: readSeatEffort\(this\.db, node\.id\)\?\.effective/,
+    );
+    const launcher = read("domain/successor-session-launcher.ts");
+    expect(launcher, "SuccessorNode must declare effort").toMatch(/effort\?: string \| null/);
+    expect(launcher, "the transient binding must thread effort").toMatch(
+      /effort: node\.effort/,
+    );
+  });
+});

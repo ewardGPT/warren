@@ -1,0 +1,126 @@
+import { useNavigate } from "@tanstack/react-router";
+import { cn } from "@/lib/utils";
+import {
+  type ActivityEvent,
+  MAX_ACTIVITY_EVENTS,
+  formatLogTime,
+  eventColor,
+  eventSummary,
+  eventRoute,
+} from "../hooks/useActivityFeed.js";
+
+interface ActivityFeedProps {
+  events: ActivityEvent[];
+  open: boolean;
+  onClose: () => void;
+}
+
+export function LogFeedList({ events }: { events: ActivityEvent[] }) {
+  const navigate = useNavigate();
+  const isCapped = events.length >= MAX_ACTIVITY_EVENTS;
+
+  return (
+    <div
+      data-testid="feed-scroll-region"
+      className="relative z-10 overflow-y-auto flex-1 min-h-0"
+    >
+      <div
+        data-testid="feed-disclosure"
+        className="px-spacing-3 py-2 border-b border-outline-variant/20 font-mono text-[9px] uppercase tracking-[0.06em] text-on-surface-variant"
+      >
+        Showing last {MAX_ACTIVITY_EVENTS} live events in this panel.
+      </div>
+      {events.length === 0 ? (
+        <div data-testid="feed-empty" className="px-spacing-3 py-spacing-4 font-mono text-[10px] text-on-surface-variant text-center">
+          No recent log entries
+        </div>
+      ) : (
+        <>
+          {events.map((event) => {
+            const route = eventRoute(event);
+            const isNavigable = route !== null;
+
+            return (
+              <div
+                key={event.seq}
+                data-testid="feed-entry"
+                data-event-type={event.type}
+                role={isNavigable ? "link" : undefined}
+                tabIndex={isNavigable ? 0 : undefined}
+                onClick={isNavigable ? () => navigate({ to: route }) : undefined}
+                onKeyDown={isNavigable ? (e) => { if (e.key === "Enter") navigate({ to: route }); } : undefined}
+                className={cn(
+                  "flex items-center gap-2 px-spacing-3 py-1.5 border-b border-outline-variant/20 transition-colors duration-150 ease-tactical font-mono text-[10px] leading-4",
+                  isNavigable && "cursor-pointer hover:bg-surface-lowest/24"
+                )}
+              >
+                <span
+                  data-testid="feed-dot"
+                  className={cn("inline-block h-[6px] w-[6px] shrink-0", eventColor(event.type))}
+                />
+
+                <span
+                  data-testid="feed-time"
+                  className="shrink-0 text-[9px] text-on-surface-variant tabular-nums"
+                >
+                  {formatLogTime(event.createdAt)}
+                </span>
+                <span
+                  data-testid="feed-summary"
+                  className="min-w-0 flex-1 truncate text-on-surface"
+                >
+                  {eventSummary(event)}
+                </span>
+              </div>
+            );
+          })}
+          {isCapped ? (
+            <div
+              data-testid="feed-end-of-history"
+              className="px-spacing-3 py-2 font-mono text-[9px] uppercase tracking-[0.06em] text-on-surface-variant text-center"
+            >
+              Older events are not loaded in this panel yet.
+            </div>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+export function ActivityFeed({ events, open, onClose }: ActivityFeedProps) {
+  if (!open) return null;
+
+  return (
+    <div
+      data-testid="activity-feed"
+      className={cn(
+        "fixed bottom-7 right-4 z-20 w-80 max-w-[calc(100vw-1rem)] max-h-[50vh] overflow-hidden",
+        "text-on-surface rounded-sm",
+        "bg-[hsl(var(--background)/0.035)] backdrop-blur-[14px] backdrop-saturate-75",
+        "supports-[backdrop-filter]:bg-[hsl(var(--background)/0.018)]",
+        "shadow-[-3px_-2px_8px_rgba(46,52,46,0.025)]",
+        "border border-outline-variant/16"
+      )}
+    >
+      <div className="relative flex max-h-[50vh] flex-col">
+        {/* Header */}
+        <div className="relative z-10 flex items-center justify-between px-spacing-3 py-spacing-2 border-b border-outline-variant/35 shrink-0">
+          <span className="text-label-sm uppercase tracking-[0.06em] text-on-surface">
+            RECENT LOG
+          </span>
+          <button
+            data-testid="feed-close"
+            onClick={onClose}
+            className="text-label-sm text-on-surface-variant hover:text-on-surface hover:bg-surface-lowest/30 transition-colors duration-150 ease-tactical px-spacing-1"
+            aria-label="Close log"
+          >
+            &times;
+          </button>
+        </div>
+
+        <LogFeedList events={events} />
+      </div>
+    </div>
+  );
+}

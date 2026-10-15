@@ -1,0 +1,181 @@
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmdirSync, statSync } from "node:fs";
+import { dirname } from "node:path";
+import { getDefaultOpenRigPath } from "./openrig-compat.js";
+
+/**
+ * The LEARNED host-identity sidecar — hosts.yaml's `known_hosts`.
+ *
+ * `hosts.yaml` is hand-authored (the operator's `~/.ssh/config`); this file is machine-learned
+ * (first-contact TOFU from `/healthz` `selfHostId` on probes we already run) and DISPOSABLE —
+ * delete it to re-learn. The registry write path canonically rewrites hosts.yaml and drops
+ * operator comments, so learned bindings NEVER go there; they live here, keyed by the registry
+ * entry's alias (`id`).
+ *
+ * Failure semantics (the known_hosts lesson — a broken binding must fail LOUDLY):
+ * - First observation for an alias: bind silently (TOFU).
+ * - A LATER observation that DIFFERS: the stored binding is NEVER silently overwritten; the
+ *   contradiction is recorded on the binding and surfaced by every reader (host ls flag, doctor
+ *   row, resolution warning). A host's self-id is minted once and never re-keyed, so a changed
+ *   observation means a genuine re-key or a mis-registration — both deserve a loud surface.
+ * - ABSENCE stays fail-open: an unbound alias resolves exactly as today.
+ */
+export interface HostBinding {
+  hostId: string;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  /** A later observation that CONTRADICTED the stored binding — kept visible, never adopted. */
+  conflict?: { hostId: string; observedAt: string };
+}
+
+export interface HostBindingsFile {
+  version: 1;
+  /** Keyed by the registry entry's alias (`HostEntry.id`). */
+  bindings: Record<string, HostBinding>;
+}
+
+export function defaultHostBindingsPath(): string {
+  return getDefaultOpenRigPath("host-bindings.json");
+}
+
+/** Load the sidecar. Fail-open by contract: missing, unreadable, or corrupt → empty bindings
+ *  (a broken sidecar must never break resolution; delete it to re-learn). */
+export function loadHostBindings(path: string = defaultHostBindingsPath()): HostBindingsFile {
+  const empty: HostBindingsFile = { version: 1, bindings: {} };
+  if (!existsSync(path)) return empty;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+    if (!parsed || typeof parsed !== "object") return empty;
+    // A declared version other than 1 is a FUTURE sidecar shape — treat it as unreadable (empty,
+    // fail-open) rather than mis-parsing v2 fields through v1 eyes. Absent version reads as v1
+    // (files this code wrote always carry it; hand-trimmed ones stay readable).
+    const version = (parsed as { version?: unknown }).version;
+    if (version !== undefined && version !== 1) return empty;
+    const bindings = (parsed as { bindings?: unknown }).bindings;
+    if (!bindings || typeof bindings !== "object") return empty;
+    const out: Record<string, HostBinding> = {};
+    for (const [alias, b] of Object.entries(bindings as Record<string, unknown>)) {
+      if (!b || typeof b !== "object") continue;
+      const bb = b as Record<string, unknown>;
+      if (typeof bb["hostId"] !== "string" || bb["hostId"].length === 0) continue;
+      out[alias] = {
+        hostId: bb["hostId"],
+        firstObservedAt: typeof bb["firstObservedAt"] === "string" ? bb["firstObservedAt"] : "",
+        lastObservedAt: typeof bb["lastObservedAt"] === "string" ? bb["lastObservedAt"] : "",
+        ...(bb["conflict"] && typeof bb["conflict"] === "object"
+          && typeof (bb["conflict"] as Record<string, unknown>)["hostId"] === "string"
+          ? {
+              conflict: {
+                hostId: (bb["conflict"] as Record<string, string>)["hostId"]!,
+                observedAt: typeof (bb["conflict"] as Record<string, unknown>)["observedAt"] === "string"
+                  ? (bb["conflict"] as Record<string, string>)["observedAt"]!
+                  : "",
+              },
+            }
+          : {}),
+      };
+    }
+    return { version: 1, bindings: out };
+  } catch {
+    return empty;
+  }
+}
+
+// r1 B4 follow-on (F2) — the read-modify-write needs a concurrency guard: 15 seats run
+// send/capture/doctor concurrently, and an interleaved write could erase a sibling's binding —
+// benign for a BINDING (TOFU re-learns) but not for a CONFLICT record, whose loss is the exact
+// silence the known_hosts lesson forbids. Guard: an mkdir-based advisory lock (atomic on every
+// platform) held across load→mutate→rename, with bounded busy-wait retries and a stale-lock
+// takeover. If the lock cannot be won inside the budget the write proceeds UNGUARDED (fail-open —
+// availability over the rare loss; the conflict re-records on the next contradicting observation).
+const LOCK_RETRIES = 40;
+const LOCK_RETRY_MS = 5;
+// NAMED TAIL (r1 F2 review, not built for): after a stale takeover the ORIGINAL holder still
+// believes it holds the lock, so its release rmdirs the NEW holder's lock — in principle that
+// cascades. Low: the critical section is fully synchronous (the loop cannot preempt it) and 2s is
+// ~3 orders of magnitude over normal hold time — but this box has run loadavg 9-11 with
+// multi-minute stalls, so the tail is not zero. The token-verified-release fix is more machinery
+// than a fail-open advisory lock over a self-healing cache justifies.
+const LOCK_STALE_MS = 2_000;
+
+function acquireLock(lockDir: string): boolean {
+  for (let i = 0; i < LOCK_RETRIES; i++) {
+    try {
+      mkdirSync(lockDir);
+      return true;
+    } catch {
+      try {
+        if (Date.now() - statSync(lockDir).mtimeMs > LOCK_STALE_MS) rmdirSync(lockDir);
+      } catch {
+        /* raced away — retry */
+      }
+      const until = Date.now() + LOCK_RETRY_MS;
+      while (Date.now() < until) { /* bounded busy-wait: sync API, sub-ms slices */ }
+    }
+  }
+  return false;
+}
+
+function releaseLock(lockDir: string): void {
+  try { rmdirSync(lockDir); } catch { /* best-effort */ }
+}
+
+export type HostObservationOutcome =
+  | { outcome: "bound"; binding: HostBinding }
+  | { outcome: "confirmed"; binding: HostBinding }
+  /** The stored binding was NOT changed; the contradiction was recorded on it. */
+  | { outcome: "conflict"; binding: HostBinding };
+
+/**
+ * Record one observation of `observedHostId` for registry alias `alias` (TOFU + loud-conflict).
+ * Persists via write-temp-then-rename so a crashed writer never leaves a torn file.
+ */
+export function recordHostObservation(args: {
+  alias: string;
+  observedHostId: string;
+  now?: () => Date;
+  path?: string;
+}): HostObservationOutcome {
+  const path = args.path ?? defaultHostBindingsPath();
+  const at = (args.now ?? (() => new Date()))().toISOString();
+  mkdirSync(dirname(path), { recursive: true });
+  const lockDir = `${path}.lock`;
+  const locked = acquireLock(lockDir);
+  try {
+    return recordUnderLock(args.alias, args.observedHostId, at, path);
+  } finally {
+    if (locked) releaseLock(lockDir);
+  }
+}
+
+function recordUnderLock(alias: string, observedHostId: string, at: string, path: string): HostObservationOutcome {
+  const file = loadHostBindings(path);
+  const existing = file.bindings[alias];
+
+  let result: HostObservationOutcome;
+  if (!existing) {
+    const binding: HostBinding = { hostId: observedHostId, firstObservedAt: at, lastObservedAt: at };
+    file.bindings[alias] = binding;
+    result = { outcome: "bound", binding };
+  } else if (existing.hostId === observedHostId) {
+    const binding: HostBinding = { ...existing, lastObservedAt: at };
+    // A re-observation of the ORIGINAL id after a recorded conflict does not clear the conflict —
+    // a flapping identity is more alarming than a stable contradiction, not less.
+    file.bindings[alias] = binding;
+    result = { outcome: "confirmed", binding };
+  } else {
+    const binding: HostBinding = { ...existing, conflict: { hostId: observedHostId, observedAt: at } };
+    file.bindings[alias] = binding;
+    result = { outcome: "conflict", binding };
+  }
+
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(file, null, 2) + "\n", "utf-8");
+  renameSync(tmp, path);
+  return result;
+}
+
+/** One line naming both ids, shared by every loud surface (ls flag detail, doctor row, resolution
+ *  warning) so the operator reads the same story everywhere. */
+export function describeBindingConflict(alias: string, binding: HostBinding): string {
+  return `host '${alias}': observed self-id '${binding.conflict?.hostId}' contradicts the learned binding '${binding.hostId}' — a host's self-id is minted once, so this is a re-key or a mis-registration. If the re-key is legitimate, delete the '${alias}' entry in ${defaultHostBindingsPath()} to re-learn (TOFU).`;
+}

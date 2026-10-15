@@ -1,0 +1,421 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { Hono } from "hono";
+import { mkdtempSync, writeFileSync, rmSync, utimesSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import type Database from "better-sqlite3";
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { coreSchema } from "../src/db/migrations/001_core_schema.js";
+import { bindingsSessionsSchema } from "../src/db/migrations/002_bindings_sessions.js";
+import { eventsSchema } from "../src/db/migrations/003_events.js";
+import { snapshotsSchema } from "../src/db/migrations/004_snapshots.js";
+import { checkpointsSchema } from "../src/db/migrations/005_checkpoints.js";
+import { resumeMetadataSchema } from "../src/db/migrations/006_resume_metadata.js";
+import { nodeSpecFieldsSchema } from "../src/db/migrations/007_node_spec_fields.js";
+import { agentspecRebootSchema } from "../src/db/migrations/014_agentspec_reboot.js";
+import { externalCliAttachmentSchema } from "../src/db/migrations/019_external_cli_attachment.js";
+import { sessionStopIntentSchema } from "../src/db/migrations/103_session_stop_intent.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { TranscriptStore } from "../src/domain/transcript-store.js";
+import { transcriptRoutes } from "../src/routes/transcripts.js";
+import type { TmuxAdapter } from "../src/adapters/tmux.js";
+import { vi } from "vitest";
+
+function setupDb(): Database.Database {
+  const db = createDb();
+  migrate(db, [coreSchema, bindingsSessionsSchema, eventsSchema, snapshotsSchema, checkpointsSchema, resumeMetadataSchema, nodeSpecFieldsSchema, agentspecRebootSchema, externalCliAttachmentSchema, sessionStopIntentSchema]);
+  return db;
+}
+
+function createApp(opts: {
+  db: Database.Database;
+  rigRepo: RigRepository;
+  sessionRegistry: SessionRegistry;
+  transcriptStore: TranscriptStore;
+  tmuxAdapter?: TmuxAdapter;
+}): Hono {
+  const app = new Hono();
+  app.use("*", async (c, next) => {
+    c.set("rigRepo" as never, opts.rigRepo);
+    c.set("sessionRegistry" as never, opts.sessionRegistry);
+    c.set("transcriptStore" as never, opts.transcriptStore);
+    c.set("db" as never, opts.db);
+    c.set("tmuxAdapter" as never, opts.tmuxAdapter);
+    await next();
+  });
+  app.route("/api/transcripts", transcriptRoutes());
+  return app;
+}
+
+describe("transcript routes", () => {
+  let db: Database.Database;
+  let rigRepo: RigRepository;
+  let sessionRegistry: SessionRegistry;
+  let tmpDir: string;
+
+  beforeEach(() => {
+    db = setupDb();
+    rigRepo = new RigRepository(db);
+    sessionRegistry = new SessionRegistry(db);
+    tmpDir = mkdtempSync(join(tmpdir(), "transcript-routes-"));
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function seedRigWithTranscript(content: string) {
+    const rig = rigRepo.createRig("my-rig");
+    const node = rigRepo.addNode(rig.id, "dev-impl", { role: "worker", runtime: "claude-code" });
+    const session = sessionRegistry.registerSession(node.id, "dev-impl@my-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    store.ensureTranscriptDir("my-rig");
+    const filePath = store.getTranscriptPath("my-rig", "dev-impl@my-rig");
+    writeFileSync(filePath, content);
+
+    return { rig, node, session, store };
+  }
+
+  it("GET /tail returns 200 with stripped content for existing transcript", async () => {
+    const { store } = seedRigWithTranscript("line1\n\x1b[1mline2\x1b[0m\nline3\n");
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail?lines=10");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.session).toBe("dev-impl@my-rig");
+    expect(body.content).toContain("line2"); // ANSI stripped
+    expect(body.content).not.toContain("\x1b[");
+  });
+
+  it("GET /tail reports live transcript ingest metadata for a fresh capture", async () => {
+    const { store } = seedRigWithTranscript("recent work\n");
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail?lines=10");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ingestHealth).toEqual(expect.objectContaining({
+      state: "live",
+      runtime: "claude-code",
+    }));
+  });
+
+  it("GET /tail fails loudly when an existing transcript is stale and capture cannot restart", async () => {
+    const { store } = seedRigWithTranscript("old misleading work\n");
+    const transcriptPath = store.getTranscriptPath("my-rig", "dev-impl@my-rig");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(transcriptPath, old, old);
+    const capturePaneContent = vi.fn(async () => null);
+    const app = createApp({
+      db,
+      rigRepo,
+      sessionRegistry,
+      transcriptStore: store,
+      tmuxAdapter: { capturePaneContent } as unknown as TmuxAdapter,
+    });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail?lines=10");
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error).toContain("Transcript ingest degraded");
+    expect(body.error).toContain("claude-code");
+    expect(body.ingestHealth).toEqual(expect.objectContaining({
+      state: "degraded",
+      runtime: "claude-code",
+      reason: "capture_stale",
+    }));
+  });
+
+  it("GET /tail with unknown session returns 404 with guidance", async () => {
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/nonexistent-session/tail");
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("not found");
+    expect(body.error).toContain("rig ps");
+  });
+
+  it("GET /tail with known session but no transcript file returns 404 with guidance", async () => {
+    // Create rig + session but NO transcript file
+    const rig = rigRepo.createRig("my-rig");
+    const node = rigRepo.addNode(rig.id, "dev-impl", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node.id, "dev-impl@my-rig");
+
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail");
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("No transcript");
+    expect(body.error).toContain("rig up");
+  });
+
+  it("GET /tail registers a transcript rotation timer for a tmux-bound session with no transcript file", async () => {
+    const {
+      getActiveRotationCount,
+      clearAllTranscriptRotationsForTest,
+    } = await import("../src/domain/transcript-rotation.js");
+    clearAllTranscriptRotationsForTest();
+    const rig = rigRepo.createRig("my-rig");
+    const node = rigRepo.addNode(rig.id, "dev-impl", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node.id, "dev-impl@my-rig");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-impl@my-rig" });
+
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    vi.spyOn(store, "ensureTranscriptDir").mockReturnValue(true);
+    // V1 pre-release Item 1: capture-pane returns null (no terminal
+    // content yet) so the rotation tick is a no-op write — the
+    // transcript file stays empty and readTail returns null, which
+    // surfaces as the legacy "started now" 404 to clients polling
+    // before the first real capture.
+    const capturePaneSpy = vi.fn(async () => null);
+    const app = createApp({
+      db,
+      rigRepo,
+      sessionRegistry,
+      transcriptStore: store,
+      tmuxAdapter: { capturePaneContent: capturePaneSpy } as unknown as TmuxAdapter,
+    });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail");
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("started now");
+    expect(getActiveRotationCount()).toBeGreaterThan(0);
+    clearAllTranscriptRotationsForTest();
+  });
+
+  it("GET /tail returns warmed content after lazy-start capture when output appears quickly", async () => {
+    const {
+      getActiveRotationCount,
+      clearAllTranscriptRotationsForTest,
+    } = await import("../src/domain/transcript-rotation.js");
+    clearAllTranscriptRotationsForTest();
+    const rig = rigRepo.createRig("my-rig");
+    const node = rigRepo.addNode(rig.id, "dev-impl", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node.id, "dev-impl@my-rig");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-impl@my-rig" });
+
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    vi.spyOn(store, "ensureTranscriptDir").mockReturnValue(true);
+    const capturePaneSpy = vi.fn(async () => "READY\n");
+    const app = createApp({
+      db,
+      rigRepo,
+      sessionRegistry,
+      transcriptStore: store,
+      tmuxAdapter: { capturePaneContent: capturePaneSpy } as unknown as TmuxAdapter,
+    });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.content).toBe("READY\n");
+    expect(getActiveRotationCount()).toBeGreaterThan(0);
+    clearAllTranscriptRotationsForTest();
+  });
+
+  it("GET /tail with non-positive lines normalizes to default", async () => {
+    const { store } = seedRigWithTranscript("line1\nline2\nline3\n");
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail?lines=-5");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Normalized to default 50, response includes the normalized value
+    expect(body.lines).toBe(50);
+  });
+
+  it("GET /tail with transcripts disabled returns 404 with guidance", async () => {
+    seedRigWithTranscript("content");
+    const disabledStore = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: false });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: disabledStore });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail");
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("disabled");
+  });
+
+  it("GET /grep with matches returns 200 with matched lines", async () => {
+    const { store } = seedRigWithTranscript("hello world\ndecision made\nfoo bar\ndecision final\n");
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/grep?pattern=decision");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.session).toBe("dev-impl@my-rig");
+    expect(body.matches).toHaveLength(2);
+    expect(body.matches[0]).toBe("decision made");
+    expect(body.matches[1]).toBe("decision final");
+  });
+
+  it("GET /grep without pattern returns 400", async () => {
+    const { store } = seedRigWithTranscript("content");
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/grep");
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("pattern");
+  });
+
+  it("GET /tail with ambiguous session name across rigs returns 409", async () => {
+    // Create two rigs with same name and same session name
+    const rig1 = rigRepo.createRig("my-rig");
+    const node1 = rigRepo.addNode(rig1.id, "dev-impl", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node1.id, "dev-impl@my-rig");
+
+    const rig2 = rigRepo.createRig("other-rig");
+    const node2 = rigRepo.addNode(rig2.id, "dev-impl2", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node2.id, "dev-impl@my-rig");
+
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/tail");
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("ambiguous");
+  });
+
+  it("GET /grep with invalid regex returns 400", async () => {
+    const { store } = seedRigWithTranscript("content");
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/grep?pattern=[invalid");
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("Invalid grep pattern");
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // M2c-Daemon — GET /:session/full route tests.
+  //
+  // Per orch decision approved-option-a-open-local-transcript-full-read-with-redaction
+  // (qitem-20260502020833-68e4eca3): full-read route adopts the existing
+  // tail/grep posture (open route, daemon-local trust boundary). Redaction
+  // is the protective primitive in this slice. The originally-requested
+  // session-scoped denial test was reframed by orch to session-resolution
+  // failure (404 unknown session), since no caller-identity / session-scope
+  // primitive exists in the daemon today.
+  //
+  // Test plan (4 cases per dispatch + 1 ambiguity bonus per orch easy-case):
+  // (a) authorized success → full transcript content in response
+  // (b) session-resolution failure → 404 unknown session
+  // (c) route-level redaction → synthetic credential patterns absent from wire payload
+  // (d) disabled/missing transcript → explicit 404
+  // (extra) ambiguity → 409 (matches tail/grep precedent)
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("GET /full returns 200 with full transcript content for existing session (success case)", async () => {
+    const fixture = "first line\nsecond line\nthird line\n";
+    const { store } = seedRigWithTranscript(fixture);
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/full");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.session).toBe("dev-impl@my-rig");
+    expect(typeof body.content).toBe("string");
+    expect(body.content).toContain("first line");
+    expect(body.content).toContain("second line");
+    expect(body.content).toContain("third line");
+  });
+
+  it("GET /full with unknown session returns 404 (session-resolution failure; reframe per orch)", async () => {
+    // Orch reframe: session-scoped denial replaced with session-resolution
+    // failure since no caller-identity/session-scope primitive exists.
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/nonexistent-session/full");
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("not found");
+    expect(body.error).toContain("rig ps");
+  });
+
+  it("GET /full applies route-level redaction: synthetic credential patterns absent from wire payload", async () => {
+    // Synthetic credentials covering 4 of the 5 v0 patterns (sk-*, gh*_*,
+    // github_pat_*, Bearer *). NOT real credentials. Per Quality Lesson v9.
+    const fixture = [
+      "INFO startup",
+      "user pasted token sk-FakeAbCdEfGhIjKlMnOpQr in chat",
+      "another sample token ghp_FakeAbCdEfGhIjKlMnOpQrSt was used",
+      "fine-grained pat: github_pat_FakeAbCdEfGhIjKlMnOpQrSt",
+      "auth header: Bearer FakeAbCdEfGhIjKlMnOpQrStUvWxYz123456",
+      "trailing line",
+    ].join("\n");
+    const { store } = seedRigWithTranscript(fixture);
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/full");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Wire payload MUST NOT contain any of the planted credential patterns.
+    expect(body.content).not.toContain("sk-FakeAbCdEfGhIjKlMnOpQr");
+    expect(body.content).not.toContain("ghp_FakeAbCdEfGhIjKlMnOpQrSt");
+    expect(body.content).not.toContain("github_pat_FakeAbCdEfGhIjKlMnOpQrSt");
+    expect(body.content).not.toContain("Bearer FakeAbCdEfGhIjKlMnOpQrStUvWxYz123456");
+    // Route-level redaction left a [REDACTED] marker in place of each.
+    expect(body.content).toContain("[REDACTED]");
+    // Surrounding context preserved (redaction is non-destructive at line level).
+    expect(body.content).toContain("INFO startup");
+    expect(body.content).toContain("trailing line");
+  });
+
+  it("GET /full with transcripts disabled returns 404 with guidance (disabled case)", async () => {
+    seedRigWithTranscript("content");
+    const disabledStore = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: false });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: disabledStore });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/full");
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("disabled");
+  });
+
+  it("GET /full with known session but no transcript file returns 404 with guidance (missing case)", async () => {
+    // Create rig + session but NO transcript file.
+    const rig = rigRepo.createRig("my-rig");
+    const node = rigRepo.addNode(rig.id, "dev-impl", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node.id, "dev-impl@my-rig");
+
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/full");
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toContain("No transcript");
+  });
+
+  it("GET /full with ambiguous session name across rigs returns 409 (precedent match with tail/grep)", async () => {
+    // Two rigs, same session name → ambiguity 409 (mirrors tail/grep behavior).
+    const rig1 = rigRepo.createRig("my-rig");
+    const node1 = rigRepo.addNode(rig1.id, "dev-impl", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node1.id, "dev-impl@my-rig");
+
+    const rig2 = rigRepo.createRig("other-rig");
+    const node2 = rigRepo.addNode(rig2.id, "dev-impl2", { role: "worker", runtime: "claude-code" });
+    sessionRegistry.registerSession(node2.id, "dev-impl@my-rig");
+
+    const store = new TranscriptStore({ transcriptsRoot: tmpDir, enabled: true });
+    const app = createApp({ db, rigRepo, sessionRegistry, transcriptStore: store });
+
+    const res = await app.request("/api/transcripts/dev-impl@my-rig/full");
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("ambiguous");
+  });
+});

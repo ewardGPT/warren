@@ -1,0 +1,226 @@
+// S10 port: the slice-11 transport receipts, re-homed onto the daemon's socket-inbound
+// service (runInboundLoop moved verbatim from the retired CLI runner; the queue seam is the
+// in-process port). The receipts themselves are unchanged — B1 periodic drain included.
+import { describe, it, expect } from "vitest";
+import { startSocketInbound, type WsLike, type SocketInboundDeps } from "../src/domain/gateway/slack/socket-inbound.js";
+import { InboundRouter, type SlackEvent } from "../src/domain/gateway/slack/inbound.js";
+import { SeenStore, DeadLetterStore, InboundReceiptStore, type StateFsOps } from "../src/domain/gateway/slack/state-store.js";
+import type { FetchImpl } from "../src/domain/gateway/slack/slack-api.js";
+
+function memFs(onAppend?: (path: string, data: string) => void): StateFsOps {
+  const files = new Map<string, string>();
+  return {
+    readFileSync: (p) => {
+      if (!files.has(p)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return files.get(p)!;
+    },
+    appendFileSync: (p, d) => { onAppend?.(p, d); files.set(p, (files.get(p) ?? "") + d); },
+    writeFileSync: (p, d) => files.set(p, d),
+    rename: (from, to) => {
+      files.set(to, files.get(from) ?? "");
+      files.delete(from);
+    },
+    mkdirp: () => {},
+  };
+}
+const clock = () => new Date("2026-07-30T00:00:00.000Z");
+const flush = () => new Promise((r) => setTimeout(r, 5));
+
+// A controllable fake Socket Mode WebSocket.
+function makeFakeWs() {
+  const sent: string[] = [];
+  const ws: WsLike = { send: (d) => sent.push(d), close: () => {}, onopen: null, onmessage: null, onclose: null, onerror: null };
+  return { ws, sent };
+}
+// fetchImpl that answers apps.connections.open with a ws url.
+const openFetch: FetchImpl = async () =>
+  new Response(JSON.stringify({ ok: true, url: "wss://fake-slack/ws" }), { status: 200, headers: { "content-type": "application/json" } });
+
+const envelope = (event: SlackEvent, id = `e-${event.ts}`) => JSON.stringify({ envelope_id: id, type: "events_api", payload: { event } });
+
+describe("Slice-11 INBOUND transport — real runInboundLoop / open / message / ack / periodic retry (B1 + proof gap)", () => {
+  it("reports a failed open as disconnected instead of leaving the connector apparently connecting", async () => {
+    const fsx = memFs();
+    const receipts = new InboundReceiptStore("/s/inbound-receipts.jsonl", fsx, clock);
+    const router = new InboundRouter({
+      queue: { createQitem: async () => "unused" },
+      seen: new SeenStore("/s/seen.jsonl", fsx, clock),
+      deadLetter: new DeadLetterStore<SlackEvent>("/s/dead.jsonl", fsx, clock),
+      destination: "operator-agent@kernel",
+      resolveSender: () => ({ admitted: true, source: "human-founder@external" }),
+    });
+    const handle = startSocketInbound("xapp-EXAMPLE-fake", router, {
+      fetchImpl: async () => new Response(JSON.stringify({ ok: false, error: "temporary outage" }), { status: 200 }),
+      inboundMaxConnects: 1,
+      receipts,
+    });
+
+    await handle.done;
+    expect(handle.status()).toMatchObject({ generation: 1, reconnects: 0, state: "disconnected" });
+    expect(handle.status().disconnectedAt).toBeDefined();
+    expect(receipts.readAll()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ generation: 1, status: "connect-attempt" }),
+      expect.objectContaining({ generation: 1, status: "connect-failed", reason: "connection-open-failed" }),
+    ]));
+  });
+
+  it("abandons a socket that never opens and reconnects instead of staying connecting forever", async () => {
+    const fsx = memFs();
+    const receipts = new InboundReceiptStore("/s/inbound-receipts.jsonl", fsx, clock);
+    const router = new InboundRouter({
+      queue: { createQitem: async () => "unused" },
+      seen: new SeenStore("/s/seen.jsonl", fsx, clock),
+      deadLetter: new DeadLetterStore<SlackEvent>("/s/dead.jsonl", fsx, clock),
+      destination: "operator-agent@kernel",
+      resolveSender: () => ({ admitted: true, source: "human-founder@external" }),
+      log: () => {},
+    });
+    // The first socket hangs: no onopen, no onclose, no onerror. The second opens at once.
+    const hung = makeFakeWs();
+    let hungClosed = 0;
+    hung.ws.close = () => { hungClosed++; };
+    const healthy = makeFakeWs();
+    const sockets = [hung.ws, healthy.ws];
+    let opened = false;
+    const handle = startSocketInbound("xapp-EXAMPLE-fake", router, {
+      fetchImpl: openFetch,
+      wsFactory: () => {
+        const ws = sockets.shift()!;
+        if (ws === healthy.ws) queueMicrotask(() => { opened = true; ws.onopen!(); });
+        return ws;
+      },
+      openTimeoutMs: 20,
+      inboundMaxConnects: 2,
+      receipts,
+      log: () => {},
+    });
+
+    await expect.poll(() => receipts.readAll().some((r) => r.status === "connect-failed")).toBe(true);
+    expect(handle.status()).toMatchObject({ generation: 1, state: "disconnected" });
+    expect(hungClosed).toBe(1);
+    // A late event from the abandoned socket has no handler to reach the loop.
+    expect([hung.ws.onopen, hung.ws.onmessage, hung.ws.onclose, hung.ws.onerror]).toEqual([null, null, null, null]);
+
+    // After the first backoff the loop opens a fresh socket.
+    await expect.poll(() => opened, { timeout: 3000 }).toBe(true);
+    await new Promise((r) => setTimeout(r, 60)); // well past openTimeoutMs
+    expect(handle.status()).toMatchObject({ generation: 2, reconnects: 1, state: "connected" });
+    expect(receipts.readAll().map((r) => [r.generation, r.status, r.reason])).toEqual([
+      [1, "connect-attempt", undefined],
+      [1, "connect-failed", "socket-open-timeout"],
+      [2, "connect-attempt", undefined],
+      [2, "connected", undefined],
+    ]);
+
+    healthy.ws.onclose!();
+    await handle.done;
+  });
+
+  it("retries after an error before open even though no close follows it", async () => {
+    const fsx = memFs();
+    const receipts = new InboundReceiptStore("/s/inbound-receipts.jsonl", fsx, clock);
+    const router = new InboundRouter({
+      queue: { createQitem: async () => "unused" },
+      seen: new SeenStore("/s/seen.jsonl", fsx, clock),
+      deadLetter: new DeadLetterStore<SlackEvent>("/s/dead.jsonl", fsx, clock),
+      destination: "operator-agent@kernel",
+      resolveSender: () => ({ admitted: true, source: "human-founder@external" }),
+      log: () => {},
+    });
+    const failing = makeFakeWs();
+    const handle = startSocketInbound("xapp-EXAMPLE-fake", router, {
+      fetchImpl: openFetch,
+      wsFactory: () => {
+        queueMicrotask(() => failing.ws.onerror!()); // refused: onerror, and never onclose
+        return failing.ws;
+      },
+      openTimeoutMs: 60_000, // far beyond the test: the error alone must end the attempt
+      inboundMaxConnects: 1,
+      receipts,
+      log: () => {},
+    });
+
+    await handle.done;
+    expect(handle.status()).toMatchObject({ generation: 1, state: "disconnected" });
+    expect(receipts.readAll().map((r) => [r.status, r.reason])).toEqual([
+      ["connect-attempt", undefined],
+      ["connect-failed", "socket-open-error"],
+    ]);
+  });
+
+  it("acks every envelope, lands human messages, and retries dead-letters ON CONNECT and PERIODICALLY while connected", async () => {
+    const order: string[] = [];
+    const fsx = memFs((path, data) => {
+      if (path.endsWith("inbound-receipts.jsonl") && data.includes('"status":"received"')) order.push("received");
+    });
+    const seen = new SeenStore("/s/seen.jsonl", fsx, clock);
+    const dead = new DeadLetterStore<SlackEvent>("/s/dead.jsonl", fsx, clock);
+    const receipts = new InboundReceiptStore("/s/inbound-receipts.jsonl", fsx, clock);
+    const queue = { createQitem: async () => "qitem-xyz" };
+    const router = new InboundRouter({ queue, seen, deadLetter: dead, destination: "operator-agent@kernel", resolveSender: (u) => ({ admitted: true, source: `human-${u}@kernel` }), log: () => {} });
+
+    // pre-seed a dead-letter that will land on the ON-CONNECT retry
+    dead.append({ type: "message", user: "U0", text: "queued during outage", ts: "D1", channel: "C0" }, 1);
+
+    const fake = makeFakeWs();
+    const send = fake.ws.send;
+    fake.ws.send = (data) => { order.push("ack"); send(data); };
+    let resolveWsCreated: () => void;
+    const wsCreated = new Promise<void>((r) => (resolveWsCreated = r));
+    const deps: SocketInboundDeps = {
+      fetchImpl: openFetch,
+      wsFactory: () => {
+        resolveWsCreated();
+        return fake.ws;
+      },
+      inboundMaxConnects: 1, // stop after this connection closes
+      retryIntervalMs: 20, // short so the periodic retry fires in-test
+      receipts,
+      log: () => {},
+    };
+
+    const handle = startSocketInbound("xapp-EXAMPLE-fake", router, deps);
+    await wsCreated;
+
+    // open → on-connect dead-letter drain (D1 lands) + periodic interval starts
+    fake.ws.onopen!();
+    await flush();
+    expect(seen.load().has("C0:D1")).toBe(true); // recovered on connect
+    expect(dead.readAll()).toHaveLength(0);
+
+    // a human message: fast-ACK + land
+    fake.ws.onmessage!({ data: envelope({ type: "message", user: "U1", text: "hi team", ts: "M1", channel: "C0" }) });
+    await flush();
+    expect(fake.sent.some((s) => s.includes('"envelope_id":"e-M1"'))).toBe(true); // fast-ack sent
+    expect(order.indexOf("ack")).toBeLessThan(order.indexOf("received")); // receipt is pre-filter, but ACK stays first
+    expect(seen.load().has("C0:M1")).toBe(true); // landed via real ack path
+
+    // The lost-reply diagnostic rail: every parsed inbound event is receipted BEFORE
+    // filtering, then receives one credential-free final disposition. Message text,
+    // sender ids, and tokens never enter the ledger.
+    const inboundReceipts = receipts.readAll();
+    expect(inboundReceipts.filter((r) => r.status === "received" && r.eventTs === "M1")).toHaveLength(1);
+    expect(inboundReceipts.filter((r) => r.status === "accepted" && r.eventTs === "M1")).toHaveLength(1);
+    expect(JSON.stringify(inboundReceipts)).not.toContain("hi team");
+    expect(JSON.stringify(inboundReceipts)).not.toContain("U1");
+    expect(handle.status()).toMatchObject({ generation: 1, reconnects: 0, lastEventTs: "M1", lastDisposition: "accepted" });
+
+    // a bot message: still ACKed, NOT ingested (loop-safety)
+    fake.ws.onmessage!({ data: envelope({ type: "message", bot_id: "B1", text: "loop", ts: "B1TS" }, "e-bot") });
+    await flush();
+    expect(fake.sent.some((s) => s.includes('"envelope_id":"e-bot"'))).toBe(true);
+    expect(seen.load().has("-:B1TS")).toBe(false);
+    expect(receipts.readAll().some((r) => r.status === "ignored" && r.eventTs === "B1TS" && r.reason === "bot_id")).toBe(true);
+
+    // B1: a NEW dead-letter appears WHILE connected → the PERIODIC timer drains it
+    // (no Slack reconnect). This is the exact gap QA flagged.
+    dead.append({ type: "message", user: "U2", text: "outage recovered", ts: "D2", channel: "C0" }, 1);
+    await new Promise((r) => setTimeout(r, 70)); // ~3 intervals of 20ms
+    expect(seen.load().has("C0:D2")).toBe(true); // retried while the socket stayed open
+    expect(dead.readAll()).toHaveLength(0);
+
+    // close → loop resolves (inboundMaxConnects reached)
+    fake.ws.onclose!();
+    await handle.done;
+  });
+});

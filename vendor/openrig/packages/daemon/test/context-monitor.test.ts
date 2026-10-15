@@ -1,0 +1,619 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import BetterSqlite3, { type Database } from "better-sqlite3";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { ContextUsageStore } from "../src/domain/context-usage-store.js";
+import { UsageSamplesStore } from "../src/domain/usage-samples-store.js";
+import { ContextMonitor } from "../src/domain/context-monitor.js";
+import { ClaudeCompactionEnforcer } from "../src/domain/claude-compaction-enforcer.js";
+import { SettingsStore } from "../src/domain/user-settings/settings-store.js";
+import type { SessionTransport } from "../src/domain/session-transport.js";
+import type { ReadinessResult } from "../src/domain/runtime-adapter.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+
+
+describe("ContextMonitor", () => {
+  let db: Database.Database;
+  let rigRepo: RigRepository;
+  let sessionRegistry: SessionRegistry;
+  let store: ContextUsageStore;
+  let monitor: ContextMonitor;
+  let ensureContextCollectorSpy: ReturnType<typeof vi.fn>;
+  let checkReadySpy: ReturnType<typeof vi.fn>;
+  let tmpDir: string;
+  let codexHomeDir: string;
+
+  beforeEach(() => {
+    db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    rigRepo = new RigRepository(db);
+    sessionRegistry = new SessionRegistry(db);
+    tmpDir = join(tmpdir(), `context-monitor-${Date.now()}`);
+    mkdirSync(join(tmpDir, "state", "context-usage"), { recursive: true });
+    codexHomeDir = join(tmpDir, "codex-home");
+    mkdirSync(join(codexHomeDir, ".codex"), { recursive: true });
+    store = new ContextUsageStore(db, { stateDir: tmpDir, codexHomeDir });
+    ensureContextCollectorSpy = vi.fn();
+    checkReadySpy = vi.fn(async (): Promise<ReadinessResult> => ({ ready: false, reason: "not_ready", code: "awaiting_runtime" }));
+    monitor = new ContextMonitor(db, store, {
+      ensureContextCollector: ensureContextCollectorSpy,
+      checkReady: checkReadySpy,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    monitor.stop();
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function seedClaudeNode(logicalId = "dev.impl", sessionName = "dev-impl@test") {
+    const rig = rigRepo.createRig("test-rig");
+    const node = rigRepo.addNode(rig.id, logicalId, { runtime: "claude-code" });
+    const session = sessionRegistry.registerSession(node.id, sessionName);
+    // Mark as running so the monitor considers it eligible
+    db.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(session.id);
+    return { rig, node, sessionName };
+  }
+
+  function seedCodexNode(status: "running" | "detached" = "running") {
+    const rig = rigRepo.createRig("test-rig-2");
+    const node = rigRepo.addNode(rig.id, "dev.qa", { runtime: "codex" });
+    const session = sessionRegistry.registerSession(node.id, "dev-qa@test");
+    db.prepare("UPDATE sessions SET status = ?, resume_type = 'codex_id', resume_token = ? WHERE id = ?")
+      .run(status, "thread-1", session.id);
+    return { rig, node, sessionName: "dev-qa@test", threadId: "thread-1" };
+  }
+
+  function seedClaimedNode() {
+    const rig = rigRepo.createRig("test-rig-3");
+    const node = rigRepo.addNode(rig.id, "adopted.node", { runtime: "claude-code" });
+    const session = sessionRegistry.registerClaimedSession(node.id, "adopted-session");
+    db.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(session.id);
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "adopted-session" });
+    return { rig, node };
+  }
+
+  function seedExternalCliClaudeNode() {
+    const rig = rigRepo.createRig("test-rig-4");
+    const node = rigRepo.addNode(rig.id, "orch.lead", { runtime: "claude-code" });
+    const session = sessionRegistry.registerClaimedSession(node.id, "orch-lead@test");
+    db.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(session.id);
+    sessionRegistry.updateBinding(node.id, { attachmentType: "external_cli", externalSessionName: "orch-lead@test" });
+    return { rig, node };
+  }
+
+  function seedStubNode(logicalId = "dev.stub", sessionName = "dev-stub@test") {
+    const rig = rigRepo.createRig("test-rig-stub");
+    const node = rigRepo.addNode(rig.id, logicalId, { runtime: "stub" });
+    const session = sessionRegistry.registerSession(node.id, sessionName);
+    // Mark as running so the monitor considers it eligible
+    db.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(session.id);
+    return { rig, node, sessionName };
+  }
+
+  function writeSidecar(sessionName: string, data: Record<string, unknown>) {
+    const safeName = sessionName.replace(/[^a-zA-Z0-9@._-]/g, "_");
+    writeFileSync(join(tmpDir, "state", "context-usage", `${safeName}.json`), JSON.stringify(data));
+  }
+
+  function writeCodexTokenCount(threadId: string) {
+    const codexDir = join(codexHomeDir, ".codex");
+    const rolloutPath = join(codexDir, "sessions", `${threadId}.jsonl`);
+    mkdirSync(join(codexDir, "sessions"), { recursive: true });
+
+    const stateDbPath = join(codexDir, "state_5.sqlite");
+    const stateDb = new BetterSqlite3(stateDbPath);
+    try {
+      stateDb.prepare("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)").run();
+      stateDb.prepare("INSERT INTO threads (id, rollout_path) VALUES (?, ?)").run(threadId, rolloutPath);
+    } finally {
+      stateDb.close();
+    }
+
+    writeFileSync(rolloutPath, JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          last_token_usage: {
+            input_tokens: 227139,
+            output_tokens: 611,
+            total_tokens: 227750,
+          },
+          model_context_window: 258400,
+        },
+      },
+    }));
+  }
+
+  const VALID_SIDECAR = {
+    context_window: {
+      context_window_size: 200000,
+      used_percentage: 67,
+      remaining_percentage: 33,
+      total_input_tokens: 120000,
+      total_output_tokens: 14000,
+      current_usage: "67% used",
+    },
+    session_id: "sess-123",
+    session_name: "dev-impl@test",
+    transcript_path: "/tmp/test.log",
+    sampled_at: new Date().toISOString(),
+  };
+
+  function installRealCompactionEnforcer() {
+    const settings = new SettingsStore(join(tmpDir, "settings.json"));
+    settings.set("policies.claude_compaction.enabled", "true");
+    settings.set("policies.claude_compaction.threshold_percent", "80");
+    const send = vi.fn(async (_session: string, text: string) => {
+      const marker = text.match(/<!-- openrig-compaction-complete .*? -->/)?.[0];
+      const target = text.match(/Write this attempt's complete restore map to ("(?:[^"\\]|\\.)*")/);
+      if (marker && target) {
+        const file = JSON.parse(target[1]!); mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, "# Completed fixture map\n" + marker + "\n");
+      }
+      return { ok: true };
+    });
+    const transport = { send } as unknown as SessionTransport;
+    const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: tmpDir, resolveOccupantGeneration: () => "fixture-generation" });
+    monitor = new ContextMonitor(db, store, undefined, enforcer);
+    return send;
+  }
+
+  it.each([-600_001, 1])("does not compact a high-usage sample with timestamp offset %s", async (offset) => {
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const { node, sessionName } = seedClaudeNode();
+    const send = installRealCompactionEnforcer();
+    writeSidecar(sessionName, {
+      ...VALID_SIDECAR,
+      sampled_at: new Date(now + offset).toISOString(),
+      context_window: { ...VALID_SIDECAR.context_window, used_percentage: 90, remaining_percentage: 10 },
+    });
+    await monitor.pollOnce();
+    expect(store.getForNode(node.id, sessionName).fresh).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  // Bring a seat to the point just after /compact: fresh 80% usage sends the preparation prompt,
+  // then the next tick sends /compact, leaving the post-compact turn boundary pending.
+  async function compactFreshSeat(sessionName: string, now: number) {
+    const send = installRealCompactionEnforcer();
+    const writeUsage = (percentage: number, sampledAt: number) => writeSidecar(sessionName, {
+      ...VALID_SIDECAR,
+      sampled_at: new Date(sampledAt).toISOString(),
+      context_window: { ...VALID_SIDECAR.context_window, used_percentage: percentage, remaining_percentage: 100 - percentage },
+    });
+    writeUsage(80, now);
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[1]).toContain("OpenRig automatic compaction preparation is now required");
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[1]).toContain("/compact");
+    return { send, writeUsage };
+  }
+
+  it("prepares then compacts fresh usage, then drains the pending restore on stale usage, one stage per tick", async () => {
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const { sessionName } = seedClaudeNode();
+    const { send, writeUsage } = await compactFreshSeat(sessionName, now);
+    // The seat takes no turn after /compact, so its sample stays stale.
+    writeUsage(30, now - 600_001);
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(send.mock.calls[2]?.[1]).toContain("OpenRig post-compaction turn boundary.");
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(4);
+    expect(send.mock.calls[3]?.[1]).toContain("restoring this Claude session after compaction");
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(5);
+    expect(send.mock.calls[4]?.[1]).toContain("Now audit your compaction restore");
+    // Nothing is pending any more, and a stale sample never starts a compaction.
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(5);
+  });
+
+  it("drains the pending restore when the sample is unknown (no sidecar)", async () => {
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const { node, sessionName } = seedClaudeNode();
+    const { send } = await compactFreshSeat(sessionName, now);
+    rmSync(join(tmpDir, "state", "context-usage", `${sessionName}.json`));
+    await monitor.pollOnce();
+    expect(store.getForNode(node.id, sessionName).availability).toBe("unknown");
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(send.mock.calls[2]?.[1]).toContain("OpenRig post-compaction turn boundary.");
+  });
+
+  it("a stale sample above the threshold drains the pending stage once and starts no new compaction", async () => {
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const { sessionName } = seedClaudeNode();
+    const { send, writeUsage } = await compactFreshSeat(sessionName, now);
+    writeUsage(90, now - 600_001); // the pre-compact reading, never refreshed
+    for (let i = 0; i < 4; i++) await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(5);
+    const texts = send.mock.calls.slice(2).map((call) => String(call[1]));
+    expect(texts[0]).toContain("OpenRig post-compaction turn boundary.");
+    expect(texts[1]).toContain("restoring this Claude session after compaction");
+    expect(texts[2]).toContain("Now audit your compaction restore");
+    expect(texts.some((text) => text.includes("preparation is now required") || text.startsWith("/compact"))).toBe(false);
+  });
+
+  it("an unknown sample with nothing pending triggers nothing", async () => {
+    seedClaudeNode();
+    const send = installRealCompactionEnforcer();
+    await monitor.pollOnce();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  // T1: pollOnce discovers running Claude sessions and persists usage
+  it("pollOnce discovers running Claude sessions and persists context usage", async () => {
+    const { node, sessionName } = seedClaudeNode();
+    writeSidecar(sessionName, VALID_SIDECAR);
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(node.id, sessionName);
+    expect(usage.availability).toBe("known");
+    expect(usage.usedPercentage).toBe(67);
+    expect(ensureContextCollectorSpy).toHaveBeenCalledWith({
+      cwd: undefined,
+      tmuxSession: sessionName,
+    });
+  });
+
+  // T2: pollOnce discovers running Codex sessions and persists usage from token_count events
+  it("pollOnce discovers running Codex sessions and persists context usage", async () => {
+    const { node: codexNode, sessionName, threadId } = seedCodexNode();
+    writeCodexTokenCount(threadId);
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(codexNode.id, sessionName);
+    expect(usage.availability).toBe("known");
+    expect(usage.source).toBe("codex_token_count_jsonl");
+    expect(usage.usedPercentage).toBe(88);
+    expect(usage.totalInputTokens).toBe(227139);
+    expect(usage.totalOutputTokens).toBe(611);
+    expect(ensureContextCollectorSpy).not.toHaveBeenCalled();
+  });
+
+  it("pollOnce backfills detached Codex sessions from resume tokens", async () => {
+    const { node: codexNode, sessionName, threadId } = seedCodexNode("detached");
+    writeCodexTokenCount(threadId);
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(codexNode.id, sessionName);
+    expect(usage.availability).toBe("known");
+    expect(usage.source).toBe("codex_token_count_jsonl");
+    expect(usage.usedPercentage).toBe(88);
+  });
+
+  it("does not capture archived Codex nodes, but resumes reads after unarchive", async () => {
+    const { node: codexNode, sessionName, threadId } = seedCodexNode("detached");
+    writeCodexTokenCount(threadId);
+    const rigId = (db.prepare("SELECT rig_id FROM nodes WHERE id = ?").get(codexNode.id) as { rig_id: string }).rig_id;
+    const samples = new UsageSamplesStore(db);
+    const nativeMonitor = new ContextMonitor(db, store, undefined, undefined, undefined, samples);
+    rigRepo.archiveRig(rigId);
+    await nativeMonitor.pollOnce();
+    expect(db.prepare("SELECT COUNT(*) AS n FROM context_usage WHERE node_id = ?").get(codexNode.id)).toEqual({ n: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM usage_samples WHERE node_id = ?").get(codexNode.id)).toEqual({ n: 0 });
+    rigRepo.unarchiveRig(rigId);
+    await nativeMonitor.pollOnce();
+    expect(store.getForNode(codexNode.id, sessionName).availability).toBe("known");
+    expect(db.prepare("SELECT COUNT(*) AS n FROM usage_samples WHERE node_id = ?").get(codexNode.id)).toEqual({ n: 1 });
+  });
+
+  it.each(["claude-code", "codex"])("still polls a running %s seat in an archived rig", async (runtime) => {
+    const { rig, node, sessionName } = runtime === "codex" ? seedCodexNode() : seedClaudeNode();
+    if (runtime === "codex") {
+      writeCodexTokenCount("thread-1");
+    } else {
+      writeSidecar(sessionName, { ...VALID_SIDECAR, sampled_at: new Date().toISOString() });
+    }
+    const samples = new UsageSamplesStore(db);
+    const maybeAutoCompact = vi.fn(async () => {});
+    const nativeMonitor = new ContextMonitor(db, store, undefined,
+      { maybeAutoCompact } as unknown as ClaudeCompactionEnforcer, undefined, samples);
+    rigRepo.archiveRig(rig.id);
+
+    await nativeMonitor.pollOnce();
+
+    expect(store.getForNode(node.id, sessionName).availability).toBe("known");
+    expect(db.prepare("SELECT COUNT(*) AS n FROM usage_samples WHERE node_id = ?").get(node.id)).toEqual({ n: 1 });
+    expect(maybeAutoCompact).toHaveBeenCalledWith(expect.objectContaining({ sessionName, runtime }));
+  });
+
+  // STUB-A (51-01 GAP-1): running stub sessions with a context sidecar are polled and observed
+  it("pollOnce discovers running stub sessions and persists context usage", async () => {
+    const { node, sessionName } = seedStubNode();
+    writeSidecar(sessionName, { ...VALID_SIDECAR, session_name: sessionName });
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(node.id, sessionName);
+    expect(usage.availability).toBe("known");
+    expect(usage.usedPercentage).toBe(67);
+  });
+
+  // STUB-B (51-01 GAP-2): stub sessions consume their own sidecar but must NOT
+  // provision the Claude context collector (no settings.local.json / collector
+  // write into a stub seat's cwd) — mirrors the codex non-provisioning contract.
+  it("pollOnce does not provision the Claude context collector for stub sessions", async () => {
+    const { node, sessionName } = seedStubNode("dev.stubb", "dev-stubb@test");
+    writeSidecar(sessionName, { ...VALID_SIDECAR, session_name: sessionName });
+
+    await monitor.pollOnce();
+
+    // The sidecar is still consumed (readAndNormalize is unconditional)...
+    const usage = store.getForNode(node.id, sessionName);
+    expect(usage.availability).toBe("known");
+    // ...but no Claude-specific collector provisioning happens for a stub seat.
+    expect(ensureContextCollectorSpy).not.toHaveBeenCalled();
+  });
+
+  // T3: pollOnce persists unknown for missing sidecar
+  it("pollOnce persists unknown for missing sidecar files", async () => {
+    const { node, sessionName } = seedClaudeNode();
+    // No sidecar file written
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(node.id, sessionName);
+    expect(usage.availability).toBe("unknown");
+    expect(usage.reason).toBe("missing_sidecar");
+  });
+
+  // T4: pollOnce handles malformed sidecar without crashing
+  it("pollOnce handles malformed sidecar without crashing", async () => {
+    const { node, sessionName } = seedClaudeNode();
+    writeSidecar(sessionName, { bad: "data" });
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(node.id, sessionName);
+    expect(usage.availability).toBe("unknown");
+    expect(usage.reason).toBe("parse_error");
+  });
+
+  // T5: pollOnce with zero eligible sessions does nothing
+  it("pollOnce with zero eligible sessions does nothing", async () => {
+    // No nodes seeded
+    await monitor.pollOnce(); // Should not throw
+  });
+
+  // T6: start/stop manages interval lifecycle
+  it("start/stop manages interval lifecycle", () => {
+    monitor.start(1000);
+    monitor.start(1000); // Idempotent — no double interval
+    monitor.stop();
+    monitor.stop(); // Safe to call again
+  });
+
+  // T7: One bad session doesn't prevent polling other sessions
+  it("one bad session does not prevent polling others", async () => {
+    const { node: node1, sessionName: s1 } = seedClaudeNode("dev.impl1", "impl1@test");
+    const rig2 = rigRepo.createRig("rig2");
+    const node2 = rigRepo.addNode(rig2.id, "dev.impl2", { runtime: "claude-code" });
+    const s2 = sessionRegistry.registerSession(node2.id, "impl2@test");
+    db.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(s2.id);
+
+    // Write valid sidecar for node2 only; node1 has no sidecar
+    writeSidecar("impl2@test", { ...VALID_SIDECAR, session_name: "impl2@test" });
+
+    await monitor.pollOnce();
+
+    // node1 should have unknown, node2 should have known
+    expect(store.getForNode(node1.id, "impl1@test").availability).toBe("unknown");
+    expect(store.getForNode(node2.id, "impl2@test").availability).toBe("known");
+  });
+
+  // T8: Monitor uses existing node/session identity (not its own)
+  it("monitor does not create its own node/session identity", async () => {
+    seedClaudeNode();
+    await monitor.pollOnce();
+
+    // No new nodes or sessions should have been created
+    const rig = rigRepo.getRig(rigRepo.listRigs()[0]!.id);
+    expect(rig!.nodes).toHaveLength(1); // Only the one we seeded
+  });
+
+  // T9: Claimed/adopted Claude tmux sessions are polled
+  it("claimed tmux sessions are polled", async () => {
+    const { node } = seedClaimedNode();
+    writeSidecar("adopted-session", { ...VALID_SIDECAR, session_name: "adopted-session" });
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(node.id, "adopted-session");
+    expect(usage.availability).toBe("known");
+    expect(usage.usedPercentage).toBe(67);
+  });
+
+  it("external_cli Claude sessions are not polled", async () => {
+    const { node } = seedExternalCliClaudeNode();
+    writeSidecar("orch-lead@test", VALID_SIDECAR);
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(node.id, "orch-lead@test");
+    expect(usage.availability).toBe("unknown");
+    expect(usage.reason).toBe("no_data");
+  });
+
+  it.each(["before", "during", "delivering", "other occupant"])("default-path consent protects pending context (%s)", async timing => {
+    const { rig, node, sessionName } = seedClaudeNode();
+    const session = sessionRegistry.getSessionsForRig(rig.id)[0]!;
+    db.prepare("UPDATE sessions SET startup_status='attention_required' WHERE id=?").run(session.id);
+    const events = new EventBus(db);
+    const pending = () => events.emit({ type: "node.startup_failed", rigId: rig.id, nodeId: node.id,
+      error: "consent", sessionId: timing === "other occupant" ? "old-occupant" : session.id, freshContextPending: true });
+    if (timing === "before" || timing === "other occupant") pending();
+    checkReadySpy.mockImplementation(async () => {
+      if (timing === "during") pending();
+      if (timing === "delivering") {
+        events.emit({ type: "node.startup_pending", rigId: rig.id, nodeId: node.id });
+        db.prepare("UPDATE sessions SET startup_status='pending' WHERE id=?").run(session.id);
+      }
+      return { ready: true };
+    });
+    // No sidecar or orientation telemetry: it must not become a prerequisite.
+    await monitor.pollOnce();
+    const row = db.prepare("SELECT startup_status FROM sessions WHERE id=?").get(session.id);
+    expect(row).toEqual({ startup_status: timing === "other occupant" ? "ready" : timing === "delivering" ? "pending" : "attention_required" });
+    expect(checkReadySpy).toHaveBeenCalledWith(expect.objectContaining({ tmuxSession: sessionName }));
+  });
+
+  it("pollOnce normalizes stale Claude startup failures back to ready when the runtime is live", async () => {
+    const { sessionName, session } = (() => {
+      const rig = rigRepo.createRig("test-rig-5");
+      const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/project" });
+      const session = sessionRegistry.registerSession(node.id, "dev-impl@test");
+      db.prepare("UPDATE sessions SET status = 'running', startup_status = 'failed' WHERE id = ?").run(session.id);
+      return { sessionName: "dev-impl@test", session };
+    })();
+    writeSidecar(sessionName, VALID_SIDECAR);
+    checkReadySpy.mockResolvedValue({ ready: true });
+
+    await monitor.pollOnce();
+
+    const refreshed = db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(session.id) as { startup_status: string };
+    expect(refreshed.startup_status).toBe("ready");
+    expect(checkReadySpy).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: session.nodeId,
+      tmuxSession: sessionName,
+      cwd: "/project",
+    }));
+  });
+
+  it("pollOnce normalizes stale Claude startup failures to attention_required when the runtime is blocked on trust", async () => {
+    const { sessionName, session } = (() => {
+      const rig = rigRepo.createRig("test-rig-5b");
+      const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/project" });
+      const session = sessionRegistry.registerSession(node.id, "dev-impl-trust@test");
+      db.prepare("UPDATE sessions SET status = 'running', startup_status = 'failed' WHERE id = ?").run(session.id);
+      return { sessionName: "dev-impl-trust@test", session };
+    })();
+    writeSidecar(sessionName, { ...VALID_SIDECAR, session_name: sessionName });
+    checkReadySpy.mockResolvedValue({
+      ready: false,
+      code: "trust_gate",
+      reason: "Claude is waiting for workspace trust approval before the session can become interactive.",
+    });
+
+    await monitor.pollOnce();
+
+    const refreshed = db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(session.id) as { startup_status: string };
+    expect(refreshed.startup_status).toBe("attention_required");
+  });
+
+  it("pollOnce leaves stale Claude startup failures as failed when the runtime has really fallen back to shell", async () => {
+    const { sessionName, session } = (() => {
+      const rig = rigRepo.createRig("test-rig-5c");
+      const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/project" });
+      const session = sessionRegistry.registerSession(node.id, "dev-impl-shell@test");
+      db.prepare("UPDATE sessions SET status = 'running', startup_status = 'failed' WHERE id = ?").run(session.id);
+      return { sessionName: "dev-impl-shell@test", session };
+    })();
+    writeSidecar(sessionName, { ...VALID_SIDECAR, session_name: sessionName });
+    checkReadySpy.mockResolvedValue({
+      ready: false,
+      code: "returned_to_shell",
+      reason: "The probe pane returned to a shell instead of staying inside the runtime.",
+    });
+
+    await monitor.pollOnce();
+
+    const refreshed = db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(session.id) as { startup_status: string };
+    expect(refreshed.startup_status).toBe("failed");
+  });
+
+  it("pollOnce normalizes stale Codex attention_required state after the trust prompt is cleared", async () => {
+    const rig = rigRepo.createRig("test-rig-codex-trust");
+    const node = rigRepo.addNode(rig.id, "dev.qa", { runtime: "codex", cwd: "/project" });
+    const session = sessionRegistry.registerSession(node.id, "dev-qa-trust@test");
+    db.prepare("UPDATE sessions SET status = 'running', startup_status = 'attention_required', resume_token = NULL WHERE id = ?")
+      .run(session.id);
+
+    const codexReadySpy = vi.fn(async (): Promise<ReadinessResult> => ({ ready: true }));
+    monitor = new ContextMonitor(db, store, {
+      ensureContextCollector: ensureContextCollectorSpy,
+      checkReady: checkReadySpy,
+    }, undefined, {
+      "claude-code": { checkReady: checkReadySpy },
+      codex: { checkReady: codexReadySpy },
+    });
+
+    await monitor.pollOnce();
+
+    const refreshed = db.prepare("SELECT startup_status, startup_completed_at FROM sessions WHERE id = ?").get(session.id) as {
+      startup_status: string;
+      startup_completed_at: string | null;
+    };
+    expect(refreshed.startup_status).toBe("ready");
+    expect(refreshed.startup_completed_at).toBeTruthy();
+    expect(codexReadySpy).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: session.nodeId,
+      tmuxSession: "dev-qa-trust@test",
+      cwd: "/project",
+    }));
+  });
+
+  it("pollOnce does not overwrite pending Claude startup state", async () => {
+    const { sessionName, session } = (() => {
+      const rig = rigRepo.createRig("test-rig-6");
+      const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/project" });
+      const session = sessionRegistry.registerSession(node.id, "dev-impl-pending@test");
+      db.prepare("UPDATE sessions SET status = 'running', startup_status = 'pending' WHERE id = ?").run(session.id);
+      return { sessionName: "dev-impl-pending@test", session };
+    })();
+    writeSidecar(sessionName, { ...VALID_SIDECAR, session_name: sessionName });
+    checkReadySpy.mockResolvedValue({ ready: true });
+
+    await monitor.pollOnce();
+
+    const refreshed = db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(session.id) as { startup_status: string };
+    expect(refreshed.startup_status).toBe("pending");
+    expect(checkReadySpy).not.toHaveBeenCalled();
+  });
+
+  it("coalesces overlapping pollOnce calls so one compaction stage is emitted once", async () => {
+    const { sessionName } = seedClaudeNode("dev.compact", "dev-compact@test");
+    writeSidecar(sessionName, { ...VALID_SIDECAR, session_name: sessionName });
+
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const maybeAutoCompact = vi.fn(async () => {
+      await blocked;
+      return { triggered: true as const };
+    });
+    monitor = new ContextMonitor(
+      db,
+      store,
+      { ensureContextCollector: ensureContextCollectorSpy, checkReady: checkReadySpy },
+      { maybeAutoCompact } as never,
+    );
+
+    const timerTick = monitor.pollOnce();
+    await vi.waitFor(() => expect(maybeAutoCompact).toHaveBeenCalledTimes(1));
+    const refreshRequest = monitor.pollOnce();
+    release();
+    await Promise.all([timerTick, refreshRequest]);
+
+    expect(maybeAutoCompact).toHaveBeenCalledTimes(1);
+  });
+});

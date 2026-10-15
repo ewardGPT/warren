@@ -1,0 +1,2199 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { PassThrough } from "node:stream";
+import type { QueueDeps } from "../src/commands/queue.js";
+import { resolveQueueBody, previewBody, waitForDeliveryOutcome } from "../src/commands/queue.js";
+import { createProgram } from "../src/index.js";
+
+/**
+ * `rig queue` CLI tests — PL-004 Phase A revision (R1).
+ *
+ * Pattern mirrors compact-plan.test.ts: mock daemon-lifecycle to fake a
+ * running daemon, inject a clientFactory that returns a stubbed HTTP client.
+ * Tests assert: command parsing, HTTP request shape, non-2xx exit handling,
+ * hot-potato error rendering. No real daemon, no DB, no network.
+ */
+
+vi.mock("../src/daemon-lifecycle.js", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("../src/daemon-lifecycle.js");
+  return {
+    ...actual,
+    getDaemonStatus: vi.fn(async () => ({ state: "running", healthy: true, pid: 1234, port: 7433 })),
+    getDaemonUrl: vi.fn(() => "http://localhost:7433"),
+  };
+});
+
+interface StubResponse {
+  status: number;
+  data: unknown;
+}
+
+function makeDeps(opts?: {
+  routes?: Record<string, StubResponse | StubResponse[]>;
+}): { deps: QueueDeps; calls: Array<{ method: string; path: string; body?: unknown }> } {
+  const calls: Array<{ method: string; path: string; body?: unknown }> = [];
+  const routes = opts?.routes ?? {};
+  return {
+    calls,
+    deps: {
+      lifecycleDeps: {} as QueueDeps["lifecycleDeps"],
+      clientFactory: () => ({
+        get: vi.fn(async (path: string) => {
+          calls.push({ method: "GET", path });
+          const route = routes[`GET ${path}`];
+          return (Array.isArray(route) ? route.shift() : route) ?? { status: 200, data: {} };
+        }),
+        getText: vi.fn(async (path: string) => {
+          calls.push({ method: "GET", path });
+          return { status: 200, data: "" };
+        }),
+        post: vi.fn(async (path: string, body: unknown) => {
+          calls.push({ method: "POST", path, body });
+          const route = routes[`POST ${path}`];
+          return (Array.isArray(route) ? route.shift() : route) ?? { status: 201, data: { qitemId: "qitem-test-1" } };
+        }),
+        delete: vi.fn(async (path: string) => {
+          calls.push({ method: "DELETE", path });
+          return { status: 204, data: null };
+        }),
+        postText: vi.fn(async (path: string) => {
+          calls.push({ method: "POST", path });
+          return { status: 200, data: "" };
+        }),
+        postExpectText: vi.fn(async (path: string) => {
+          calls.push({ method: "POST", path });
+          return { status: 200, data: "" };
+        }),
+      }) as unknown as ReturnType<QueueDeps["clientFactory"]>,
+    },
+  };
+}
+
+describe("rig queue CLI", () => {
+  let logs: string[];
+  let errors: string[];
+
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    // P21 HERMETIC: the queue verbs derive source/actor from the seat env (X-OpenRig-Session), so an
+    // env-less harness aborts pre-POST. Stub a deterministic seat so these tests never depend on the
+    // AMBIENT OPENRIG_SESSION_NAME (which masked the env-less break in a managed runner). Per-test stubs
+    // that need a specific seat override this.
+    vi.stubEnv("OPENRIG_SESSION_NAME", "seat@rig");
+    logs = [];
+    errors = [];
+    vi.spyOn(console, "log").mockImplementation((...args) => logs.push(args.join(" ")));
+    vi.spyOn(console, "error").mockImplementation((...args) => errors.push(args.join(" ")));
+    process.exitCode = undefined;
+  });
+
+  it("queue is registered on createProgram with all R1 subcommands", async () => {
+    const { deps } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    const queueCmd = program.commands.find((c) => c.name() === "queue");
+    expect(queueCmd).toBeDefined();
+    const subs = queueCmd!.commands.map((c) => c.name()).sort();
+    // R1 ratified contract: handoff-and-complete + whoami present alongside the originals.
+    expect(subs).toContain("create");
+    expect(subs).toContain("handoff");
+    expect(subs).toContain("handoff-and-complete");
+    expect(subs).toContain("whoami");
+    expect(subs).toContain("update");
+    expect(subs).toContain("inbox-drop");
+    expect(subs).toContain("inbox-absorb");
+    expect(subs).toContain("inbox-deny");
+    expect(subs).toContain("list");
+    expect(subs).toContain("show");
+  });
+
+  it("create sends NO body sourceSession — the source derives from the transport header (X-OpenRig-Session); an explicit --source is dropped, never forwarded as a body claim", async () => {
+    const saved = process.env["OPENRIG_SESSION_NAME"];
+    process.env["OPENRIG_SESSION_NAME"] = "alice@rig"; // the seat env == the X-OpenRig-Session the DaemonClient stamps
+    try {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "qitem-x", state: "pending" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "forged@evil", // P21: IGNORED — must not ride the body
+        "--destination", "bob@rig",
+        "--body", "do thing",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      expect(create).toBeDefined();
+      const body = create!.body as Record<string, unknown>;
+      // P21 I3 reconcile: no body identity claim — the daemon derives the source from the header, and
+      // the forged --source is DROPPED (not forwarded). The destination is the TARGET, a legit body field.
+      expect(body.sourceSession).toBeUndefined();
+      expect(body.destinationSession).toBe("bob@rig");
+      expect(body.body).toBe("do thing");
+      // R1: commander's --no-nudge sets opts.nudge to true by default.
+      // The CLI sends nudge: true, and the daemon treats nudge !== false as nudging.
+      expect(body.nudge).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+      else process.env["OPENRIG_SESSION_NAME"] = saved;
+    }
+  });
+
+  it("create accepts an explicit source outside a managed seat as a body claim", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("RIGGED_SESSION_NAME", "");
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    await program.parseAsync(["node", "rig", "queue", "create", "--source", "external@rig",
+      "--destination", "bob@rig", "--body", "external work", "--summary", "External work", "--json"]);
+    expect(process.exitCode).toBeUndefined();
+    const body = calls.find(c => c.path === "/api/queue/create")?.body as Record<string, unknown>;
+    expect(body.sourceSession).toBe("external@rig");
+    expect(body.destinationSession).toBe("bob@rig");
+  });
+
+  it("create still requires a source when neither the managed env nor explicit claim is supplied", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("RIGGED_SESSION_NAME", "");
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    await program.parseAsync(["node", "rig", "queue", "create", "--destination", "bob@rig",
+      "--body", "external work", "--summary", "External work", "--json"]);
+    expect(process.exitCode).toBe(1);
+    expect(calls).toEqual([]);
+    expect(errors.join("\n")).toContain("--source is required");
+  });
+
+  it("create preserves the legacy managed source env without forwarding an explicit body claim", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("RIGGED_SESSION_NAME", "legacy@rig");
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    await program.parseAsync(["node", "rig", "queue", "create", "--source", "ignored@rig",
+      "--destination", "bob@rig", "--body", "legacy work", "--summary", "Legacy work", "--json"]);
+    expect(process.exitCode).toBeUndefined();
+    const body = calls.find(c => c.path === "/api/queue/create")?.body as Record<string, unknown>;
+    expect(body.sourceSession).toBeUndefined();
+  });
+
+  it("create --human-questions-file sends the parsed questions; unreadable JSON is refused before any request", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "queue-human-questions-"));
+    const file = path.join(directory, "questions.json");
+    const questions = [{ id: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres", recommended: true }, { id: "sqlite", label: "SQLite" }] }];
+    fs.writeFileSync(file, JSON.stringify(questions));
+    const broken = path.join(directory, "broken.json");
+    fs.writeFileSync(broken, "{ not json");
+    try {
+      const { deps, calls } = makeDeps();
+      await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Pick one.", "--human-intent", "decision", "--human-questions-file", file, "--json"]);
+      expect(calls.find((c) => c.path === "/api/queue/create")?.body).toMatchObject({ humanIntent: "decision", humanQuestions: questions });
+
+      const again = makeDeps();
+      await createProgram({ queueDeps: again.deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Pick one.", "--human-intent", "decision", "--human-questions-file", broken, "--json"]);
+      expect(process.exitCode).toBe(1);
+      expect(again.calls.find((c) => c.path === "/api/queue/create")).toBeUndefined();
+    } finally { process.exitCode = undefined; fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  // Slice-03 Atom 6b — --body-context snapshot + provenance rule.
+  it("create preserves explicit human intent and authored supplemental file bytes", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "queue-human-detail-"));
+    const file = path.join(directory, "detail.txt");
+    const detail = "Supporting context.\nEmoji: 😀; symbols: < & >.\n";
+    fs.writeFileSync(file, detail);
+    try {
+      const { deps, calls } = makeDeps();
+      await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "No action needed.", "--human-intent", "update", "--human-detail-file", file, "--json"]);
+      expect(calls.find((c) => c.path === "/api/queue/create")?.body).toMatchObject({ humanIntent: "update", humanDetail: detail, body: "No action needed." });
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  // #96 — --reply-to posts an update into an earlier item's Slack thread.
+  it("create --reply-to without --human-intent update fails locally with a named error and never contacts the daemon", async () => {
+    const { deps, calls } = makeDeps();
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Merged.", "--reply-to", "qitem-earlier", "--json"]);
+    expect(process.exitCode).toBe(1);
+    expect(errors.join("\n")).toMatch(/reply_to_requires_update/);
+    expect(calls.filter((c) => c.path === "/api/queue/create")).toHaveLength(0);
+    process.exitCode = 0;
+  });
+
+  it("create --reply-to with --human-intent update sends replyTo", async () => {
+    const { deps, calls } = makeDeps();
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Merged.", "--human-intent", "update", "--reply-to", "qitem-earlier", "--json"]);
+    expect(calls.find((c) => c.path === "/api/queue/create")?.body).toMatchObject({ humanIntent: "update", replyTo: "qitem-earlier" });
+  });
+
+  it("delivery verification names a --reply-to fallback to a top-level post", async () => {
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => ({ status: 200, data: { deliveryOutcome: "posted", replyTo: "qitem-earlier", replyToFallback: "root-missing (qitem-earlier)" } as T }) },
+      "qitem-update",
+    );
+    expect(result).toMatchObject({ outcome: "posted", connectorAccepted: true, threaded: false });
+    expect(result.detail).toMatch(/top-level.*root-missing/);
+    const threaded = await waitForDeliveryOutcome(
+      { get: async <T>() => ({ status: 200, data: { deliveryOutcome: "posted", replyTo: "qitem-earlier", replyToFallback: null } as T }) },
+      "qitem-update",
+    );
+    expect(threaded).toMatchObject({ outcome: "posted", threaded: true });
+    expect(threaded.detail).toBeUndefined();
+  });
+
+  it("create --body-context snapshots the RESOLVED content as the body + a provenance tag", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "GET /api/context-packs/library/by-ref/pieces?ref=packs%2Fbrief": { status: 200, data: { ref: "packs/brief", text: "BRIEF-BODY", bytes: 10, missingFiles: [] } },
+        "POST /api/queue/create": { status: 201, data: { qitemId: "qitem-y", state: "pending" } },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "alice@rig", "--destination", "bob@rig",
+      "--body-context", "packs/brief", "--summary", "onboarding",
+    ]);
+    const create = calls.find((c) => c.path === "/api/queue/create");
+    expect(create, "expected the qitem to be created").toBeDefined();
+    const body = create!.body as { body: string; tags?: string[] };
+    // Snapshot: the RESOLVED content is the body (not the ref); a later library
+    // edit can never rewrite this handoff's history.
+    expect(body.body).toBe("BRIEF-BODY");
+    // Provenance: the ref rides as a tag so "what context was this agent given?"
+    // stays auditable.
+    expect(body.tags).toContain("body-context:packs/brief");
+  });
+
+  it("create --body-context ABORTS (no qitem created) when the pack has a missing member", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "GET /api/context-packs/library/by-ref/pieces?ref=packs%2Fbroken": { status: 200, data: { ref: "packs/broken", text: "X", missingFiles: [{ path: "gone.md" }] } },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "alice@rig", "--destination", "bob@rig",
+      "--body-context", "packs/broken", "--summary", "x",
+    ]);
+    expect(calls.find((c) => c.path === "/api/queue/create"), "no qitem created on a broken pack").toBeUndefined();
+    expect(process.exitCode).toBe(1);
+    expect(errors.join("\n")).toMatch(/gone\.md/);
+  });
+
+  it("create --body-context is mutually exclusive with --body", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "alice@rig", "--destination", "bob@rig",
+      "--body", "x", "--body-context", "packs/brief", "--summary", "x",
+    ]);
+    expect(calls.find((c) => c.path === "/api/queue/create")).toBeUndefined();
+    expect(process.exitCode).toBe(1);
+    expect(errors.join("\n")).toMatch(/mutually exclusive/i);
+  });
+
+  it("create --no-nudge passes nudge: false to the daemon (cold-queue opt-out)", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "alice@rig",
+      "--destination", "bob@rig",
+      "--body", "cold",
+      "--no-nudge",
+    ]);
+    const create = calls.find((c) => c.path === "/api/queue/create");
+    expect((create!.body as { nudge: boolean }).nudge).toBe(false);
+  });
+
+  it("create --verify waits for the existing gateway receipt and keeps persistence, connector acceptance, and readership distinct", async () => {
+    const id = "qitem-human-verify";
+    const { deps, calls } = makeDeps({
+      routes: {
+        "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "pending", destinationSession: "founder@external" } },
+        [`GET /api/queue/${id}`]: [
+          { status: 200, data: { qitemId: id, deliveryOutcome: null } },
+          { status: 200, data: { qitemId: id, deliveryOutcome: "posted" } },
+        ],
+      },
+    });
+    deps.deliveryVerify = { timeoutMs: 50, intervalMs: 0, sleep: async () => {} };
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--destination", "founder@external",
+      "--body", "Please decide",
+      "--summary", "Founder decision",
+      "--evidence-ref", "proof/decision.md",
+      "--verify",
+      "--json",
+    ]);
+    const out = JSON.parse(logs.at(-1)!) as Record<string, unknown>;
+    expect(out).toMatchObject({
+      qitemId: id,
+      persisted: true,
+      delivery: {
+        receiptSource: "gateway",
+        destinationKind: "human",
+        outcome: "posted",
+        connectorAccepted: true,
+        humanReadership: "unknown",
+      },
+    });
+    expect(calls.filter((call) => call.method === "POST" && call.path === "/api/queue/create")).toHaveLength(1);
+    expect(calls.filter((call) => call.method === "GET" && call.path === `/api/queue/${id}`)).toHaveLength(2);
+  });
+
+  it("create --verify times out indeterminate without retrying or weakening the durable create", async () => {
+    const id = "qitem-human-pending";
+    const { deps, calls } = makeDeps({
+      routes: {
+        "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "pending" } },
+        [`GET /api/queue/${id}`]: { status: 200, data: { qitemId: id, deliveryOutcome: null } },
+      },
+    });
+    let now = 0;
+    deps.deliveryVerify = { timeoutMs: 2, intervalMs: 0, sleep: async () => { now += 2; }, now: () => now };
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--destination", "founder@external", "--body", "Please decide", "--summary", "Founder decision", "--evidence-ref", "proof/decision.md", "--verify", "--json",
+    ]);
+    const out = JSON.parse(logs.at(-1)!) as Record<string, unknown>;
+    expect(out).toMatchObject({
+      qitemId: id,
+      persisted: true,
+      delivery: {
+        receiptSource: "gateway",
+        destinationKind: "human",
+        outcome: "still-pending",
+        connectorAccepted: null,
+        humanReadership: "unknown",
+        nextAction: `rig queue show ${id} --json`,
+      },
+    });
+    expect(calls.filter((call) => call.method === "POST" && call.path === "/api/queue/create")).toHaveLength(1);
+  });
+
+  it.each(["transport-failed", "never-posted"] as const)(
+    "create --verify returns the terminal %s receipt without retrying",
+    async (outcome) => {
+      const id = `qitem-human-${outcome}`;
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "pending" } },
+          [`GET /api/queue/${id}`]: { status: 200, data: { qitemId: id, deliveryOutcome: outcome, deliveryFailureDetail: `${outcome} detail` } },
+        },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--destination", "founder@external", "--body", "Please decide", "--summary", "Founder decision", "--evidence-ref", "proof/decision.md", "--verify", "--json",
+      ]);
+      expect(JSON.parse(logs.at(-1)!)).toMatchObject({
+        persisted: true,
+        delivery: { receiptSource: "gateway", destinationKind: "human", outcome, connectorAccepted: false, humanReadership: "unknown", detail: `${outcome} detail` },
+      });
+      expect(calls.filter((call) => call.method === "POST" && call.path === "/api/queue/create")).toHaveLength(1);
+    },
+  );
+
+  it("delivery verification preserves an HTTP refusal as indeterminate", async () => {
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => ({ status: 503, data: { error: "projection unavailable" } as T }) },
+      "qitem-human-http",
+      {},
+      { destinationSession: "founder@external" },
+    );
+    expect(result).toMatchObject({ outcome: "indeterminate", connectorAccepted: null, humanReadership: "unknown" });
+    expect(result.detail).toContain("HTTP 503");
+  });
+
+  it("delivery verification reports an unreadable receipt as indeterminate, not rejected", async () => {
+    const result = await waitForDeliveryOutcome(
+      { get: async () => { throw new Error("daemon read timed out"); } } as never,
+      "qitem-human-indeterminate",
+      {},
+      { destinationSession: "founder@external" },
+    );
+    expect(result).toMatchObject({
+      outcome: "indeterminate",
+      connectorAccepted: null,
+      humanReadership: "unknown",
+    });
+  });
+
+  // A terminal (pane-bound) destination's receipt is the row's wake result (lastNudgeResult) and
+  // its pickup is the claim; a registered person with a pane may also get a gateway receipt (see
+  // the nested describe). Keep persistence, terminal receipt, claim, Slack and human readership
+  // apart, and never call a saved row failed.
+  describe("--verify for a terminal destination", () => {
+    const ROW = { qitemId: "qitem-t", state: "pending", claimedAt: null, lastNudgeResult: null, deliveryOutcome: null, pickup: { state: "unclaimed" } };
+    // Each poll reads the next row; the last row repeats. The caller's array is not mutated.
+    function rowsClient(rows: Array<Record<string, unknown>>) {
+      let reads = 0;
+      return {
+        get reads() { return reads; },
+        get: async <T>() => {
+          const row = rows[Math.min(reads, rows.length - 1)]!;
+          reads += 1;
+          return { status: 200, data: { ...ROW, ...row } as T };
+        },
+      };
+    }
+    function boundedDeps(timeoutMs = 10) {
+      let now = 0;
+      return { timeoutMs, intervalMs: 1, sleep: async (ms: number) => { now += ms; }, now: () => now };
+    }
+    const verify = (rows: Array<Record<string, unknown>>, target: { destinationSession?: string; nudge?: boolean } = { destinationSession: "bob@rig" }) => {
+      const client = rowsClient(rows);
+      return waitForDeliveryOutcome(client, "qitem-t", boundedDeps(), target).then((result) => ({ result, reads: client.reads }));
+    };
+
+    it("smoke-test case through create: settles on the first delivered-ack-pending read, not a failed handoff", async () => {
+      const id = "qitem-agent-verify";
+      const rows = [
+        {},
+        { lastNudgeResult: "delivered-ack-pending" },
+        { lastNudgeResult: "delivered-ack-pending", state: "in-progress", claimedAt: "2026-10-08T10:00:10.000Z", pickup: { state: "working" } },
+      ];
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "pending", destinationSession: "bob@rig" } },
+          [`GET /api/queue/${id}`]: rows.map((row) => ({ status: 200, data: { ...ROW, qitemId: id, ...row } })),
+        },
+      });
+      deps.deliveryVerify = boundedDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "create", "--destination", "bob@rig", "--body", "Review this", "--summary", "Review", "--verify", "--json"]);
+      const out = JSON.parse(logs.at(-1)!) as { persisted: boolean; delivery: Record<string, unknown> };
+      expect(out.persisted).toBe(true);
+      expect(out.delivery).toEqual({
+        receiptSource: "terminal",
+        destinationKind: "agent",
+        outcome: "delivered-ack-pending",
+        wakeResult: "delivered-ack-pending",
+        claim: { observed: false, claimedAt: null, pickup: "unclaimed" },
+        detail: "The qitem is saved. Terminal receipt unconfirmed (delivered-ack-pending): the wake was sent, but its render could not be confirmed. No claim observed yet. This is not a failed handoff.",
+        nextAction: `rig queue show ${id} --json`,
+      });
+      expect(process.exitCode).toBeUndefined();
+      expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+      // The wait ends on the first recorded wake result; the later claim is not awaited.
+      expect(calls.filter((call) => call.method === "GET" && call.path === `/api/queue/${id}`)).toHaveLength(2);
+    });
+
+    it("persisted row with an unconfirmed receipt and no claim: saved, unconfirmed, not a failed handoff, at once", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "delivered-ack-pending" }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "delivered-ack-pending", claim: { observed: false, claimedAt: null, pickup: "unclaimed" }, nextAction: "rig queue show qitem-t --json" });
+      expect(result).not.toHaveProperty("humanReadership");
+      expect(result).not.toHaveProperty("connectorAccepted");
+      expect(result.detail).toBe("The qitem is saved. Terminal receipt unconfirmed (delivered-ack-pending): the wake was sent, but its render could not be confirmed. No claim observed yet. This is not a failed handoff.");
+    });
+
+    it("an existing claim is reported with the first wake result", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "delivered-ack-pending", state: "in-progress", claimedAt: "2026-10-08T10:00:10.000Z", pickup: { state: "working" } }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "delivered-ack-pending", claim: { observed: true, claimedAt: "2026-10-08T10:00:10.000Z", pickup: "working" }, nextAction: null });
+      expect(result.detail).toContain("A claim shows the seat took the item; it does not prove the body was read.");
+      expect(result.detail).not.toContain("not a failed handoff");
+    });
+
+    it("a verified wake is distinct from delivered-ack-pending and settles the wait", async () => {
+      const { result, reads } = await verify([{}, { lastNudgeResult: "verified" }, { lastNudgeResult: "verified", claimedAt: "x" }]);
+      expect(result).toMatchObject({ outcome: "verified", wakeResult: "verified", claim: { observed: false } });
+      expect(result.detail).not.toContain("not a failed handoff");
+      expect(reads).toBe(2);
+    });
+
+    it.each([
+      "failed:tmux reports no session",
+      "unroutable: 'revieweer@rig' has no terminal transport on this daemon and names no registered human",
+    ])("a %s wake is a failed wake on a saved row, reported at once", async (wakeResult) => {
+      const { result, reads } = await verify([{ lastNudgeResult: wakeResult }]);
+      expect(result).toMatchObject({ outcome: "failed", wakeResult });
+      expect(result.detail).toMatch(/^The qitem is saved\. The wake failed/);
+      expect(result.detail).not.toContain("not a failed handoff");
+      expect(reads).toBe(1);
+    });
+
+    it("a claimed row's unconfirmed wake reads claimed, not indeterminate, and is never verified", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "claimed", state: "in-progress", claimedAt: "2026-10-11T20:00:00.000Z", pickup: { state: "working" } }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "claimed", wakeResult: "claimed", claim: { observed: true, claimedAt: "2026-10-11T20:00:00.000Z", pickup: "working" }, nextAction: null });
+      expect(result.detail).toContain("Terminal receipt unconfirmed, but the seat has claimed the item (claimed).");
+      expect(result.detail).toContain("it does not prove the body was read");
+    });
+
+    it("an unrecognised wake result is indeterminate and never labelled not-failed", async () => {
+      const { result } = await verify([{ lastNudgeResult: "refused:new-prefix" }]);
+      expect(result).toMatchObject({ outcome: "indeterminate", wakeResult: "refused:new-prefix" });
+      expect(result.detail).not.toContain("not a failed handoff");
+    });
+
+    it("an indeterminate:* wake is reported unconfirmed at once", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "indeterminate:timeout" }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "indeterminate", nextAction: "rig queue show qitem-t --json" });
+      expect(result.detail).toContain("Terminal receipt unconfirmed (indeterminate:timeout)");
+      expect(result.detail).toContain("This is not a failed handoff.");
+    });
+
+    it("a retained wake is reported at once, points at the held message and does not promise a retry", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "retained:typing_guard" }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "retained", nextAction: "rig seat held-messages bob@rig" });
+      expect(result.detail).toContain("nothing was typed into the pane");
+      expect(result.detail).toContain("not retried automatically");
+      expect(result.detail).not.toMatch(/ladder retries/);
+    });
+
+    it("only a missing wake result waits, up to the bound, then stays still-pending", async () => {
+      const { result, reads } = await verify([{}]);
+      expect(reads).toBeGreaterThan(1);
+      expect(result).toMatchObject({ outcome: "still-pending", wakeResult: null, claim: { observed: false } });
+      expect(result.detail).toContain("No terminal receipt was recorded within 10ms.");
+    });
+
+    it("a claim before any wake result ends the wait without a null duration", async () => {
+      const { result } = await verify([{ state: "in-progress", claimedAt: "2026-10-08T10:00:02.000Z" }]);
+      expect(result).toMatchObject({ outcome: "still-pending", claim: { observed: true }, nextAction: null });
+      expect(result.detail).toContain("No terminal receipt was recorded before the claim.");
+      expect(result.detail).not.toContain("null");
+    });
+
+    it("--no-nudge through create: one read, no wake requested, no claim that nobody was notified", async () => {
+      const id = "qitem-cold";
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "pending" } },
+          [`GET /api/queue/${id}`]: { status: 200, data: { ...ROW, qitemId: id } },
+        },
+      });
+      deps.deliveryVerify = boundedDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "create", "--destination", "bob@rig", "--body", "cold", "--summary", "Cold", "--no-nudge", "--verify", "--json"]);
+      expect((calls.find((c) => c.path === "/api/queue/create")!.body as { nudge: boolean }).nudge).toBe(false);
+      const out = JSON.parse(logs.at(-1)!) as { delivery: Record<string, unknown> };
+      expect(out.delivery).toMatchObject({ receiptSource: "terminal", outcome: "not-requested", claim: { observed: false } });
+      expect(out.delivery.detail).toBe("The qitem is saved. No terminal wake was requested (--no-nudge). No claim observed yet. This is not a failed handoff.");
+      expect(calls.filter((call) => call.method === "GET" && call.path === `/api/queue/${id}`)).toHaveLength(1);
+    });
+
+    it("--no-nudge to a registered person's alias keeps the bounded gateway wait (daemon destinationClass)", async () => {
+      const { result, reads } = await verify([{ destinationClass: "gateway-routable" }], { destinationSession: "mike@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "gateway", destinationKind: "human", outcome: "still-pending", connectorAccepted: null, humanReadership: "unknown" });
+      expect(reads).toBeGreaterThan(1);
+    });
+
+    it("--no-nudge to a registered person's alias settles on the gateway receipt", async () => {
+      const { result } = await verify([{ destinationClass: "gateway-routable" }, { destinationClass: "gateway-routable", deliveryOutcome: "posted" }], { destinationSession: "mike@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "gateway", outcome: "posted", connectorAccepted: true });
+    });
+
+    it("--no-nudge to a seat the daemon classes pane-bound reads once as not-requested", async () => {
+      const { result, reads } = await verify([{ destinationClass: "pane-bound" }], { destinationSession: "bob@rig", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "not-requested" });
+      expect(reads).toBe(1);
+    });
+
+    it("the daemon's pane-bound class for a human seat wins over the address pattern", async () => {
+      const { result, reads } = await verify([{ destinationClass: "pane-bound" }], { destinationSession: "human-founder@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "human", outcome: "not-requested", humanReadership: "unknown" });
+      expect(reads).toBe(1);
+    });
+
+    // A registered person who is also a seat with its own pane: the gateway may post the row to
+    // Slack too (the row's owner notification level is what its selector keys on), so --verify
+    // keeps a bounded wait for that receipt and reports both sides separately.
+    describe("a pane-bound registered person (owner notification level set)", () => {
+      const PANE_PERSON = { destinationClass: "pane-bound", ownerNotificationLevel: "ALERT" };
+      const target = { destinationSession: "dev-a@rig1" };
+
+      it("waits for the Slack receipt after the terminal receipt and reports both", async () => {
+        const { result, reads } = await verify([
+          PANE_PERSON,
+          { ...PANE_PERSON, lastNudgeResult: "verified" },
+          { ...PANE_PERSON, lastNudgeResult: "verified", deliveryOutcome: "posted" },
+        ], target);
+        expect(reads).toBe(3);
+        expect(result).toMatchObject({
+          receiptSource: "terminal", destinationKind: "human", humanReadership: "unknown",
+          outcome: "verified", wakeResult: "verified",
+          gateway: { outcome: "posted", connectorAccepted: true },
+        });
+        expect(result.detail).toContain("Slack receipt: posted.");
+      });
+
+      it("keeps the bounded wait when Slack has not posted, without failing the terminal side", async () => {
+        const { result, reads } = await verify([{ ...PANE_PERSON, lastNudgeResult: "verified" }], target);
+        expect(reads).toBeGreaterThan(1);
+        expect(result).toMatchObject({ outcome: "verified", gateway: { outcome: "still-pending", connectorAccepted: null }, nextAction: "rig queue show qitem-t --json" });
+        expect(result.detail).toContain("No Slack receipt within 10ms.");
+      });
+
+      it("reports a Slack transport failure on its own side", async () => {
+        const { result } = await verify([{ ...PANE_PERSON, lastNudgeResult: "delivered-ack-pending", deliveryOutcome: "transport-failed", deliveryFailureDetail: "slack 500" }], target);
+        expect(result).toMatchObject({ outcome: "delivered-ack-pending", gateway: { outcome: "transport-failed", connectorAccepted: false, detail: "slack 500" } });
+        expect(result.detail).not.toContain("not a failed handoff");
+      });
+
+      it("with --no-nudge, reports no terminal wake and still waits for Slack", async () => {
+        const { result } = await verify([PANE_PERSON, { ...PANE_PERSON, deliveryOutcome: "posted" }], { ...target, nudge: false });
+        expect(result).toMatchObject({ outcome: "not-requested", gateway: { outcome: "posted", connectorAccepted: true } });
+      });
+
+      it("a pane-bound seat with no owner notification level is unchanged: no Slack side, settles at once", async () => {
+        const { result, reads } = await verify([{ destinationClass: "pane-bound", ownerNotificationLevel: null, lastNudgeResult: "verified" }], target);
+        expect(reads).toBe(1);
+        expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "verified" });
+        expect(result).not.toHaveProperty("gateway");
+        expect(result).not.toHaveProperty("humanReadership");
+      });
+
+      it("a Slack receipt that lands before the wake result keeps waiting on the terminal side", async () => {
+        const { result, reads } = await verify([
+          { ...PANE_PERSON, deliveryOutcome: "posted" },
+          { ...PANE_PERSON, deliveryOutcome: "posted", lastNudgeResult: "delivered-ack-pending" },
+        ], target);
+        expect(reads).toBe(2);
+        expect(result).toMatchObject({ outcome: "delivered-ack-pending", gateway: { outcome: "posted" } });
+      });
+
+      it("a claim with Slack still pending keeps the bounded Slack wait", async () => {
+        const { result, reads } = await verify([{ ...PANE_PERSON, state: "in-progress", claimedAt: "2026-10-08T10:00:02.000Z" }], target);
+        expect(reads).toBeGreaterThan(1);
+        expect(result).toMatchObject({ claim: { observed: true }, gateway: { outcome: "still-pending" }, nextAction: "rig queue show qitem-t --json" });
+      });
+
+      it("a recorded terminal wake still wins over a gateway-routable class read later (#1029 order)", async () => {
+        const { result, reads } = await verify([{ destinationClass: "gateway-routable", ownerNotificationLevel: "ALERT", lastNudgeResult: "verified", deliveryOutcome: "posted" }], target);
+        expect(reads).toBe(1);
+        expect(result).toMatchObject({ receiptSource: "terminal", outcome: "verified", wakeResult: "verified", gateway: { outcome: "posted" } });
+      });
+
+      it("an older daemon's posted receipt beside a terminal wake reports both sides", async () => {
+        const { result } = await verify([{ lastNudgeResult: "verified", deliveryOutcome: "posted" }], target);
+        expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "human", outcome: "verified", gateway: { outcome: "posted" } });
+      });
+    });
+
+    it("--no-nudge to a human-seat address on a daemon without destinationClass keeps the bounded gateway wait", async () => {
+      const { result, reads } = await verify([{}], { destinationSession: "human-founder@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "gateway", destinationKind: "human", outcome: "still-pending", humanReadership: "unknown" });
+      expect(reads).toBeGreaterThan(1);
+    });
+
+    it("an idempotent --id retry verifies the existing row by that id, with one POST", async () => {
+      const id = "qitem-agent-retry";
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "in-progress" } },
+          [`GET /api/queue/${id}`]: { status: 200, data: { ...ROW, qitemId: id, lastNudgeResult: "verified", state: "in-progress", claimedAt: "2026-10-08T10:00:10.000Z" } },
+        },
+      });
+      deps.deliveryVerify = boundedDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "create", "--destination", "bob@rig", "--body", "b", "--summary", "s", "--id", id, "--verify", "--json"]);
+      expect((calls.find((c) => c.path === "/api/queue/create")!.body as { qitemId: string }).qitemId).toBe(id);
+      expect(JSON.parse(logs.at(-1)!).delivery).toMatchObject({ outcome: "verified", claim: { observed: true } });
+      expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    });
+
+    it("a registry alias (<entityId>@<rig>) moves to the gateway receipt once gateway-owned lands", async () => {
+      const { result } = await verify([{}, { lastNudgeResult: "gateway-owned: 'mike@kernel' is a virtual paneless human destination" }, { lastNudgeResult: "gateway-owned: x", deliveryOutcome: "posted" }], { destinationSession: "mike@kernel" });
+      expect(result).toMatchObject({ receiptSource: "gateway", destinationKind: "human", outcome: "posted", connectorAccepted: true, humanReadership: "unknown" });
+    });
+
+    it("a human seat with a real pane reports its terminal receipt and keeps human readership unknown", async () => {
+      const { result, reads } = await verify([{}, { lastNudgeResult: "verified" }], { destinationSession: "human-founder@kernel" });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "human", outcome: "verified", humanReadership: "unknown" });
+      expect(result.detail).not.toContain("connector");
+      expect(reads).toBe(2);
+    });
+
+    it("an unreadable receipt for a terminal destination is indeterminate with no readership claim", async () => {
+      const result = await waitForDeliveryOutcome({ get: async () => { throw new Error("daemon read timed out"); } } as never, "qitem-t", boundedDeps(), { destinationSession: "bob@rig" });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "indeterminate", wakeResult: null, claim: { observed: false }, nextAction: "rig queue show qitem-t --json" });
+      expect(result.detail).toContain("daemon read timed out");
+      expect(result).not.toHaveProperty("humanReadership");
+    });
+  });
+
+  // OPR.0.3.2.21.FR-4(a) — body input resolution kills the
+  // backtick-corruption class. Three accepted shapes: --body inline,
+  // --body-file <path>, --body / --body-file - for stdin. Exactly one
+  // of --body / --body-file is required; mutual exclusion validates.
+  describe("FR-4(a) — --body-file + stdin support", () => {
+    it("resolveQueueBody returns inline body when --body is passed", async () => {
+      const out = await resolveQueueBody({ body: "inline value" });
+      expect(out).toBe("inline value");
+    });
+
+    it("resolveQueueBody reads from a file path when --body-file is passed", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "queue-body-"));
+      const bodyPath = path.join(tmp, "body.txt");
+      const content = "Multi-line body with `raw backticks` and\nliteral newlines\n— this is the corruption class --body-file kills.";
+      fs.writeFileSync(bodyPath, content, "utf8");
+      try {
+        const out = await resolveQueueBody({ bodyFile: bodyPath });
+        expect(out).toBe(content);
+        // Discriminator: the backtick-corruption shell class is bypassed
+        // entirely because no shell substitution happens on file content.
+        expect(out).toMatch(/`raw backticks`/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("resolveQueueBody throws 3-part error when both --body and --body-file are passed", async () => {
+      await expect(resolveQueueBody({ body: "inline", bodyFile: "/tmp/x" })).rejects.toMatchObject({
+        fact: expect.stringMatching(/mutually exclusive|ambiguous/i),
+        consequence: expect.stringMatching(/did not run/),
+        action: expect.stringMatching(/exactly one/),
+      });
+    });
+
+    it("resolveQueueBody throws 3-part error when neither --body nor --body-file is passed", async () => {
+      await expect(resolveQueueBody({})).rejects.toMatchObject({
+        fact: expect.stringMatching(/Neither --body nor --body-file/),
+        consequence: expect.stringMatching(/did not run/),
+        action: expect.stringMatching(/--body|--body-file/),
+      });
+    });
+
+    it("resolveQueueBody throws 3-part error when --body-file path does not exist", async () => {
+      await expect(resolveQueueBody({ bodyFile: "/tmp/this-path-does-not-exist-fr4a-test.md" })).rejects.toMatchObject({
+        fact: expect.stringMatching(/does not exist/),
+        consequence: expect.stringMatching(/did not run/),
+        action: expect.stringMatching(/Check the path/),
+      });
+    });
+
+    // OPR.0.3.2.21.FR-4 cleanup (guard non-blocking note on FR-4a CLEAR): a
+    // directory passed to --body-file used to fall through to fs.readFileSync
+    // and surface a bare Error("EISDIR: illegal operation on a directory") with
+    // blank consequence/action. The cleanup commit emits the 3-part shape
+    // explicitly so the error reads consistently with the other body-resolve
+    // failure modes.
+    it("resolveQueueBody throws 3-part error when --body-file path is a directory (not a regular file)", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "queue-body-isdir-"));
+      try {
+        await expect(resolveQueueBody({ bodyFile: tmp })).rejects.toMatchObject({
+          fact: expect.stringMatching(/not a regular file/),
+          consequence: expect.stringMatching(/did not run/),
+          action: expect.stringMatching(/Pass a path to a readable file/),
+        });
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("resolveQueueBody calls the injected stdin reader when --body is -", async () => {
+      const stdinReader = vi.fn(async () => "from stdin\n");
+      const out = await resolveQueueBody({ body: "-" }, stdinReader);
+      expect(out).toBe("from stdin\n");
+      expect(stdinReader).toHaveBeenCalledTimes(1);
+    });
+
+    it("resolveQueueBody calls the injected stdin reader when --body-file is -", async () => {
+      const stdinReader = vi.fn(async () => "from stdin file dash\n");
+      const out = await resolveQueueBody({ bodyFile: "-" }, stdinReader);
+      expect(out).toBe("from stdin file dash\n");
+      expect(stdinReader).toHaveBeenCalledTimes(1);
+    });
+
+    it("S4b RED: refuses an empty --body-file with source-aware 3-part guidance", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "queue-body-empty-"));
+      const bodyPath = path.join(tmp, "empty.md");
+      fs.writeFileSync(bodyPath, "", "utf8");
+      try {
+        await expect(resolveQueueBody({ bodyFile: bodyPath })).rejects.toMatchObject({
+          fact: expect.stringMatching(new RegExp(`0 bytes|empty.*${path.basename(bodyPath)}`, "i")),
+          consequence: expect.stringMatching(/nothing was persisted|daemon was not contacted/i),
+          action: expect.stringMatching(/add.*content|non-empty/i),
+        });
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("S4b RED: refuses empty stdin and names stdin before any queue persistence", async () => {
+      await expect(resolveQueueBody({ bodyFile: "-" }, async () => "")).rejects.toMatchObject({
+        fact: expect.stringMatching(/0 bytes|empty.*stdin/i),
+        consequence: expect.stringMatching(/nothing was persisted|daemon was not contacted/i),
+        action: expect.stringMatching(/provide|pipe.*content|non-empty/i),
+      });
+    });
+
+    it("S4b RED: empty file aborts queue create before the daemon can persist a row", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "queue-create-empty-"));
+      const bodyPath = path.join(tmp, "empty.md");
+      fs.writeFileSync(bodyPath, "", "utf8");
+      try {
+        const { deps, calls } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        await program.parseAsync([
+          "node", "rig", "queue", "create",
+          "--destination", "bob@rig",
+          "--body-file", bodyPath,
+          "--json",
+        ]);
+        expect(process.exitCode).toBe(1);
+        expect(calls.some((call) => call.method === "POST" && call.path === "/api/queue/create")).toBe(false);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("create --body-file <file-with-backticks> POSTs the file content as body (operator-copy-paste-safe)", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "queue-create-body-file-"));
+      const bodyPath = path.join(tmp, "body.txt");
+      const content = "Per-commit handoff for OPR.X.Y.Z\n\n```bash\nrig queue handoff qitem-1 --to next@rig\n```\n\nDone.";
+      fs.writeFileSync(bodyPath, content, "utf8");
+      try {
+        const { deps, calls } = makeDeps({
+          routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "qitem-fr4a-1", state: "pending" } } },
+        });
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        await program.parseAsync([
+          "node", "rig", "queue", "create",
+          "--source", "alice@rig",
+          "--destination", "bob@rig",
+          "--body-file", bodyPath,
+          "--json",
+        ]);
+        const create = calls.find((c) => c.path === "/api/queue/create");
+        expect(create, "expected POST /api/queue/create to fire").toBeDefined();
+        const body = create!.body as Record<string, unknown>;
+        expect(body.body).toBe(content);
+        // Discriminator: the backtick fence survived intact, proving the
+        // shell-substitution class never touched the content.
+        expect((body.body as string)).toMatch(/```bash[\s\S]*?```/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("create with both --body and --body-file errors with exit 1 + 3-part error + does NOT contact the daemon", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "queue-create-conflict-"));
+      const bodyPath = path.join(tmp, "body.txt");
+      fs.writeFileSync(bodyPath, "x", "utf8");
+      try {
+        const { deps, calls } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        const prevExit = process.exitCode;
+        process.exitCode = undefined;
+        try {
+          await program.parseAsync([
+            "node", "rig", "queue", "create",
+            "--source", "alice@rig",
+            "--destination", "bob@rig",
+            "--body", "inline",
+            "--body-file", bodyPath,
+            "--json",
+          ]);
+          expect(process.exitCode).toBe(1);
+          expect(calls.find((c) => c.path === "/api/queue/create")).toBeUndefined();
+        } finally {
+          process.exitCode = prevExit;
+        }
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("create with neither --body nor --body-file errors with exit 1 + does NOT contact the daemon", async () => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      const prevExit = process.exitCode;
+      process.exitCode = undefined;
+      try {
+        await program.parseAsync([
+          "node", "rig", "queue", "create",
+          "--source", "alice@rig",
+          "--destination", "bob@rig",
+          "--json",
+        ]);
+        expect(process.exitCode).toBe(1);
+        expect(calls.find((c) => c.path === "/api/queue/create")).toBeUndefined();
+      } finally {
+        process.exitCode = prevExit;
+      }
+    });
+  });
+
+  // OPR.0.3.2.21.FR-4(b) — --mission / --slice first-class flags
+  // translate to mission:<id> / slice:<id> tags and compose with --tags.
+  // This is tag-formalization only — no schema change; the qitem still
+  // stores tags as a flat list.
+  describe("FR-4(b) — --mission / --slice first-class flag-formalization", () => {
+    it("--mission translates to a mission:<id> tag", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-fr4b-1" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "alice@rig",
+        "--destination", "bob@rig",
+        "--body", "x",
+        "--mission", "release-0.3.2",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      expect((create!.body as { tags: string[] }).tags).toEqual(["mission:release-0.3.2"]);
+    });
+
+    it("--slice translates to a slice:<id> tag", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-fr4b-2" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "alice@rig",
+        "--destination", "bob@rig",
+        "--body", "x",
+        "--slice", "21-fr-4-queue-ergonomics",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      expect((create!.body as { tags: string[] }).tags).toEqual(["slice:21-fr-4-queue-ergonomics"]);
+    });
+
+    it("--mission + --slice + --tags merges all three sets (mission/slice first, --tags appended) and de-duplicates", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-fr4b-3" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "alice@rig",
+        "--destination", "bob@rig",
+        "--body", "x",
+        "--mission", "release-0.3.2",
+        "--slice", "21-fr-4-queue-ergonomics",
+        "--tags", "gate:guard,handoff:per-commit",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      expect((create!.body as { tags: string[] }).tags).toEqual([
+        "mission:release-0.3.2",
+        "slice:21-fr-4-queue-ergonomics",
+        "gate:guard",
+        "handoff:per-commit",
+      ]);
+    });
+
+    it("--mission release-0.3.2 + --tags mission:release-0.3.2 de-duplicates the redundant tag (one mission:X kept)", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-fr4b-4" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "alice@rig",
+        "--destination", "bob@rig",
+        "--body", "x",
+        "--mission", "release-0.3.2",
+        "--tags", "mission:release-0.3.2,gate:guard",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      const tags = (create!.body as { tags: string[] }).tags;
+      expect(tags.filter((t) => t === "mission:release-0.3.2")).toHaveLength(1);
+      expect(tags).toContain("gate:guard");
+    });
+
+    it("no --mission/--slice/--tags → tags is undefined on the wire (legacy behavior preserved)", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-fr4b-5" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "alice@rig",
+        "--destination", "bob@rig",
+        "--body", "x",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      expect((create!.body as { tags?: string[] }).tags).toBeUndefined();
+    });
+  });
+
+  // OPR.0.4.3.16 — --gate <role> first-class flag stamps a gate:<role> tag,
+  // the producer the idle-gate watchdog's centralized predicate reads.
+  describe("OPR.0.4.3.16 — --gate <role> gate-predicate producer", () => {
+    it("create --gate guard translates to a gate:guard tag", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-gate-1" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "dev@rig",
+        "--destination", "dev-guard@rig",
+        "--body", "review this diff",
+        "--gate", "guard",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      expect((create!.body as { tags: string[] }).tags).toEqual(["gate:guard"]);
+    });
+
+    it("create --gate composes with --slice/--tags and de-duplicates", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-gate-2" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "create",
+        "--source", "dev@rig",
+        "--destination", "spec-guard@rig",
+        "--body", "x",
+        "--slice", "16",
+        "--gate", "spec-review",
+        "--tags", "gate:spec-review,handoff:per-commit",
+        "--json",
+      ]);
+      const create = calls.find((c) => c.path === "/api/queue/create");
+      expect((create!.body as { tags: string[] }).tags).toEqual([
+        "slice:16",
+        "gate:spec-review",
+        "handoff:per-commit",
+      ]);
+    });
+
+    it("handoff --gate guard translates to a gate:guard tag on the new qitem", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/q-src/handoff": { status: 201, data: { qitemId: "q-new" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "handoff", "q-src",
+        "--from", "dev@rig",
+        "--to", "dev-guard@rig",
+        "--gate", "guard",
+        "--summary", "code review",
+        "--json",
+      ]);
+      const handoff = calls.find((c) => c.path === "/api/queue/q-src/handoff");
+      expect((handoff!.body as { tags: string[] }).tags).toEqual(["gate:guard"]);
+    });
+  });
+
+  it("update --state done WITHOUT --closure-reason renders structured hot-potato error and exits non-zero", async () => {
+    const { deps } = makeDeps({
+      routes: {
+        "POST /api/queue/qitem-x/update": {
+          status: 400,
+          data: {
+            error: "missing_closure_reason",
+            message: "state=done requires closure_reason; valid values: handed_off_to, blocked_on, denied, canceled, no-follow-on, escalation",
+            validReasons: ["handed_off_to", "blocked_on", "denied", "canceled", "no-follow-on", "escalation"],
+          },
+        },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "update", "qitem-x",
+      "--actor", "bob@rig",
+      "--state", "done",
+      "--json",
+    ]);
+    expect(process.exitCode).toBe(1);
+    const out = logs.join("\n");
+    expect(out).toContain("missing_closure_reason");
+    expect(out).toContain("validReasons");
+  });
+
+  it("update accepts a note without state", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+
+    await program.parseAsync([
+      "node", "rig", "queue", "update", "qitem-note",
+      "--note", "audit bytes",
+      "--json",
+    ]);
+
+    expect(calls.find((c) => c.path === "/api/queue/qitem-note/update")?.body).toEqual({
+      state: undefined,
+      reopen: undefined,
+      closureReason: undefined,
+      closureTarget: undefined,
+      blockedOn: undefined,
+      summary: undefined,
+      evidenceRef: undefined,
+      transitionNote: "audit bytes",
+    });
+  });
+
+  it("update forwards explicit reopen acknowledgment", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+
+    await program.parseAsync([
+      "node", "rig", "queue", "update", "qitem-reopen",
+      "--state", "pending",
+      "--note", "repair",
+      "--reopen",
+      "--json",
+    ]);
+
+    expect(calls.find((c) => c.path === "/api/queue/qitem-reopen/update")?.body).toMatchObject({
+      state: "pending",
+      reopen: true,
+      transitionNote: "repair",
+    });
+  });
+
+  it("S03: block forwards the continuation and an atomic timer wake", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "block", "qitem-park",
+      "--on", "external:cooldown",
+      "--continuation", "resume after the cooldown",
+      "--wake-after", "90s",
+      "--json",
+    ]);
+    expect(calls.find((c) => c.path === "/api/queue/qitem-park/update")?.body).toMatchObject({
+      state: "blocked",
+      blockedOn: "external:cooldown",
+      transitionNote: "continuation: resume after the cooldown",
+      wakeAfterSeconds: 90,
+    });
+  });
+
+  it("S03: block help teaches all wake paths and the workspace rule", () => {
+    const { deps } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    const block = program.commands.find((c) => c.name() === "queue")?.commands.find((c) => c.name() === "block");
+    let help = "";
+    block?.configureOutput({ writeOut: (text) => { help += text; } });
+    block?.outputHelp();
+    expect(block?.description()).toContain("Requires --on <blocker>");
+    expect(help).toContain("--on <blocker> is always required; a wake option does not replace it.");
+    expect(help).toMatch(/watchdog id/i);
+    expect(help).toMatch(/timer/i);
+    expect(help).toMatch(/live blocker/i);
+    expect(help).toMatch(/workspace.*not.imminent/i);
+  });
+
+  it("handoff-and-complete sends NO body fromSession — the handing-off seat derives from the transport header (X-OpenRig-Session); --from is dropped, --to stays the target", async () => {
+    const saved = process.env["OPENRIG_SESSION_NAME"];
+    process.env["OPENRIG_SESSION_NAME"] = "bob@rig"; // the seat env == the X-OpenRig-Session the DaemonClient stamps
+    try {
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/qitem-src/handoff-and-complete": {
+            status: 201,
+            data: {
+              closed: { state: "done", closureReason: "handed_off_to" },
+              created: { state: "pending", qitemId: "qitem-new" },
+            },
+          },
+        },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "handoff-and-complete", "qitem-src",
+        "--from", "forged@evil", // P21: IGNORED — must not ride the body
+        "--to", "carol@rig",
+        "--body", "carol's piece",
+        "--json",
+      ]);
+      const call = calls.find((c) => c.path === "/api/queue/qitem-src/handoff-and-complete");
+      expect(call).toBeDefined();
+      const body = call!.body as Record<string, unknown>;
+      // P21 I3 reconcile: no body identity claim — the daemon derives fromSession from the header, and
+      // the forged --from is DROPPED. toSession is the TARGET, a legit body field.
+      expect(body.fromSession).toBeUndefined();
+      expect(body.toSession).toBe("carol@rig");
+      expect(body.body).toBe("carol's piece");
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+      else process.env["OPENRIG_SESSION_NAME"] = saved;
+    }
+  });
+
+  it("whoami GETs /api/queue/whoami with session + recentLimit query params", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "GET /api/queue/whoami?session=bob%40rig&recentLimit=10": {
+          status: 200,
+          data: {
+            session: "bob@rig",
+            asDestination: { pending: 2, inProgress: 1, blocked: 0, recent: [] },
+            asSource: { total: 5 },
+          },
+        },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "whoami",
+      "--session", "bob@rig",
+      "--recent-limit", "10",
+      "--json",
+    ]);
+    const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/whoami"));
+    expect(call).toBeDefined();
+    expect(call!.path).toContain("session=bob%40rig");
+    expect(call!.path).toContain("recentLimit=10");
+  });
+
+  it("whoami defaults the session from OPENRIG_SESSION_NAME when --session is omitted", async () => {
+    const saved = process.env["OPENRIG_SESSION_NAME"];
+    process.env["OPENRIG_SESSION_NAME"] = "bob@rig";
+    try {
+      const { deps, calls } = makeDeps({
+        routes: {
+          "GET /api/queue/whoami?session=bob%40rig&recentLimit=25": {
+            status: 200,
+            data: {
+              session: "bob@rig",
+              asDestination: { pending: 1, inProgress: 0, blocked: 0, recent: [] },
+              asSource: { total: 0 },
+            },
+          },
+        },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "whoami", "--json"]);
+
+      const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/whoami"));
+      expect(call).toBeDefined();
+      expect(call!.path).toContain("session=bob%40rig");
+      expect(call!.path).toContain("recentLimit=25");
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+      else process.env["OPENRIG_SESSION_NAME"] = saved;
+    }
+  });
+
+  it("claim sends NO body destinationSession — the claimant derives from the transport header (X-OpenRig-Session); env present ⇒ POST fires", async () => {
+    const saved = process.env["OPENRIG_SESSION_NAME"];
+    process.env["OPENRIG_SESSION_NAME"] = "bob@rig";
+    try {
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/qitem-x/claim": {
+            status: 200,
+            data: { qitemId: "qitem-x", destinationSession: "bob@rig", state: "in-progress" },
+          },
+        },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "claim", "qitem-x", "--json"]);
+
+      const call = calls.find((c) => c.path === "/api/queue/qitem-x/claim");
+      expect(call).toBeDefined();
+      // P21 I3 reconcile: the claimant is NOT a body claim — the daemon derives it from the
+      // X-OpenRig-Session header (env present ⇒ pre-check passes ⇒ POST fires). No forgeable body field.
+      expect((call!.body as Record<string, unknown>).destinationSession).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+      else process.env["OPENRIG_SESSION_NAME"] = saved;
+    }
+  });
+
+  it("update sends NO body actorSession — the actor derives from the transport header (X-OpenRig-Session); env present ⇒ POST fires", async () => {
+    const saved = process.env["OPENRIG_SESSION_NAME"];
+    process.env["OPENRIG_SESSION_NAME"] = "bob@rig";
+    try {
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/qitem-x/update": {
+            status: 200,
+            data: { qitemId: "qitem-x", state: "done", closureReason: "no-follow-on" },
+          },
+        },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "update", "qitem-x",
+        "--state", "done",
+        "--closure-reason", "no-follow-on",
+        "--json",
+      ]);
+
+      const call = calls.find((c) => c.path === "/api/queue/qitem-x/update");
+      expect(call).toBeDefined();
+      // P21 I3 reconcile: the actor is NOT a body claim — the daemon derives it from the header.
+      expect((call!.body as Record<string, unknown>).actorSession).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+      else process.env["OPENRIG_SESSION_NAME"] = saved;
+    }
+  });
+
+  it("handoff sends NO body fromSession — the handing-off seat derives from the transport header (X-OpenRig-Session); env present ⇒ POST fires", async () => {
+    const saved = process.env["OPENRIG_SESSION_NAME"];
+    process.env["OPENRIG_SESSION_NAME"] = "bob@rig";
+    try {
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/qitem-x/handoff": {
+            status: 201,
+            data: { closed: { state: "handed-off" }, created: { qitemId: "qitem-new" } },
+          },
+        },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync([
+        "node", "rig", "queue", "handoff", "qitem-x",
+        "--to", "carol@rig",
+        "--json",
+      ]);
+
+      const call = calls.find((c) => c.path === "/api/queue/qitem-x/handoff");
+      expect(call).toBeDefined();
+      // P21 I3 reconcile: the handing-off seat is NOT a body claim — the daemon derives it from the header.
+      expect((call!.body as Record<string, unknown>).fromSession).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+      else process.env["OPENRIG_SESSION_NAME"] = saved;
+    }
+  });
+
+  it("create against unknown destination rig surfaces 400 error and exits non-zero", async () => {
+    const { deps } = makeDeps({
+      routes: {
+        "POST /api/queue/create": {
+          status: 400,
+          data: {
+            error: "unknown_destination_rig",
+            message: "destination_session bob@phantom-rig references an unknown rig",
+          },
+        },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "alice@known-rig",
+      "--destination", "bob@phantom-rig",
+      "--body", "x",
+      "--json",
+    ]);
+    expect(process.exitCode).toBe(1);
+    const out = logs.join("\n");
+    expect(out).toContain("unknown_destination_rig");
+  });
+
+  it("queue create --host attempts the real write when the local health probe is inconclusive and surfaces the daemon response", async () => {
+    vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:7766");
+    const { getDaemonStatus } = await import("../src/daemon-lifecycle.js");
+    vi.mocked(getDaemonStatus).mockResolvedValueOnce({ state: "stopped" });
+    const { deps, calls } = makeDeps({
+      routes: {
+        "POST /api/queue/create": {
+          status: 400,
+          data: {
+            error: "unknown_destination_rig",
+            message: "destination_session bob@phantom-rig references an unknown rig",
+          },
+        },
+      },
+    });
+    const clientUrls: string[] = [];
+    const clientFactory = deps.clientFactory;
+    deps.clientFactory = (baseUrl) => {
+      clientUrls.push(baseUrl);
+      return clientFactory(baseUrl);
+    };
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "alice@known-rig",
+      "--destination", "bob@phantom-rig",
+      "--host", "remote-a",
+      "--body", "x",
+      "--json",
+    ]);
+
+    expect(calls).toContainEqual({
+      method: "POST",
+      path: "/api/queue/create",
+      body: expect.objectContaining({ hostId: "remote-a" }),
+    });
+    expect(clientUrls).toEqual(["http://127.0.0.1:7766"]);
+    expect(logs.join("\n")).toContain("unknown_destination_rig");
+    expect(errors.join("\n")).not.toContain("Daemon not running");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("plain local queue create remains blocked when the daemon probe confirms no reachable operation target", async () => {
+    const { getDaemonStatus } = await import("../src/daemon-lifecycle.js");
+    vi.mocked(getDaemonStatus).mockResolvedValueOnce({ state: "stopped" });
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "alice@known-rig",
+      "--destination", "bob@known-rig",
+      "--body", "x",
+      "--json",
+    ]);
+
+    expect(calls).toEqual([]);
+    expect(errors.join("\n")).toContain("Daemon not running");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("handoff with --no-nudge passes nudge: false through to daemon", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "POST /api/queue/qitem-x/handoff": {
+          status: 201,
+          data: { closed: {}, created: {} },
+        },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "handoff", "qitem-x",
+      "--from", "bob@rig",
+      "--to", "carol@rig",
+      "--no-nudge",
+    ]);
+    const call = calls.find((c) => c.path === "/api/queue/qitem-x/handoff");
+    expect((call!.body as { nudge: boolean }).nudge).toBe(false);
+  });
+
+  it("list constructs /api/queue/list with filter params", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "list",
+      "--destination", "bob@rig",
+      "--state", "pending",
+      "--limit", "50",
+      "--json",
+    ]);
+    const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    expect(call!.path).toContain("destinationSession=bob%40rig");
+    expect(call!.path).toContain("state=pending");
+    expect(call!.path).toContain("limit=50");
+    expect(call!.path).toContain("compact=1");
+    expect(call!.path).not.toContain("as=");
+    expect(call!.path).not.toContain("rig=");
+  });
+
+  it("list -a includes history (no activeOnly param)", async () => {
+    const saved = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "dev1@my-rig";
+    try {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "list", "-a", "--json"]);
+      const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+      expect(call).toBeDefined();
+      expect(call!.path).not.toContain("activeOnly=");
+      expect(call!.path).toContain("rig=my-rig");
+      expect(call!.path).toContain("compact=1");
+    } finally {
+      if (saved === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = saved;
+    }
+  });
+
+  it("list -A is cross-rig (no rig param)", async () => {
+    const saved = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "dev1@my-rig";
+    try {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "list", "-A", "--json"]);
+      const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+      expect(call).toBeDefined();
+      expect(call!.path).not.toContain("rig=");
+      expect(call!.path).toContain("activeOnly=1");
+      expect(call!.path).toContain("compact=1");
+    } finally {
+      if (saved === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = saved;
+    }
+  });
+
+  it("list --full --all --all-rigs = firehose (no compact, no active, no rig)", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync(["node", "rig", "queue", "list", "--full", "--all", "--all-rigs", "--json"]);
+    const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    expect(call!.path).not.toContain("compact=");
+    expect(call!.path).not.toContain("activeOnly=");
+    expect(call!.path).not.toContain("rig=");
+    expect(call!.path).not.toContain("as=");
+  });
+
+  it("list with --destination does not inject implicit rig scope", async () => {
+    const saved = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "my-seat@my-rig";
+    try {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "list", "--destination", "bob@rig", "--json"]);
+      const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+      expect(call).toBeDefined();
+      expect(call!.path).toContain("destinationSession=bob%40rig");
+      expect(call!.path).toContain("compact=1");
+      expect(call!.path).not.toContain("rig=");
+      expect(call!.path).not.toContain("as=");
+    } finally {
+      if (saved === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = saved;
+    }
+  });
+
+  it("recipe command 'rig queue list --destination <seat>' parses successfully and rejects --session", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+
+    // The generated recipe from queue-stuck-sweep uses --destination <seat>
+    await program.parseAsync(["node", "rig", "queue", "list", "--destination", "next@r"]);
+    const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    expect(call!.path).toContain("destinationSession=next%40r");
+
+    // --session is not an option on queue list and must fail parsing
+    const failProgram = createProgram({ queueDeps: deps });
+    failProgram.exitOverride();
+    await expect(
+      failProgram.parseAsync(["node", "rig", "queue", "list", "--session", "next@r"])
+    ).rejects.toThrow();
+  });
+
+  it("list --mine scopes to caller session", async () => {
+    const saved = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "dev1-driver@openrig-delivery";
+    try {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "list", "--mine", "--json"]);
+      const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+      expect(call).toBeDefined();
+      expect(call!.path).toContain("as=dev1-driver%40openrig-delivery");
+      expect(call!.path).not.toContain("rig=");
+    } finally {
+      if (saved === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = saved;
+    }
+  });
+
+  it("S4b RED: list --owned scopes only to rows whose destination is the caller", async () => {
+    const saved = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "dev1-driver@openrig-delivery";
+    try {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "list", "--owned", "--json"]);
+      const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+      expect(call).toBeDefined();
+      expect(call!.path).toContain("destinationSession=dev1-driver%40openrig-delivery");
+      expect(call!.path).not.toContain("as=");
+      expect(call!.path).not.toContain("sourceSession=");
+      expect(call!.path).not.toContain("rig=");
+    } finally {
+      if (saved === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = saved;
+    }
+  });
+
+  it("S4b final RED: list --owned without either seat identity refuses before any GET", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("RIGGED_SESSION_NAME", "");
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+
+    await program.parseAsync(["node", "rig", "queue", "list", "--owned", "--json"]);
+
+    expect(process.exitCode).toBe(1);
+    expect(errors.join("\n")).toMatch(/--owned.*OPENRIG_SESSION_NAME.*RIGGED_SESSION_NAME/i);
+    expect(calls.some((call) => call.method === "GET" && call.path.startsWith("/api/queue/list"))).toBe(false);
+  });
+
+  it("S4b RED: list help distinguishes destination-owned obligations from --mine's authored union", () => {
+    const { deps } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    const queue = program.commands.find((command) => command.name() === "queue")!;
+    const list = queue.commands.find((command) => command.name() === "list")!;
+    const help = list.helpInformation();
+    expect(help).toMatch(/--owned[^\n]*(destination|assigned|owe)/i);
+    expect(help).toMatch(/--mine[^\n]*(source or destination|authored.*do not own)/i);
+  });
+
+  it("list default injects rig=<rigName> + activeOnly=1 + compact=1", async () => {
+    const saved = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "dev1-driver@openrig-delivery";
+    try {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "list", "--json"]);
+      const call = calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/list"));
+      expect(call).toBeDefined();
+      expect(call!.path).toContain("rig=openrig-delivery");
+      expect(call!.path).toContain("activeOnly=1");
+      expect(call!.path).toContain("compact=1");
+      expect(call!.path).not.toContain("as=");
+    } finally {
+      if (saved === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = saved;
+    }
+  });
+
+  // OPR.0.4.3.03 — `rig queue show` body preview + `--full` compatibility.
+  // Bound + bodyTruncated are CODE-POINT-count based (IMPL-SPEC §2.3-2.4);
+  // bodyBytes is the honest TRUE total UTF-8 byte size.
+  describe("queue show body preview (OPR.0.4.3.03)", () => {
+    const PREVIEW_MAX_CODEPOINTS = 512;
+
+    function showRoute(item: unknown, id = "qitem-1") {
+      return makeDeps({ routes: { [`GET /api/queue/${id}`]: { status: 200, data: item } } });
+    }
+
+    // --- previewBody helper (unit) ---
+
+    it("previewBody: empty body → preview '', 0 bytes, not truncated", () => {
+      expect(previewBody("")).toEqual({ preview: "", bodyBytes: 0, bodyTruncated: false });
+    });
+
+    it("previewBody: small body under bound → full body, honest bytes, not truncated", () => {
+      const small = "hello world";
+      expect(previewBody(small)).toEqual({
+        preview: small,
+        bodyBytes: Buffer.byteLength(small, "utf8"),
+        bodyTruncated: false,
+      });
+    });
+
+    it("previewBody: body exactly at 512 code points → not truncated (boundary inclusive)", () => {
+      const exact = "z".repeat(512);
+      expect(previewBody(exact)).toEqual({ preview: exact, bodyBytes: 512, bodyTruncated: false });
+    });
+
+    it("previewBody: oversized body (>512 code points) → truncated, honest bodyBytes = TRUE total, preview = first 512 code points", () => {
+      const body = "x".repeat(1000);
+      const out = previewBody(body);
+      expect(out.bodyTruncated).toBe(true);
+      expect(out.bodyBytes).toBe(1000); // honest total, not the preview length
+      expect(Array.from(out.preview).length).toBe(PREVIEW_MAX_CODEPOINTS);
+      expect(out.preview).toBe("x".repeat(512));
+    });
+
+    it("previewBody: multibyte body >512 code points → 512-code-point slice on a clean code-point boundary (valid UTF-8, no split surrogate)", () => {
+      // 4-byte emoji (astral, surrogate pair in UTF-16). 600 of them = 600 code
+      // points / 2400 bytes → exceeds the 512-CODE-POINT bound.
+      const emoji = "😀"; // 4 UTF-8 bytes, 1 code point, 2 UTF-16 units
+      const body = emoji.repeat(600);
+      const out = previewBody(body);
+      expect(out.bodyTruncated).toBe(true); // 600 code points > 512
+      expect(out.bodyBytes).toBe(2400); // honest total byte size
+      // Preview is exactly the first 512 code points (each a whole emoji)...
+      expect(Array.from(out.preview).length).toBe(512);
+      expect([...out.preview].every((ch) => ch === emoji)).toBe(true);
+      // ...ending on a clean code-point boundary: re-encode round-trips, no
+      // lone surrogate / U+FFFD replacement char from a split sequence.
+      expect(Buffer.byteLength(out.preview, "utf8")).toBe(512 * 4);
+      const roundTrip = Buffer.from(out.preview, "utf8").toString("utf8");
+      expect(roundTrip).toBe(out.preview);
+      expect(roundTrip).not.toContain("�");
+    });
+
+    // --- show command (end-to-end via program) ---
+
+    it("show default: oversized body → preview + marker line + honest bodyBytes + bodyTruncated=true (human)", async () => {
+      const full = "A".repeat(1000);
+      const { deps } = showRoute({ qitemId: "qitem-1", state: "pending", body: full });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1"]);
+      const printed = JSON.parse(logs[0]);
+      expect(printed.bodyTruncated).toBe(true);
+      expect(printed.bodyBytes).toBe(1000);
+      expect(Array.from(printed.body).length).toBe(512);
+      // marker line on its OWN line, with the honest total byte size
+      expect(logs.join("\n")).toContain("bounded preview — complete body is 1000 bytes; full record");
+      expect(logs.join("\n")).toContain("rig queue show 'qitem-1' --full --json");
+      expect(logs.join("\n")).not.toMatch(/\btruncated\b/i);
+    });
+
+    it("show default: small body → full body, NO marker, bodyTruncated=false", async () => {
+      const { deps } = showRoute({ qitemId: "qitem-1", body: "short body" });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1"]);
+      const printed = JSON.parse(logs[0]);
+      expect(printed.body).toBe("short body");
+      expect(printed.bodyTruncated).toBe(false);
+      expect(printed.bodyBytes).toBe(10);
+      expect(logs.join("\n")).not.toContain("truncated");
+    });
+
+    it("show default: empty body → bodyBytes 0, bodyTruncated=false, no marker, no crash", async () => {
+      const { deps } = showRoute({ qitemId: "qitem-1", body: "" });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1"]);
+      const printed = JSON.parse(logs[0]);
+      expect(printed.body).toBe("");
+      expect(printed.bodyBytes).toBe(0);
+      expect(printed.bodyTruncated).toBe(false);
+      expect(logs.join("\n")).not.toContain("truncated");
+      expect(process.exitCode).not.toBe(1);
+    });
+
+    it("show default --json: carries preview + bodyBytes + bodyTruncated (JSON parity)", async () => {
+      const full = "B".repeat(1000);
+      const { deps } = showRoute({ qitemId: "qitem-1", body: full });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--json"]);
+      expect(logs.length).toBe(1); // compact single-line JSON, no separate marker line
+      const printed = JSON.parse(logs[0]);
+      expect(printed.bodyTruncated).toBe(true);
+      expect(printed.bodyBytes).toBe(1000);
+      expect(Array.from(printed.body).length).toBe(PREVIEW_MAX_CODEPOINTS);
+    });
+
+    it("show --full --json: byte-identical COMPLETE item body (compatibility contract — no preview fields)", async () => {
+      const item = { qitemId: "qitem-1", state: "pending", body: "C".repeat(1000), chain_of_record: [{ a: 1 }] };
+      const { deps } = showRoute(item);
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--full", "--json"]);
+      // Byte-identical to a raw JSON.stringify of the item (today's shape).
+      expect(logs[0]).toBe(JSON.stringify(item));
+      const printed = JSON.parse(logs[0]);
+      expect(printed.body).toBe("C".repeat(1000)); // complete, untruncated
+      expect(printed).not.toHaveProperty("bodyBytes");
+      expect(printed).not.toHaveProperty("bodyTruncated");
+    });
+
+    it("show --full (human): complete body, no preview fields, no marker", async () => {
+      const full = "D".repeat(1000);
+      const item = { qitemId: "qitem-1", body: full, chain_of_record: [] };
+      const { deps } = showRoute(item);
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--full"]);
+      const printed = JSON.parse(logs[0]);
+      expect(printed.body).toBe(full);
+      expect(printed).not.toHaveProperty("bodyBytes");
+      expect(printed).not.toHaveProperty("bodyTruncated");
+      expect(logs.join("\n")).not.toContain("truncated");
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // slice-08 OPR.0.4.7.8 — queue verb-surface body-input parity (TEST-ONLY RED).
+  // Production queue.ts is NOT edited yet; these pin the atomic-A contract so it
+  // fails today and passes after the four verbs route through the shipped
+  // resolveQueueBody. Anchors grounded at 4b05f970; locked spec sha b2db0f2b.
+  //
+  // Guard-ruled classification (honest, per-input):
+  //   GENUINE RED (fails today): --body-file exact POST ×4; --body - stdin exact
+  //     POST ×4; --help documents --body-file + stdin '-' ×4; command-neutral
+  //     resolver error wording.
+  //   PRESERVATION GREEN (must NOT regress): handoff/handoff-and-complete neither
+  //     → POST body undefined (source-body default); inbox-drop/outbox-record
+  //     neither → error + no POST (mechanism-neutral: Commander requiredOption
+  //     today, resolver reject tomorrow).
+  //   NEW-CAPABILITY GREEN: both sources → error + no POST (unknown-option today).
+  // Exact equality only for all 8 body transports; never length/contains.
+  // ───────────────────────────────────────────────────────────────────────────
+  describe("slice-08 OPR.0.4.7.8 — queue body-input parity", () => {
+    // Byte-discriminating body: multiline + Unicode + backticks — the exact
+    // corruption class file/stdin input kills.
+    const DISCRIMINATOR =
+      "line-1 `raw backticks`\nlíne-2 ünïcode ☑\n```bash\nrig queue handoff q --to x\n```\n";
+
+    // Command-level stdin harness (Guard-specified): swap process.stdin for an
+    // ended PassThrough carrying exact bytes; restore the ORIGINAL descriptor in
+    // finally. Node22 process.stdin is getter-only but configurable, so
+    // defineProperty is viable; a PassThrough is not a TTY so defaultStdinReader
+    // reads it to EOF instead of short-circuiting empty.
+    async function withStdin(bytes: string, fn: () => Promise<void>): Promise<void> {
+      const originalStdin = Object.getOwnPropertyDescriptor(process, "stdin");
+      const prevExit = process.exitCode;
+      const fake = new PassThrough();
+      fake.end(bytes);
+      Object.defineProperty(process, "stdin", { value: fake, configurable: true });
+      try {
+        await fn();
+      } finally {
+        // Restore BOTH globals this helper owns: the stdin descriptor and
+        // process.exitCode. If process had no own stdin descriptor originally,
+        // delete the temporary own property rather than leaving it installed.
+        if (originalStdin) Object.defineProperty(process, "stdin", originalStdin);
+        else delete (process as unknown as Record<string, unknown>).stdin;
+        process.exitCode = prevExit;
+        fake.destroy();
+      }
+    }
+
+    function verbSubcommand(program: ReturnType<typeof createProgram>, name: string) {
+      const queue = program.commands.find((c) => c.name() === "queue")!;
+      return queue.commands.find((c) => c.name() === name)!;
+    }
+
+    // Endpoints + required flags grounded at 4b05f970. `argv` is everything after
+    // `rig` except the body flags; `neither` is the verb's no-body contract.
+    const VERBS = [
+      {
+        name: "handoff",
+        argv: ["queue", "handoff", "q1", "--from", "a@rig", "--to", "b@rig"],
+        pathMatch: (p: string) => p === "/api/queue/q1/handoff",
+        neither: "undefined-body" as const,
+      },
+      {
+        name: "handoff-and-complete",
+        argv: ["queue", "handoff-and-complete", "q1", "--from", "a@rig", "--to", "b@rig"],
+        pathMatch: (p: string) => p === "/api/queue/q1/handoff-and-complete",
+        neither: "undefined-body" as const,
+      },
+      {
+        name: "inbox-drop",
+        argv: ["queue", "inbox-drop", "b@rig", "--sender", "a@rig"],
+        pathMatch: (p: string) => p === "/api/queue/inbox/drop",
+        neither: "reject" as const,
+      },
+      {
+        name: "outbox-record",
+        argv: ["queue", "outbox-record", "--sender", "a@rig", "--destination", "b@rig"],
+        pathMatch: (p: string) => p === "/api/queue/outbox/record",
+        neither: "reject" as const,
+      },
+    ];
+
+    // ── STEP 1: harness calibration on EXISTING create --body - (GREEN today).
+    // Proves the process.stdin swap technique works before it carries any RED.
+    it("CALIBRATION (green): create --body - consumes the stdin PassThrough as the exact POST body", async () => {
+      const { deps, calls } = makeDeps({
+        routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q-cal", state: "pending" } } },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await withStdin(DISCRIMINATOR, async () => {
+        await program.parseAsync(["node", "rig", "queue", "create", "--source", "a@rig", "--destination", "b@rig", "--body", "-", "--json"]);
+      });
+      const post = calls.find((c) => c.path === "/api/queue/create");
+      expect(post, "create should POST after consuming stdin").toBeDefined();
+      expect((post!.body as Record<string, unknown>).body).toBe(DISCRIMINATOR);
+    });
+
+    // ── GENUINE RED ×4: --body-file exact POST body.
+    for (const v of VERBS) {
+      it(`RED: ${v.name} --body-file <path> POSTs the exact file bytes`, async () => {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `s08-${v.name}-file-`));
+        const bodyPath = path.join(tmp, "body.txt");
+        fs.writeFileSync(bodyPath, DISCRIMINATOR, "utf8");
+        const { deps, calls } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        try {
+          // Today --body-file is an unknown option on these verbs; catch the
+          // Commander rejection so the discriminator is the missing/incorrect
+          // POST body, not an uncaught parser throw.
+          try {
+            await program.parseAsync(["node", "rig", ...v.argv, "--body-file", bodyPath, "--json"]);
+          } catch {
+            /* expected Commander unknown-option today */
+          }
+          const post = calls.find((c) => v.pathMatch(c.path));
+          expect(post, `${v.name} should POST the file body`).toBeDefined();
+          expect((post!.body as Record<string, unknown>).body).toBe(DISCRIMINATOR);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+      });
+    }
+
+    // ── GENUINE RED ×4: --body - stdin exact POST body.
+    for (const v of VERBS) {
+      it(`RED: ${v.name} --body - consumes stdin as the exact POST body`, async () => {
+        const { deps, calls } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        await withStdin(DISCRIMINATOR, async () => {
+          try {
+            await program.parseAsync(["node", "rig", ...v.argv, "--body", "-", "--json"]);
+          } catch {
+            /* no throw expected today (--body exists); guarded for symmetry */
+          }
+        });
+        const post = calls.find((c) => v.pathMatch(c.path));
+        expect(post, `${v.name} should POST after consuming stdin`).toBeDefined();
+        // Today this is the literal "-" (bodyBytes:1) — the exact silent-dash bug.
+        expect((post!.body as Record<string, unknown>).body).toBe(DISCRIMINATOR);
+      });
+    }
+
+    // ── GENUINE RED ×4: help documents --body-file + stdin '-'.
+    for (const v of VERBS) {
+      it(`RED: ${v.name} --help documents --body-file and stdin '-'`, () => {
+        const { deps } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        const help = verbSubcommand(program, v.name).helpInformation();
+        expect(help, `${v.name} help should teach --body-file`).toContain("--body-file");
+        expect(help, `${v.name} help should teach stdin '-'`).toMatch(/stdin|read from stdin|use -/i);
+      });
+    }
+
+    // ── PRESERVATION GREEN ×2: handoff pair, neither → POST body undefined.
+    for (const v of VERBS.filter((x) => x.neither === "undefined-body")) {
+      it(`PRESERVE (green): ${v.name} with no body POSTs body undefined (source-body default)`, async () => {
+        const { deps, calls } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        try {
+          await program.parseAsync(["node", "rig", ...v.argv, "--json"]);
+        } catch {
+          /* not expected */
+        }
+        const post = calls.find((c) => v.pathMatch(c.path));
+        expect(post, `${v.name} should still POST with the source-body default`).toBeDefined();
+        expect((post!.body as Record<string, unknown>).body).toBeUndefined();
+      });
+    }
+
+    // ── PRESERVATION GREEN ×2: inbox/outbox, neither → error + no POST
+    // (mechanism-neutral across Commander requiredOption today and resolver reject later).
+    for (const v of VERBS.filter((x) => x.neither === "reject")) {
+      it(`PRESERVE (green): ${v.name} with no body errors and does NOT contact the daemon`, async () => {
+        const { deps, calls } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        const prevExit = process.exitCode;
+        process.exitCode = undefined;
+        let errored = false;
+        try {
+          await program.parseAsync(["node", "rig", ...v.argv, "--json"]);
+        } catch {
+          errored = true; // Commander requiredOption throws today
+        }
+        try {
+          expect(errored || process.exitCode === 1, `${v.name} should signal an error`).toBe(true);
+          expect(calls.find((c) => v.pathMatch(c.path)), `${v.name} must not POST`).toBeUndefined();
+        } finally {
+          process.exitCode = prevExit;
+        }
+      });
+    }
+
+    // ── NEW-CAPABILITY GREEN ×4: both sources → error + no POST
+    // (unknown-option today; resolver mutual-exclusion after A — either way no daemon contact).
+    for (const v of VERBS) {
+      it(`NEW-CAP (green): ${v.name} with both --body and --body-file errors and does NOT POST`, async () => {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `s08-${v.name}-both-`));
+        const bodyPath = path.join(tmp, "body.txt");
+        fs.writeFileSync(bodyPath, "x", "utf8");
+        const { deps, calls } = makeDeps();
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        const prevExit = process.exitCode;
+        process.exitCode = undefined;
+        let errored = false;
+        try {
+          await program.parseAsync(["node", "rig", ...v.argv, "--body", "inline", "--body-file", bodyPath, "--json"]);
+        } catch {
+          errored = true;
+        }
+        try {
+          expect(errored || process.exitCode === 1, `${v.name} should reject dual sources`).toBe(true);
+          expect(calls.find((c) => v.pathMatch(c.path)), `${v.name} must not POST`).toBeUndefined();
+        } finally {
+          process.exitCode = prevExit;
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+      });
+    }
+
+    // ── GENUINE RED: shared resolver errors must be command-NEUTRAL.
+    // Today all four say "rig queue create did not run" — false once handoff/
+    // inbox/outbox share the helper. Pin generic wording; no stale "queue create".
+    it("RED: resolveQueueBody 'neither' error wording is command-neutral (no 'queue create')", async () => {
+      await expect(resolveQueueBody({})).rejects.toMatchObject({
+        consequence: expect.not.stringMatching(/queue create/i),
+      });
+    });
+
+    it("RED: resolveQueueBody 'both' error wording is command-neutral (no 'queue create')", async () => {
+      await expect(resolveQueueBody({ body: "x", bodyFile: "/tmp/y" })).rejects.toMatchObject({
+        consequence: expect.not.stringMatching(/queue create/i),
+      });
+    });
+
+    it("RED: resolveQueueBody missing-file error wording is command-neutral (no 'queue create')", async () => {
+      await expect(
+        resolveQueueBody({ bodyFile: "/tmp/s08-does-not-exist-neutral-wording.md" }),
+      ).rejects.toMatchObject({
+        consequence: expect.not.stringMatching(/queue create/i),
+      });
+    });
+
+    // BLOCKER-1 fix: the FOURTH stale consequence — the not-a-regular-file /
+    // directory branch — was unguarded. A negative search found FOUR 'rig queue
+    // create did not run' occurrences; the packet must pin all four, not three.
+    it("RED: resolveQueueBody not-a-regular-file error wording is command-neutral (no 'queue create')", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "s08-notregular-wording-"));
+      try {
+        await expect(resolveQueueBody({ bodyFile: tmp })).rejects.toMatchObject({
+          consequence: expect.not.stringMatching(/queue create/i),
+        });
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    // BLOCKER-2 fix: the gate required generic BODY guidance, not only the
+    // consequence. The neither ACTION today is "Pass the qitem body via …",
+    // which is false for inbox/outbox records. It must teach --body/--body-file
+    // and stay generic — no 'qitem'. Phrasing-tolerant (no exact-prose lock).
+    it("RED: resolveQueueBody 'neither' action gives generic body guidance (no 'qitem')", async () => {
+      await expect(resolveQueueBody({})).rejects.toMatchObject({
+        action: expect.stringMatching(/--body\b|--body-file/),
+      });
+      await expect(resolveQueueBody({})).rejects.toMatchObject({
+        action: expect.not.stringMatching(/qitem/i),
+      });
+    });
+  });
+});
+
+// P3 — authored-summary TEACHING LAYER. The shipped warn-then-require rail (OPR.0.4.1.18
+// FR-7) tells callers a missing --summary falls back to a bounded body preview; the teaching
+// layer additionally TEACHES the convention (what a good summary is + where a human reads it), so
+// the needs-you rows a human skims are actually authored, not just hoped for. Rails held:
+// warn → stderr (json stdout clean), warn-not-hard-break, the two handoff advisories stay
+// byte-identical, facts-not-fabricated (teaches, never invents).
+describe("P3 — authored-summary teaching layer (advisory + --summary hint)", () => {
+  let stderrOut: string[];
+  const TEACHES_WHERE = /needs-you view/;      // teaches WHERE the summary is read
+  const TEACHES_WHY = /why it needs this seat/; // teaches the WHAT+WHY convention
+
+  beforeEach(() => {
+    stderrOut = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      stderrOut.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+      return true;
+    });
+    process.exitCode = undefined;
+  });
+
+  it("create without --summary teaches the same truthful bounded-preview fallback and does NOT hard-break", async () => {
+    const { deps, calls } = makeDeps({
+      routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q1", state: "pending" } } },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "a@rig", "--destination", "b@rig", "--body", "x", "--json",
+    ]);
+    const warn = stderrOut.join("");
+    expect(warn).toMatch(TEACHES_WHERE);
+    expect(warn).toMatch(TEACHES_WHY);
+    expect(warn).toMatch(/pass --summary <text>/i);
+    expect(warn).toMatch(/bounded body preview/i);
+    expect(warn).not.toMatch(/body truncation/i);
+    // warn-not-require rail: the qitem is still created (no hard-break on omission).
+    expect(calls.find((c) => c.path === "/api/queue/create")).toBeDefined();
+  });
+
+  it("handoff + handoff-and-complete without --summary carry the SAME teaching advisory (byte-identical parity)", async () => {
+    async function warnFor(sub: "handoff" | "handoff-and-complete"): Promise<string> {
+      stderrOut = [];
+      const { deps } = makeDeps({
+        routes: {
+          "POST /api/queue/handoff": { status: 201, data: { qitemId: "q2" } },
+          "POST /api/queue/handoff-and-complete": { status: 201, data: { qitemId: "q3" } },
+        },
+      });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      try {
+        await program.parseAsync([
+          "node", "rig", "queue", sub, "qitem-src-1",
+          "--from", "a@rig", "--to", "b@rig", "--body", "y", "--json",
+        ]);
+      } catch { /* exitOverride / downstream mock — the warn fires before the daemon call */ }
+      return stderrOut.join("");
+    }
+    const h = await warnFor("handoff");
+    const hc = await warnFor("handoff-and-complete");
+    expect(h).toMatch(TEACHES_WHERE);
+    expect(h).toMatch(TEACHES_WHY);
+    expect(h).toMatch(/pass --summary <text>/i);
+    expect(h).toMatch(/bounded body preview/i);
+    expect(h).not.toMatch(/body truncation/i);
+    expect(hc).toBe(h); // parity rail: the two handoff advisories are byte-identical
+  });
+
+  it("the create --summary option hint teaches WHERE the summary is read (not only the cost)", () => {
+    const { deps } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    const queueCmd = program.commands.find((c) => c.name() === "queue")!;
+    const createCmd = queueCmd.commands.find((c) => c.name() === "create")!;
+    const summaryOpt = createCmd.options.find((o) => o.long === "--summary")!;
+    expect(summaryOpt.description).toMatch(TEACHES_WHERE);
+  });
+});

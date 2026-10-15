@@ -1,0 +1,211 @@
+/* OPR.0.4.1.19 — Story tab: queue-lineage as a git-graph UI (3-tier).
+ * Light-mode, git-client aesthetic, from the founder-approved mockup
+ * (digital-twin/opr-0.4.1.19/story-gitgraph-ui.intent.html).
+ *
+ * Font-gotcha (twin/README): component-scoped CSS MUST lead with the registered
+ * "<Family> Variable" name or it falls through to a system font silently. */
+.sg-mono {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+}
+
+.sg-wrap {
+  --sg-paper: #faf9f5;
+  --sg-paper-2: #f3f1ea;
+  --sg-ink: #2e342e;
+  --sg-ink-2: #5b615a;
+  --sg-line: #d8d4c8;
+  --sg-line-2: #e7e3d8;
+  --sg-rail: #cdc8bb;
+  --sg-green: #2f9e54;
+  --sg-amber: #b9822f;
+  --sg-amber-soft: #f6ecd9;
+  --sg-merged: #7a6cc4;
+  --sg-blue: #3f7fb0;
+  --sg-gutter: 88px;
+  color: var(--sg-ink);
+}
+
+.sg-legend {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--sg-ink-2);
+  padding: 13px 2px 9px;
+}
+.sg-legend b { color: var(--sg-amber); font-weight: 500; }
+
+.sg-tbl { border: 1px solid var(--sg-line); position: relative; background: var(--sg-paper); }
+.sg-thead {
+  display: grid;
+  grid-template-columns: var(--sg-gutter) 1fr 132px 96px 104px 132px;
+  background: var(--sg-paper-2);
+  border-bottom: 1px solid var(--sg-line);
+}
+.sg-thead > div {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.13em;
+  color: var(--sg-ink-2);
+  padding: 8px 14px;
+}
+.sg-tbody { display: flex; }
+.sg-gutcol {
+  flex: 0 0 var(--sg-gutter);
+  position: relative;
+  border-right: 1px solid var(--sg-line-2);
+}
+.sg-gutcol svg { position: absolute; inset: 0; }
+.sg-rows { flex: 1; min-width: 0; }
+
+/* The row is a BLOCK container (mockup `.trow.hrow{display:block}` pattern): the
+ * topline IS the 5-column grid, and the expanded detail is a full-width band
+ * STACKED below it. A grid `.sg-trow` would auto-place the detail sibling into
+ * the final column (the QA "12.4% width" blocker) and squeeze the topline into
+ * the 1fr column. Block stacking keeps both full-width; row heights are unchanged
+ * (JS-computed), so the gutter centerY/lane geometry is preserved. */
+.sg-trow {
+  display: block;
+  border-bottom: 1px solid var(--sg-line-2);
+}
+.sg-topline {
+  height: 54px;
+  display: grid;
+  grid-template-columns: 1fr 132px 96px 104px 132px;
+  align-items: center;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  width: 100%;
+  text-align: left;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+}
+.sg-trow.sg-human .sg-topline { background: var(--sg-amber-soft); }
+.sg-cell { padding: 0 14px; display: flex; align-items: center; min-width: 0; }
+.sg-summary {
+  font-size: 13.5px;
+  color: var(--sg-ink);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sg-owner {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--sg-ink-2);
+}
+.sg-state {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sg-state .sg-sd { width: 7px; height: 7px; border-radius: 50%; background: var(--sg-ink-2); }
+.sg-state.sg-done { color: var(--sg-green); }
+.sg-state.sg-done .sg-sd { background: var(--sg-green); }
+.sg-state.sg-merged { color: var(--sg-merged); }
+.sg-state.sg-merged .sg-sd { background: var(--sg-merged); }
+.sg-state.sg-progress { color: var(--sg-blue); }
+.sg-state.sg-progress .sg-sd { background: var(--sg-blue); }
+.sg-state.sg-blocked { color: var(--sg-amber); }
+.sg-state.sg-blocked .sg-sd { background: var(--sg-amber); }
+.sg-date {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  color: var(--sg-ink-2);
+}
+.sg-qid {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px;
+  color: #a39e90;
+}
+.sg-chev { color: var(--sg-ink-2); font-size: 9px; margin-left: 8px; }
+
+/* TIER 2 — full-width BANDS (commit-body lead + labeled bands; no columns) */
+.sg-detail {
+  padding: 10px 18px 12px 18px;
+  border-top: 1px dashed var(--sg-line);
+  background: #f7f6f1;
+}
+.sg-dctx { font-size: 12.5px; line-height: 1.5; color: #3a403a; padding-bottom: 8px; }
+.sg-band { display: flex; align-items: baseline; gap: 12px; padding: 6px 0; border-top: 1px solid var(--sg-line-2); }
+.sg-bl {
+  flex: 0 0 70px;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--sg-ink-2);
+}
+.sg-bc { flex: 1; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.sg-chain {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+}
+.sg-cnode {
+  border: 1px solid var(--sg-rail);
+  border-radius: 3px;
+  padding: 2px 8px;
+  color: var(--sg-blue);
+  text-decoration: underline;
+  background: transparent;
+  cursor: pointer;
+}
+.sg-cnode.sg-self {
+  border-color: var(--sg-amber);
+  color: var(--sg-amber);
+  background: #fff;
+  text-decoration: none;
+  font-weight: 600;
+  cursor: default;
+}
+.sg-carrow { color: var(--sg-ink-2); }
+.sg-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--sg-rail);
+  border-radius: 4px;
+  padding: 3px 9px;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px;
+  color: #3a403a;
+  background: #fff;
+}
+/* viewable artifact -> clickable open affordance (FileLink) */
+.sg-chip-link { color: var(--sg-blue); text-decoration: underline; cursor: pointer; }
+/* non-viewable ref -> inert, explicitly muted so it does not read as openable */
+.sg-chip-inert { color: var(--sg-ink-2); border-style: dashed; cursor: default; }
+.sg-metarow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 0 0; border-top: 1px solid var(--sg-line-2); }
+.sg-tags { display: flex; gap: 5px; flex-wrap: wrap; }
+.sg-tagpill {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 8.5px;
+  letter-spacing: 0.04em;
+  color: var(--sg-ink-2);
+  border: 1px solid var(--sg-rail);
+  border-radius: 9px;
+  padding: 1px 8px;
+}
+.sg-fieldline {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 9.5px;
+  color: var(--sg-ink-2);
+}
+.sg-openlink {
+  margin-left: auto;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  color: var(--sg-blue);
+  text-decoration: underline;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+}

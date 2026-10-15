@@ -1,0 +1,592 @@
+import { describe, it, expect } from "vitest";
+import { RigSpecSchema, LegacyRigSpecSchema } from "../src/domain/rigspec-schema.js";
+
+const VALID_RIG = {
+  version: "0.2",
+  name: "dev-rig",
+  summary: "Development rig",
+  culture_file: "culture.md",
+  pods: [
+    {
+      id: "dev",
+      label: "Development",
+      continuity_policy: {
+        enabled: true,
+        sync_triggers: ["pre_compaction", "manual"],
+      },
+      members: [
+        { id: "impl", agent_ref: "local:agents/impl", profile: "tdd", runtime: "claude-code", cwd: ".", model: "sonnet" },
+        { id: "qa", agent_ref: "local:agents/qa", profile: "reviewer", runtime: "codex", cwd: "." },
+      ],
+      edges: [
+        { kind: "can_observe", from: "qa", to: "impl" },
+      ],
+    },
+    {
+      id: "arch",
+      label: "Architecture",
+      members: [
+        { id: "reviewer", agent_ref: "local:agents/reviewer", profile: "default", runtime: "claude-code", cwd: "." },
+      ],
+      edges: [],
+    },
+  ],
+  edges: [
+    { kind: "escalates_to", from: "dev.impl", to: "arch.reviewer" },
+  ],
+};
+
+describe("RigSpec schema (pod-aware)", () => {
+  // T1: valid rig with embedded pods passes validation
+  it("valid rig with embedded pods passes validation", () => {
+    const result = RigSpecSchema.validate(VALID_RIG);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it.each([
+    {
+      label: "rig root",
+      path: "operating_mod",
+      key: "operating_mod",
+      mutate: (rig: Record<string, unknown>) => { rig["operating_mod"] = "lab"; },
+    },
+    {
+      label: "pod",
+      path: "pods[0].summmary",
+      key: "summmary",
+      mutate: (rig: Record<string, unknown>) => {
+        ((rig["pods"] as Record<string, unknown>[])[0]!)["summmary"] = "typo";
+      },
+    },
+    {
+      label: "member",
+      path: "pods[0].members[0].modle",
+      key: "modle",
+      mutate: (rig: Record<string, unknown>) => {
+        ((((rig["pods"] as Record<string, unknown>[])[0]!["members"] as Record<string, unknown>[])[0]!))["modle"] = "opus";
+      },
+    },
+    {
+      label: "edge",
+      path: "pods[0].edges[0].weight",
+      key: "weight",
+      mutate: (rig: Record<string, unknown>) => {
+        ((((rig["pods"] as Record<string, unknown>[])[0]!["edges"] as Record<string, unknown>[])[0]!))["weight"] = 2;
+      },
+    },
+  ])("rejects an unknown $label key with its exact path and silent-normalization consequence", ({ path, key, mutate }) => {
+    const rig = structuredClone(VALID_RIG) as unknown as Record<string, unknown>;
+    mutate(rig);
+
+    const result = RigSpecSchema.validate(rig);
+
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain(
+      `${path}: unknown key "${key}"; refusing the spec because normalization would otherwise discard it and alter the requested topology`,
+    );
+  });
+
+  it("allows codex_config_profile for Codex members and normalizes it", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[1] as Record<string, unknown>)["codex_config_profile"] = "sysadmin";
+
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+
+    const normalized = RigSpecSchema.normalize(rig);
+    expect(normalized.pods[0]!.members[1]!.codexConfigProfile).toBe("sysadmin");
+  });
+
+  it("allows effort for pod members and normalizes it", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["effort"] = "high";
+
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+
+    const normalized = RigSpecSchema.normalize(rig);
+    expect(normalized.pods[0]!.members[0]!.effort).toBe("high");
+  });
+
+  it("handles non-text or empty effort with an advisory and drops it during normalization", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["effort"] = 42;
+
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    expect(result.advisories).toBeDefined();
+    expect(result.advisories![0]).toMatch(/pods\[0\]\.members\[0\]\.effort: non-string value "42" ignored/);
+
+    const normalized = RigSpecSchema.normalize(rig);
+    expect(normalized.pods[0]!.members[0]!.effort).toBeUndefined();
+  });
+
+  it("rejects codex_config_profile on non-Codex members", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["codex_config_profile"] = "sysadmin";
+
+    const result = RigSpecSchema.validate(rig);
+
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/codex_config_profile.*only valid/);
+  });
+
+  // T2: missing pod member agent_ref fails
+  it("missing pod member agent_ref fails", () => {
+    const rig = structuredClone(VALID_RIG);
+    delete (rig.pods[0]!.members[0] as Record<string, unknown>)["agent_ref"];
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/agent_ref.*required/);
+  });
+
+  // T3: missing pod member profile fails
+  it("missing pod member profile fails", () => {
+    const rig = structuredClone(VALID_RIG);
+    delete (rig.pods[0]!.members[0] as Record<string, unknown>)["profile"];
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/profile.*required/);
+  });
+
+  // T4: unknown edge kind fails
+  it("unknown edge kind fails", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[0]!.edges[0]!.kind = "unknown_kind";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/kind.*must be one of/);
+  });
+
+  // T5: cross-pod edge using unqualified id fails
+  it("cross-pod edge using unqualified id fails", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.edges[0]!.from = "impl";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/fully-qualified.*pod\.member/);
+  });
+
+  // T6: pod-local edge using fully-qualified id fails
+  it("pod-local edge using fully-qualified id fails", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[0]!.edges[0]!.from = "dev.qa";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/pod-local.*unqualified/);
+  });
+
+  // T7: duplicate pod id fails
+  it("duplicate pod id fails", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[1]!.id = "dev";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/duplicate pod id "dev"/);
+  });
+
+  // T8: duplicate member id inside one pod fails
+  it("duplicate member id inside one pod fails", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[0]!.members[1]!.id = "impl";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/duplicate member id "impl"/);
+  });
+
+  // T9: dot in pod id or member id fails
+  it("dot in pod id or member id fails", () => {
+    const rig1 = structuredClone(VALID_RIG);
+    rig1.pods[0]!.id = "dev.team";
+    expect(RigSpecSchema.validate(rig1).errors[0]).toMatch(/must not contain dots/);
+
+    const rig2 = structuredClone(VALID_RIG);
+    rig2.pods[0]!.members[0]!.id = "impl.main";
+    expect(RigSpecSchema.validate(rig2).errors[0]).toMatch(/must not contain dots/);
+  });
+
+  // T10: culture_file round-trips through normalize
+  it("culture_file round-trips through normalize", () => {
+    const normalized = RigSpecSchema.normalize(VALID_RIG);
+    expect(normalized.cultureFile).toBe("culture.md");
+  });
+
+  // T11: normalize preserves pod/member/edge ordering
+  it("normalize preserves pod/member/edge ordering", () => {
+    const normalized = RigSpecSchema.normalize(VALID_RIG);
+    expect(normalized.pods[0]!.id).toBe("dev");
+    expect(normalized.pods[1]!.id).toBe("arch");
+    expect(normalized.pods[0]!.members[0]!.id).toBe("impl");
+    expect(normalized.pods[0]!.members[1]!.id).toBe("qa");
+    expect(normalized.pods[0]!.edges[0]!.from).toBe("qa");
+    expect(normalized.edges[0]!.from).toBe("dev.impl");
+  });
+
+  // T12: serialize -> parse -> validate round-trips
+  it("normalize produces correct typed shape", () => {
+    const normalized = RigSpecSchema.normalize(VALID_RIG);
+    expect(normalized.version).toBe("0.2");
+    expect(normalized.name).toBe("dev-rig");
+    expect(normalized.pods).toHaveLength(2);
+    expect(normalized.pods[0]!.members[0]!.agentRef).toBe("local:agents/impl");
+    expect(normalized.pods[0]!.continuityPolicy?.enabled).toBe(true);
+    expect(normalized.edges).toHaveLength(1);
+  });
+
+  // T13a: malformed member startup is rejected
+  it("malformed member startup block is rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = { files: "not-array" };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("files") && e.includes("array"))).toBe(true);
+  });
+
+  // T13b: malformed continuity_policy artifacts/restore_protocol rejected
+  it("malformed continuity_policy nested fields are rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.continuity_policy as Record<string, unknown>)["artifacts"] = "bad";
+    (rig.pods[0]!.continuity_policy as Record<string, unknown>)["restore_protocol"] = "bad";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("artifacts") && e.includes("object"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("restore_protocol") && e.includes("object"))).toBe(true);
+  });
+
+  // T13c: invalid startup action semantics in member startup are rejected
+  it("invalid startup action type in member startup is rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [],
+      actions: [{ type: "shell", value: "npm install", idempotent: true }],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("shell") && e.includes("not supported"))).toBe(true);
+  });
+
+  // T13d: invalid startup action phase/applies_on in pod startup
+  it("invalid startup action phase and applies_on rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[0] = { ...rig.pods[0]!, startup: {
+      files: [],
+      actions: [{ type: "slash_command", value: "/test", phase: "before_ready", applies_on: ["rehydrate"], idempotent: true }],
+    }};
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("phase") && e.includes("must be one of"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("applies_on") && e.includes("rehydrate"))).toBe(true);
+  });
+
+  // T13e: invalid file delivery_hint and applies_on in member startup
+  it("invalid file delivery_hint and applies_on in startup rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [{ path: "test.md", delivery_hint: "bogus", applies_on: ["rehydrate"] }],
+      actions: [],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("delivery_hint"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("applies_on") && e.includes("rehydrate"))).toBe(true);
+  });
+
+  // T13f: non-boolean idempotent in startup action rejected
+  it("non-boolean idempotent in startup action is rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [],
+      actions: [{ type: "slash_command", value: "/test", phase: "after_ready", idempotent: "yes" }],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("idempotent") && e.includes("boolean"))).toBe(true);
+  });
+
+  // T13g: non-idempotent action on restore rejected
+  it("non-idempotent action on restore in member startup is rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [],
+      actions: [{ type: "slash_command", value: "/setup", phase: "after_ready", idempotent: false, applies_on: ["fresh_start", "restore"] }],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("non-idempotent") && e.includes("restore"))).toBe(true);
+  });
+
+  // T13h: scalar applies_on on action rejected
+  it("scalar applies_on on startup action rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [],
+      actions: [{ type: "slash_command", value: "/test", phase: "after_ready", idempotent: true, applies_on: "fresh_start" }],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("applies_on") && e.includes("array"))).toBe(true);
+  });
+
+  // T13i: nested continuity-policy boolean typing validated
+  it("non-boolean continuity_policy nested fields rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.continuity_policy as Record<string, unknown>)["artifacts"] = { session_log: "yes" };
+    (rig.pods[0]!.continuity_policy as Record<string, unknown>)["restore_protocol"] = { peer_driven: "yes" };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("session_log") && e.includes("boolean"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("peer_driven") && e.includes("boolean"))).toBe(true);
+  });
+
+  // T14: legacy flat-node schema still validates
+  it("legacy flat-node schema still validates old specs", () => {
+    const legacySpec = {
+      schema_version: 1, name: "test", version: "1.0",
+      nodes: [
+        { id: "orchestrator", runtime: "claude-code", role: "orchestrator" },
+        { id: "impl", runtime: "claude-code", role: "impl" },
+      ],
+      edges: [{ from: "orchestrator", to: "impl", kind: "delegates_to" }],
+    };
+    const result = LegacyRigSpecSchema.validate(legacySpec);
+    expect(result.valid).toBe(true);
+    const normalized = LegacyRigSpecSchema.normalize(legacySpec);
+    expect(normalized.nodes).toHaveLength(2);
+  });
+
+  // -- Checkpoint 1 review fix regressions --
+
+  // R2: startup action missing value rejected
+  it("startup action missing value rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [],
+      actions: [{ type: "slash_command", phase: "after_ready", idempotent: true }],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("value") && e.includes("non-empty"))).toBe(true);
+  });
+
+  // R3: startup action missing idempotent rejected
+  it("startup action missing idempotent rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [],
+      actions: [{ type: "slash_command", value: "/test", phase: "after_ready" }],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("idempotent") && e.includes("required"))).toBe(true);
+  });
+
+  // R4: restore-safety with undefined idempotent + default applies_on
+  it("undefined idempotent with default applies_on triggers restore-safety rejection", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["startup"] = {
+      files: [],
+      actions: [{ type: "slash_command", value: "/setup", phase: "after_ready" }],
+    };
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("non-idempotent") && e.includes("restore"))).toBe(true);
+  });
+
+  // R5: member restore_policy "bogus" rejected
+  it("member restore_policy bogus rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["restore_policy"] = "bogus";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/restore_policy.*must be one of/);
+  });
+
+  // R6: member agent_ref "github:foo/bar" rejected
+  it("member agent_ref github: rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["agent_ref"] = "github:foo/bar";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/agent_ref.*must start with "local:" or "path:"/);
+  });
+
+  // R7: cross-pod edge from dev.impl to dev.qa (same pod) rejected
+  it("cross-pod edge referencing same pod rejected", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.edges = [{ kind: "can_observe", from: "dev.impl", to: "dev.qa" }];
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/cross-pod edge must reference different pods/);
+  });
+
+  // -- NS-T03: Terminal sentinel validation --
+
+  // Test 4: validates terminal member with exact sentinel triple
+  it("validates terminal member with builtin:terminal + none + terminal", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods.push({
+      id: "infra",
+      label: "Infrastructure",
+      members: [
+        { id: "server", agent_ref: "builtin:terminal", profile: "none", runtime: "terminal", cwd: "." } as any,
+      ],
+      edges: [],
+    });
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+  });
+
+  // Test 5: rejects terminal member with wrong sentinel pair
+  it("rejects terminal member with builtin:terminal but profile != none", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods.push({
+      id: "infra",
+      label: "Infrastructure",
+      members: [
+        { id: "server", agent_ref: "builtin:terminal", profile: "default", runtime: "terminal", cwd: "." } as any,
+      ],
+      edges: [],
+    });
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("terminal") && e.includes("profile") && e.includes("none"))).toBe(true);
+  });
+
+  // Test 6: rejects non-terminal member using builtin:terminal
+  it("rejects non-terminal member using builtin:terminal", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods.push({
+      id: "infra",
+      label: "Infrastructure",
+      members: [
+        { id: "server", agent_ref: "builtin:terminal", profile: "none", runtime: "claude-code", cwd: "." } as any,
+      ],
+      edges: [],
+    });
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("builtin:terminal") && e.includes("terminal"))).toBe(true);
+  });
+});
+
+// ─── OPR.0.5.6.20 A5 — member-level compaction_strategy live ingestion ─────────
+// RED-FIRST over d9e01f2e3: validateMember has no compaction_strategy leg and
+// normalizePod drops the field, so a member override never survives the real
+// YAML -> validate -> normalize path (the exact bypass the delivery review caught;
+// the P3 resolver test constructed members directly and could not see it).
+describe("member compaction_strategy — live ingestion (OPR.0.5.6.20 A5)", () => {
+  const rigWithMemberStrategy = (value: string) => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["compaction_strategy"] = value;
+    return rig;
+  };
+
+  it("canonical member value validates and survives normalization to the resolved member", () => {
+    const rig = rigWithMemberStrategy("managed-compaction");
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    const normalized = RigSpecSchema.normalize(rig);
+    expect(normalized.pods[0]!.members[0]!.compactionStrategy).toBe("managed-compaction");
+  });
+
+  it("deprecated alias at member level validates WITH advisory and normalizes to canonical (A1 at member level)", () => {
+    const rig = rigWithMemberStrategy("harness_native");
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    expect((result.advisories ?? []).join(" ")).toMatch(/harness_native.*deprecated.*default-compaction/);
+    const normalized = RigSpecSchema.normalize(rig);
+    expect(normalized.pods[0]!.members[0]!.compactionStrategy).toBe("default-compaction");
+  });
+
+  it("invalid member value fails validation with an error naming the member", () => {
+    const rig = rigWithMemberStrategy("yolo-mode");
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/members\[0\].*compaction_strategy.*yolo-mode/);
+  });
+
+  it("custom_prompt keeps the byte-preserved teaching rejection at member level", () => {
+    const rig = rigWithMemberStrategy("custom_prompt");
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes('"custom_prompt" is not supported in v1'))).toBe(true);
+  });
+
+  it("absent member field stays undefined after normalization (resolver F-6 default owns absence — green at base, floor pin)", () => {
+    const rig = structuredClone(VALID_RIG);
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    const normalized = RigSpecSchema.normalize(rig);
+    expect(normalized.pods[0]!.members[0]!.compactionStrategy).toBeUndefined();
+  });
+});
+
+describe("member mechanic — live ingestion (S20 A7/A8)", () => {
+  it("accepts and preserves a canonical member override", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["mechanic"] = "member-mechanic@kernel";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]!.mechanic).toBe(
+      "member-mechanic@kernel",
+    );
+  });
+
+  it("rejects a non-canonical member mechanic instead of dropping it", () => {
+    const rig = structuredClone(VALID_RIG);
+    (rig.pods[0]!.members[0] as Record<string, unknown>)["mechanic"] = "member-mechanic";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/members\[0\].*mechanic.*canonical.*seat@rig/i);
+  });
+});
+
+
+describe("malformed topology stays a validation result", () => {
+  it("rejects an array at the topology root", () => {
+    expect(RigSpecSchema.validate([])).toEqual({ valid: false, errors: ["rig spec must be an object"] });
+  });
+  it("does not coerce a malformed pod id while collecting member addresses", () => {
+    const spec = structuredClone(VALID_RIG);
+    (spec.pods[0] as Record<string, unknown>)["id"] = { toString: null, valueOf: null };
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0].id: required non-empty string");
+  });
+
+  it.each([null, 42, "wrong", []])("rejects a non-mapping pod: %j", value => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, pods: [value] });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0]: must be an object");
+  });
+  it.each([null, 42, "wrong", []])("rejects a non-mapping member: %j", value => {
+    const spec = structuredClone(VALID_RIG);
+    (spec.pods[0]!.members as unknown[]) = [value];
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0].members[0]: must be an object");
+  });
+  it.each([null, 42, "wrong", []])("rejects a non-mapping local edge: %j", value => {
+    const spec = structuredClone(VALID_RIG);
+    (spec.pods[0]!.edges as unknown[]) = [value];
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0].edges[0]: must be an object");
+  });
+  it.each([null, 42, "wrong", []])("rejects a non-mapping cross-pod edge: %j", value => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, edges: [value] });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("edges[0]: must be an object");
+  });
+  it.each([true, 42, [], {}])("reports non-string cross-pod endpoints: %j", value => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, edges: [{ kind: "escalates_to", from: value, to: "arch.reviewer" }] });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("edges[0].from: required string");
+  });
+  it("still collects later well-formed topology errors after a bad pod", () => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, pods: [null, VALID_RIG.pods[1]], edges: [{kind:"escalates_to",from:"absent.worker",to:"arch.reviewer"}] });
+    expect(result.errors).toContain("pods[0]: must be an object");
+    expect(result.errors).toContain('edges[0].from: "absent.worker" does not resolve to a pod member');
+  });
+});

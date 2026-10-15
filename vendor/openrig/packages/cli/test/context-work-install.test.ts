@@ -1,0 +1,835 @@
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
+import { Command } from "commander";
+import { contextCommand } from "../src/commands/context.js";
+import { applyExitOverride } from "../src/cli-error.js";
+
+function captureLogs(fn: () => Promise<void>): Promise<{ logs: string[]; errLogs: string[]; exitCode: number | undefined }> {
+  return new Promise(async (resolve) => {
+    const logs: string[] = [];
+    const errLogs: string[] = [];
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalExitCode = process.exitCode;
+    console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+    console.error = (...args: unknown[]) => { errLogs.push(args.map(String).join(" ")); };
+    process.exitCode = undefined;
+    try { await fn(); } catch { /* commander.exitOverride */ }
+    const exitCode = process.exitCode;
+    console.log = originalLog;
+    console.error = originalError;
+    process.exitCode = originalExitCode;
+    resolve({ logs, errLogs, exitCode });
+  });
+}
+
+function makeCommand(): Command {
+  const command = new Command();
+  command.exitOverride();
+  command.addCommand(contextCommand());
+  applyExitOverride(command);
+  return command;
+}
+
+describe("rig context work-install", () => {
+  let root: string;
+  let catalogRoot: string;
+  let alphaRoot: string;
+  let betaRoot: string;
+  let skillsRoot: string;
+  let contextRoot: string;
+  let workingRoot: string;
+  let savedWorkspaceRoot: string | undefined;
+  let savedCatalogPath: string | undefined;
+  let savedSkillsRoot: string | undefined;
+  let savedContextRoot: string | undefined;
+  let savedSystemWorld: string | undefined;
+  let savedSessionName: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "openrig-context-work-install-"));
+    catalogRoot = join(root, "catalog");
+    alphaRoot = join(root, "alpha-root");
+    betaRoot = join(root, "unrelated-beta-tree");
+    skillsRoot = join(root, "managed-skills");
+    contextRoot = join(root, "context");
+    workingRoot = join(root, "agent-working-directory");
+    mkdirSync(catalogRoot, { recursive: true });
+    mkdirSync(skillsRoot, { recursive: true });
+    mkdirSync(join(contextRoot, "system"), { recursive: true });
+    mkdirSync(workingRoot, { recursive: true });
+    mkdirSync(join(alphaRoot, "missions", "alpha-active", "slices", "01-live-work"), { recursive: true });
+    mkdirSync(join(betaRoot, "missions", "beta-scaffold"), { recursive: true });
+    catalogRoot = realpathSync(catalogRoot);
+    alphaRoot = realpathSync(alphaRoot);
+    betaRoot = realpathSync(betaRoot);
+    writeFileSync(join(catalogRoot, "workspace.yaml"), `schema: openrig.workspace/v0alpha1
+projects:
+  - id: alpha
+    root: ${relative(catalogRoot, alphaRoot)}
+  - id: beta
+    root: ${relative(catalogRoot, betaRoot)}
+`);
+    writeFileSync(join(alphaRoot, "SPEC.md"), "# Alpha project\n");
+    writeFileSync(join(alphaRoot, "project.yaml"), `schema: openrig.project/v0alpha1
+kind: project
+id: alpha
+install:
+  intent: SPEC.md
+  skills: [project-skill]
+`);
+    writeFileSync(join(alphaRoot, "missions", "alpha-active", "SPEC.md"), "# Alpha mission\n");
+    writeFileSync(join(alphaRoot, "missions", "alpha-active", "PROGRESS.md"), "# Alpha mission progress\n\n- [x] Story 2 complete\n- [ ] Release acceptance pending\n");
+    writeFileSync(join(alphaRoot, "missions", "alpha-active", "mission.yaml"), `schema: openrig.mission/v0alpha1
+kind: mission
+composition:
+  mission_markdown:
+    spec: SPEC.md
+`);
+    writeFileSync(join(alphaRoot, "missions", "alpha-active", "slices", "01-live-work", "SPEC.md"), `---
+id: OPR.0.5.8.13
+---
+# Alpha slice
+`);
+    writeFileSync(join(alphaRoot, "missions", "alpha-active", "slices", "01-live-work", "PROGRESS.md"), "# Alpha slice progress\n\n- [x] Story 3 complete\n- [ ] Public publish pending\n");
+    writeFileSync(join(betaRoot, "SPEC.md"), "# Beta project\n");
+    writeFileSync(join(betaRoot, "project.yaml"), `schema: openrig.project/v0alpha1
+kind: project
+id: beta
+install:
+  intent: SPEC.md
+`);
+    writeFileSync(join(betaRoot, "missions", "beta-scaffold", "SPEC.md"), "# Beta mission\n");
+    writeFileSync(join(betaRoot, "missions", "beta-scaffold", "mission.yaml"), `schema: openrig.mission/v0alpha1
+kind: mission
+composition:
+  mission_markdown:
+    spec: SPEC.md
+`);
+    writeFileSync(join(skillsRoot, "catalog.yaml"), "schema: openrig.skill-catalog/v1\nsystem: [system-skill]\n");
+    writeFileSync(join(contextRoot, "system", "system-world.yaml"), `schema: openrig.system-world/v0alpha1
+id: test-default
+version: "0.5.9"
+context:
+  - ref: onboarding-width
+  - ref: world-public
+    profiles: { claude: guided, codex: codex-coverage }
+skills: [system-skill]
+`);
+    for (const id of ["system-skill", "topology-skill", "project-skill"]) {
+      mkdirSync(join(skillsRoot, id));
+      writeFileSync(join(skillsRoot, id, "SKILL.md"), `---\nname: ${id}\ndescription: Use when testing ${id}.\n---\n\n# ${id}\n`);
+    }
+    execFileSync("git", ["-C", root, "init", "-q"]);
+    execFileSync("git", ["-C", root, "config", "user.email", "test@openrig.invalid"]);
+    execFileSync("git", ["-C", root, "config", "user.name", "OpenRig Test"]);
+    execFileSync("git", ["-C", root, "add", "managed-skills"]);
+    execFileSync("git", ["-C", root, "commit", "-qm", "catalog fixture"]);
+
+    execFileSync("git", ["-C", alphaRoot, "init", "-q"]);
+    execFileSync("git", ["-C", alphaRoot, "config", "user.email", "test@openrig.invalid"]);
+    execFileSync("git", ["-C", alphaRoot, "config", "user.name", "OpenRig Test"]);
+    execFileSync("git", ["-C", alphaRoot, "add", "."]);
+    execFileSync("git", ["-C", alphaRoot, "commit", "-qm", "project fixture"]);
+    writeFileSync(join(workingRoot, "README.md"), "# Agent working directory\n");
+    execFileSync("git", ["-C", workingRoot, "init", "-q"]);
+    execFileSync("git", ["-C", workingRoot, "config", "user.email", "test@openrig.invalid"]);
+    execFileSync("git", ["-C", workingRoot, "config", "user.name", "OpenRig Test"]);
+    execFileSync("git", ["-C", workingRoot, "add", "README.md"]);
+    execFileSync("git", ["-C", workingRoot, "commit", "-qm", "working directory fixture"]);
+    savedWorkspaceRoot = process.env["OPENRIG_WORKSPACE_ROOT"];
+    savedCatalogPath = process.env["OPENRIG_WORKSPACE_CATALOG_PATH"];
+    savedSkillsRoot = process.env["OPENRIG_SKILLS_ROOT"];
+    savedContextRoot = process.env["OPENRIG_CONTEXT_ROOT"];
+    savedSystemWorld = process.env["OPENRIG_CONTEXT_SYSTEM_WORLD"];
+    savedSessionName = process.env["OPENRIG_SESSION_NAME"];
+    delete process.env["OPENRIG_SESSION_NAME"];
+    process.env["OPENRIG_WORKSPACE_ROOT"] = catalogRoot;
+    delete process.env["OPENRIG_WORKSPACE_CATALOG_PATH"];
+    process.env["OPENRIG_SKILLS_ROOT"] = skillsRoot;
+    process.env["OPENRIG_CONTEXT_ROOT"] = contextRoot;
+    delete process.env["OPENRIG_CONTEXT_SYSTEM_WORLD"];
+  });
+
+  afterEach(() => {
+    if (savedWorkspaceRoot === undefined) delete process.env["OPENRIG_WORKSPACE_ROOT"];
+    else process.env["OPENRIG_WORKSPACE_ROOT"] = savedWorkspaceRoot;
+    if (savedCatalogPath === undefined) delete process.env["OPENRIG_WORKSPACE_CATALOG_PATH"];
+    else process.env["OPENRIG_WORKSPACE_CATALOG_PATH"] = savedCatalogPath;
+    if (savedSkillsRoot === undefined) delete process.env["OPENRIG_SKILLS_ROOT"];
+    else process.env["OPENRIG_SKILLS_ROOT"] = savedSkillsRoot;
+    if (savedContextRoot === undefined) delete process.env["OPENRIG_CONTEXT_ROOT"];
+    else process.env["OPENRIG_CONTEXT_ROOT"] = savedContextRoot;
+    if (savedSystemWorld === undefined) delete process.env["OPENRIG_CONTEXT_SYSTEM_WORLD"];
+    else process.env["OPENRIG_CONTEXT_SYSTEM_WORLD"] = savedSystemWorld;
+    if (savedSessionName === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+    else process.env["OPENRIG_SESSION_NAME"] = savedSessionName;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("honors the configured project catalog path", async () => {
+    const separateWorkspace = join(root, "workspace-without-catalog");
+    mkdirSync(separateWorkspace);
+    process.env["OPENRIG_WORKSPACE_ROOT"] = separateWorkspace;
+    process.env["OPENRIG_WORKSPACE_CATALOG_PATH"] = join(catalogRoot, "workspace.yaml");
+
+    const result = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install", "--project", "alpha", "--json",
+      ]);
+    });
+
+    expect(result.exitCode).toBeUndefined();
+    const plan = JSON.parse(result.logs.join("")) as { position: { projectId: string; projectRoot: string } };
+    expect(plan.position).toMatchObject({ projectId: "alpha", projectRoot: alphaRoot });
+  });
+
+  describe("selection without --project", () => {
+    type Plan = { position: { projectId: string; projectRoot: string; selectedBy: string }; warnings: string[] };
+    type Failure = { ok: false; error: { code: string; message: string; candidates?: string[] } };
+    const run = (...args: string[]) => captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", ...args]);
+    });
+    const catalog = (projects: string) => writeFileSync(
+      join(catalogRoot, "workspace.yaml"),
+      `schema: openrig.workspace/v0alpha1\nprojects:\n${projects}`,
+    );
+    const alphaRel = () => relative(catalogRoot, alphaRoot);
+    const betaRel = () => relative(catalogRoot, betaRoot);
+
+    it("picks the project whose catalog entry lists the calling rig, ahead of the working directory", async () => {
+      catalog(`  - id: alpha\n    root: ${alphaRel()}\n    rigs: [other-rig]\n  - id: beta\n    root: ${betaRel()}\n    rigs: [dev-rig]\n`);
+      process.env["OPENRIG_SESSION_NAME"] = "driver@dev-rig";
+
+      const json = await run("--cwd", join(alphaRoot, "missions"), "--json");
+      expect(json.exitCode).toBeUndefined();
+      expect((JSON.parse(json.logs.join("")) as Plan).position).toMatchObject({ projectId: "beta", projectRoot: betaRoot, selectedBy: "rig" });
+
+      const text = await run("--cwd", workingRoot);
+      expect(text.logs[0]).toBe(`project beta: ${betaRoot} (selected by this rig's catalog entry)`);
+    });
+
+    it("keeps project_required when two projects list the calling rig", async () => {
+      catalog(`  - id: alpha\n    root: ${alphaRel()}\n    rigs: [dev-rig]\n  - id: beta\n    root: ${betaRel()}\n    rigs: [dev-rig]\n`);
+      process.env["OPENRIG_SESSION_NAME"] = "driver@dev-rig";
+
+      const result = await run("--cwd", join(alphaRoot, "missions"), "--json");
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.logs.join("")) as Failure).toMatchObject({
+        ok: false,
+        error: { code: "project_required", candidates: ["alpha", "beta"], message: expect.stringContaining("rig 'dev-rig'") },
+      });
+    });
+
+    it("ignores a malformed rigs value with a warning and falls through to the working directory", async () => {
+      catalog(`  - id: alpha\n    root: ${alphaRel()}\n  - id: beta\n    root: ${betaRel()}\n    rigs: dev-rig\n`);
+      process.env["OPENRIG_SESSION_NAME"] = "driver@dev-rig";
+
+      const result = await run("--cwd", join(alphaRoot, "missions", "alpha-active"), "--json");
+      expect(result.exitCode).toBeUndefined();
+      const plan = JSON.parse(result.logs.join("")) as Plan;
+      expect(plan.position).toMatchObject({ projectId: "alpha", selectedBy: "cwd" });
+      expect(plan.warnings).toEqual([expect.stringContaining("project 'beta' rigs must be a list of rig names")]);
+    });
+
+    it("picks the deepest catalog root containing the working directory", async () => {
+      const bundleRoot = join(catalogRoot, "projects", "bundle");
+      mkdirSync(join(bundleRoot, "src"), { recursive: true });
+      mkdirSync(join(catalogRoot, "notes"), { recursive: true });
+      catalog(`  - id: default\n    root: .\n  - id: bundle\n    root: projects/bundle\n`);
+
+      const inBundle = await run("--cwd", join(bundleRoot, "src"), "--json");
+      expect(inBundle.exitCode).toBeUndefined();
+      expect((JSON.parse(inBundle.logs.join("")) as Plan).position).toMatchObject({ projectId: "bundle", projectRoot: bundleRoot, selectedBy: "cwd" });
+
+      const outside = await run("--cwd", join(catalogRoot, "notes"));
+      expect(outside.logs[0]).toBe(`project default: ${catalogRoot} (selected by the working directory)`);
+
+      const unrelated = await run("--cwd", workingRoot, "--json");
+      expect(unrelated.exitCode).toBe(1);
+      expect(JSON.parse(unrelated.logs.join("")) as Failure).toMatchObject({
+        error: { code: "project_required", candidates: ["default", "bundle"] },
+      });
+    });
+
+    it("keeps project_required when two ids share the deepest root", async () => {
+      catalog(`  - id: alpha\n    root: ${alphaRel()}\n  - id: alpha-copy\n    root: ${alphaRel()}\n  - id: beta\n    root: ${betaRel()}\n`);
+
+      const result = await run("--cwd", join(alphaRoot, "missions"), "--json");
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.logs.join("")) as Failure).toMatchObject({
+        error: { code: "project_required", candidates: ["alpha", "alpha-copy"] },
+      });
+    });
+
+    it("keeps a rig with no association on the only unclaimed project after a claimed project is added", async () => {
+      mkdirSync(join(catalogRoot, "projects", "bundle"), { recursive: true });
+      catalog(`  - id: default\n    root: .\n  - id: bundle\n    root: projects/bundle\n    rigs: [openrig-dev]\n`);
+
+      process.env["OPENRIG_SESSION_NAME"] = "driver@user-rig";
+      const userRig = await run("--cwd", workingRoot, "--json");
+      expect(userRig.exitCode).toBeUndefined();
+      expect((JSON.parse(userRig.logs.join("")) as Plan).position).toMatchObject({ projectId: "default", projectRoot: catalogRoot, selectedBy: "unclaimed" });
+      expect((await run("--cwd", workingRoot)).logs[0]).toBe(`project default: ${catalogRoot} (the only project no rig claims)`);
+
+      delete process.env["OPENRIG_SESSION_NAME"];
+      const plainShell = await run("--cwd", workingRoot, "--json");
+      expect((JSON.parse(plainShell.logs.join("")) as Plan).position).toMatchObject({ projectId: "default", selectedBy: "unclaimed" });
+
+      process.env["OPENRIG_SESSION_NAME"] = "driver@openrig-dev";
+      const bundleRig = await run("--cwd", workingRoot, "--json");
+      expect((JSON.parse(bundleRig.logs.join("")) as Plan).position).toMatchObject({ projectId: "bundle", selectedBy: "rig" });
+    });
+
+    it("keeps project_required when every project is claimed and the calling rig has no association", async () => {
+      catalog(`  - id: alpha\n    root: ${alphaRel()}\n    rigs: [rig-a]\n  - id: beta\n    root: ${betaRel()}\n    rigs: [rig-b]\n`);
+      process.env["OPENRIG_SESSION_NAME"] = "driver@rig-c";
+
+      const result = await run("--cwd", workingRoot, "--json");
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.logs.join("")) as Failure).toMatchObject({
+        error: { code: "project_required", candidates: ["alpha", "beta"] },
+      });
+    });
+
+    it("lets an explicit --project override the rig and the working directory, and reports a single entry", async () => {
+      catalog(`  - id: alpha\n    root: ${alphaRel()}\n  - id: beta\n    root: ${betaRel()}\n    rigs: [dev-rig]\n`);
+      process.env["OPENRIG_SESSION_NAME"] = "driver@dev-rig";
+      const explicit = await run("--project", "alpha", "--cwd", join(betaRoot, "missions"), "--json");
+      expect((JSON.parse(explicit.logs.join("")) as Plan).position).toMatchObject({ projectId: "alpha", selectedBy: "explicit" });
+
+      catalog(`  - id: alpha\n    root: ${alphaRel()}\n`);
+      const single = await run("--cwd", workingRoot, "--json");
+      expect((JSON.parse(single.logs.join("")) as Plan).position).toMatchObject({ projectId: "alpha", selectedBy: "single" });
+    });
+  });
+
+  it("reports replacement and disabled System World states without missing-file inference", async () => {
+    writeFileSync(join(contextRoot, "replacement.yaml"), `schema: openrig.system-world/v0alpha1
+id: replacement
+version: "1"
+context: [{ ref: world-public, profiles: { codex: codex-coverage } }]
+skills: []
+`);
+    process.env["OPENRIG_CONTEXT_SYSTEM_WORLD"] = "replacement.yaml";
+    const replacement = await captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", "--project", "alpha", "--json"]);
+    });
+    expect(replacement.exitCode).toBeUndefined();
+    expect(JSON.parse(replacement.logs.join("")).systemWorld).toMatchObject({
+      state: "replacement",
+      source: "env",
+      selection: "replacement.yaml",
+      id: "replacement",
+    });
+
+    process.env["OPENRIG_CONTEXT_SYSTEM_WORLD"] = "disabled";
+    const disabled = await captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", "--project", "alpha", "--json"]);
+    });
+    expect(disabled.exitCode).toBeUndefined();
+    expect(JSON.parse(disabled.logs.join("")).systemWorld).toEqual({
+      state: "disabled",
+      source: "env",
+      selection: "disabled",
+      manifestPath: null,
+      id: null,
+      version: null,
+      context: [],
+      skills: [],
+    });
+  });
+
+  describe("install.worlds", () => {
+    const writeAlphaInstall = (worlds: string) => writeFileSync(join(alphaRoot, "project.yaml"), `schema: openrig.project/v0alpha1
+kind: project
+id: alpha
+install:
+  intent: SPEC.md
+  skills: [project-skill]
+${worlds}`);
+    const run = (...args: string[]) => captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", "--project", "alpha", ...args]);
+    });
+
+    it("lists declared worlds in order after the System World, ignoring repeats and invalid entries with warnings", async () => {
+      writeAlphaInstall(`  worlds:
+    - ref: openrig-world
+    - ref: world-public
+    - ref: private-overlay
+      profiles: { claude: guided }
+    - ref: openrig-world
+    - ref: ../escape
+`);
+      const json = await run("--json");
+      expect(json.exitCode).toBeUndefined();
+      const plan = JSON.parse(json.logs.join("")) as { worlds: unknown; skills: string[]; warnings: string[] };
+      expect(plan.worlds).toEqual([{ ref: "openrig-world" }, { ref: "private-overlay", profiles: { claude: "guided" } }]);
+      expect(plan.skills).toEqual(["project-skill"]);
+      expect(plan.warnings).toEqual([
+        "project.yaml install.worlds[1] repeats 'world-public', already listed by the System World; ignored that entry",
+        "project.yaml install.worlds[3] repeats 'openrig-world', already listed by an earlier entry; ignored that entry",
+        "project.yaml install.worlds[4].ref must be a safe context-pack ref; ignored that entry",
+      ]);
+
+      const text = await run();
+      expect(text.logs.slice(1, 8)).toEqual([
+        `system  default [default] test-default@0.5.9 ${join(contextRoot, "system", "system-world.yaml")}`,
+        "context system onboarding-width",
+        "context system world-public (claude=guided, codex=codex-coverage)",
+        "context world openrig-world",
+        "context world private-overlay (claude=guided)",
+        "worlds  read each with: rig context get <ref>",
+        "skills  system=system-skill",
+      ]);
+    });
+
+    it("ignores a non-list install.worlds with a warning and keeps the rest of the install", async () => {
+      writeAlphaInstall("  worlds: openrig-world\n");
+      const result = await run("--json");
+      expect(result.exitCode).toBeUndefined();
+      const plan = JSON.parse(result.logs.join("")) as { worlds: unknown; skills: string[]; warnings: string[] };
+      expect(plan.worlds).toEqual([]);
+      expect(plan.skills).toEqual(["project-skill"]);
+      expect(plan.warnings).toEqual([
+        "project.yaml: optional install.worlds must be an ordered list of { ref, profiles } entries; ignored it",
+      ]);
+      expect((await run()).logs.some((line) => line.startsWith("worlds  "))).toBe(false);
+    });
+
+    it("adds nothing to the output when install.worlds is absent", async () => {
+      const json = await run("--json");
+      expect(Object.hasOwn(JSON.parse(json.logs.join("")) as object, "worlds")).toBe(false);
+      const text = await run();
+      expect(text.logs.some((line) => line.startsWith("context world") || line.startsWith("worlds  "))).toBe(false);
+    });
+  });
+
+  it("selects two declared roots and returns stable intent with current progress", async () => {
+    const alpha = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--mission", "alpha-active", "--slice", "01-live-work", "--json",
+      ]);
+    });
+    expect(alpha.exitCode).toBeUndefined();
+    const alphaPlan = JSON.parse(alpha.logs.join("")) as {
+      position: { projectId: string; projectRoot: string; mission: string; slice: string; frontier: string };
+      pieces: Array<{ altitude: string; address: string; path: string; exists: boolean; source: string }>;
+      skills: string[];
+    };
+    expect(alphaPlan.position).toMatchObject({
+      projectId: "alpha",
+      projectRoot: alphaRoot,
+      mission: "alpha-active",
+      slice: "01-live-work",
+      frontier: "slice",
+    });
+    expect(alphaPlan.skills).toEqual(["project-skill"]);
+    expect(alphaPlan.pieces.map(({ altitude, address, exists, source }) => ({ altitude, address, exists, source }))).toEqual([
+      { altitude: "project", address: "project:SPEC.md", exists: true, source: "manifest" },
+      { altitude: "mission", address: "mission:SPEC.md", exists: true, source: "manifest" },
+      { altitude: "mission", address: "mission:PROGRESS.md", exists: true, source: "default" },
+      { altitude: "slice", address: "mission:slices/01-live-work/SPEC.md", exists: true, source: "explicit" },
+      { altitude: "slice", address: "mission:slices/01-live-work/PROGRESS.md", exists: true, source: "default" },
+    ]);
+    expect(alphaPlan.pieces.every((piece) => piece.path.startsWith(alphaRoot))).toBe(true);
+    expect(alphaPlan.pieces.filter((piece) => piece.address.endsWith("PROGRESS.md")).map((piece) => readFileSync(piece.path, "utf8"))).toEqual([
+      "# Alpha mission progress\n\n- [x] Story 2 complete\n- [ ] Release acceptance pending\n",
+      "# Alpha slice progress\n\n- [x] Story 3 complete\n- [ ] Public publish pending\n",
+    ]);
+
+    const beta = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "beta", "--mission", "beta-scaffold", "--json",
+      ]);
+    });
+    expect(beta.exitCode).toBeUndefined();
+    const betaPlan = JSON.parse(beta.logs.join("")) as {
+      position: { projectId: string; projectRoot: string; mission: string; slice: null; frontier: string };
+      pieces: Array<{ altitude: string; address: string; path: string; exists: boolean; source: string }>;
+    };
+    expect(betaPlan.position).toMatchObject({
+      projectId: "beta",
+      projectRoot: betaRoot,
+      mission: "beta-scaffold",
+      slice: null,
+      frontier: "mission",
+    });
+    expect(JSON.stringify(betaPlan)).not.toContain(alphaRoot);
+    expect(betaPlan.pieces.map(({ altitude, address, exists, source }) => ({ altitude, address, exists, source }))).toEqual([
+      { altitude: "project", address: "project:SPEC.md", exists: true, source: "manifest" },
+      { altitude: "mission", address: "mission:SPEC.md", exists: true, source: "manifest" },
+      { altitude: "mission", address: "mission:PROGRESS.md", exists: false, source: "default" },
+    ]);
+    expect(betaPlan.pieces.every((piece) => piece.path.startsWith(betaRoot))).toBe(true);
+  });
+
+  it.each(["claude-code", "claude", "codex"])("projects %s skills with canonical metadata and idempotent effects without dirtying product Git", async (runtime) => {
+    const run = () => captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--runtime", runtime, "--cwd", workingRoot,
+        "--topology", "topology-skill", "--apply-skills", "--json",
+      ]);
+    });
+
+    const first = await run();
+    expect(first.exitCode).toBeUndefined();
+    const installed = JSON.parse(first.logs.join("")) as {
+      pieces: Array<{ address: string; exists: boolean }>;
+      skillLoadout: { entries: Array<{ id: string; selectedBy: string[] }> };
+      skillProjection: { ok: boolean; applied: boolean; receipts: Array<{ id: string; status: string }> };
+    };
+    expect(installed.pieces).toEqual(expect.arrayContaining([expect.objectContaining({ address: "project:SPEC.md", exists: true })]));
+    expect(installed.skillLoadout.entries.map((entry) => [entry.id, entry.selectedBy])).toEqual([
+      ["project-skill", ["project"]],
+      ["system-skill", ["system"]],
+      ["topology-skill", ["topology"]],
+    ]);
+    expect(installed.skillProjection).toMatchObject({ ok: true, applied: true, runtime: runtime === "codex" ? "codex" : "claude-code" });
+    expect(installed.skillProjection.receipts.every((receipt) => receipt.status === "current")).toBe(true);
+    expect(readFileSync(join(workingRoot, runtime === "codex" ? ".agents" : ".claude", "skills", "project-skill", "SKILL.md"), "utf8"))
+      .toBe(readFileSync(join(skillsRoot, "project-skill", "SKILL.md"), "utf8"));
+    expect(execFileSync("git", ["-C", alphaRoot, "status", "--short"], { encoding: "utf8" })).toBe("");
+    expect(execFileSync("git", ["-C", workingRoot, "status", "--short"], { encoding: "utf8" })).toBe("");
+
+    const second = await run();
+    expect(second.exitCode).toBeUndefined();
+    expect(JSON.parse(second.logs.join("")).skillProjection).toMatchObject({ ok: true, applied: false });
+    expect(execFileSync("git", ["-C", alphaRoot, "status", "--short"], { encoding: "utf8" })).toBe("");
+    expect(execFileSync("git", ["-C", workingRoot, "status", "--short"], { encoding: "utf8" })).toBe("");
+  });
+
+  it("projects the rest past a skill with uncommitted content, and exits 1 only when something selected it", async () => {
+    writeFileSync(join(skillsRoot, "topology-skill", "draft.md"), "uncommitted work\n");
+    const run = (...topology: string[]) => captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--runtime", "codex", "--cwd", workingRoot,
+        ...topology, "--apply-skills", "--json",
+      ]);
+    });
+    type Output = {
+      skillLoadout: { entries: Array<{ id: string }>; skipped: Array<{ id: string; selectedBy: string[]; message: string }> };
+      skillProjection: { ok: boolean; applied: boolean };
+    };
+
+    const unselected = await run();
+    expect(unselected.exitCode).toBeUndefined();
+    const quiet = JSON.parse(unselected.logs.join("")) as Output;
+    expect(quiet.skillLoadout.skipped).toMatchObject([{ id: "topology-skill", selectedBy: [] }]);
+    expect(quiet.skillLoadout.skipped[0]!.message).toMatch(/^catalog_skill_skipped: 'topology-skill' /);
+
+    const selected = await run("--topology", "topology-skill");
+    expect(selected.exitCode).toBe(1);
+    const output = JSON.parse(selected.logs.join("")) as Output;
+    expect(output.skillLoadout.entries.map((entry) => entry.id)).toEqual(["project-skill", "system-skill"]);
+    expect(output.skillLoadout.skipped).toMatchObject([{ id: "topology-skill", selectedBy: ["topology"] }]);
+    expect(output.skillProjection).toMatchObject({ ok: true });
+    expect(existsSync(join(workingRoot, ".agents", "skills", "project-skill", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(workingRoot, ".agents", "skills", "topology-skill"))).toBe(false);
+  });
+
+  it.each(["unknown-runtime", ""])("rejects explicit runtime %j before project lookup or projection", async (runtime) => {
+    const command = makeCommand();
+    const workInstall = command.commands[0]!.commands.find((cmd) => cmd.name() === "work-install")!;
+    workInstall.configureOutput({ writeErr: () => {} });
+    await expect(command.parseAsync([
+      "node", "rig", "context", "work-install", "--project", "missing-project",
+      "--runtime", runtime, "--cwd", workingRoot, "--apply-skills", "--json",
+    ])).rejects.toMatchObject({ code: "commander.invalidArgument", message: expect.stringContaining("claude-code, claude, codex") });
+    expect(existsSync(join(workingRoot, ".claude"))).toBe(false);
+    expect(existsSync(join(workingRoot, ".agents"))).toBe(false);
+    expect(existsSync(join(workingRoot, ".openrig"))).toBe(false);
+  });
+
+  it("refuses work-install before projecting when a foreign ignore covers only skill entrypoints", async () => {
+    mkdirSync(join(skillsRoot, "project-skill", "scripts"), { recursive: true });
+    writeFileSync(join(skillsRoot, "project-skill", "scripts", "helper.txt"), "managed helper\n");
+    execFileSync("git", ["-C", root, "add", "managed-skills/project-skill/scripts/helper.txt"]);
+    execFileSync("git", ["-C", root, "commit", "-qm", "multi-file skill fixture"]);
+    const ignorePath = join(workingRoot, ".agents", "skills", ".gitignore");
+    mkdirSync(join(ignorePath, ".."), { recursive: true });
+    writeFileSync(ignorePath, "/*/SKILL.md\n");
+    execFileSync("git", ["-C", workingRoot, "add", ".agents/skills/.gitignore"]);
+    execFileSync("git", ["-C", workingRoot, "commit", "-qm", "foreign partial skill ignore"]);
+
+    const run = () => captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--runtime", "codex", "--cwd", workingRoot,
+        "--topology", "topology-skill", "--apply-skills", "--json",
+      ]);
+    });
+    const result = await run();
+    const repeated = await run();
+    const output = JSON.parse(result.logs.join("")) as {
+      skillProjection: { ok: boolean; applied: boolean; errors: Array<{ code: string }> };
+    };
+    const repeatedOutput = JSON.parse(repeated.logs.join("")) as typeof output;
+
+    expect(result.exitCode).toBe(1);
+    expect(output.skillProjection).toMatchObject({
+      ok: false,
+      applied: false,
+      errors: [{ code: "git_exclusion_failed" }],
+    });
+    expect(repeated.exitCode).toBe(1);
+    expect(repeatedOutput.skillProjection).toMatchObject({
+      ok: false,
+      applied: false,
+      errors: [{ code: "git_exclusion_failed" }],
+    });
+    expect(readFileSync(ignorePath, "utf8")).toBe("/*/SKILL.md\n");
+    expect(execFileSync("git", ["-C", workingRoot, "status", "--short", "--untracked-files=all"], { encoding: "utf8" })).toBe("");
+    expect(() => readFileSync(join(workingRoot, ".agents", "skills", "project-skill", "SKILL.md"), "utf8")).toThrow();
+    expect(() => readFileSync(join(workingRoot, ".openrig", "skill-loadouts", "codex.json"), "utf8")).toThrow();
+  });
+
+  it("delivers extant pieces byte-for-byte in plan order and marks absent pieces", async () => {
+    const args = [
+      "node", "rig", "context", "work-install",
+      "--project", "alpha", "--mission", "alpha-active", "--slice", "01-live-work", "--json",
+    ];
+    const planOnly = await captureLogs(async () => {
+      await makeCommand().parseAsync(args);
+    });
+    const delivered = await captureLogs(async () => {
+      await makeCommand().parseAsync([...args, "--deliver"]);
+    });
+
+    expect(delivered.exitCode).toBeUndefined();
+    const delivery = JSON.parse(delivered.logs.join("")) as {
+      pieces: Array<{ altitude: string; address: string; path: string; exists: boolean; content?: string }>;
+    };
+    expect(delivery.pieces.map(({ path, content }) => ({ path, content }))).toEqual(
+      delivery.pieces.map(({ path }) => ({ path, content: readFileSync(path, "utf8") })),
+    );
+    const planShape = {
+      ...delivery,
+      pieces: delivery.pieces.map(({ content: _content, ...piece }) => piece),
+    };
+    expect(JSON.stringify(planShape, null, 2)).toBe(planOnly.logs.join(""));
+
+    const missing = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "beta", "--mission", "beta-scaffold", "--deliver", "--json",
+      ]);
+    });
+    const missingDelivery = JSON.parse(missing.logs.join("")) as {
+      pieces: Array<{ altitude: string; address: string; path: string; exists: boolean; content?: string }>;
+    };
+    expect(missingDelivery.pieces.map((piece) => ({
+      address: piece.address,
+      exists: piece.exists,
+      hasContent: Object.hasOwn(piece, "content"),
+    }))).toEqual([
+      { address: "project:SPEC.md", exists: true, hasContent: true },
+      { address: "mission:SPEC.md", exists: true, hasContent: true },
+      { address: "mission:PROGRESS.md", exists: false, hasContent: false },
+    ]);
+
+    const planHuman = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "beta", "--mission", "beta-scaffold",
+      ]);
+    });
+    expect(planHuman.logs).toEqual([
+      `project beta: ${betaRoot}`,
+      `system  default [default] test-default@0.5.9 ${join(contextRoot, "system", "system-world.yaml")}`,
+      "context system onboarding-width",
+      "context system world-public (claude=guided, codex=codex-coverage)",
+      "skills  system=system-skill",
+      "skills  topology=(none)",
+      "skills  project=(none)",
+      `project project:SPEC.md [manifest] ${join(betaRoot, "SPEC.md")}`,
+      `mission mission:SPEC.md [manifest] ${join(betaRoot, "missions", "beta-scaffold", "SPEC.md")}`,
+      `mission mission:PROGRESS.md [default] (absent: ${join(betaRoot, "missions", "beta-scaffold", "PROGRESS.md")})`,
+    ]);
+
+    const human = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "beta", "--mission", "beta-scaffold", "--deliver",
+      ]);
+    });
+    expect(human.logs.filter((line) => line.startsWith("=== "))).toEqual([
+      "=== project project:SPEC.md ===",
+      "=== mission mission:SPEC.md ===",
+      `=== mission:PROGRESS.md (absent: ${join(betaRoot, "missions", "beta-scaffold", "PROGRESS.md")}) ===`,
+    ]);
+  });
+
+  it("resolves an explicit slice by directory name or unique dotted id and refuses missing or ambiguous matches", async () => {
+    const run = (slice: string) => captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--mission", "alpha-active", "--slice", slice, "--json",
+      ]);
+    });
+
+    for (const selector of ["01-live-work", "OPR.0.5.8.13"]) {
+      const result = await run(selector);
+      expect(result.exitCode).toBeUndefined();
+      const body = JSON.parse(result.logs.join("")) as {
+        position: { slice: string; sliceRoot: string; frontier: string };
+        pieces: Array<{ address: string }>;
+      };
+      expect(body.position).toMatchObject({
+        slice: "01-live-work",
+        sliceRoot: join(alphaRoot, "missions", "alpha-active", "slices", "01-live-work"),
+        frontier: "slice",
+      });
+      expect(body.pieces.slice(-2).map((piece) => piece.address)).toEqual([
+        "mission:slices/01-live-work/SPEC.md",
+        "mission:slices/01-live-work/PROGRESS.md",
+      ]);
+    }
+
+    const missing = await run("OPR.0.5.8.99");
+    expect(missing.exitCode).toBe(1);
+    expect(JSON.parse(missing.logs.join(""))).toMatchObject({
+      ok: false,
+      error: { code: "slice_not_found", candidates: ["01-live-work"] },
+    });
+
+    const duplicateRoot = join(alphaRoot, "missions", "alpha-active", "slices", "02-duplicate-id");
+    mkdirSync(duplicateRoot, { recursive: true });
+    writeFileSync(join(duplicateRoot, "SPEC.md"), `---
+id: OPR.0.5.8.13
+---
+# Duplicate slice id
+`);
+    const ambiguous = await run("OPR.0.5.8.13");
+    expect(ambiguous.exitCode).toBe(1);
+    expect(JSON.parse(ambiguous.logs.join(""))).toMatchObject({
+      ok: false,
+      error: {
+        code: "slice_identity_ambiguous",
+        candidates: ["01-live-work", "02-duplicate-id"],
+      },
+    });
+  });
+
+  it("uses explicit mission composition as the strict slice-selection boundary", async () => {
+    const missionRoot = join(alphaRoot, "missions", "alpha-active");
+    writeFileSync(join(missionRoot, "slices", "01-live-work", "slice.yaml"), `schema: openrig.slice/v0alpha1
+kind: slice
+metadata: { id: OPR.0.5.8.13 }
+composition: { mission: ../../mission.yaml }
+`);
+    writeFileSync(join(missionRoot, "mission.yaml"), `schema: openrig.mission/v0alpha1
+kind: mission
+composition:
+  mission_markdown: { spec: SPEC.md }
+  slices:
+    - { ref: slices/01-live-work/slice.yaml, order: 10, active: true }
+`);
+    const unlistedRoot = join(missionRoot, "slices", "02-unlisted");
+    mkdirSync(unlistedRoot, { recursive: true });
+    writeFileSync(join(unlistedRoot, "SPEC.md"), "# Unlisted slice\n");
+
+    const result = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--mission", "alpha-active", "--slice", "02-unlisted", "--json",
+      ]);
+    });
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.logs.join(""))).toMatchObject({
+      ok: false,
+      error: { code: "slice_not_found", candidates: ["01-live-work"] },
+    });
+  });
+
+  it("refuses a selected project id that names two catalog roots", async () => {
+    for (const projectRoot of [alphaRoot, betaRoot]) {
+      writeFileSync(join(projectRoot, "project.yaml"), `schema: openrig.project/v0alpha1
+kind: project
+id: duplicate
+`);
+    }
+    writeFileSync(join(catalogRoot, "workspace.yaml"), `schema: openrig.workspace/v0alpha1
+projects:
+  - id: duplicate
+    root: ${relative(catalogRoot, alphaRoot)}
+  - id: duplicate
+    root: ${relative(catalogRoot, betaRoot)}
+`);
+
+    const result = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install", "--project", "duplicate", "--json",
+      ]);
+    });
+    expect(result.exitCode).toBe(1);
+    const body = JSON.parse(result.logs.join("")) as {
+      ok: boolean;
+      error: { code: string };
+      position?: { projectRoot?: string };
+    };
+    expect(body).toMatchObject({ ok: false, error: { code: "project_identity_ambiguous" } });
+    expect(body.position?.projectRoot).toBeUndefined();
+  });
+
+  it("lists each project candidate with its exact command in text and JSON when selection is required", async () => {
+    const text = await captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", "--mission", "alpha-active"]);
+    });
+    expect(text.exitCode).toBe(1);
+    expect(text.logs).toEqual([]);
+    expect(text.errLogs).toEqual([
+      "project_required: multiple projects are declared; select one with --project",
+      "Run one of:",
+      "  rig context work-install --project alpha --mission alpha-active",
+      "  rig context work-install --project beta --mission alpha-active",
+    ]);
+
+    const json = await captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", "--json"]);
+    });
+    expect(json.exitCode).toBe(1);
+    expect(JSON.parse(json.logs.join(""))).toEqual({
+      ok: false,
+      error: {
+        code: "project_required",
+        message: "multiple projects are declared; select one with --project",
+        candidates: ["alpha", "beta"],
+        commands: ["rig context work-install --project alpha", "rig context work-install --project beta"],
+      },
+    });
+  });
+
+  it("lists exact commands for an undeclared project and plain candidates for an unknown slice", async () => {
+    const project = await captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", "--project", "gamma"]);
+    });
+    expect(project.exitCode).toBe(1);
+    expect(project.errLogs).toEqual([
+      `project_not_found: project 'gamma' is not declared in ${join(catalogRoot, "workspace.yaml")}`,
+      "Run one of:",
+      "  rig context work-install --project alpha",
+      "  rig context work-install --project beta",
+    ]);
+
+    const slice = await captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--mission", "alpha-active", "--slice", "OPR.0.5.8.99",
+      ]);
+    });
+    expect(slice.exitCode).toBe(1);
+    expect(slice.errLogs).toEqual([
+      "slice_not_found: slice 'OPR.0.5.8.99' is not a child of the selected mission",
+      "Candidates:",
+      "  01-live-work",
+    ]);
+  });
+});

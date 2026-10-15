@@ -1,0 +1,249 @@
+// release-0.4.7 intent-stage/scaffold-projection — T1 (helper unit vectors) +
+// T6 (new outcome scaffold and legacy generic-triple compatibility).
+//
+// T1 derives its placeholder vectors FROM THE SHIPPED TEMPLATES (every
+// proof-contract checkbox text and mini-reqs numbered item across
+// scope-templates/*.md must classify placeholder) so template drift breaks
+// these tests honestly instead of silently un-classifying a placeholder.
+// T6 ensures new progress scaffolds do not invent an acceptance checklist,
+// while preserving recognition of generic checkboxes emitted by older versions.
+
+import { describe, it, expect } from "vitest";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import {
+  isScaffoldPlaceholderText,
+  GENERIC_SCAFFOLD_ACCEPTANCE,
+} from "../src/domain/scope/scaffold-placeholder.js";
+
+const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..", "..");
+const TEMPLATES_DIR = path.join(REPO_ROOT, "packages/cli/src/lib/scope-templates");
+
+/** Body of a `## <heading>` section up to the next `#`-heading (test-local,
+ *  line-anchored — mirrors the production extractors' section shape). */
+function sectionBody(content: string, heading: string): string | null {
+  const re = new RegExp(`^##\\s+${heading}\\s*$`, "mi");
+  const m = re.exec(content);
+  if (!m) return null;
+  const rest = content.slice(m.index + m[0].length);
+  const next = rest.search(/^#{1,6}\s/m);
+  return next === -1 ? rest : rest.slice(0, next);
+}
+
+function checkboxTexts(body: string): string[] {
+  const out: string[] = [];
+  for (const line of body.split("\n")) {
+    const m = line.match(/^\s*-?\s*\[(?:\s|x|X|~)\]\s+(.+)$/);
+    if (m) out.push(m[1]!.trim());
+  }
+  return out;
+}
+
+function numberedTexts(body: string): string[] {
+  const out: string[] = [];
+  for (const line of body.split("\n")) {
+    const m = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (m) out.push(m[1]!.trim());
+  }
+  return out;
+}
+
+const SLICE_TEMPLATES_WITH_CONTRACT = [
+  "placeholder.md",
+  "implementation-prd.md",
+  "bug-fix.md",
+  "research.md",
+  "release-feature.md",
+  "backlog-deprecation.md",
+  "backlog-tech-debt.md",
+];
+
+describe("T1 — isScaffoldPlaceholderText unit vectors", () => {
+  it("every shipped template's proof-contract checkbox text classifies placeholder", () => {
+    let vectors = 0;
+    for (const file of SLICE_TEMPLATES_WITH_CONTRACT) {
+      const content = fs.readFileSync(path.join(TEMPLATES_DIR, file), "utf8");
+      const body = sectionBody(content, "Proof contract");
+      expect(body, `${file} must have a ## Proof contract section`).not.toBeNull();
+      for (const text of checkboxTexts(body!)) {
+        expect(isScaffoldPlaceholderText(text), `${file}: ${text}`).toBe(true);
+        vectors++;
+      }
+    }
+    expect(vectors).toBeGreaterThanOrEqual(SLICE_TEMPLATES_WITH_CONTRACT.length);
+  });
+
+  it("every shipped template's mini-reqs numbered item classifies placeholder", () => {
+    let vectors = 0;
+    for (const file of ["placeholder.md", "implementation-prd.md"]) {
+      const content = fs.readFileSync(path.join(TEMPLATES_DIR, file), "utf8");
+      const body = sectionBody(content, "Mini-requirements");
+      expect(body, `${file} must have a ## Mini-requirements section`).not.toBeNull();
+      for (const text of numberedTexts(body!)) {
+        expect(isScaffoldPlaceholderText(text), `${file}: ${text}`).toBe(true);
+        vectors++;
+      }
+    }
+    expect(vectors).toBeGreaterThanOrEqual(2);
+  });
+
+  it("real text is NOT a placeholder", () => {
+    expect(isScaffoldPlaceholderText("phone journey video")).toBe(false);
+    expect(isScaffoldPlaceholderText("Implementation complete")).toBe(false);
+    expect(isScaffoldPlaceholderText("1080p capture of the drawer opening")).toBe(false);
+  });
+
+  it("bracket edge: ANY character outside the brackets makes it real", () => {
+    expect(isScaffoldPlaceholderText("[P0] ship the drawer")).toBe(false);
+    expect(isScaffoldPlaceholderText("a [placeholder-looking] middle")).toBe(false);
+    expect(isScaffoldPlaceholderText("[almost].")).toBe(false);
+    expect(isScaffoldPlaceholderText("x[wrapped]")).toBe(false);
+  });
+
+  it("trims before classifying; degenerate `[]` is a placeholder", () => {
+    expect(isScaffoldPlaceholderText("  [padded placeholder]  ")).toBe(true);
+    expect(isScaffoldPlaceholderText("[]")).toBe(true);
+  });
+
+  it("`[a] and [b]` classifies placeholder — arch-grammar-faithful (starts `[`, ends `]`); deliberately NOT special-cased", () => {
+    // The grammar is `^\[.*\]$` verbatim (no private grammar). A real
+    // deliverable written this way is written in template grammar — the
+    // documented honest edge, pinned here so a future "fix" is a decision.
+    expect(isScaffoldPlaceholderText("[a] and [b]")).toBe(true);
+  });
+});
+
+describe("T6 — progress records outcomes without a second acceptance checklist", () => {
+  it("new scaffolds point to attributed proof and have no generic acceptance boxes", () => {
+    const content = fs.readFileSync(path.join(TEMPLATES_DIR, "slice-progress.md"), "utf8");
+    expect(content).toContain("rig proof show <slice>");
+    expect(sectionBody(content, "Current state")).not.toBeNull();
+    expect(sectionBody(content, "Outcomes")).not.toBeNull();
+    expect(checkboxTexts(content)).toEqual([]);
+  });
+
+  it("retains the old generic triple for existing-file placeholder recognition", () => {
+    expect([...GENERIC_SCAFFOLD_ACCEPTANCE]).toEqual([
+      "Implementation complete", "Tests passing", "Review approved",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// release-0.4.7 placeholder-suppression completeness micro-bundle —
+// T-B2 (isPlaceholderOnlyBlock unit vectors), T-A grammar
+// (hasAuthoredNumberedItem unit vectors), T-C (prose/bullet-only suppression
+// pin — asserts the arch-ruled, reviewer-L1 behavior).
+// ---------------------------------------------------------------------------
+
+import {
+  hasAuthoredNumberedItem,
+  isPlaceholderOnlyBlock,
+} from "../src/domain/scope/scaffold-placeholder.js";
+
+describe("T-B2 — isPlaceholderOnlyBlock (block-level 'nothing authored here')", () => {
+  it("null/empty → false (absence is its own state; callers keep null handling)", () => {
+    expect(isPlaceholderOnlyBlock(null)).toBe(false);
+    expect(isPlaceholderOnlyBlock("")).toBe(false);
+    expect(isPlaceholderOnlyBlock("   \n  \n")).toBe(false);
+  });
+
+  it("single fully-bracket-wrapped line → true (the shipped template Intent scaffold)", () => {
+    expect(isPlaceholderOnlyBlock("[The recorded intent, verbatim — what was asked for and why.]")).toBe(true);
+    expect(isPlaceholderOnlyBlock("\n  [padded placeholder]  \n")).toBe(true);
+  });
+
+  it("multi-line per-LINE case: `[a]\\n[b]` → true (the whole-string trim would miss this)", () => {
+    expect(isPlaceholderOnlyBlock("[a]\n[b]")).toBe(true);
+  });
+
+  it("blank lines are ignored between placeholder lines", () => {
+    expect(isPlaceholderOnlyBlock("[a]\n\n[b]\n")).toBe(true);
+  });
+
+  it("ANY authored line makes the block authored (mixed → false)", () => {
+    expect(isPlaceholderOnlyBlock("[a]\nreal authored words")).toBe(false);
+    expect(isPlaceholderOnlyBlock("The founder's exact words.")).toBe(false);
+  });
+});
+
+describe("T-A grammar — hasAuthoredNumberedItem (the ONE authored-numbered-item grammar)", () => {
+  it("dot-form and paren-form authored items both count (`1.` / `1)`)", () => {
+    expect(hasAuthoredNumberedItem("1. Drawer opens from the right side.")).toBe(true);
+    expect(hasAuthoredNumberedItem("1) Drawer opens from the right side.")).toBe(true);
+  });
+
+  it("placeholder-only numbered item → false (template `1. [...]` scaffold)", () => {
+    expect(hasAuthoredNumberedItem("1. [The concise one-glance requirement tier.]")).toBe(false);
+  });
+
+  it("null → false", () => {
+    expect(hasAuthoredNumberedItem(null)).toBe(false);
+  });
+
+  it("T-C: prose-only body → false (reviewer-L1 ruling — deliberately not-authored)", () => {
+    expect(hasAuthoredNumberedItem("Some prose describing intent without structure.")).toBe(false);
+  });
+
+  it("T-C: bullet-only body → false (bullets are not the numbered requirement tier)", () => {
+    expect(hasAuthoredNumberedItem("- bullet item one\n- bullet item two")).toBe(false);
+  });
+
+  it("T-C: mixed prose + one authored numbered item → true", () => {
+    expect(hasAuthoredNumberedItem("Context prose first.\n\n1. One real observable outcome.")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PM dogfood #1 (qitem-20260720015700-630eef64) — isPristineScaffoldSection:
+// the SECTION-level pristine test (every non-blank line is scaffold
+// placeholder content, allowing the template's structural list markers).
+// Dynamic import so this file still collects while the predicate is unbuilt
+// (the RED phase reads as assertion failures, not a module-load crash).
+// ---------------------------------------------------------------------------
+
+describe("isPristineScaffoldSection — section-level pristine grammar (PM dogfood #1)", () => {
+  type Fn = (body: string | null) => boolean;
+  const load = async (): Promise<Fn> => {
+    const mod = (await import("../src/domain/scope/scaffold-placeholder.js")) as Record<string, unknown>;
+    expect(typeof mod.isPristineScaffoldSection, "isPristineScaffoldSection must be exported from the twin module").toBe("function");
+    return mod.isPristineScaffoldSection as Fn;
+  };
+
+  it("template mini-reqs row (numbered marker + bracket text) is pristine", async () => {
+    const fn = await load();
+    expect(fn("1. [The concise one-glance requirement tier — this is where approval starts.]")).toBe(true);
+  });
+
+  it("template proof-contract row (checkbox marker + bracket text) is pristine", async () => {
+    const fn = await load();
+    expect(fn("- [ ] [One promised deliverable, written as an observable outcome — captured.]")).toBe(true);
+  });
+
+  it("multi-row all-placeholder section (bare + bulleted + numbered) is pristine", async () => {
+    const fn = await load();
+    expect(fn("[intro placeholder]\n\n1. [one]\n- [ ] [two]\n- [three]")).toBe(true);
+  });
+
+  it("an authored numbered row makes the section NOT pristine", async () => {
+    const fn = await load();
+    expect(fn("1. first authored requirement")).toBe(false);
+  });
+
+  it("MIXED placeholder + authored rows is NOT pristine (mixed-authored stays canonical)", async () => {
+    const fn = await load();
+    expect(fn("1. [placeholder row]\n2. real authored outcome")).toBe(false);
+  });
+
+  it("authored prose is NOT pristine (malformed authored stays visible)", async () => {
+    const fn = await load();
+    expect(fn("authored prose, deliberately no numbered items")).toBe(false);
+  });
+
+  it("null and blank-only are NOT pristine (absence is its own state — never triggers fallback)", async () => {
+    const fn = await load();
+    expect(fn(null)).toBe(false);
+    expect(fn("")).toBe(false);
+    expect(fn("   \n \n")).toBe(false);
+  });
+});

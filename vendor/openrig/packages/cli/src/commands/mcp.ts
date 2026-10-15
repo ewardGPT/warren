@@ -1,0 +1,63 @@
+import { Command } from "commander";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { DaemonClient } from "../client.js";
+import { getDaemonStatus, getDaemonUrl, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
+import { createMcpServer } from "../mcp-server.js";
+import { realDeps } from "./daemon.js";
+import type { StatusDeps } from "./status.js";
+
+/**
+ * `rig mcp serve` — start MCP server wrapping the daemon API.
+ * @param depsOverride - injectable deps for testing
+ * @returns Commander command
+ */
+export function mcpCommand(depsOverride?: StatusDeps): Command {
+  const cmd = new Command("mcp").description("MCP server for agent integration");
+  const getDepsF = () => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
+
+  cmd
+    .command("serve")
+    .description("Start MCP server (stdio transport)")
+    .option("--port <port>", "Daemon port override")
+    .action(async (opts: { port?: string }) => {
+      const deps = getDepsF();
+
+      let daemonUrl: string;
+      if (opts.port) {
+        const daemonPort = parseInt(opts.port, 10);
+        if (isNaN(daemonPort)) {
+          console.error("Invalid port number");
+          process.exitCode = 1;
+          return;
+        }
+        daemonUrl = `http://127.0.0.1:${daemonPort}`;
+      } else {
+        const status = await getDaemonStatus(deps.lifecycleDeps);
+        if (!daemonStatusGuard(status)) return;
+        daemonUrl = getDaemonUrl(status);
+      }
+
+      const client = deps.clientFactory(daemonUrl);
+      const server = createMcpServer(client);
+      const transport = new StdioServerTransport();
+      let finish!: () => void;
+      const closed = new Promise<void>((resolve) => { finish = resolve; });
+      server.server.onclose = finish;
+      process.stdin.once("end", finish);
+      process.once("SIGINT", finish);
+      process.once("SIGTERM", finish);
+      try {
+        // EOF is a normal stdio disconnect, not an unresolved top-level await.
+        await server.connect(transport);
+        if (process.stdin.readableEnded) finish();
+        await closed;
+      } finally {
+        process.stdin.removeListener("end", finish);
+        process.removeListener("SIGINT", finish);
+        process.removeListener("SIGTERM", finish);
+        await server.close();
+      }
+    });
+
+  return cmd;
+}

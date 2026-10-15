@@ -1,0 +1,369 @@
+import nodePath from "node:path";
+import * as os from "node:os";
+import { OPENRIG_HOME } from "../openrig-compat.js";
+import type { StartupBlock } from "./types.js";
+import { classifyResourceProjection } from "./conflict-detector.js";
+import type { ResolvedNodeConfig, QualifiedResource, ResolvedResources } from "./profile-resolver.js";
+import type { ResourceCollision } from "./agent-resolver.js";
+import type { ResolvedStartupFile } from "./runtime-adapter.js";
+import { DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "./managed-blocks.js";
+
+// -- Types --
+
+export type ProjectionClassification =
+  | "safe_projection"
+  | "managed_merge"
+  | "hash_conflict"
+  | "no_op"
+  // P20 — manifest-discriminated splits of the old "target ≠ source" conflict:
+  | "stale_overwrite" // target == what WE last wrote; source advanced → safe to overwrite
+  | "operator_conflict"; // target diverged from BOTH our last write and the source → protect
+
+export interface ProjectionEntry {
+  category: "skill" | "guidance" | "subagent" | "plugin" | "runtime_resource";
+  effectiveId: string;
+  sourceSpec: string;
+  sourcePath: string;
+  resourcePath: string;
+  absolutePath: string;
+  resourceType?: string;
+  classification: ProjectionClassification;
+  conflictDetail?: { reason: string; existingHash?: string; sourceHash?: string };
+  mergeStrategy?: "managed_block" | "append";
+  target?: string;
+  /** Plugin runtime applicability hint. Only meaningful for category=plugin.
+   *  - "claude" / "codex": explicit operator override; only the named runtime adapter projects
+   *  - "auto" or undefined: adapter detects manifest dirs (.claude-plugin/ vs .codex-plugin/)
+   *    and projects only when its runtime-specific manifest is present
+   */
+  pluginType?: "claude" | "codex" | "auto";
+}
+
+export interface ProjectionPlan {
+  runtime: string;
+  cwd: string;
+  entries: ProjectionEntry[];
+  startup: StartupBlock;
+  conflicts: ProjectionEntry[];
+  noOps: ProjectionEntry[];
+  diagnostics: string[];
+}
+
+export interface ProjectionFsOps {
+  readFile(path: string): string;
+  exists(path: string): boolean;
+}
+
+export interface ProjectionInput {
+  config: ResolvedNodeConfig;
+  collisions: ResourceCollision[];
+  fsOps: ProjectionFsOps;
+  /** Optional: resolve target path for conflict detection. If absent, all entries are safe_projection.
+   *  P17: the source absolutePath rides as the 4th arg so file-shaped targets
+   *  (subagent basenames) can be derived; existing 3-arg callers unaffected. */
+  resolveTargetPath?: (category: string, effectiveId: string, cwd: string, sourcePath?: string) => string | null;
+  /** P20 — the projector's LAST-written hash for a target (from the projection
+   *  manifest), or null. Absent → classify falls back to P17 (hash_conflict).
+   *  Consulted fail-closed inside classify (a throw → no-manifest fallback). */
+  lastHashLookup?: (targetPath: string) => string | null;
+}
+
+export type PlanResult =
+  | { ok: true; plan: ProjectionPlan }
+  | { ok: false; errors: string[] };
+
+// -- Category mapping --
+
+const CATEGORY_MAP: Record<string, ProjectionEntry["category"]> = {
+  skills: "skill",
+  guidance: "guidance",
+  subagents: "subagent",
+  plugins: "plugin",
+  runtimeResources: "runtime_resource",
+};
+
+// -- Public API --
+
+/**
+ * Plan the effective runtime projection for one resolved node.
+ * @param input - resolved config, collision diagnostics, and filesystem ops
+ * @returns projection plan or errors
+ */
+export function planProjection(input: ProjectionInput): PlanResult {
+  const { config, collisions, fsOps } = input;
+  const errors: string[] = [];
+  const diagnostics: string[] = [];
+  const entries: ProjectionEntry[] = [];
+
+  // Check for import/import ambiguity in selected resources
+  const ambiguityErrors = checkAmbiguity(config.selectedResources, collisions);
+  if (ambiguityErrors.length > 0) {
+    return { ok: false, errors: ambiguityErrors };
+  }
+
+  // Record collision diagnostics
+  for (const col of collisions) {
+    if (col.sources.length >= 2) {
+      diagnostics.push(`Collision in ${col.category}: "${col.resourceId}" declared by ${col.sources.map((s) => s.specName).join(", ")}`);
+    }
+  }
+
+  // Plan each resource category
+  for (const [catKey, catSingular] of Object.entries(CATEGORY_MAP)) {
+    const resources = config.selectedResources[catKey as keyof ResolvedResources] as QualifiedResource[];
+    for (const qr of resources) {
+      // Runtime resource filtering
+      if (catKey === "runtimeResources") {
+        const rr = qr.resource as { runtime: string; type?: string };
+        if (rr.runtime !== config.runtime) continue;
+      }
+
+      // Plugins use a different shape: { id, source: { kind, path } } — extract path from source.
+      // Plugin paths support four forms:
+      //   1. absolute system path → preserved exactly
+      //   2. tilde-home-prefixed (~/... or bare ~) → expanded to os.homedir()
+      //   3. openrig-home:... → relative to the configured daemon home
+      //   4. relative to spec dir → resolved against qr.sourcePath
+      // ~user (with username) is NOT expanded — treated as a literal relative segment
+      // per Node's nodePath convention to avoid surprising operators with implicit
+      // username lookups.
+      let resourcePath: string;
+      let absolutePath: string;
+      if (catKey === "plugins") {
+        const pluginSource = (qr.resource as { source: { kind: string; path: string } }).source;
+        resourcePath = pluginSource.path;
+        if (resourcePath.startsWith("openrig-home:") && nodePath.isAbsolute(resourcePath.slice("openrig-home:".length))) {
+          errors.push(`Plugin "${qr.effectiveId}": openrig-home: requires a relative path.`);
+          return { ok: false, errors };
+        }
+        absolutePath = resolvePluginPath(resourcePath, qr.sourcePath, OPENRIG_HOME);
+      } else {
+        resourcePath = (qr.resource as { path: string }).path;
+        absolutePath = nodePath.resolve(qr.sourcePath, resourcePath);
+      }
+
+      const entry: ProjectionEntry = {
+        category: catSingular,
+        effectiveId: qr.effectiveId,
+        sourceSpec: qr.sourceSpec,
+        sourcePath: qr.sourcePath,
+        resourcePath,
+        absolutePath,
+        classification: "safe_projection",
+      };
+
+      if (catKey === "runtimeResources") {
+        entry.resourceType = (qr.resource as { type?: string }).type;
+      }
+
+      if (catKey === "plugins") {
+        const pluginRes = qr.resource as { pluginType?: "claude" | "codex" | "auto" };
+        entry.pluginType = pluginRes.pluginType ?? "auto";
+      }
+
+      // Guidance-specific
+      if (catKey === "guidance") {
+        const g = qr.resource as { target?: string; merge?: string };
+        entry.target = g.target;
+        entry.mergeStrategy = g.merge as "managed_block" | "append" | undefined;
+      }
+
+      // Classify using hash-based conflict detection
+      if (input.resolveTargetPath) {
+        const targetPath = input.resolveTargetPath(catSingular, qr.effectiveId, config.cwd, entry.absolutePath);
+        if (targetPath) {
+          // P17 dir-shaped realism: a skill source is a DIRECTORY — compare the
+          // representative SKILL.md (readFile on a dir would throw the classifier
+          // into a false hash_conflict). File-shaped sources compare as-is.
+          const skillRep = `${entry.absolutePath}/SKILL.md`;
+          const compareSource =
+            catSingular === "skill" && fsOps.exists(skillRep) ? skillRep : entry.absolutePath;
+          entry.classification = classifyResourceProjection(
+            compareSource,
+            targetPath,
+            catSingular,
+            entry.mergeStrategy,
+            fsOps,
+            input.lastHashLookup,
+          );
+          if (entry.classification === "hash_conflict") {
+            entry.conflictDetail = {
+              reason: `${catSingular} "${qr.effectiveId}" exists at target with different content`,
+            };
+          } else if (entry.classification === "operator_conflict") {
+            // P20 — the target diverges from BOTH our last projection AND the new
+            // source → operator edit. Protect it (a conflict, not an overwrite).
+            entry.conflictDetail = {
+              reason: `${catSingular} "${qr.effectiveId}" was modified after OpenRig last projected it (operator edit?) — not overwriting; move it aside or fold it into the spec, then re-project`,
+            };
+          }
+        }
+      }
+      // Without resolveTargetPath, classification stays safe_projection (deferred to adapter)
+
+      entries.push(entry);
+    }
+  }
+
+  // Sort deterministically: by category then effectiveId
+  entries.sort((a, b) => {
+    const catCmp = a.category.localeCompare(b.category);
+    return catCmp !== 0 ? catCmp : a.effectiveId.localeCompare(b.effectiveId);
+  });
+
+  // P20 — operator_conflict PROTECTS (a real conflict); stale_overwrite is SAFE
+  // (falls through to applied, silently — it's our own old output being refreshed).
+  const conflicts = entries.filter(
+    (e) => e.classification === "hash_conflict" || e.classification === "operator_conflict",
+  );
+  const noOps = entries.filter((e) => e.classification === "no_op");
+
+  return {
+    ok: true,
+    plan: {
+      runtime: config.runtime,
+      cwd: config.cwd,
+      entries,
+      startup: config.startup,
+      conflicts,
+      noOps,
+      diagnostics,
+    },
+  };
+}
+
+// -- Ambiguity guard --
+
+function checkAmbiguity(selected: ResolvedResources, collisions: ResourceCollision[]): string[] {
+  const errors: string[] = [];
+
+  // Check each category separately — collisions are category-scoped
+  const categoryEntries: Array<{ category: string; resources: QualifiedResource[] }> = [
+    { category: "skills", resources: selected.skills },
+    { category: "guidance", resources: selected.guidance },
+    { category: "subagents", resources: selected.subagents },
+    { category: "plugins", resources: selected.plugins },
+    { category: "runtimeResources", resources: selected.runtimeResources },
+  ];
+
+  for (const { category, resources } of categoryEntries) {
+    for (const qr of resources) {
+      // Only check unqualified ids (no colon)
+      if (qr.effectiveId.includes(":")) continue;
+
+      // Find matching collision IN THE SAME CATEGORY
+      const collision = collisions.find((c) => c.category === category && c.resourceId === qr.effectiveId);
+      if (!collision || collision.sources.length < 2) continue;
+
+      // Check if base owns the unqualified id
+      const baseOwner = collision.sources.find((s) => s.qualifiedId === collision.resourceId);
+      if (baseOwner) continue; // base owns it — not ambiguous
+
+      // No base owner — import/import ambiguity
+      errors.push(
+        `Ambiguous resource "${qr.effectiveId}" in selected resources: declared by ${collision.sources.map((s) => s.specName).join(", ")}. Use a qualified id like "${collision.sources[0]!.qualifiedId}"`
+      );
+    }
+  }
+
+  return errors;
+}
+
+// Classification is now handled via classifyResourceProjection from conflict-detector.ts
+// when resolveTargetPath is provided. Without it, entries default to safe_projection.
+
+/**
+ * Resolve a plugin source.path to a concrete absolute path.
+ * Four forms supported:
+ *   - absolute (`/abs/...`)        → preserved exactly
+ *   - tilde-home (`~/...` or `~`)  → expanded to os.homedir()
+ *   - OpenRig home (`openrig-home:plugins/...`) → configured daemon home
+ *   - relative (`plugins/...`)     → resolved against specSourcePath
+ * `~user/...` (with explicit username) is NOT expanded; treated as a
+ * literal relative segment per Node's nodePath convention.
+ */
+export function resolvePluginPath(rawPath: string, specSourcePath: string, openrigHome: string = OPENRIG_HOME): string {
+  if (rawPath.startsWith("openrig-home:")) return nodePath.resolve(openrigHome, rawPath.slice("openrig-home:".length));
+  if (rawPath === "~") return os.homedir();
+  if (rawPath.startsWith("~/")) return nodePath.join(os.homedir(), rawPath.slice(2));
+  if (nodePath.isAbsolute(rawPath)) return rawPath;
+  return nodePath.resolve(specSourcePath, rawPath);
+}
+
+// ── P17 (finding A2): the PRODUCTION conflict-target resolver + loud surfacing ──
+
+/** Map a projection entry to the concrete FILE the claude adapter would write,
+ *  for hash-conflict detection. Mirrors claude-code-adapter.resolveTargetDir:
+ *  categories whose write is a merge or a whole directory return null —
+ *  their classification stays deferred to the adapter, exactly as before. */
+export function claudeConflictTargetPath(
+  category: string,
+  effectiveId: string,
+  cwd: string,
+  sourcePath?: string,
+  managedBlockFile: ClaudeManagedBlockFile = DEFAULT_CLAUDE_MANAGED_BLOCK_FILE,
+): string | null {
+  switch (category) {
+    case "skill":
+      return nodePath.join(cwd, ".claude", "skills", effectiveId, "SKILL.md");
+    case "subagent":
+      return sourcePath ? nodePath.join(cwd, ".claude", "agents", nodePath.basename(sourcePath)) : null;
+    case "guidance":
+      return nodePath.join(cwd, managedBlockFile);
+    default:
+      return null; // plugin / runtime_resource: merged or dir-shaped — deferred
+  }
+}
+
+/** Render plan conflicts as LOUD instantiate warnings: the file, the reason,
+ *  and the consequence stated plainly. Restores the warnings-site threading the
+ *  4.8 restack dropped — a divergent target is never silently overwritten again
+ *  (it is overwritten WITH a named warning; manifest-based operator-vs-stale
+ *  discrimination is the routed follow-on). */
+export function projectionConflictWarnings(plan: Pick<ProjectionPlan, "conflicts">): string[] {
+  return plan.conflicts.map((c) => {
+    const reason = c.conflictDetail?.reason ?? `${c.category} "${c.effectiveId}" diverges from the projection source`;
+    if (c.classification === "operator_conflict") {
+      // P20 PROTECT: the manifest tells us the target diverged from BOTH our last
+      // write and the source — an operator edited it. filterProtectedProjections
+      // holds the file back, so "not overwritten" is now TRUE (not just a warning).
+      return `projection conflict: ${reason} — PROTECTED: the target is NOT overwritten; re-run projection with --force to overwrite it, or fold the operator edit into the spec source`;
+    }
+    // hash_conflict — the P17 fallback: no projection manifest for this target yet,
+    // so an operator edit can't be told apart from a stale projection. We overwrite
+    // WITH a warning (softened, transitional): the write records the manifest, and a
+    // future divergence then classifies operator_conflict and becomes protectable.
+    return `projection conflict: ${reason} — no projection manifest for this target yet, so an operator edit can't be told apart from a stale projection; the target will be overwritten by re-projection (the write records the manifest, making future edits protectable). If this is an operator edit, move it aside or fold it into the spec source`;
+  });
+}
+
+/** P20 atom-4 — PROTECT. An operator_conflict means the target diverged from BOTH
+ *  our last recorded write and the current source: an operator edited a projected
+ *  file. Hold those files back from delivery so the adapter never overwrites the
+ *  edit — unless the operator explicitly forces re-projection. hash_conflict (no
+ *  manifest yet) is NOT protected: it stays the P17 overwrite-with-warning fallback,
+ *  since operator-vs-stale can't be told apart without a recorded last hash.
+ *  Returns the files to deliver and the files held back (for reporting). */
+export function filterProtectedProjections(
+  files: ResolvedStartupFile[],
+  plan: Pick<ProjectionPlan, "conflicts">,
+  opts?: { force?: boolean },
+): { delivered: ResolvedStartupFile[]; protected: ResolvedStartupFile[] } {
+  if (opts?.force) return { delivered: [...files], protected: [] };
+  const protectedRoots = new Set(
+    plan.conflicts
+      .filter((c) => c.classification === "operator_conflict")
+      .map((c) => c.absolutePath),
+  );
+  if (protectedRoots.size === 0) return { delivered: [...files], protected: [] };
+  const delivered: ResolvedStartupFile[] = [];
+  const held: ResolvedStartupFile[] = [];
+  for (const f of files) {
+    // skill targets live at <entry.absolutePath>/SKILL.md; file-shaped targets
+    // match the entry path directly. Match either shape so a held-back skill's
+    // SKILL.md is caught by its parent-dir entry.
+    const matches = protectedRoots.has(f.absolutePath) || protectedRoots.has(nodePath.dirname(f.absolutePath));
+    (matches ? held : delivered).push(f);
+  }
+  return { delivered, protected: held };
+}

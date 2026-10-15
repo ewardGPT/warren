@@ -1,0 +1,60 @@
+import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+
+const read = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8");
+
+describe("polish-8 demo-readiness source guards", () => {
+  it("LiveNodeDetails uses tab-owned body content and compact terminal preview", () => {
+    const src = read("../src/components/LiveNodeDetails.tsx");
+    expect(src).not.toContain("LiveIdentityDisplay");
+    expect(src).toContain("data-testid=\"live-node-tab-body\"");
+    // OPR.0.4.0.1: the inline terminal is the reusable progressive component
+    // (default-static -> click-to-live under the global cap), not a direct
+    // always-live FocusedTerminal.
+    expect(src).toContain("ProgressiveTerminal");
+    expect(src).toContain("bg-stone-950/65");
+  });
+
+  it("TimelineTab renders a newest-first connected step tree", () => {
+    const src = read("../src/components/slices/tabs/TimelineTab.tsx");
+    expect(src).toContain("data-testid=\"story-step-tree\"");
+    expect(src).toContain("data-order=\"newest-first\"");
+    expect(src).toContain("story-step-connector");
+    expect(src).toContain("timestampSortValue(b.ts) - timestampSortValue(a.ts)");
+  });
+
+  it("Slice Overview and Artifacts are distinct surfaces", () => {
+    const src = read("../src/components/project/ScopePages.tsx");
+    // OPR.0.4.6.MH2 guard-B1: the signature gained the remoteGated gate.
+    expect(src).toContain("function SliceOverviewTab({ detail, remoteGated }");
+    expect(src).toContain("slice-overview-summary");
+    // OPR.0.4.1 AC-4-FF: the slice Artifacts surface IS the ArtifactsNavigator (file
+    // navigator at slice altitude); the prior Files/Commits/Docs/Decisions card wall
+    // (SliceArtifactsTab) is removed — Commits flagged 0.4.2, Decisions live in Story.
+    // OPR.0.4.6.MH2 guard-B1: the mount gained the selection-known files gate.
+    expect(src).toContain("<ArtifactsNavigator scopePath={filesAllowed ? detail.slicePath : null}");
+    expect(src).not.toContain("function SliceArtifactsTab");
+    expect(src).not.toContain("slice-artifacts-commits");
+  });
+
+  it("TopologyTab reaches the React Flow workflow graph instead of the adjacency panel", () => {
+    const topologySrc = read("../src/components/slices/tabs/TopologyTab.tsx");
+    const graphSrc = read("../src/components/slices/tabs/SliceWorkflowGraph.tsx");
+    expect(topologySrc).toContain("const runtimeGraph = specGraph ?? deriveRuntimeGraph(affectedRigs);");
+    expect(topologySrc).toContain("{runtimeGraph && <SliceWorkflowGraph specGraph={runtimeGraph} />}");
+    expect(topologySrc).toContain("function deriveRuntimeGraph");
+    expect(topologySrc).not.toContain("function SpecGraphPanel");
+    expect(graphSrc).toContain("ReactFlow");
+    expect(graphSrc).toContain("dagre.layout");
+    expect(graphSrc).toContain("RegistrationMarks");
+  });
+
+  it("SliceWorkflowGraph single-sources rendered node dimensions with dagre layout dimensions", () => {
+    const graphSrc = read("../src/components/slices/tabs/SliceWorkflowGraph.tsx");
+    expect(graphSrc.match(/\b200\b/g) ?? []).toHaveLength(1);
+    expect(graphSrc.match(/\b112\b/g) ?? []).toHaveLength(1);
+    expect(graphSrc).toContain("style={{ width: NODE_WIDTH, height: NODE_HEIGHT }}");
+    expect(graphSrc).not.toContain("w-[200px]");
+    expect(graphSrc).not.toContain("h-[112px]");
+  });
+});

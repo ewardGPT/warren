@@ -1,0 +1,754 @@
+import { Command } from "commander";
+import { execSync } from "node:child_process";
+import { readFileSync, writeFileSync, existsSync, accessSync, constants, mkdirSync } from "node:fs";
+import path from "node:path";
+import { homedir } from "node:os";
+import { shellQuote } from "../cross-host-executor.js";
+import { fileURLToPath } from "node:url";
+import { parseDocument } from "yaml";
+import { runDoctorChecks, type DoctorDeps } from "./doctor.js";
+import { resolveDaemonPath } from "../daemon-lifecycle.js";
+import { ConfigStore } from "../config-store.js";
+import { buildTmuxControlFailure, probeTmuxControl } from "../tmux-health.js";
+import { checkClaudeAuth, checkCodexAuth } from "../provider-auth.js";
+
+export interface SetupStep {
+  id: string;
+  status: "pass" | "applied" | "warn" | "fail" | "skipped";
+  message: string;
+  reason?: string;
+  fixHint?: string;
+}
+
+export interface VerificationCheck {
+  name: string;
+  status: "pass" | "warn" | "fail" | "skipped";
+  message: string;
+  reason?: string;
+  fix?: string;
+}
+
+export interface RuntimeConfigDisclosure {
+  scope: "global" | "project";
+  runtime: "claude-code" | "codex" | "cmux";
+  path: string;
+  purpose: string;
+}
+
+export interface SetupResult {
+  profile: "core" | "full";
+  platform: string;
+  ready: boolean;
+  steps: SetupStep[];
+  runtimeConfig: RuntimeConfigDisclosure[];
+  verification?: {
+    checks: VerificationCheck[];
+  };
+}
+
+export interface SetupDeps {
+  exec: (cmd: string, opts?: { timeoutMs?: number }) => string;
+  readFile: (path: string) => string | null;
+  writeFile: (path: string, content: string) => void;
+  exists: (path: string) => boolean;
+  mkdirp?: (path: string) => void;
+  platform?: NodeJS.Platform;
+  /** Environment for CODEX_HOME and provider credential checks (default process.env). */
+  env?: NodeJS.ProcessEnv;
+}
+
+// Preserve the setup module's existing selector export.
+export { selectCodexProviderAuth, type CodexProviderAuth } from "../provider-auth.js";
+
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const INSTALL_COMMAND_TIMEOUT_MS = 5 * 60_000;
+const HERDR_INSTALL_COMMAND = "curl -fsSL https://herdr.dev/install.sh | sh";
+
+const CORE_STEP_IDS = [
+  "brew",
+  "tmux_install",
+  "herdr_install",
+  "ghostty_install",
+  "claude_install",
+  "claude_auth",
+  "codex_install",
+  "codex_auth",
+  "tmux_config",
+  "verify",
+];
+const FULL_EXTRA_STEP_IDS = ["jq_install", "gh_install"];
+const BREW_PLATFORM_SKIP = "Skipped: Homebrew setup path is only used on macOS.";
+/** Homebrew is only used by the macOS setup path. Herdr also installs on Linux. */
+const NON_DARWIN_DRY_RUN_SKIPS: Record<string, string> = {
+  brew: BREW_PLATFORM_SKIP,
+};
+const BASE_RUNTIME_CONFIG_DISCLOSURE: RuntimeConfigDisclosure[] = [
+  // OPR.0.4.8.2 agnostic rip-out: OpenRig no longer writes ~/.claude/settings.json — the global
+  // permission allow-list (C2) is removed, so that global file is no longer touched at all.
+  {
+    scope: "global",
+    runtime: "claude-code",
+    path: "~/.claude.json or <CLAUDE_CONFIG_DIR>/.claude.json",
+    purpose: "Pre-trust managed workspaces and mark Claude onboarding complete. Explicit permission modes use the launch-selected HOME/config; classic startup uses the daemon home.",
+  },
+  {
+    scope: "project",
+    runtime: "claude-code",
+    path: ".claude/settings.local.json",
+    purpose:
+      "Apply context-collector statusLine config and the acceptEdits floor fragment. The team and kernel launch defaults pass allow/ask lists per launch and save none; a selected Claude settings fragment can merge native settings, rules included; the harness-native permissions are the control surface.",
+  },
+  {
+    scope: "project",
+    runtime: "claude-code",
+    path: ".mcp.json",
+    purpose: "Apply selected Claude MCP runtime-resource fragments.",
+  },
+  {
+    scope: "global",
+    runtime: "codex",
+    path: "$CODEX_HOME/config.toml (default: ~/.codex/config.toml)",
+    purpose: "Pre-trust managed workspaces and apply selected Codex config runtime-resource fragments.",
+  },
+];
+
+export function defaultDeps(): SetupDeps {
+  return {
+    exec: (cmd: string, opts?: { timeoutMs?: number }) =>
+      execSync(cmd, {
+        encoding: "utf-8",
+        timeout: opts?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+    readFile: (p: string) => { try { return readFileSync(p, "utf-8"); } catch { return null; } },
+    writeFile: (p: string, c: string) => writeFileSync(p, c, "utf-8"),
+    exists: (p: string) => existsSync(p),
+    mkdirp: (p: string) => mkdirSync(p, { recursive: true }),
+  };
+}
+
+function installCommand(deps: SetupDeps, cmd: string): string {
+  return deps.exec(cmd, { timeoutMs: INSTALL_COMMAND_TIMEOUT_MS });
+}
+
+/** Probe without starting a server or taking over the installing terminal. */
+function findHerdrCommand(deps: SetupDeps): string | null {
+  const env = deps.env ?? process.env;
+  const installDir = env["HERDR_INSTALL_DIR"] ?? path.join(env["HOME"] ?? homedir(), ".local", "bin");
+  for (const command of ["herdr", shellQuote(path.join(installDir, "herdr"))]) {
+    try {
+      deps.exec(`${command} --version`);
+      return command;
+    } catch { /* Try the installer's default path if it is not on PATH. */ }
+  }
+  return null;
+}
+
+function installHerdr(deps: SetupDeps, platform: NodeJS.Platform): SetupStep {
+  if (platform !== "darwin" && platform !== "linux") {
+    return { id: "herdr_install", status: "skipped", message: "Automatic herdr installation is supported on macOS and Linux." };
+  }
+  let command = findHerdrCommand(deps);
+  const present = command !== null;
+  try {
+    if (!command) {
+      installCommand(deps, HERDR_INSTALL_COMMAND);
+      command = findHerdrCommand(deps);
+      if (!command) throw new Error("The installer returned, but the herdr binary could not be verified.");
+    }
+    return {
+      id: "herdr_install",
+      status: present ? "pass" : "applied",
+      message: `${present ? "Found" : "Installed"} herdr (${command}). No terminal or view was opened.`,
+      ...(command !== "herdr" ? { fixHint: `Use ${command} when opening the view, or add its directory to your shell PATH.` } : {}),
+    };
+  } catch (err) {
+    return {
+      id: "herdr_install", status: "warn",
+      message: `Could not install or verify herdr: ${(err as Error).message}`,
+      reason: "The OpenRig view can use plain tmux without herdr. Existing cmux workflows remain available.",
+      fixHint: `Retry \`${HERDR_INSTALL_COMMAND}\`, or follow https://herdr.dev/docs/install/.`,
+    };
+  }
+}
+
+/** The installing agent asks once; only an explicit Yes installs the optional Mac terminal. */
+function installGhostty(deps: SetupDeps, platform: NodeJS.Platform, choice?: boolean): SetupStep {
+  const id = "ghostty_install";
+  if (platform !== "darwin") return { id, status: "skipped", message: "The Ghostty offer is for macOS; existing Linux terminals remain available." };
+  if (choice === false) return { id, status: "skipped", message: "Ghostty declined (--no-ghostty). Terminal.app remains available." };
+  const home = (deps.env ?? process.env)["HOME"] ?? homedir();
+  const locations = ["/Applications/Ghostty.app", path.join(home, "Applications/Ghostty.app")];
+  if (locations.some(deps.exists)) return { id, status: "pass", message: "Ghostty is already installed. No terminal was opened." };
+  if (choice !== true) return {
+    id, status: "skipped",
+    message: "Installing agent: ask once, 'Install Ghostty for the OpenRig view?'",
+    fixHint: "On Yes, rerun rig setup with --ghostty, preserving earlier choices such as --no-herdr and --providers. On No, use --no-ghostty; Terminal.app remains available. The person types no command.",
+  };
+  try {
+    installCommand(deps, "brew install --cask ghostty");
+    if (!locations.some(deps.exists)) throw new Error("The installer returned, but Ghostty.app was not found.");
+    return { id, status: "applied", message: "Installed Ghostty. No terminal was opened." };
+  } catch (err) {
+    return { id, status: "fail", message: `Could not install or verify Ghostty: ${(err as Error).message}`,
+      fixHint: "Check Homebrew and https://ghostty.org/docs/install/binary. Terminal.app remains available; no view was opened." };
+  }
+}
+
+// Slice-03 Lane B (OPR.0.4.8) onboarding RECORD path. RULING-C (b4913ed4): the v1 onboarding menu
+// EDITS/RECORDS a deliberate policy choice into an EXISTING RigSpec only — a NEW INSTALL has no spec,
+// so nothing is written and the floor holds by ABSENCE. Persistence is the RigSpec `permission_policy`
+// field ONLY (P6 fence: no config.json / daemon-state widening). The record is a least-destructive
+// YAML edit (parse -> set the one key -> serialize), never a codec re-emit that could drop keys.
+//   chosen built-in  -> permission_policy: builtin:<name>   (Seam-B ref semantics)
+//   deliberate-none  -> permission_policy: none             (origin deliberate_none; floor==absent)
+// P3: the record runs ONLY on an explicit --policy selection, NEVER on skip/quit/timeout (no flag =>
+// no step => bare setup byte-unchanged). P1: no path here upgrades an absent spec to deliberate_none.
+export const POLICY_CHOICES = ["locked", "standard", "open", "yolo", "auto", "none"] as const;
+export type PolicyChoice = (typeof POLICY_CHOICES)[number];
+
+// Root-spec filenames, matching the CLI's established file-or-directory spec convention
+// (see specs.ts resolveAddSpecSource + `rig up <source>`).
+const ROOT_SPEC_NAMES = ["rig.yaml", "rig.yml", "agent.yaml", "agent.yml"];
+
+function policyRefFor(choice: PolicyChoice): string {
+  // Deliberate-none is the explicit reserved value; every built-in name carries the MANDATORY
+  // `builtin:` prefix (bare canonical names never resolve — anti-shadowing, policy-ref.ts A1).
+  return choice === "none" ? "none" : `builtin:${choice}`;
+}
+
+/**
+ * Resolve `specPath` to a readable EXISTING root spec file, or null. Accepts a direct file path or a
+ * directory containing a root spec. Uses deps.readFile as the read+existence probe (null = absent), so
+ * the resolver stays fs-injectable and never mints a spec — RULING-C: no scaffold-authoring here.
+ */
+export function resolveExistingSpecPath(deps: SetupDeps, specPath: string): string | null {
+  if (deps.readFile(specPath) !== null) return specPath;
+  for (const name of ROOT_SPEC_NAMES) {
+    const candidate = path.join(specPath, name);
+    if (deps.readFile(candidate) !== null) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Record a deliberate policy choice into an existing spec, returning the `policy_record` SetupStep.
+ * Only called when the operator explicitly passed --policy (P3). Unknown choice or no resolvable
+ * existing spec => a `fail` step and NOTHING is written (P1 + RULING-C new-install-writes-nothing).
+ */
+export function recordPermissionPolicyStep(deps: SetupDeps, choice: string, specPath: string | undefined): SetupStep {
+  if (!(POLICY_CHOICES as readonly string[]).includes(choice)) {
+    return {
+      id: "policy_record",
+      status: "fail",
+      message: `Unknown policy choice '${choice}'.`,
+      reason: `--policy must be one of: ${POLICY_CHOICES.join(", ")}.`,
+      fixHint: `Re-run with --policy <${POLICY_CHOICES.join("|")}>.`,
+    };
+  }
+
+  const resolved = specPath ? resolveExistingSpecPath(deps, specPath) : null;
+  if (!resolved) {
+    return {
+      id: "policy_record",
+      status: "fail",
+      message: "No existing rig spec to record the policy into.",
+      reason:
+        "The onboarding menu records a policy choice into an EXISTING spec only. A new install has no spec, so nothing is written — team seats keep the team default.",
+      fixHint: "Point --spec at an existing rig.yaml (or a directory containing one), then re-run `rig setup --policy`.",
+    };
+  }
+
+  const ref = policyRefFor(choice as PolicyChoice);
+  try {
+    const raw = deps.readFile(resolved) ?? "";
+    // Comment-preserving least-destructive edit: parseDocument retains comment TEXT (top + inline),
+    // key ORDER, QUOTING, and STRUCTURE; we set ONLY the permission_policy key and re-serialize. (Honest
+    // API limit: pre-`#` padding may normalize — this is a text/structure preserve, not a byte-image of
+    // arbitrary whitespace.) A plain parse->stringify would DROP every comment — pinned by the test above.
+    const doc = parseDocument(raw);
+    doc.set("permission_policy", ref);
+    deps.writeFile(resolved, String(doc));
+  } catch (err) {
+    return {
+      id: "policy_record",
+      status: "fail",
+      message: `Could not record the policy into ${resolved}: ${(err as Error).message}`,
+      reason: "The spec could not be parsed or written; no partial change was applied.",
+      fixHint: "Repair the spec YAML, then re-run `rig setup --policy`.",
+    };
+  }
+
+  return {
+    id: "policy_record",
+    status: "applied",
+    message:
+      choice === "none"
+        ? `Recorded a deliberate no-policy choice (permission_policy: none) into ${resolved}.`
+        : `Recorded permission_policy: ${ref} into ${resolved}.`,
+  };
+}
+
+export type SetupProvider = "claude" | "codex";
+const PROVIDER_LABELS: Record<SetupProvider, string> = { claude: "Claude Code", codex: "Codex" };
+
+/** `--providers`: the person's choice, comma-separated (`claude`, `codex`, `claude,codex` or `both`). */
+export function parseSetupProviders(value: string): SetupProvider[] | { error: string } {
+  const names = value.split(",").map((name) => name.trim().toLowerCase()).filter(Boolean);
+  const chosen = new Set<SetupProvider>();
+  for (const name of names) {
+    if (name === "both") { chosen.add("claude"); chosen.add("codex"); }
+    else if (name === "claude" || name === "codex") chosen.add(name);
+    else return { error: `Unknown provider '${name}' in --providers: use claude, codex, or both.` };
+  }
+  if (chosen.size === 0) return { error: "--providers needs claude, codex, or both." };
+  return [...chosen];
+}
+
+/** A provider the person didn't choose is left out: not installed, not checked, and never failed. */
+function notSelectedSteps(provider: SetupProvider, chosen: readonly SetupProvider[]): SetupStep[] {
+  const label = PROVIDER_LABELS[provider];
+  const choice = chosen.map((p) => PROVIDER_LABELS[p]).join(" and ");
+  return [
+    { id: `${provider}_install`, status: "skipped", message: `Not selected: the person chose ${choice} (--providers), so ${label} is not installed here.` },
+    { id: `${provider}_auth`, status: "skipped", message: `Not selected: ${label} sign-in is not needed for this choice.` },
+  ];
+}
+
+export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?: boolean; policy?: string; specPath?: string; herdr?: boolean; ghostty?: boolean; providers?: readonly SetupProvider[]; doctorDeps?: DoctorDeps }): Promise<SetupResult> {
+  const profile = opts.full ? "full" : "core";
+  const platform = deps.platform ?? process.platform;
+  const runtimeConfig = [...BASE_RUNTIME_CONFIG_DISCLOSURE];
+  const stepIds = opts.full ? [...CORE_STEP_IDS, ...FULL_EXTRA_STEP_IDS] : [...CORE_STEP_IDS];
+  const steps: SetupStep[] = [];
+  // No --providers: both are checked, as before. With it, only the chosen ones.
+  const selected = (provider: SetupProvider) => !opts.providers || opts.providers.includes(provider);
+
+  if (opts.dryRun) {
+    for (const id of stepIds) {
+      const provider = (["claude", "codex"] as const).find((p) => id === `${p}_install` || id === `${p}_auth`);
+      if (provider && !selected(provider)) {
+        steps.push(notSelectedSteps(provider, opts.providers!).find((step) => step.id === id)!);
+        continue;
+      }
+      const platformSkip = id === "herdr_install" && opts.herdr === false ? "Skipped: herdr installation declined (--no-herdr)."
+        : id === "herdr_install" && !["darwin", "linux"].includes(platform) ? "Automatic herdr installation is supported on macOS and Linux."
+        : id === "ghostty_install" ? (platform !== "darwin" ? "The Ghostty offer is for macOS."
+          : opts.ghostty === false ? "Ghostty declined (--no-ghostty)."
+          : opts.ghostty === true ? "Dry run: Ghostty installation would be attempted."
+          : "Dry run: the installing agent offers Ghostty once; only Yes installs it.")
+        : platform !== "darwin" ? NON_DARWIN_DRY_RUN_SKIPS[id] : undefined;
+      steps.push({ id, status: "skipped", message: platformSkip ?? `Dry run: ${id} would be attempted.` });
+    }
+    if (opts.policy !== undefined) {
+      steps.push({ id: "policy_record", status: "skipped", message: `Dry run: would record permission_policy for '${opts.policy}'.` });
+    }
+    return { profile, platform, ready: false, steps, runtimeConfig };
+  }
+
+  // Core steps
+  // 1. Homebrew (macOS-first setup path)
+  let brewOk = false;
+  if (platform !== "darwin") {
+    steps.push({
+      id: "brew",
+      status: "skipped",
+      message: BREW_PLATFORM_SKIP,
+    });
+  } else {
+    try {
+      deps.exec("brew --version");
+      brewOk = true;
+      steps.push({ id: "brew", status: "pass", message: "Homebrew available." });
+    } catch {
+      steps.push({
+        id: "brew",
+        status: "fail",
+        message: "Homebrew not found.",
+        reason: "Homebrew is required to install tmux on macOS.",
+        fixHint: "Install Homebrew: https://brew.sh",
+      });
+    }
+  }
+
+  // 2. tmux
+  const tmuxProbe = probeTmuxControl((cmd) => deps.exec(cmd));
+  if (tmuxProbe.code === "not_installed") {
+    if (!brewOk) {
+      steps.push({ id: "tmux_install", status: "skipped", message: "Skipped: Homebrew not available.", reason: "tmux install requires Homebrew." });
+    } else {
+      try {
+        installCommand(deps, "brew install tmux");
+        steps.push({ id: "tmux_install", status: "applied", message: "Installed tmux with Homebrew." });
+      } catch (err) {
+        steps.push({ id: "tmux_install", status: "fail", message: `Failed to install tmux: ${(err as Error).message}` });
+      }
+    }
+  } else if (!tmuxProbe.available) {
+    const failure = buildTmuxControlFailure(tmuxProbe.detail ?? "unknown tmux control failure");
+    steps.push({
+      id: "tmux_install",
+      status: "fail",
+      message: failure.message,
+      reason: failure.reason,
+      fixHint: failure.fix,
+    });
+  } else {
+    steps.push({ id: "tmux_install", status: "pass", message: "tmux available." });
+  }
+
+  // 3. Herdr is the default view provider. Leave optional cmux installations untouched.
+  steps.push(opts.herdr === false
+    ? { id: "herdr_install", status: "skipped", message: "Skipped: herdr installation declined (--no-herdr)." }
+    : installHerdr(deps, platform));
+  steps.push(installGhostty(deps, platform, opts.ghostty));
+
+  // 4. Claude Code runtime
+  if (!selected("claude")) steps.push(...notSelectedSteps("claude", opts.providers!));
+  else {
+    let claudeInstalled = false;
+    try {
+      deps.exec("claude --version");
+      claudeInstalled = true;
+      steps.push({ id: "claude_install", status: "pass", message: "Claude Code available." });
+    } catch {
+      try {
+        installCommand(deps, "npm install -g @anthropic-ai/claude-code");
+        deps.exec("claude --version");
+        claudeInstalled = true;
+        steps.push({ id: "claude_install", status: "applied", message: "Installed Claude Code with npm." });
+      } catch (err) {
+        steps.push({
+          id: "claude_install",
+          status: "fail",
+          message: `Failed to install Claude Code: ${(err as Error).message}`,
+          reason: "Claude Code seats need the Claude CLI; a Codex-only project can use its own runtime readiness result.",
+          fixHint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`.",
+        });
+      }
+    }
+
+    const { name: claudeName, fix: claudeFix, ...claudeAuth } = checkClaudeAuth(deps, claudeInstalled);
+    steps.push({ id: claudeName, ...claudeAuth, ...(claudeFix ? { fixHint: claudeFix } : {}) });
+  }
+
+  // 5. Codex runtime
+  if (!selected("codex")) steps.push(...notSelectedSteps("codex", opts.providers!));
+  else {
+    let codexInstalled = false;
+    try {
+      deps.exec("codex --version");
+      codexInstalled = true;
+      steps.push({ id: "codex_install", status: "pass", message: "Codex available." });
+    } catch {
+      try {
+        installCommand(deps, "npm install -g @openai/codex");
+        deps.exec("codex --version");
+        codexInstalled = true;
+        steps.push({ id: "codex_install", status: "applied", message: "Installed Codex with npm." });
+      } catch (err) {
+        steps.push({
+          id: "codex_install",
+          status: "fail",
+          message: `Failed to install Codex: ${(err as Error).message}`,
+          reason: "Codex seats need the Codex CLI installed on this machine.",
+          fixHint: "Install Codex with `npm install -g @openai/codex`.",
+        });
+      }
+    }
+
+    const { name: codexName, fix: codexFix, ...codexAuth } = checkCodexAuth(deps, codexInstalled);
+    steps.push({ id: codexName, ...codexAuth, ...(codexFix ? { fixHint: codexFix } : {}) });
+  }
+
+  // 6. tmux config
+  const TMUX_CONF = `${process.env["HOME"] ?? "~"}/.tmux.conf`;
+  const MANAGED_MARKER = "# OpenRig managed block";
+  const MANAGED_BLOCK = [
+    MANAGED_MARKER,
+    "set -g mouse on",
+    "set -g history-limit 50000",
+    `# End ${MANAGED_MARKER}`,
+  ].join("\n");
+
+  try {
+    const existing = deps.readFile(TMUX_CONF);
+    if (existing && existing.includes(MANAGED_MARKER)) {
+      // Replace existing managed block
+      const replaced = existing.replace(
+        new RegExp(`${MANAGED_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?# End ${MANAGED_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+        MANAGED_BLOCK,
+      );
+      deps.writeFile(TMUX_CONF, replaced);
+      steps.push({ id: "tmux_config", status: "applied", message: "Updated OpenRig managed tmux config block." });
+    } else if (existing) {
+      deps.writeFile(TMUX_CONF, existing.trimEnd() + "\n\n" + MANAGED_BLOCK + "\n");
+      steps.push({ id: "tmux_config", status: "applied", message: "Appended OpenRig managed tmux config block." });
+    } else {
+      deps.writeFile(TMUX_CONF, MANAGED_BLOCK + "\n");
+      steps.push({ id: "tmux_config", status: "applied", message: "Created .tmux.conf with OpenRig managed block." });
+    }
+  } catch (err) {
+    steps.push({ id: "tmux_config", status: "warn", message: `Could not update tmux config: ${(err as Error).message}` });
+  }
+
+  // 7. Verify
+  const tmuxOk = steps.some((s) => s.id === "tmux_install" && (s.status === "pass" || s.status === "applied"));
+  const anyFail = steps.some((s) => s.status === "fail");
+  steps.push({
+    id: "verify",
+    status: anyFail ? "warn" : "pass",
+    message: anyFail ? "Some setup steps failed; follow their Fix hints." : "Core setup verified.",
+  });
+
+  // Full profile extras
+  if (opts.full) {
+    for (const tool of [{ id: "jq_install", cmd: "jq", brew: "jq" }, { id: "gh_install", cmd: "gh", brew: "gh" }]) {
+      try {
+        deps.exec(`${tool.cmd} --version`);
+        steps.push({ id: tool.id, status: "pass", message: `${tool.cmd} available.` });
+      } catch {
+        if (!brewOk) {
+          steps.push({ id: tool.id, status: "skipped", message: `Skipped: Homebrew not available.` });
+        } else {
+          try {
+            installCommand(deps, `brew install ${tool.brew}`);
+            steps.push({ id: tool.id, status: "applied", message: `Installed ${tool.cmd} with Homebrew.` });
+          } catch {
+            steps.push({ id: tool.id, status: "warn", message: `Failed to install ${tool.cmd}.`, fixHint: `Install ${tool.cmd} manually.` });
+          }
+        }
+      }
+    }
+  }
+
+  // Run doctor-backed verification if not dry-run and doctorDeps available
+  let verification: SetupResult["verification"];
+  if (!opts.dryRun && opts.doctorDeps) {
+    const doctorDeps = opts.doctorDeps;
+    // Reuse the post-install facts above; do not repeat login probes during verification.
+    const providerChecks = steps
+      .filter((step) => ["claude_install", "claude_auth", "codex_install", "codex_auth"].includes(step.id))
+      .map(({ id, status, fixHint, ...check }) => ({
+        name: id, status: status === "applied" ? "pass" as const : status,
+        ...check, ...(fixHint ? { fix: fixHint } : {}),
+      }));
+    const doctor = runDoctorChecks(doctorDeps, providerChecks);
+    const asyncResults = await Promise.all(doctor.asyncChecks);
+    const allDoctorChecks = [...doctor.checks, ...asyncResults];
+    verification = {
+      checks: allDoctorChecks.map((c) => ({
+        name: c.name,
+        status: c.status,
+        message: c.message,
+        ...(c.reason ? { reason: c.reason } : {}),
+        ...(c.fix ? { fix: c.fix } : {}),
+      })),
+    };
+  }
+
+  // P3: record a deliberate policy choice ONLY when --policy was explicitly passed (never on a bare
+  // run). No flag => no policy_record step => bare setup byte-unchanged (anchor 1).
+  if (opts.policy !== undefined) {
+    steps.push(recordPermissionPolicyStep(deps, opts.policy, opts.specPath));
+  }
+
+  // ready = no fail statuses in steps or verification checks
+  const stepsFailed = steps.some((s) => s.status === "fail");
+  const verificationFailed = verification?.checks.some((c) => c.status === "fail") ?? false;
+  const ready = !stepsFailed && !verificationFailed;
+  return { profile, platform, ready, steps, runtimeConfig, ...(verification ? { verification } : {}) };
+}
+
+function buildDefaultDoctorDeps(setupDeps: SetupDeps): DoctorDeps {
+  const platform = setupDeps.platform ?? process.platform;
+  const baseDir = path.dirname(path.dirname(fileURLToPath(new URL(import.meta.url))));
+  return {
+    exists: setupDeps.exists,
+    baseDir,
+    readFile: setupDeps.readFile,
+    exec: setupDeps.exec,
+    checkPort: async (port: number) => {
+      const net = await import("node:net");
+      return new Promise<boolean>((resolve) => {
+        const socket = new net.default.Socket();
+        socket.once("connect", () => { socket.destroy(); resolve(false); });
+        socket.once("error", () => resolve(true));
+        socket.connect(port, "127.0.0.1");
+      });
+    },
+    configStore: new ConfigStore(),
+    platform: platform as NodeJS.Platform,
+    mkdirp: (p: string) => mkdirSync(p, { recursive: true }),
+    checkWritable: (p: string) => accessSync(p, constants.W_OK),
+    fetch: globalThis.fetch,
+  };
+}
+
+/**
+ * OPR.0.3.3.04.2 (AC-1): the ONE canonical ordered golden path over EXISTING
+ * verbs - no magic mega-command, no hidden state. `rig setup` prints this as its
+ * next-steps; `rig status`/`rig doctor` only HINT back to it; the durable
+ * reference is docs/reference/getting-started.md. Returns the lines to print.
+ */
+export function goldenPathNextSteps(): string[] {
+  return [
+    "Finish installing (full reference: rig context get reference/getting-started.md). Once setup has applied, steps 2 to 5 are",
+    "  part of the install, not extras: do them without stopping to ask whether to go on",
+    "  1. Check only selected logins: claude auth status or codex login status; one working provider is enough",
+    "  2. rig daemon start                 If stopped. Starting OpenRig finishes the install; it is not a step beyond setup",
+    "     A fresh instance also starts the kernel, including operator and advisor",
+    "     The kernel is part of installation. Keep it for normal setup; --no-kernel is for automation or when requested",
+    "  3. rig status                       Read the kernel boot state; rig ps --nodes --rig kernel checks its seats",
+    "     Started is not ready. The view may open while agents finish starting; report their actual state",
+    "     For an existing kernel or blocked startup: rig context get reference/getting-started.md#incomplete-setup-and-restart",
+    "  4. Show the person OpenRig: open the OpenRig TUI and operator for them now. Say so first; it's the next step, not a question",
+    "     It opens a NEW terminal tab/window, or a space in their current Herdr, and preserves this terminal",
+    "     rig terminal open saved:kernel --window --json (TUI and operator, advisor on its own tab; herdr, otherwise plain tmux)",
+    "     rig context get reference/getting-started.md#open-the-kernel-conversations",
+    "     If they said not now: give the command to open it later. Over headless SSH: ask the person to open a new terminal/tab and give the exact connection/attach command",
+    "     Herdr needs a terminal the person can see; switching the shared TUI to :terminals does not open one",
+    "     No, SSH and headless use are fine background outcomes; do not report an unseen window as opened",
+    "     On a desktop, no copying or typing for the person; check the result notes, not just CLI success",
+    "     On a Mac, offer Ghostty once: on Yes run rig setup --ghostty; preserve earlier choices such as --no-herdr and --providers",
+    "     On No use --no-ghostty; Terminal.app remains available",
+    "     Setup installs herdr by default; use --no-herdr if the person declines. Plain tmux remains available",
+    "     Only if the window cannot open: rig tui --shared is the dashboard-only fallback, not the operator's conversation",
+    "     If opening fails, inspect any new surface before retrying; report the error and finish the local action",
+    "     Do not replace a failed desktop action with commands for the person to copy or type",
+    "  5. Installing agent: ask the person's goal and project folder, then hand them to the ready operator",
+    "     Find operator.agent with rig ps --nodes --rig kernel --json; use its canonicalSessionName with rig send",
+    "     Send the goal and folder, or have the person type them in the operator pane; show where it answers",
+    "     In the message, say: This is the agent that installed OpenRig. The person will answer in your pane",
+    "     Do not implement the person's project yourself. The operator helps them choose and start a team",
+    "     If the person gives you a goal later, forward it and the folder with rig send; leave the work with the operator's team",
+    "     Finish installation when the operator is ready and the person is talking to it; daemon health alone is not completion",
+    "     If they choose to talk later, leave the exact connection step and name the pending handoff",
+    "     The operator handles team choice, launch and goal delivery. The installing agent stops at the handoff",
+    "  Manual path (without the operator):",
+    "  1. Pick a first team, then cd <your-repository>",
+    "     Teams: starter (a Claude builder and a Codex reviewer), workshop (a rig bundle) or factory (seven agents)",
+    "     With one provider, use a team adapted to it; first-project is starter's old name",
+    "     Preview rig up <team> --cwd . --plan; with your yes, rig up <team> --cwd .",
+    "     rig ps --nodes --rig <team> checks the project seats before giving them work",
+    "  2. rig send dev-build@starter '<one useful change, boundaries, and how to check it>' (workshop, factory: orch-lead@<team>)",
+    "  Next: rig queue list --destination dev-build@starter; rig workspace doctor; rig scope ...; rig workflow specs",
+  ];
+}
+
+/**
+ * Slice-03 Lane B (OPR.0.4.8) onboarding menu copy. The 0.4.8 lineage has no TUI, so the "menu" is
+ * calm-register narrative text presenting the permission-policy choice. Copy is FROZEN + founder-picked
+ * (missions/.../MENU-COPY-FROZEN-2026-08-04): verbatim `Policy Mode`/`YOLO Mode` labels, the NAME
+ * "Operator" never appears (YOLO Mode is the user-facing label for it), the exact deliberate-none and
+ * skip-line phrasing, NO pre-selected default, and `Standard` carries the ⭐ recommendation marker.
+ * REGISTER RULE (pm-lead): factual + version-neutral — never "treacherous"/editorializing/
+ * founder-internal wording. Recording is a thought, never a gate — `rig up` always works bare.
+ * 0.6.7: the question, the deliberate-none line and the skip line now state the team launch default
+ * (#893) that ships with 0.6.6, matching docs/reference/getting-started.md and the
+ * applying-a-permission-policy skill. The labels, marker and register are unchanged.
+ */
+export function permissionPolicyMenuLines(): string[] {
+  return [
+    "Before team launch, your agent recommends keeping the team default (reuse an existing explicit choice):",
+    "  Claude team seats with no policy or explicit seat choice run ordinary rig commands, project reads and common tests without prompts; lifecycle commands such as rig up and rig down still ask.",
+    "  Only if you want more, it offers once: Remember these selected OpenRig commands in your native settings for this project?",
+    "  Yes / No — keep the team default. No answer leaves settings unchanged too.",
+    "  A remembered allowance can cover all rig verbs, but Claude team seats still ask before lifecycle commands; not global YOLO or authority to invent work.",
+    "  Personal project scope unless you explicitly choose user-wide sessions. On Yes, the agent adds native rules, preserving stricter rules.",
+    "  Procedure: rig context get skills/applying-a-permission-policy/SKILL.md",
+    "  Undo: ask your agent to remove only the OpenRig command allowances added by this setup.",
+    "  This printed guidance collects no answer and writes no native rules; --policy below is a separate spec choice.",
+    "",
+    "Permission policy (optional — recording is a thought, not a gate; `rig up` always works without one):",
+    "  Policy Mode:",
+    "    Locked            The most restrictive built-in policy.",
+    "    Standard  ⭐      The recommended balanced built-in policy.",
+    "    Open              The least restrictive built-in policy.",
+    "  YOLO Mode           The full-bypass built-in policy.",
+    "  No policy — deliberate choice (recorded): the floor, without the team allowances",
+    "",
+    "  If you skip: nothing is recorded; team seats launch with the team default unless a seat choice or named Codex profile applies",
+    "",
+    "  To record a choice into an existing spec:",
+    "    rig setup --policy <locked|standard|open|yolo|auto|none> --spec <path>",
+  ];
+}
+
+export function setupCommand(depsOverride?: SetupDeps): Command {
+  const cmd = new Command("setup").description("Prepare the machine for OpenRig");
+
+  cmd
+    .option("--dry-run", "Show the plan without making changes")
+    .option("--json", "Machine-readable JSON output")
+    .option("--full", "Install broader operator workstation tools")
+    .option("--no-herdr", "Skip the default herdr installation; the OpenRig view can use plain tmux")
+    .option("--ghostty", "Install Ghostty on macOS after the person accepts the offer")
+    .option("--no-ghostty", "Decline Ghostty; Terminal.app remains available on macOS")
+    .option("--providers <list>", "The person's provider choice: claude, codex, or both. One not chosen is skipped (not installed or checked), never failed")
+    .option("--policy <name>", `Record a deliberate permission-policy choice into an existing spec (${POLICY_CHOICES.join("|")})`)
+    .option("--spec <path>", "Existing rig spec (file or directory) to record the --policy choice into")
+    .action(async (opts: { dryRun?: boolean; json?: boolean; full?: boolean; herdr?: boolean; ghostty?: boolean; providers?: string; policy?: string; spec?: string }) => {
+      const providers = opts.providers === undefined ? undefined : parseSetupProviders(opts.providers);
+      if (providers && "error" in providers) {
+        console.error(providers.error);
+        process.exitCode = 1;
+        return;
+      }
+      const deps = depsOverride ?? defaultDeps();
+      const doctorDeps = opts.dryRun ? undefined : buildDefaultDoctorDeps(deps);
+      const result = await runSetup(deps, { dryRun: opts.dryRun, full: opts.full, policy: opts.policy, specPath: opts.spec, herdr: opts.herdr, ghostty: opts.ghostty, providers, doctorDeps });
+
+      if (opts.json) {
+        console.log(JSON.stringify({ ...result, nextSteps: goldenPathNextSteps() }, null, 2));
+        if (!opts.dryRun && !result.ready) process.exitCode = 1;
+        return;
+      }
+
+      console.log(`\nProfile: ${result.profile}`);
+      console.log(`Platform: ${result.platform}\n`);
+      console.log("OpenRig may modify runtime config in these locations:");
+      for (const item of result.runtimeConfig) {
+        console.log(`  - [${item.scope}] ${item.runtime} ${item.path} — ${item.purpose}`);
+      }
+      console.log("  - Note: already-running adopted sessions may need restart to pick up runtime config changes.\n");
+
+      for (const step of result.steps) {
+        const icon = step.status === "pass" ? "OK" : step.status === "applied" ? "APPLIED" : step.status === "warn" ? "WARN" : step.status === "skipped" ? "SKIP" : "FAIL";
+        console.log(`  [${icon}] ${step.id}: ${step.message}`);
+        if (step.reason) console.log(`       Why: ${step.reason}`);
+        if (step.fixHint) console.log(`       Fix: ${step.fixHint}`);
+      }
+      if (!providers) {
+        console.log("\n  Providers: setup installs and checks both Claude Code and Codex. If the person chose one, pass it,");
+        console.log("  for example rig setup --providers claude; the other then reads not selected instead of failed.");
+      }
+
+      // OPR.0.3.3.04.2 (AC-1): the canonical ordered golden path. `rig setup` is
+      // the primary surface for the new-operator sequence (status/doctor only
+      // HINT back to it; the durable reference is docs/reference/getting-started.md).
+      if (result.ready) {
+        console.log("\nSetup complete.\n");
+      } else {
+        console.log("\nSome steps need attention:");
+        if (opts.dryRun) console.log("Plan only: no setup changes were made; readiness was not checked.");
+        for (const step of result.steps.filter(step => step.status === "fail")) {
+          console.log(`  ${step.id}: ${step.message}`);
+          if (step.fixHint) console.log(`    Fix: ${step.fixHint}`);
+        }
+        console.log("Only the harnesses selected for your project need a login; an unused harness does not (rerun with --providers to leave it out).");
+        console.log("Run `rig doctor` to recheck the system and provider authentication.");
+      }
+      // Keep the conversation route available even after a dry run or incomplete setup,
+      // before the optional menu so a short output read still includes the handoff.
+      console.log("");
+      for (const line of goldenPathNextSteps()) console.log(line);
+
+      // This printed menu records no choice and changes no native permissions.
+      console.log("");
+      for (const line of permissionPolicyMenuLines()) console.log(line);
+      if (!opts.dryRun && !result.ready) process.exitCode = 1;
+    });
+
+  return cmd;
+}

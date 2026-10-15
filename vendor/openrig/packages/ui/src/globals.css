@@ -1,0 +1,687 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@layer base {
+  :root {
+    /* Vellum Paper — "The Tactical Dossier" */
+    /* Reference: docs/design/design-v2-vellum-paper/code.md */
+
+    /* Paper surfaces */
+    --background: 47 20% 97%;           /* #faf9f5 — base paper */
+    --surface-container-lowest: 0 0% 100%;  /* #ffffff — card bodies */
+    --surface-container-low: 80 10% 95%;    /* #f3f4ef — secondary panels */
+    --surface-container: 80 10% 92%;        /* #ecefe8 — mid containers */
+    --surface-container-high: 100 10% 89%;  /* #e5e9e2 — active workspaces */
+    --surface-container-highest: 100 10% 87%; /* #dfe4dc — highest elevation */
+
+    /* Ink */
+    --on-surface: 120 8% 19%;           /* #2e342e — primary text */
+    --on-surface-variant: 108 5% 36%;   /* #5b615a — secondary text */
+
+    /* Technical annotations */
+    --secondary: 213 15% 39%;           /* hsl(var(--secondary)) — lines, crosshairs, edge connectors */
+    --secondary-container: 220 39% 91%; /* #d8e3fa */
+
+    /* Stamped alerts */
+    --tertiary: 1 63% 42%;              /* #b12d2a — red ink stamps, critical */
+    --error: 0 43% 44%;                 /* #9f403d */
+
+    /* Interactive */
+    --primary: 0 1% 37%;               /* #5f5e5e — primary actions */
+    --inverse-surface: 120 10% 4%;     /* #0d0f0d — dark fills, header stripes */
+
+    /* Borders */
+    --outline: 108 4% 47%;              /* #767c75 */
+    --outline-variant: 108 4% 68%;      /* #aeb4ac — ghost borders at 15% */
+
+    /* Success */
+    --success: 145 63% 35%;             /* #21955a */
+
+    /* shadcn compatibility */
+    --foreground: var(--on-surface);
+    --foreground-muted: var(--on-surface-variant);
+    --border: var(--outline-variant);
+    --input: var(--outline);
+    --ring: var(--secondary);
+    --radius: 0px;
+
+    --card: var(--surface-container-lowest);
+    --card-foreground: var(--on-surface);
+    --popover: var(--surface-container-lowest);
+    --popover-foreground: var(--on-surface);
+    --muted: var(--surface-container-low);
+    --muted-foreground: var(--on-surface-variant);
+
+    --destructive: var(--tertiary);
+    --destructive-foreground: 0 0% 100%;
+    --warning: 40 90% 50%;
+    --accent: var(--secondary);
+  }
+
+  * {
+    border-color: hsl(var(--outline-variant) / 0.15);
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--on-surface));
+    font-family: "Inter", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* Blueprint dot grid — the paper texture */
+    background-image: radial-gradient(#d1d1cf 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+
+  ::selection {
+    background-color: hsl(var(--secondary) / 0.2);
+    color: hsl(var(--on-surface));
+  }
+}
+
+/* === REGISTRATION MARKS === */
+/* 8px L-shaped crosshairs at container corners, in secondary blue */
+
+@layer components {
+  .reg-mark { position: relative; }
+  .reg-mark::before,
+  .reg-mark::after,
+  .reg-mark > .reg-tl::before,
+  .reg-mark > .reg-tl::after { content: ''; position: absolute; background-color: hsl(var(--secondary)); }
+
+  .reg-tl { position: absolute; top: 0; left: 0; width: 0; height: 0; }
+  .reg-tl::before { content: ''; position: absolute; top: 0; left: 0; width: 1px; height: 8px; background-color: hsl(var(--secondary)); }
+  .reg-tl::after  { content: ''; position: absolute; top: 0; left: 0; width: 8px; height: 1px; background-color: hsl(var(--secondary)); }
+
+  .reg-tr { position: absolute; top: 0; right: 0; width: 0; height: 0; }
+  .reg-tr::before { content: ''; position: absolute; top: 0; right: 0; width: 1px; height: 8px; background-color: hsl(var(--secondary)); }
+  .reg-tr::after  { content: ''; position: absolute; top: 0; right: 0; width: 8px; height: 1px; background-color: hsl(var(--secondary)); }
+
+  .reg-bl { position: absolute; bottom: 0; left: 0; width: 0; height: 0; }
+  .reg-bl::before { content: ''; position: absolute; bottom: 0; left: 0; width: 1px; height: 8px; background-color: hsl(var(--secondary)); }
+  .reg-bl::after  { content: ''; position: absolute; bottom: 0; left: 0; width: 8px; height: 1px; background-color: hsl(var(--secondary)); }
+
+  .reg-br { position: absolute; bottom: 0; right: 0; width: 0; height: 0; }
+  .reg-br::before { content: ''; position: absolute; bottom: 0; right: 0; width: 1px; height: 8px; background-color: hsl(var(--secondary)); }
+  .reg-br::after  { content: ''; position: absolute; bottom: 0; right: 0; width: 8px; height: 1px; background-color: hsl(var(--secondary)); }
+}
+
+/* === VELLUM OVERLAYS === */
+
+@layer components {
+  .vellum {
+    background: rgba(255, 255, 255, 0.4);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+  .vellum-heavy {
+    background: rgba(255, 255, 255, 0.7);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+  }
+
+  /* Crosshair marks inside vellum sheets */
+  .crosshair { position: relative; }
+  .crosshair::before {
+    content: ''; position: absolute;
+    top: 50%; left: -5px; right: -5px;
+    height: 0.5px; background: hsl(var(--secondary)); opacity: 0.5;
+  }
+  .crosshair::after {
+    content: ''; position: absolute;
+    left: 50%; top: -5px; bottom: -5px;
+    width: 0.5px; background: hsl(var(--secondary)); opacity: 0.5;
+  }
+}
+
+/* === HARD SHADOWS === */
+
+@layer components {
+  .hard-shadow { box-shadow: 2px 2px 0px #2e342e; }
+  .hard-shadow-light { box-shadow: 4px 4px 0px hsl(var(--surface-container-high)); }
+  .hard-shadow-hover:hover { box-shadow: 1px 1px 0px #2e342e; translate: 1px 1px; }
+}
+
+/* === VELLUM BACK-LAYER AMBIENT DRIFT ===
+   Slow continuous translate/rotate animations for back-layer shapes
+   in the Dashboard / VellumLab. Defined OUTSIDE any @layer wrapper —
+   Tailwind's tree-shaker can drop keyframes-inside-@layer in some
+   PostCSS configurations, causing the animation to never apply.
+   Three variants so shapes drift independently. */
+
+@keyframes vellum-drift-a {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  50%      { transform: translate3d(50px, -36px, 0) rotate(2deg) scale(1.04); }
+}
+@keyframes vellum-drift-b {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  50%      { transform: translate3d(-44px, 42px, 0) rotate(-2.5deg) scale(1.05); }
+}
+@keyframes vellum-drift-c {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  50%      { transform: translate3d(36px, 48px, 0) rotate(1.6deg) scale(0.96); }
+}
+
+.vellum-drift-a { animation: vellum-drift-a 18s ease-in-out infinite; will-change: transform; transform-origin: center; }
+.vellum-drift-b { animation: vellum-drift-b 24s ease-in-out infinite; will-change: transform; transform-origin: center; }
+.vellum-drift-c { animation: vellum-drift-c 21s ease-in-out infinite; will-change: transform; transform-origin: center; }
+
+/* Seamless horizontal scroll for back-layer patterns. The pattern
+   author makes the SVG 2× viewport-wide with a periodic wave whose
+   period equals viewport width — translating by -50% (= -1 period)
+   moves the second half into the first half's position, looping
+   without a visible seam. */
+@keyframes vellum-scroll-x {
+  from { transform: translate3d(0, 0, 0); }
+  to   { transform: translate3d(-50%, 0, 0); }
+}
+.vellum-scroll-x { animation: vellum-scroll-x 60s linear infinite; will-change: transform; }
+
+@media (prefers-reduced-motion: reduce) {
+  .vellum-scroll-x { animation: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vellum-drift-a,
+  .vellum-drift-b,
+  .vellum-drift-c {
+    animation: none;
+  }
+}
+
+/* === INKY VELLUM PRINT (Vellum Lab + showcase dashboard) === */
+
+@layer components {
+  /* Subtle paper-grain "ink-on-vellum" texture for top-layer card
+     surfaces. Uses a faint SVG-noise tile so cards feel printed
+     rather than rendered. The grain is very subtle by design — it
+     must NOT compete with text legibility, only set the haptic
+     paper feel that the founder reference (declassified vellum
+     dossier) implies. */
+  .vellum-card-inky {
+    background-image:
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='1.4' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.06 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    background-blend-mode: multiply;
+  }
+
+  /* Inky text — micro text-shadow that mimics the way laser-printer
+     ink bleeds slightly into vellum paper fibers. Not a glow; the
+     bleed is asymmetric (offset by ~0.3px) and dark, so the eye
+     reads it as physical ink, not a UI effect. */
+  .inky-text {
+    text-shadow:
+      0.3px 0.3px 0 rgba(0, 0, 0, 0.18),
+      -0.2px -0.2px 0 rgba(0, 0, 0, 0.06);
+  }
+
+  /* Heavier ink-bleed for very large display headlines (the WELCOME
+     BACK / RIG·OS scale). The reference's massive ANGEL(s*) word
+     has visible ink-grain — this is our static approximation. */
+  .inky-display {
+    text-shadow:
+      0.6px 0.6px 0 rgba(0, 0, 0, 0.22),
+      -0.4px -0.4px 0 rgba(0, 0, 0, 0.08),
+      0 0 0.5px rgba(0, 0, 0, 0.4);
+  }
+}
+
+/* === STAMPS === */
+
+@layer components {
+  .stamp-watermark {
+    position: absolute;
+    pointer-events: none;
+    z-index: 0;
+    border: 4px solid hsl(var(--tertiary));
+    color: hsl(var(--tertiary));
+    font-family: 'Space Grotesk Variable', 'Space Grotesk', sans-serif;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: -0.02em;
+    transform: rotate(-12deg);
+    opacity: 0.04;
+    padding: 0.5rem 1.5rem;
+  }
+  .stamp-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    border: 1px solid hsl(var(--tertiary) / 0.3);
+    background: hsl(var(--tertiary) / 0.08);
+    color: hsl(var(--tertiary));
+    padding: 0.125rem 0.5rem;
+    font-family: 'JetBrains Mono Variable', monospace;
+    font-size: 9px;
+    font-weight: 700;
+  }
+}
+
+/* === MOTION === */
+
+@layer components {
+  @keyframes status-ping {
+    0% { box-shadow: 0 0 0 0 var(--status-color, hsl(var(--success))); }
+    70% { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+  .status-changed { animation: status-ping 600ms ease-out; }
+
+  @keyframes panel-switch {
+    0% { opacity: 0; }
+    100% { opacity: 1; }
+  }
+  .route-enter { animation: panel-switch 150ms ease-out; }
+
+  @keyframes node-enter {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .node-enter {
+    animation: node-enter 200ms cubic-bezier(0.2, 0, 0, 1) forwards;
+    opacity: 0;
+  }
+
+  @keyframes edge-draw-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .edge-draw-in {
+    animation: edge-draw-in 300ms ease-out forwards;
+    opacity: 0;
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  .shimmer {
+    background: linear-gradient(90deg, hsl(var(--surface-container)) 25%, hsl(var(--surface-container-highest)) 50%, hsl(var(--surface-container)) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 2s ease-in-out infinite;
+  }
+
+  .animate-pulse-tactical {
+    animation: shimmer 2s ease-in-out infinite;
+  }
+}
+
+/* === REACT FLOW === */
+
+@layer components {
+  .react-flow__controls {
+    border: 1px solid hsl(var(--outline-variant) / 0.3) !important;
+    box-shadow: 2px 2px 0px hsl(var(--on-surface) / 0.08) !important;
+    background: hsl(var(--background)) !important;
+  }
+  .react-flow__controls-button {
+    background-color: hsl(var(--background)) !important;
+    border: none !important;
+    border-bottom: 1px solid hsl(var(--outline-variant) / 0.15) !important;
+    fill: hsl(var(--on-surface-variant)) !important;
+  }
+  .react-flow__controls-button:hover {
+    background-color: hsl(var(--surface-container-high)) !important;
+    fill: hsl(var(--on-surface)) !important;
+  }
+  .react-flow__handle {
+    background-color: hsl(var(--secondary)) !important;
+    border: none !important;
+    width: 6px !important;
+    height: 6px !important;
+    border-radius: 50% !important;
+  }
+}
+
+/* === PL-019 ACTIVITY INDICATORS === */
+
+@layer components {
+  /* Subtle slow pulse for the running activity state on RigNode dot.
+     Low-amplitude opacity + box-shadow halo. The brief is explicit:
+     pulses, not blinking — running stays calm and confident, needs_input
+     is the eye-catcher (and stays static color). */
+  @keyframes activity-pulse-running-frames {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.0); }
+    50%      { opacity: 0.85; box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18); }
+  }
+  .activity-pulse-running {
+    animation: activity-pulse-running-frames 1.8s ease-in-out infinite;
+  }
+
+  /* V1 attempt-3 Phase 5 P5-7 — Topology terminal grid pulsing-ring per
+     topology-terminal-view.md L47. Cards for "active" agents (output
+     emitted within polling window) get a pulsing ring around the card;
+     idle cards are neutral. At-a-glance scan signal so the human can
+     spot which agents to attend to without reading every card. */
+  @keyframes terminal-card-active-frames {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.0); }
+    50%      { box-shadow: 0 0 0 3px rgba(167, 139, 250, 0.30); }
+  }
+  .terminal-card-active {
+    animation: terminal-card-active-frames 2.2s ease-in-out infinite;
+  }
+
+  /* PL-019 item 6 — edge animation. One-shot ~1.2s emphasis on edges
+     between source-seat and dest-seat when a queue event fires. React Flow
+     renders edges as SVG <path> wrapped in .react-flow__edge; we toggle
+     classes on the wrapper through the edge `className` prop so the SVG
+     stroke responds without us swapping React Flow's edge component. */
+  .edge-recent-traffic .react-flow__edge-path,
+  .react-flow__edge.edge-recent-traffic .react-flow__edge-path {
+    stroke-width: 3px !important;
+    filter: brightness(1.15);
+    transition: stroke-width 250ms ease-out, filter 250ms ease-out;
+  }
+  .edge-just-fired .react-flow__edge-path,
+  .react-flow__edge.edge-just-fired .react-flow__edge-path {
+    animation: edge-just-fired-frames 1.2s ease-out 1;
+  }
+  @keyframes edge-just-fired-frames {
+    0%   { stroke-width: 3px; filter: brightness(1.6); }
+    60%  { stroke-width: 3px; filter: brightness(1.3); }
+    100% { stroke-width: 3px; filter: brightness(1.15); }
+  }
+
+  @keyframes activity-ring-active-frames {
+    0%, 100% { opacity: 0.58; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.0); }
+    50%      { opacity: 0.92; box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.14); }
+  }
+  @keyframes activity-ring-needs-input-frames {
+    0%, 100% { opacity: 0.72; box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.0); }
+    50%      { opacity: 1; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.22); }
+  }
+  @keyframes activity-ring-blocked-frames {
+    0%, 100% { opacity: 0.78; box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.0); }
+    50%      { opacity: 1; box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.18); }
+  }
+  @keyframes activity-ring-flash-frames {
+    0%   { opacity: 1; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.42); }
+    100% { opacity: 0.82; box-shadow: 0 0 0 5px rgba(16, 185, 129, 0.0); }
+  }
+  @keyframes activity-card-active-frames {
+    0%, 100% {
+      background-color: rgba(220, 252, 231, 0.82);
+      box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(16, 185, 129, 0.16);
+    }
+    50% {
+      background-color: rgba(187, 247, 208, 0.96);
+      box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(16, 185, 129, 0.30);
+    }
+  }
+  @keyframes activity-card-needs-input-frames {
+    0%, 100% {
+      background-color: rgba(254, 243, 199, 0.88);
+      box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(245, 158, 11, 0.22);
+    }
+    50% {
+      background-color: rgba(253, 230, 138, 0.98);
+      box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(245, 158, 11, 0.38);
+    }
+  }
+  @keyframes activity-card-blocked-frames {
+    0%, 100% {
+      background-color: rgba(254, 226, 226, 0.88);
+      box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(220, 38, 38, 0.26);
+    }
+    50% {
+      background-color: rgba(254, 202, 202, 0.96);
+      box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(220, 38, 38, 0.38);
+    }
+  }
+  @keyframes activity-card-source-flash-frames {
+    0% {
+      background-color: rgba(167, 243, 208, 0.98);
+      box-shadow: 2px 2px 0px #2e342e, 0 0 0 5px rgba(16, 185, 129, 0.34), 0 0 24px rgba(16, 185, 129, 0.30);
+    }
+    100% {
+      box-shadow: 2px 2px 0px #2e342e, 0 0 0 0 rgba(16, 185, 129, 0);
+    }
+  }
+  @keyframes activity-card-target-flash-frames {
+    0% {
+      background-color: rgba(110, 231, 183, 1);
+      box-shadow: 2px 2px 0px #2e342e, 0 0 0 7px rgba(16, 185, 129, 0.42), 0 0 32px rgba(16, 185, 129, 0.38);
+    }
+    100% {
+      box-shadow: 2px 2px 0px #2e342e, 0 0 0 0 rgba(16, 185, 129, 0);
+    }
+  }
+  .activity-card-surface {
+    background-color: rgba(255, 255, 255, 0.72);
+  }
+  .activity-card-active {
+    background-color: rgba(220, 252, 231, 0.88);
+    box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(16, 185, 129, 0.18);
+  }
+  .activity-card-needs-input {
+    background-color: rgba(254, 243, 199, 0.92);
+    box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(245, 158, 11, 0.24);
+  }
+  .activity-card-blocked {
+    background-color: rgba(254, 226, 226, 0.92);
+    box-shadow: 2px 2px 0px #2e342e, inset 0 0 0 1px rgba(220, 38, 38, 0.28);
+  }
+  .activity-card-active:not(.activity-card-reduced-motion) {
+    animation: activity-card-active-frames 2.4s ease-in-out infinite;
+  }
+  .activity-card-needs-input:not(.activity-card-reduced-motion) {
+    animation: activity-card-needs-input-frames 2.1s ease-in-out infinite;
+  }
+  .activity-card-blocked:not(.activity-card-reduced-motion) {
+    animation: activity-card-blocked-frames 3.4s ease-in-out infinite;
+  }
+  .activity-card-source-flash:not(.activity-card-reduced-motion) {
+    animation: activity-card-source-flash-frames 760ms ease-out 1;
+  }
+  .activity-card-target-flash:not(.activity-card-reduced-motion) {
+    animation: activity-card-target-flash-frames 900ms ease-out 1;
+  }
+  .activity-ring-active {
+    animation: activity-ring-active-frames 2.2s ease-in-out infinite;
+  }
+  .activity-ring-needs-input {
+    animation: activity-ring-needs-input-frames 1.9s ease-in-out infinite;
+  }
+  .activity-ring-blocked {
+    animation: activity-ring-blocked-frames 3.2s ease-in-out infinite;
+  }
+  .activity-ring-source-flash,
+  .activity-ring-target-flash {
+    animation: activity-ring-flash-frames 700ms ease-out 1;
+  }
+
+  /* OPR.0.4.1.26 — BRIGHTEN while a handoff is live; the 450ms ease-out is the
+     explicit SETTLE: when the packet expires the class drops and the edge eases
+     back to static (a calm settle on camera, not an abrupt snap). */
+  .hot-potato-edge-active .react-flow__edge-path,
+  .react-flow__edge.hot-potato-edge-active .react-flow__edge-path {
+    filter: drop-shadow(0 0 7px rgba(16, 185, 129, 0.55)) !important;
+    stroke: #059669 !important;
+    stroke-width: 4px !important;
+    transition: stroke-width 450ms ease-out, filter 450ms ease-out, stroke 450ms ease-out;
+    vector-effect: non-scaling-stroke;
+  }
+  .hot-potato-packet,
+  .hot-potato-packet-cross {
+    filter: drop-shadow(0 0 8px rgba(16, 185, 129, 0.52));
+  }
+  .hot-potato-packet-cross {
+    opacity: 0.86;
+    filter: drop-shadow(0 0 6px rgba(120, 113, 108, 0.36));
+  }
+  /* OPR.0.4.1.26 — DIRECTION: the dashed overlay marches source -> destination
+     by driving stroke-dashoffset negative (toward the path end). CSS only. */
+  .hot-potato-flow {
+    animation: hot-potato-flow-frames 650ms linear infinite;
+    filter: drop-shadow(0 0 3px rgba(16, 185, 129, 0.45));
+  }
+  .hot-potato-flow-cross {
+    animation-duration: 900ms;
+    filter: drop-shadow(0 0 3px rgba(120, 113, 108, 0.4));
+  }
+  @keyframes hot-potato-flow-frames {
+    from { stroke-dashoffset: 0; }
+    to   { stroke-dashoffset: -13; }
+  }
+
+  @keyframes rig-activity-frame-frames {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.0); }
+    50%      { box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.12); }
+  }
+  .rig-activity-frame-pulse {
+    animation: rig-activity-frame-frames 2.4s ease-in-out infinite;
+  }
+}
+
+/* === REDUCED MOTION === */
+
+@media (prefers-reduced-motion: reduce) {
+  .status-changed,
+  .route-enter,
+  .node-enter,
+  .edge-draw-in,
+  .shimmer,
+  .animate-pulse-tactical,
+  .activity-pulse-running,
+  .terminal-card-active,
+  .edge-just-fired,
+  .hot-potato-flow,
+  .activity-ring-active,
+  .activity-ring-needs-input,
+  .activity-ring-blocked,
+  .activity-ring-source-flash,
+  .activity-ring-target-flash,
+  .activity-card-active,
+  .activity-card-needs-input,
+  .activity-card-blocked,
+  .activity-card-source-flash,
+  .activity-card-target-flash,
+  .rig-activity-frame-pulse {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ============================================================================
+   === OPR.0.4.3.29 — VELLUM DARK (the first new theme) ===
+   ----------------------------------------------------------------------------
+   PART A — the `.dark {}` token block. Founder-approved "Vellum Dark" palette
+   (source: slice 29 twin-mockup dark-theme.css Part A, pasted verbatim). It
+   re-declares the same token names `:root` (above) defines with dark values; the
+   `hsl(var(--token))` cascade then flips every token-backed component. Scoped
+   under `.dark`, so this is INERT until the `.dark` class is on <html> — light
+   (`:root`) stays pixel-identical when dark is off (the regression floor).
+
+   Palette principle (founder + PRD): NOT a mechanical invert. Warm-vellum hue
+   family preserved (a dark tactical dossier); backgrounds drop to low lightness,
+   ink rises, and SATURATED accents (blue / red / green) get HIGHER lightness so
+   contrast holds on the dark ground. FLAT / RECESSED elevation — the lightest
+   surface ≈ black; depth is carried by borders + the hard-shadow offset, not a
+   rising gray ramp.
+
+   NOTE ON SCOPE (Part B / token-bypass inventory): the mockup's Part B (raw
+   Tailwind palette utilities in components — bg-white/NN, bg-stone-*, text-stone-*,
+   border-stone-*) is a BYPASS INVENTORY, not shipped here as a shim. It is
+   delivered as a finding doc for a follow-up per-component token conversion. The
+   `.dark` variants below fix ONLY the escape hatches that are hardcoded WITHIN
+   this stylesheet (co-located with their light rule = the real fix, not a
+   `[class*="bg-white/"]` override hack). See the slice PART-B bypass inventory.
+   ========================================================================== */
+
+.dark {
+  /* Paper surfaces → warm charcoal. FLAT / RECESSED (do NOT ramp lighter per
+     nesting): base cards sit a hair above the ground; MORE-nested surfaces go
+     DARKER (toward black). Range compressed to 7.5–9.5% L; depth = borders +
+     hard-shadow offset. */
+  --background: 120 8% 7%;                   /* #111311 — warm near-black ground */
+  --surface-container-lowest: 120 6% 9.5%;   /* #171917 — base card: a hair above ground */
+  --surface-container-low: 120 5% 9%;        /* slightly recessed */
+  --surface-container: 120 5% 8.5%;          /* nested panels recede */
+  --surface-container-high: 120 5% 8%;       /* deeper nesting = darker */
+  --surface-container-highest: 120 4% 7.5%;  /* most-nested ≈ ground */
+
+  /* Ink → high lightness, warm-green tint kept. */
+  --on-surface: 100 10% 90%;               /* #e4e8e0 — primary text */
+  --on-surface-variant: 108 6% 66%;        /* #a3a99f — secondary text */
+
+  /* Technical blue — HIGHER L + a touch more sat to read on dark. */
+  --secondary: 213 30% 70%;                /* #92abcf — lines / crosshairs / edges */
+  --secondary-container: 220 24% 24%;      /* #2f3a4c */
+
+  /* Stamped red — saturated → HIGHER lightness in dark. */
+  --tertiary: 2 72% 64%;                   /* #e26562 — critical / destructive ink */
+  --error: 0 62% 62%;                      /* #dc5b5b */
+
+  /* Interactive — primary lifted to a light warm neutral so it reads on dark. */
+  --primary: 100 6% 76%;                   /* #bfc4bd */
+  --inverse-surface: 100 12% 92%;          /* dark theme's "inverse" is now LIGHT */
+
+  /* Borders → mid, subtle on dark. */
+  --outline: 108 5% 40%;                   /* #616b5f */
+  --outline-variant: 108 6% 32%;           /* #4b5349 — ghost borders at 15% opacity */
+
+  /* Success green — HIGHER lightness for dark contrast. */
+  --success: 145 52% 52%;                  /* #43c684 */
+
+  /* Warning amber — slightly brighter for dark. */
+  --warning: 42 92% 60%;                   /* #f6b13a */
+
+  /* shadcn compat aliases reference the base tokens above (var(--…)) → they
+     inherit the dark values automatically (--foreground/--card/--border/--input/
+     --ring/--muted/--destructive/--accent/--popover). */
+  --destructive-foreground: 0 0% 100%;
+}
+
+/* --- Co-located .dark variants for the hardcoded-hex/rgba escape hatches that
+   live in THIS stylesheet (real fix; no component shim). Unlayered rules win
+   over the @layer components light rules; !important is used only where a rule
+   must beat a keyframe animation (activity cards). --- */
+
+/* Hard-shadow ink #2e342e → black depth on dark. */
+.dark .hard-shadow { box-shadow: 2px 2px 0px #000000; }
+.dark .hard-shadow-hover:hover { box-shadow: 1px 1px 0px #000000; }
+
+/* Body dot-grid #d1d1cf (light) → a faint dark dot on the near-black ground. */
+.dark body {
+  background-image: radial-gradient(hsl(120 6% 22%) 1px, transparent 1px);
+}
+
+/* Vellum translucent overlays were white-tinted → tint dark, or they glow white. */
+.dark .vellum { background: rgba(31, 34, 31, 0.5); }
+.dark .vellum-heavy { background: rgba(31, 34, 31, 0.72); }
+
+/* Topology agent-card fills (activity-card-*) hardcode light pastels + animate
+   the same. Founder direction: STATE is a small accent (the activity DOT + the
+   thin inset ring), NOT a full-card wash — node BODIES stay uniformly dark. The
+   !important beats the running keyframe animations (important author > animation
+   in the cascade), so the body holds dark mid-pulse; the inset colored ring in
+   the base rule remains as the small state accent. */
+.dark .activity-card-surface,
+.dark .activity-card-active,
+.dark .activity-card-needs-input,
+.dark .activity-card-blocked {
+  background-color: hsl(var(--surface-container-lowest)) !important;
+}
+
+/* Pod-group slab (founder-handed, HybridTopologyNodes:78). The visible slab surface
+   is the HybridPodGroupNode component div, now tokenized (bg-background/25 +
+   border-outline), so the token cascade carries dark. xyflow v12 puts NO default
+   background on the .react-flow__node-podGroup wrapper (verified against the installed
+   @xyflow/react/dist/style.css — no node-group / custom-type bg rule), but the mockup
+   warned a STACKED react-flow wrapper could carry a light gray in a future default-style
+   change. Defensively force the wrapper transparent under .dark so no stacked light gray
+   can ever win; the component div's own token surface remains the visible fill. Live-browser
+   QC still owns the final visual confirmation of the stacked-layer behavior. */
+.dark .react-flow__node-podGroup { background: transparent !important; }

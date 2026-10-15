@@ -1,0 +1,779 @@
+import { inventoryCaptureOptions, type ShadowCapture } from "../domain/shadow-capture.js";
+import { Hono } from "hono";
+import { observeInventoryHandler } from "../domain/request-phase-observer.js";
+import { getSelfHostId } from "../domain/hosts/fanout-contract.js";
+import type { RigRepository } from "../domain/rig-repository.js";
+import type { SessionRegistry } from "../domain/session-registry.js";
+import type { NodeLauncher } from "../domain/node-launcher.js";
+import type { CmuxAdapter } from "../adapters/cmux.js";
+import type { TmuxAdapter } from "../adapters/tmux.js";
+import type { NodeCmuxService } from "../domain/node-cmux-service.js";
+import type { TranscriptStore } from "../domain/transcript-store.js";
+import type { AgentActivityStore } from "../domain/agent-activity-store.js";
+import type { SeatActivityService } from "../domain/seat-activity-service.js";
+import type { SeatStructuralActivityService } from "../domain/seat-structural-activity-service.js";
+import {
+  attachAgentActivity,
+  attachTerminalActivityAndWork,
+  getNodeInventory,
+  getNodeDetail,
+  getNodeInventoryWithContext,
+  getNodeDetailWithContext,
+} from "../domain/node-inventory.js";
+import type { ContextUsageStore } from "../domain/context-usage-store.js";
+import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
+import type { SessionTransport } from "../domain/session-transport.js";
+import type { PreviewRateLimiter } from "../domain/preview/preview-rate-limiter.js";
+import type { ClaimService } from "../domain/claim-service.js";
+import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
+import { convergeOp } from "../domain/topology-converge.js";
+import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
+import { launchStatusIsRunning } from "../domain/restore-orchestrator.js";
+import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
+import type { MiddlewareHandler } from "hono";
+import type { EventBus } from "../domain/event-bus.js";
+import { validateResumeToken } from "../domain/resume-token-validation.js";
+import type { PermissionDriftReader } from "../domain/permission-drift-observer.js";
+import { ProcessCensus } from "../domain/process-census.js";
+import { CodexThreadIdResolver } from "../domain/codex-thread-id.js";
+import { resolveLiveCodexThreadId } from "../domain/model-divergence/current-generation-record.js";
+import { SeatIdentityStore } from "../domain/seat-identity-store.js";
+import { parseSqliteUtcMs } from "../domain/sqlite-time.js";
+
+const generationCensus = new ProcessCensus({ freshnessMs: 0 }); // coalesce concurrent receipts; recheck each later read
+const generationThreadIds = new CodexThreadIdResolver({ codexHome: process.env.CODEX_HOME || undefined });
+
+function terminalAuthGuard(): MiddlewareHandler {
+  return async (c, next) => {
+    const token = (c.get("terminalBearerToken" as never) as string | null | undefined) ?? null;
+    const mw = authBearerTokenMiddleware({ expectedToken: token });
+    return mw(c, next);
+  };
+}
+
+export const sessionsRoutes = new Hono();
+export const nodesRoutes = new Hono();
+export const sessionAdminRoutes = new Hono();
+
+function getDeps(c: { get: (key: string) => unknown }) {
+  return {
+    shadowCapture: c.get("shadowCapture" as never) as ShadowCapture | undefined,
+    rigRepo: c.get("rigRepo" as never) as RigRepository,
+    sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
+    nodeLauncher: c.get("nodeLauncher" as never) as NodeLauncher,
+    tmuxAdapter: c.get("tmuxAdapter" as never) as TmuxAdapter,
+    cmuxAdapter: c.get("cmuxAdapter" as never) as CmuxAdapter,
+    agentActivityStore: c.get("agentActivityStore" as never) as AgentActivityStore | undefined,
+    seatActivityService: c.get("seatActivityService" as never) as SeatActivityService | undefined,
+    seatStructuralActivityService: c.get("seatStructuralActivityService" as never) as SeatStructuralActivityService | undefined,
+    rigLifecycleService: c.get("rigLifecycleService" as never) as RigLifecycleService | undefined,
+    restoreOrchestrator: c.get("restoreOrchestrator" as never) as RestoreOrchestrator | undefined,
+  };
+}
+
+function narrowLaunchErrorStatus(code: string | undefined): 404 | 409 | 500 {
+  if (code === "rig_not_found" || code === "no_matching_nodes" || code === "snapshot_not_found" || code === "snapshot_wrong_rig" || code === "no_usable_snapshot") return 404;
+  if (code === "snapshot_unusable") return 409;
+  return 500;
+}
+
+// OPR.0.4.3.20 FR-7 (Gap 2a) — build the runtime adapters + fsOps a node-subset
+// launch needs so its pod-aware seats run the SAME resume/continuity verification
+// as a full restore (mirrors routes/snapshots.ts). Without these, launchNodeSubset
+// skipped verification and returned `fresh-primed` — a silent fresh-prime. When no
+// adapters are wired, FR-7's fail-closed lands a resume seat at awaiting-decision.
+async function resumeLaunchOpts(c: { get: (key: string) => unknown }): Promise<{
+  adapters: Record<string, import("../domain/runtime-adapter.js").RuntimeAdapter>;
+  fsOps: { exists(path: string): boolean };
+}> {
+  const adapters = (c.get("runtimeAdapters" as never) as Record<string, import("../domain/runtime-adapter.js").RuntimeAdapter> | undefined) ?? {};
+  const fs = await import("node:fs");
+  return { adapters, fsOps: { exists: (p: string) => fs.existsSync(p) } };
+}
+
+// GET /api/rigs/:rigId/sessions
+sessionsRoutes.get("/", (c) => {
+  const rigId = c.req.param("rigId")!;
+  const { sessionRegistry } = getDeps(c);
+  return c.json(sessionRegistry.getSessionsForRig(rigId));
+});
+
+// GET /api/rigs/:rigId/nodes — node inventory projection
+// ?refresh=true triggers a context-monitor re-sample before responding
+nodesRoutes.get("/", observeInventoryHandler, async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const deps = getDeps(c);
+  const rig = deps.rigRepo.getRig(rigId);
+  if (!rig) return c.json({ error: `Rig "${rigId}" not found. List rigs with: rig ps` }, 404);
+
+  const refresh = c.req.query("refresh") === "true";
+  if (refresh) {
+    const monitor = c.get("contextMonitor" as never) as { pollOnce(): Promise<void> } | undefined;
+    if (monitor) {
+      try {
+        await monitor.pollOnce();
+      } catch (err) {
+        return c.json({
+          error: "Context refresh failed. Stale data may be returned.",
+          code: "context_refresh_failed",
+          detail: err instanceof Error ? err.message : String(err),
+        }, 502);
+      }
+    }
+  }
+
+  const contextUsageStore = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
+  const transcriptStore = c.get("transcriptStore" as never) as TranscriptStore | undefined;
+  const inventory = contextUsageStore
+    ? getNodeInventoryWithContext(deps.rigRepo.db, rigId, contextUsageStore, transcriptStore)
+    : getNodeInventory(deps.rigRepo.db, rigId);
+  // Slice 15 — enrich with the two new orthogonal primitives. Order is
+  // independent (each enrichment reads its own source), so the chain
+  // composes cleanly with attachAgentActivity. The non-inference
+  // contract is preserved at the data layer; this route is purely
+  // assembling the JSON response.
+  // OPR.0.4.3 healthz-wedge amplification fix: cheap by default (no per-node tmux
+  // capture). Opt into the per-node fallback with ?full=true / ?refresh=true — the
+  // latter already implies a fresh sweep above.
+  const full = c.req.query("full") === "true" || refresh;
+  const withActivity = await attachAgentActivity(inventory, {
+    ...inventoryCaptureOptions(deps.rigRepo.db, deps.shadowCapture),
+    tmuxAdapter: deps.tmuxAdapter,
+    activityStore: deps.agentActivityStore,
+    structuralActivity: deps.seatStructuralActivityService,
+    // ACTIVITY D1+D2 — the SAME SeatActivityService instance `attachTerminalActivityAndWork` reads
+    // just below. One observation now feeds both the TERMINAL column and the ACTIVITY verdict.
+    //
+    // They can still DISAGREE, deliberately: TERMINAL projects the cached `isActiveWithinWindow`
+    // computed at POLL time, while ACTIVITY re-ages the raw `lastActivityAt` against the REQUEST
+    // clock. When the tmux read has been failing, `pollSeat` leaves the last record in place, so the
+    // cached boolean can stay `true` long after the pane went quiet — TERMINAL keeps reporting that
+    // stale `true` and ACTIVITY refuses it.
+    //
+    // That divergence IS the stale-cache protection working, not an inconsistency to reconcile. Do
+    // not "fix" it by making ACTIVITY trust the cached boolean again: the re-aging is the guard, and
+    // removing it restores a state where an unavailable observation reads as an affirmative liveness
+    // claim.
+    seatActivity: deps.seatActivityService,
+    captureFallback: full,
+  });
+  const withTerminalAndWork = attachTerminalActivityAndWork(withActivity, {
+    db: deps.rigRepo.db,
+    seatActivity: deps.seatActivityService,
+  });
+  // Slice 13 fix 2 — HOST ATTRIBUTION AT THE SOURCE. A daemon only inventories its own seats, so
+  // every row it serves lives on THIS host; stamping the boot-reconciled self-id here means a
+  // merged multi-host roster stays attributable row-by-row (a roster missing a host is legible as
+  // partial instead of looking authoritative). Explicit null before the boot reconcile: the key is
+  // always present, so "not yet known" is a value, never an absence a consumer can misread.
+  // selfHostId ONLY — never host.name (display-only; the DP4 conflation healthz already refuses).
+  const hostSelfId = getSelfHostId();
+  return c.json(withTerminalAndWork.map((n) => ({ ...n, hostSelfId })));
+});
+
+// GET /api/rigs/:rigId/nodes/:logicalId — node detail
+nodesRoutes.get("/:logicalId", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const logicalId = c.req.param("logicalId")!;
+  const deps = getDeps(c);
+  const rig = deps.rigRepo.getRig(rigId);
+  if (!rig) return c.json({ error: `Rig "${rigId}" not found. List rigs with: rig ps` }, 404);
+  const contextUsageStore = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
+  const detail = contextUsageStore
+    ? getNodeDetailWithContext(deps.rigRepo.db, rigId, logicalId, contextUsageStore)
+    : getNodeDetail(deps.rigRepo.db, rigId, logicalId);
+  if (!detail) return c.json({ error: `Node "${logicalId}" not found in rig "${rigId}". Check node IDs with: rig ps --nodes` }, 404);
+  // Node DETAIL is a single node — the per-node tmux capture is cheap here, so
+  // detail always runs the full fallback (freshest needs_input for the one seat).
+  const [detailWithActivity] = await attachAgentActivity([detail], { ...inventoryCaptureOptions(deps.rigRepo.db, deps.shadowCapture), tmuxAdapter: deps.tmuxAdapter, activityStore: deps.agentActivityStore, seatActivity: deps.seatActivityService, captureFallback: true });
+  const [detailWithTerminalAndWork] = attachTerminalActivityAndWork(detailWithActivity ? [detailWithActivity] : [detail], {
+    db: deps.rigRepo.db,
+    seatActivity: deps.seatActivityService,
+  });
+  Object.assign(detail, {
+    agentActivity: detailWithTerminalAndWork?.agentActivity,
+    terminalActive: detailWithTerminalAndWork?.terminalActive,
+    // ARCH RULING 3a947fb1: serve the raw lastActivityAt fact on node-detail too
+    // (the list route serves the whole entry wholesale) — same per-seat surface.
+    lastActivityAt: detailWithTerminalAndWork?.lastActivityAt,
+    hasAssignedWork: detailWithTerminalAndWork?.hasAssignedWork,
+    pendingWorkCount: detailWithTerminalAndWork?.pendingWorkCount,
+    // Slice 13 fix 2 — same host attribution as the list route (see its comment).
+    hostSelfId: getSelfHostId(),
+  });
+
+  // W3: detail is a single explicit seat, so this read-only filesystem
+  // observation is allowed here. It is deliberately absent from the list path.
+  const observer = c.get("permissionDriftObserver" as never) as PermissionDriftReader | undefined;
+  if (observer) {
+    const row = deps.rigRepo.db.prepare("SELECT id FROM nodes WHERE rig_id = ? AND logical_id = ?")
+      .get(rigId, logicalId) as { id: string } | undefined;
+    if (row) detail.permissionDrift = observer.diagnose(row.id);
+  }
+
+  // PL-019 item 5: surface in-progress qitems on node-detail when the
+  // node has a session name (matches /graph payload's enrichment shape).
+  if (detail.canonicalSessionName) {
+    const rows = deps.rigRepo.db.prepare(
+      `SELECT qitem_id, body, tier
+         FROM queue_items
+         WHERE state = 'in-progress' AND destination_session = ?
+         ORDER BY ts_updated DESC
+         LIMIT 3`
+    ).all(detail.canonicalSessionName) as Array<{ qitem_id: string; body: string; tier: string | null }>;
+    Object.assign(detail, {
+      currentQitems: rows.map((r) => ({
+        qitemId: r.qitem_id,
+        bodyExcerpt: r.body.length > 80 ? `${r.body.slice(0, 80)}…` : r.body,
+        tier: r.tier,
+      })),
+    });
+  }
+
+  // Enrich transcript info from TranscriptStore (not available to pure DB helper)
+  const transcriptStore = c.get("transcriptStore" as never) as TranscriptStore | undefined;
+  if (transcriptStore?.enabled && detail.canonicalSessionName) {
+    const path = transcriptStore.getTranscriptPath(rig.rig.name, detail.canonicalSessionName);
+    detail.transcript = {
+      enabled: true,
+      path,
+      tailCommand: `rig transcript ${detail.canonicalSessionName} --tail 100`,
+    };
+  }
+
+  return c.json(detail);
+});
+
+// POST /api/rigs/:rigId/nodes/:logicalId/launch
+nodesRoutes.post("/:logicalId/launch", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const logicalId = c.req.param("logicalId")!;
+  const { rigRepo, nodeLauncher } = getDeps(c);
+
+  const rig = rigRepo.getRig(rigId);
+  if (!rig) {
+    return c.json({ ok: false, code: "rig_not_found", error: `Rig "${rigId}" not found` }, 404);
+  }
+
+  const node = rig.nodes.find((entry) => entry.logicalId === logicalId || entry.id === logicalId);
+  if (!node) {
+    return c.json({ ok: false, code: "node_not_found", error: `Node "${logicalId}" not found in rig "${rigId}"` }, 404);
+  }
+
+  const body = await c.req.json().catch(() => ({})) as { snapshotId?: string; retryStartupFrom?: { member?: Record<string, unknown>; rigRoot?: string } };
+  if (body.retryStartupFrom !== undefined) {
+    const retry = body.retryStartupFrom;
+    if (body.snapshotId || !retry || !retry.member || typeof retry.member !== "object" || Array.isArray(retry.member) || typeof retry.rigRoot !== "string") {
+      return c.json({ ok: false, code: "invalid_retry", message: "Supply retryStartupFrom.member and an absolute rigRoot, without snapshotId." }, 400);
+    }
+    const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+    if (!instantiator) return c.json({ ok: false, code: "internal_error", message: "Pod instantiator unavailable" }, 500);
+    const result = await instantiator.retryFirstStart(rigId, node.id, retry.member, retry.rigRoot);
+    return c.json(result, result.ok ? 201 : result.code === "failed" ? 500 : 409);
+  }
+
+  if (node.podId) {
+    const { restoreOrchestrator } = getDeps(c);
+    if (!restoreOrchestrator) {
+      return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
+    }
+    const result = await restoreOrchestrator.launchSingleNode(rigId, node.logicalId, { snapshotId: body.snapshotId, ...(await resumeLaunchOpts(c)) });
+    if (!result.ok) {
+      return c.json(result, narrowLaunchErrorStatus(result.code));
+    }
+    const failedTarget = result.failedTargets?.find((n) => n.logicalId === node.logicalId);
+    if (failedTarget) {
+      return c.json({ ok: false, code: "target_liveness_unknown", error: `Target '${node.logicalId}' tmux probe failed (fail-closed). Cannot determine if seat is live.`, failedTargets: result.failedTargets }, 503);
+    }
+    const launchedNode = result.launched?.[0];
+    if (launchedNode) {
+      // OPR.0.4.3.20 FR-7 — a restore that landed awaiting-decision / attention_required
+      // / failed is NOT a successful launch (no session is running). Never report it as
+      // 201 ok:true — surface it honestly so the CLI exits non-zero.
+      if (!launchStatusIsRunning(launchedNode.status)) {
+        return c.json({
+          ok: false, rigId, nodeId: launchedNode.nodeId, logicalId: launchedNode.logicalId,
+          code: launchedNode.status, status: launchedNode.status, error: launchedNode.error,
+          launched: result.launched, held: result.held, warnings: result.warnings,
+          snapshotSelection: result.snapshotSelection, nonTargetEffects: result.nonTargetEffects,
+        }, launchedNode.status === "failed" ? 500 : 409);
+      }
+      return c.json({ ok: true, rigId, nodeId: launchedNode.nodeId, logicalId: launchedNode.logicalId, launched: result.launched, held: result.held, alreadyRunning: result.alreadyRunning, warnings: result.warnings, snapshotSelection: result.snapshotSelection, nonTargetEffects: result.nonTargetEffects }, 201);
+    }
+    const alreadyRunningNode = result.alreadyRunning?.find((n) => n.logicalId === node.logicalId);
+    if (alreadyRunningNode) {
+      return c.json({ ok: true, rigId, nodeId: alreadyRunningNode.nodeId, logicalId: alreadyRunningNode.logicalId, code: "already_running", launched: result.launched, held: result.held, alreadyRunning: result.alreadyRunning, snapshotSelection: result.snapshotSelection, nonTargetEffects: result.nonTargetEffects });
+    }
+    return c.json(result);
+  }
+
+  const result = await nodeLauncher.launchNode(rigId, logicalId);
+
+  if (!result.ok) {
+    const status = result.code === "node_not_found" ? 404
+      : result.code === "already_bound" ? 409
+      : result.code === "invalid_session_name" ? 400
+      : 500;
+    return c.json(result, status);
+  }
+
+  return c.json(result, 201);
+});
+
+// POST /api/rigs/:rigId/nodes/launch-subset — multi-target managed subset launch
+nodesRoutes.post("/launch-subset", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const { restoreOrchestrator } = getDeps(c);
+  if (!restoreOrchestrator) {
+    return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
+  }
+  const body = await c.req.json().catch(() => ({})) as { seats?: string[]; holdReason?: string; snapshotId?: string; plan?: boolean; nonTargetMode?: "unchanged" | "detach_and_hold" };
+  if (!Array.isArray(body.seats) || body.seats.length === 0) {
+    return c.json({ ok: false, code: "invalid_request", error: "Request body must include a non-empty 'seats' array of logical IDs" }, 400);
+  }
+  const result = body.plan === true
+    ? restoreOrchestrator.planNodeSubset(rigId, body.seats, { holdReason: body.holdReason, snapshotId: body.snapshotId, nonTargetMode: body.nonTargetMode })
+    : await restoreOrchestrator.launchNodeSubset(rigId, body.seats, { holdReason: body.holdReason, snapshotId: body.snapshotId, ...(await resumeLaunchOpts(c)) });
+  if (!result.ok) {
+    return c.json(result, narrowLaunchErrorStatus(result.code));
+  }
+  // OPR.0.4.3.20 FR-7 — a target that landed awaiting-decision / attention_required /
+  // failed is NOT launched (no running session). Success requires at least one running
+  // launch AND zero non-running targets; otherwise surface ok:false + 409 so the CLI
+  // exits non-zero and never prints a false "Launched".
+  const launchedEntries = result.launched ?? [];
+  const nonRunning = launchedEntries.filter((n) => !launchStatusIsRunning(n.status));
+  const running = launchedEntries.filter((n) => launchStatusIsRunning(n.status));
+  const status = nonRunning.length > 0 ? 409 : running.length > 0 ? 201 : 200;
+  return c.json({ ...result, ok: nonRunning.length === 0 && result.ok }, status);
+});
+
+// GET /api/rigs/:rigId/nodes/:logicalId/preview?lines=N
+//
+// Preview Terminal v0 (PL-018): returns the seat's last N lines via
+// SessionTransport.capture. Rate-limited per session through the
+// daemon-side PreviewRateLimiter (default 1 sec window) so live polling
+// from multiple panes doesn't hammer tmux.
+//
+// Returns 404 when the rig/node/session can't be resolved (UI surfaces
+// this as "preview unavailable on this rig"). Returns 503 when
+// SessionTransport is missing from context (degraded daemon).
+nodesRoutes.get("/:logicalId/preview", terminalAuthGuard(), async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const logicalId = c.req.param("logicalId")!;
+  const deps = getDeps(c);
+  const sessionTransport = c.get("sessionTransport" as never) as SessionTransport | undefined;
+  const rateLimiter = c.get("previewRateLimiter" as never) as PreviewRateLimiter<{
+    content: string;
+    lines: number;
+    sessionName: string;
+    capturedAt: string;
+  }> | undefined;
+  if (!sessionTransport) {
+    return c.json({ error: "preview_unavailable", hint: "SessionTransport not configured on this daemon." }, 503);
+  }
+
+  const rig = deps.rigRepo.getRig(rigId);
+  if (!rig) return c.json({ error: `Rig "${rigId}" not found.` }, 404);
+
+  // Resolve canonical session name. The node-detail projector already
+  // does this; we re-use the raw rig object to keep the route cheap.
+  const node = rig.nodes.find((n) => n.logicalId === logicalId || n.id === logicalId);
+  if (!node) return c.json({ error: `Node "${logicalId}" not found in rig "${rigId}".` }, 404);
+  const sessionName = node.binding?.tmuxSession;
+  if (!sessionName) {
+    return c.json({
+      error: "session_unbound",
+      hint: "Node has no tmux session yet. Use rig up or rig launch to start the seat.",
+    }, 409);
+  }
+
+  const linesRaw = c.req.query("lines");
+  const linesParsed = linesRaw ? parseInt(linesRaw, 10) : NaN;
+  // Clamp lines to a sensible range; default 50 matches the v0 UI pref.
+  const lines = Number.isFinite(linesParsed) && linesParsed > 0
+    ? Math.min(linesParsed, 1000)
+    : 50;
+
+  // Cache key includes the line count so a 50-line poll doesn't poison
+  // a 200-line manual fetch (and vice versa).
+  const cacheKey = `${sessionName}:${lines}`;
+  const cached = rateLimiter?.get(cacheKey);
+  if (cached) {
+    return c.json(cached.payload);
+  }
+
+  const result = await sessionTransport.capture(sessionName, { lines });
+  if (!result.ok) {
+    return c.json({
+      error: result.reason ?? "capture_failed",
+      hint: result.error,
+      sessionName,
+    }, 502);
+  }
+  const payload = {
+    content: result.content ?? "",
+    lines: result.lines ?? lines,
+    sessionName,
+    capturedAt: new Date().toISOString(),
+  };
+  rateLimiter?.set(cacheKey, payload);
+  return c.json(payload);
+});
+
+// POST /api/rigs/:rigId/nodes/:logicalId/open-cmux
+nodesRoutes.post("/:logicalId/open-cmux", terminalAuthGuard(), async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const logicalId = c.req.param("logicalId")!;
+  const nodeCmuxService = c.get("nodeCmuxService" as never) as NodeCmuxService | undefined;
+
+  if (!nodeCmuxService) {
+    return c.json({ ok: false, error: "cmux service not available", code: "unavailable" }, 500);
+  }
+
+  const result = await nodeCmuxService.openOrFocusNodeSurface(rigId, logicalId);
+  if (!result.ok && result.code === "not_found") {
+    return c.json(result, 404);
+  }
+  return c.json(result);
+});
+
+// POST /api/rigs/:rigId/nodes/:logicalId/focus
+nodesRoutes.post("/:logicalId/focus", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const logicalId = c.req.param("logicalId")!;
+  const { rigRepo, cmuxAdapter } = getDeps(c);
+
+  const rig = rigRepo.getRig(rigId);
+  if (!rig) return c.json({ error: "rig not found" }, 404);
+
+  const node = rig.nodes.find((n) => n.logicalId === logicalId);
+  if (!node) return c.json({ error: "node not found" }, 404);
+
+  const cmuxSurface = node.binding?.cmuxSurface;
+  if (!cmuxSurface) {
+    return c.json({ error: "node has no cmux surface binding" }, 409);
+  }
+
+  const result = await cmuxAdapter.focusSurface(cmuxSurface);
+  return c.json(result);
+});
+
+// DELETE /api/rigs/:rigId/nodes/:logicalId
+nodesRoutes.delete("/:logicalId", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const nodeRef = c.req.param("logicalId")!;
+  const fallbackDestination = c.req.query("fallback");
+  const { rigLifecycleService } = getDeps(c);
+  if (!rigLifecycleService) {
+    return c.json({ error: "Lifecycle service not available" }, 500);
+  }
+
+  const result = await rigLifecycleService.removeNode(rigId, nodeRef, { fallbackDestination });
+  if (!result.ok) {
+    const status = result.code === "rig_not_found" ? 404
+      : result.code === "node_not_found" ? 404
+      : result.code === "active_qitems" ? 409
+      : result.code === "fallback_not_running" ? 409
+      : result.code === "fallback_in_target" ? 409
+      : result.code === "kill_failed" ? 409
+      : 500;
+    return c.json(result, status);
+  }
+
+  return c.json(result, 200);
+});
+
+// GET /api/sessions/:sessionName/preview?lines=N
+//
+// Preview Terminal v0 (PL-018) — session-keyed alias for /preview.
+// Used by surfaces that hold a sessionName but not a (rigId, logicalId)
+// pair (Steering Loop State panel, Slice Story View Topology tab).
+// Behavior identical to the rig+node-keyed route otherwise.
+sessionAdminRoutes.get("/:sessionName/preview", terminalAuthGuard(), async (c) => {
+  const sessionName = c.req.param("sessionName")!;
+  const sessionTransport = c.get("sessionTransport" as never) as SessionTransport | undefined;
+  const rateLimiter = c.get("previewRateLimiter" as never) as PreviewRateLimiter<{
+    content: string;
+    lines: number;
+    sessionName: string;
+    capturedAt: string;
+  }> | undefined;
+  if (!sessionTransport) {
+    return c.json({ error: "preview_unavailable", hint: "SessionTransport not configured on this daemon." }, 503);
+  }
+
+  const linesRaw = c.req.query("lines");
+  const linesParsed = linesRaw ? parseInt(linesRaw, 10) : NaN;
+  const lines = Number.isFinite(linesParsed) && linesParsed > 0
+    ? Math.min(linesParsed, 1000)
+    : 50;
+
+  const cacheKey = `${sessionName}:${lines}`;
+  const cached = rateLimiter?.get(cacheKey);
+  if (cached) return c.json(cached.payload);
+
+  const result = await sessionTransport.capture(sessionName, { lines });
+  if (!result.ok) {
+    return c.json({
+      error: result.reason ?? "capture_failed",
+      hint: result.error,
+      sessionName,
+    }, 502);
+  }
+  const payload = {
+    content: result.content ?? "",
+    lines: result.lines ?? lines,
+    sessionName,
+    capturedAt: new Date().toISOString(),
+  };
+  rateLimiter?.set(cacheKey, payload);
+  return c.json(payload);
+});
+
+// POST /api/sessions/:sessionName/reconcile — OPR.0.3.4.3 no-launch reconcile.
+// Adopt a LIVE hand-resumed canonical session back into its persisted node via
+// the reconcile_session converge op (sugar over the topology spine). Never
+// launches/kills/replays startup or writes input into the target pane.
+sessionAdminRoutes.post("/:sessionName/reconcile", terminalAuthGuard(), async (c) => {
+  const sessionName = c.req.param("sessionName")!;
+  const claimService = c.get("claimService" as never) as ClaimService | undefined;
+  const podInstantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!claimService || !podInstantiator) {
+    return c.json({ error: "Reconcile unavailable: claim service not configured on this daemon." }, 503);
+  }
+
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const rigId = typeof body["rigId"] === "string" ? body["rigId"] : undefined;
+  const logicalId = typeof body["logicalId"] === "string" ? body["logicalId"] : undefined;
+  if ((rigId && !logicalId) || (!rigId && logicalId)) {
+    return c.json({ error: "rigId and logicalId must be provided together (or both omitted)." }, 400);
+  }
+
+  const converged = await convergeOp(
+    { instantiator: podInstantiator, claimService },
+    rigId ?? "",
+    { kind: "reconcile_session", sessionName, rigId, logicalId },
+    ".",
+  );
+  if (converged.kind !== "reconcile_session" || !converged.supported) {
+    return c.json({ error: "Unexpected converge result for reconcile_session" }, 500);
+  }
+  const outcome = converged.outcome;
+
+  if (!outcome.ok) {
+    switch (outcome.code) {
+      case "session_not_found":
+      case "node_not_found":
+      case "rig_not_found":
+        return c.json(outcome, 404);
+      case "node_mismatch":
+        return c.json(outcome, 409);
+      default:
+        return c.json(outcome, 500);
+    }
+  }
+
+  return c.json(outcome, 200);
+});
+
+// POST /api/sessions/:sessionName/clear-attention — OPR.0.3.4.10.
+sessionAdminRoutes.post("/:sessionName/clear-attention", terminalAuthGuard(), async (c) => {
+  const sessionName = c.req.param("sessionName")!;
+  const reconciler = c.get("seatAttentionReconciler" as never) as import("../domain/seat-attention-reconciler.js").SeatAttentionReconciler | undefined;
+  if (!reconciler) {
+    return c.json({ error: "Seat attention reconciler not configured on this daemon." }, 503);
+  }
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const reason = typeof body["reason"] === "string" ? body["reason"].trim() : undefined;
+  const result = await reconciler.clearAttention(sessionName, reason ? { reason } : undefined);
+  if (!result.ok) {
+    return c.json(result, result.code === "not_in_attention" ? 409 : 422);
+  }
+  return c.json(result, 200);
+});
+
+// POST /api/sessions/:sessionName/resume-token — OPR.0.4.0.22.
+// Managed, attested, audited SET of a seat's durable resume token (the
+// host-upgrade de-risk gate; replaces the manual-SQLite-edit anti-pattern).
+// GUARDED by terminalAuthGuard() (credential write). The raw token arrives in
+// the request BODY (the CLI reads it from stdin, never argv) and is NEVER
+// echoed back, placed in an error message, logged, or written to the audit
+// event — it is credential-class.
+sessionAdminRoutes.post("/:sessionName/resume-token", terminalAuthGuard(), async (c) => {
+  const sessionName = c.req.param("sessionName")!;
+  const { sessionRegistry } = getDeps(c);
+  const eventBus = c.get("eventBus" as never) as EventBus | undefined;
+
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const reason = typeof body["reason"] === "string" ? body["reason"].trim() : "";
+  if (!reason) {
+    return c.json({ error: "missing_reason", message: "set-resume-token requires --reason (operator attestation)." }, 400);
+  }
+
+  const ctx = sessionRegistry.findResumeContextByName(sessionName);
+  if (!ctx) {
+    return c.json({ error: "session_not_found", message: `Session '${sessionName}' not found.` }, 404);
+  }
+
+  // FR-2: validate per runtime; reject malformed. The error is redacted (it
+  // never contains the token value).
+  const validation = validateResumeToken(ctx.runtime, body["token"]);
+  if (!validation.ok) {
+    return c.json({ error: "invalid_token", message: validation.error }, 422);
+  }
+
+  // FR-1: operator/attested provenance OUTRANKS hook/scrape.
+  sessionRegistry.updateResumeToken(ctx.sessionId, validation.resumeType, validation.token, "operator");
+
+  // FR-5: append-only audit event — NO raw token.
+  if (eventBus) {
+    eventBus.emit({
+      type: "session.resume_token_set",
+      rigId: ctx.rigId,
+      nodeId: ctx.nodeId,
+      sessionName,
+      sessionId: ctx.sessionId,
+      resumeType: validation.resumeType,
+      previousProvenance: (ctx.currentProvenance as "hook" | "scrape" | "operator" | null) ?? null,
+      newProvenance: "operator",
+      source: "operator_set",
+      reason,
+      redacted: true,
+    });
+  }
+
+  // Response carries NO token (FR-2 redaction).
+  return c.json({
+    ok: true,
+    sessionName,
+    resumeType: validation.resumeType,
+    provenance: "operator",
+    previousProvenance: ctx.currentProvenance ?? null,
+    reason,
+    redacted: true,
+  }, 200);
+});
+
+// POST /api/sessions/:sessionRef/unclaim
+sessionAdminRoutes.post("/:sessionRef/unclaim", terminalAuthGuard(), async (c) => {
+  const sessionRef = c.req.param("sessionRef")!;
+  const { rigLifecycleService } = getDeps(c);
+  if (!rigLifecycleService) {
+    return c.json({ error: "Lifecycle service not available" }, 500);
+  }
+
+  const result = await rigLifecycleService.unclaimSession(sessionRef);
+  if (!result.ok) {
+    const status = result.code === "session_ambiguous" ? 409 : 404;
+    return c.json(result, status);
+  }
+
+  return c.json(result, 200);
+});
+
+// GET /api/sessions/:sessionName/generation-record?sinceBytes=N
+// Mechanics-gate fix (desk ruling d9b3989a): the CONSUMPTION-BY-EFFECT source for `rig walk`.
+// Serves the seat's current-generation append-only conversation record identity plus the suffix
+// from sinceBytes. Claude uses its context sidecar; Codex joins the current bound pane/process
+// to its native thread and then the existing context store's thread table — never a pane snapshot
+// or a transcript-recency search. Refuses LOUD when the seat has no resolvable record: verification is
+// impossible, never receive an empty success.
+// Round-2 (r2 HIGH-2): raw conversation bytes with no transcript redaction — a TERMINAL-CLASS
+// surface behind the same bearer gate as its neighbors (401/401/200; null-token loopback passes).
+sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), async (c) => {
+  const sessionName = c.req.param("sessionName")!;
+  const store = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
+  if (!store) {
+    return c.json({ error: "unsupported_runtime", message: "No context-usage store on this daemon; the seat's generation record cannot be resolved." }, 409);
+  }
+  const { sessionRegistry: registry, tmuxAdapter } = getDeps(c);
+  const context = registry?.findResumeContextByName(sessionName);
+  const occupant = context ? registry.currentOccupantTenure(context.nodeId) : null;
+  const runtime = context?.runtime ?? "claude-code";
+  let transcriptPath: string | null;
+  let sessionId: string | null;
+  if (runtime === "codex") {
+    const binding = registry.getBindingForNode(context!.nodeId);
+    const identity = new SeatIdentityStore(registry.db).getForNode(context!.nodeId);
+    if (!occupant || !binding?.tmuxPane || binding.tmuxSession !== sessionName
+      || identity?.verdict !== "verified" || identity.sessionName !== sessionName
+      || identity.evidence.registeredPane !== binding.tmuxPane
+      || !(Date.parse(identity.observedAt) >= parseSqliteUtcMs(occupant.bootAt))) {
+      return c.json({ error: "record_identity_unverified", message: `No verified current occupant/pane binding for '${sessionName}'.` }, 409);
+    }
+    try {
+      const pid = await tmuxAdapter?.getPanePid?.(binding.tmuxPane);
+      if (!pid || pid !== identity.evidence.observedPid) {
+        return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant.` }, 409);
+      }
+      const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
+        getPanePid: async () => pid,
+        listProcesses: () => generationCensus.list(),
+        readThreadIdByPid: (nativePid, startedAt) => startedAt
+          ? generationThreadIds.resolve(nativePid, startedAt) : undefined,
+      });
+      if (!live.ok) return c.json({ error: "record_identity_unverified", message: live.reason }, 409);
+      sessionId = live.id;
+      transcriptPath = store.readCodexTranscriptPath(sessionId);
+      if (registry.currentOccupantTenure(context!.nodeId)?.generationUuid !== occupant.generationUuid
+        || registry.getBindingForNode(context!.nodeId)?.tmuxPane !== binding.tmuxPane
+        || await tmuxAdapter.getPanePid?.(binding.tmuxPane) !== pid) {
+        return c.json({ error: "record_identity_unverified", message: `The occupant binding changed while resolving '${sessionName}'.` }, 409);
+      }
+    } catch (err) {
+      return c.json({ error: "record_identity_unverified", message: `Cannot resolve '${sessionName}': ${(err as Error).message}` }, 409);
+    }
+  } else {
+    const usage = store.readAndNormalize(sessionName);
+    transcriptPath = usage.transcriptPath;
+    sessionId = usage.sessionId;
+  }
+  if (!transcriptPath || !sessionId) {
+    return c.json({ error: "unsupported_runtime", message: `No current-generation record resolves for '${sessionName}' (${runtime}) — consumption cannot be verified for this seat.` }, 409);
+  }
+  const fs = await import("node:fs");
+  const sinceRaw = c.req.query("sinceBytes");
+  const since = sinceRaw === undefined ? 0 : Number(sinceRaw);
+  if (!Number.isSafeInteger(since) || since < 0 || sinceRaw === "") {
+    return c.json({ error: "invalid_since_bytes", message: "sinceBytes must be a non-negative safe integer." }, 400);
+  }
+  // Cap the served suffix — the caller polls; a runaway record must not become a runaway response.
+  const MAX_SUFFIX_BYTES = 8 * 1024 * 1024;
+  try {
+    const fd = fs.openSync(transcriptPath, "r");
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) throw new Error("record is not a regular file");
+      const totalBytes = stat.size;
+      // Identity and bytes come from the same open file. Appends preserve this identity;
+      // replacing a rollout at the same path changes it, even if its native id is unchanged.
+      const generationId = JSON.stringify([occupant?.generationUuid ?? null, sessionId, transcriptPath, stat.dev, stat.ino, stat.birthtimeMs]);
+      if (runtime === "codex") {
+        let header = "";
+        for (let offset = 0; offset < Math.min(totalBytes, MAX_SUFFIX_BYTES) && !header.includes("\n");) {
+          const chunk = Buffer.alloc(Math.min(64 * 1024, totalBytes - offset, MAX_SUFFIX_BYTES - offset));
+          const n = fs.readSync(fd, chunk, 0, chunk.length, offset);
+          if (!n) break;
+          header += chunk.subarray(0, n).toString("utf8");
+          offset += n;
+        }
+        let meta;
+        try { meta = JSON.parse(header.slice(0, header.indexOf("\n"))); } catch { /* explicit no-answer below */ }
+        if (meta?.type !== "session_meta" || meta.payload?.id !== sessionId) {
+          return c.json({ error: "record_identity_mismatch", message: `The rollout header does not identify current thread '${sessionId}'.` }, 409);
+        }
+      }
+      if (sinceRaw === undefined) return c.json({ generationId, sessionId, runtime, totalBytes });
+      if (since > totalBytes) return c.json({ error: "record_truncated", message: "Generation record shrank below the requested byte boundary." }, 409);
+      const length = Math.min(totalBytes - since, MAX_SUFFIX_BYTES);
+      const buf = Buffer.alloc(length);
+      const read = fs.readSync(fd, buf, 0, length, since);
+      return c.json({ generationId, sessionId, runtime, totalBytes, suffix: buf.subarray(0, read).toString("utf8"), truncated: totalBytes - since > read });
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    return c.json({ error: "record_unreadable", message: `Generation record for '${sessionName}' is unreadable: ${(err as Error).message}` }, 409);
+  }
+});

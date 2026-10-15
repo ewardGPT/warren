@@ -1,0 +1,1805 @@
+// release-0.3.2 slice 12 — `rig scope` command-surface integration
+// tests. Drives the commander tree end-to-end with a tmp substrate
+// fixture so every HG-N gate has direct coverage.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFile, execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { Command } from "commander";
+import YAML from "yaml";
+
+import { scopeCommand } from "../src/commands/scope.js";
+import { readFrontmatter } from "../src/lib/scope/scope-fs.js";
+
+function mktemp(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "rig-scope-cmd-"));
+}
+
+function writeFile(p: string, content: string): void {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, content, "utf8");
+}
+
+function seedSubstrate(workspaceFolder = "internal-docs"): { root: string; missionsRoot: string } {
+  const root = mktemp();
+  const missionsRoot = path.join(root, workspaceFolder, "missions");
+  execFileSync("git", ["-C", root, "init", "-q"], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "config", "user.email", "t@e.com"], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "config", "user.name", "T"], { stdio: "ignore" });
+  fs.mkdirSync(missionsRoot, { recursive: true });
+  writeFile(
+    path.join(missionsRoot, "release-0.3.2", "README.md"),
+    "---\nid: OPR.0.3.2\n---\n# release-0.3.2\n",
+  );
+  writeFile(
+    path.join(missionsRoot, "release-0.3.2", "slices", "01-existing", "README.md"),
+    "---\nid: OPR.0.3.2.1\nstatus: active\n---\n# existing\n",
+  );
+  writeFile(
+    path.join(missionsRoot, "backlog", "README.md"),
+    "---\nid: OPR.99.0.1\n---\n# backlog\n",
+  );
+  writeFile(
+    path.join(missionsRoot, "backlog", "slices", "01-debt-foo", "README.md"),
+    "---\nid: OPR.99.0.1.1\nstatus: active\n---\n# debt\n",
+  );
+  execFileSync("git", ["-C", root, "add", "."], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "commit", "-m", "seed", "-q"], { stdio: "ignore" });
+  return { root, missionsRoot };
+}
+
+interface CompositionMember {
+  ref: string;
+  order: number;
+  active: boolean;
+}
+
+function seedMissionComposition(
+  missionsRoot: string,
+  mission: string,
+  members: CompositionMember[],
+): string {
+  const missionPath = path.join(missionsRoot, mission);
+  for (const member of members) {
+    writeFile(path.join(missionPath, member.ref), "kind: slice\n");
+  }
+  const manifestPath = path.join(missionPath, "mission.yaml");
+  writeFile(manifestPath, YAML.stringify({ kind: "mission", composition: { slices: members } }));
+  return manifestPath;
+}
+
+function readMissionComposition(missionsRoot: string, mission: string): CompositionMember[] {
+  const manifest = YAML.parse(
+    fs.readFileSync(path.join(missionsRoot, mission, "mission.yaml"), "utf8"),
+  ) as { composition: { slices: CompositionMember[] } };
+  return manifest.composition.slices;
+}
+
+function commitFixture(root: string): void {
+  execFileSync("git", ["-C", root, "add", "."], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "commit", "-m", "composition fixture", "-q"], { stdio: "ignore" });
+}
+
+interface CaptureResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+async function run(args: string[], workspace: string): Promise<CaptureResult> {
+  const stdoutBuf: string[] = [];
+  const stderrBuf: string[] = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  const origErrWrite = process.stderr.write.bind(process.stderr);
+  const origExit = process.exit;
+  let exitCode = 0;
+  process.stdout.write = ((chunk: unknown) => { stdoutBuf.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: unknown) => { stderrBuf.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  process.exit = ((code?: number) => {
+    exitCode = code ?? 0;
+    throw new Error(`__EXIT__${exitCode}`);
+  }) as typeof process.exit;
+  const program = new Command();
+  program.addCommand(scopeCommand());
+  program.exitOverride();
+  try {
+    await program.parseAsync(["node", "rig", "scope", ...args, "--workspace", path.dirname(workspace)]);
+  } catch (err) {
+    const msg = (err as Error).message ?? "";
+    if (!msg.startsWith("__EXIT__")) {
+      stderrBuf.push(msg + "\n");
+    }
+  } finally {
+    process.stdout.write = origWrite;
+    process.stderr.write = origErrWrite;
+    process.exit = origExit;
+  }
+  return {
+    exitCode,
+    stdout: stdoutBuf.join(""),
+    stderr: stderrBuf.join(""),
+  };
+}
+
+describe("rig scope resolve-notes", () => {
+  let root: string;
+  beforeEach(() => { root = mktemp(); });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  it.each([
+    { label: "current readable", current: true, legacy: false, unreadableCurrent: false, expected: "NOTES.md" },
+    { label: "legacy readable", current: false, legacy: true, unreadableCurrent: false, expected: "MISSION_NOTES.md" },
+    { label: "both readable prefer current", current: true, legacy: true, unreadableCurrent: false, expected: "NOTES.md" },
+    { label: "current unreadable falls through", current: true, legacy: true, unreadableCurrent: true, expected: "MISSION_NOTES.md" },
+    { label: "no readable notes", current: false, legacy: false, unreadableCurrent: false, expected: null },
+  ])("returns the locked JSON shape: $label", async ({ current, legacy, unreadableCurrent, expected }) => {
+    const node = path.join(root, "mission");
+    const currentPath = path.join(node, "NOTES.md");
+    const legacyPath = path.join(node, "MISSION_NOTES.md");
+    fs.mkdirSync(node, { recursive: true });
+    if (current) fs.writeFileSync(currentPath, "current\n", "utf8");
+    if (legacy) fs.writeFileSync(legacyPath, "legacy\n", "utf8");
+    if (unreadableCurrent) fs.chmodSync(currentPath, 0o000);
+
+    try {
+      const result = await run(["resolve-notes", node, "--json"], root);
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout)).toEqual({
+        ok: true,
+        resolution: expected ? { path: path.join(node, expected), name: expected } : null,
+      });
+    } finally {
+      if (unreadableCurrent) fs.chmodSync(currentPath, 0o600);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-1 + HG-9: rig scope slice ls --json + state filter
+// ---------------------------------------------------------------------
+
+describe("rig scope slice ls", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("HG-1 + HG-9: --json returns active slices from a specific mission", async () => {
+    const r = await run(["slice", "ls", "--mission", "release-0.3.2", "--state", "active", "--json"], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.slices.map((s: { name: string }) => s.name)).toEqual(["01-existing"]);
+    expect(parsed.slices[0].id).toBe("OPR.0.3.2.1");
+  });
+
+  it("returns slices from all missions when --mission is omitted", async () => {
+    const r = await run(["slice", "ls", "--json"], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.count).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-2: rig scope slice show
+// ---------------------------------------------------------------------
+
+describe("rig scope slice show (HG-2)", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("renders frontmatter + README + children", async () => {
+    const r = await run([
+      "slice", "show", "01-existing",
+      "--mission", "release-0.3.2",
+      "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.slice.id).toBe("OPR.0.3.2.1");
+    expect(parsed.slice.readme).toContain("# existing");
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-3 + HG-4 + HG-15: rig scope slice create
+// ---------------------------------------------------------------------
+
+describe("rig scope slice create", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("HG-3: auto-finds next NN, never reuses numbers", async () => {
+    // Add a closed slice 04 so existing NNs are 01 + 04. Next must be 05.
+    writeFile(
+      path.join(env.missionsRoot, "release-0.3.2", "closed", "04-old", "README.md"),
+      "---\nid: OPR.0.3.2.4\nstatus: closed-stale\n---\n",
+    );
+    const r = await run([
+      "slice", "create", "release-0.3.2", "new-thing", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.slice.name).toMatch(/^05-/);
+  });
+
+  it("HG-4: --template populates the template", async () => {
+    const r = await run([
+      "slice", "create", "release-0.3.2", "perf-fix",
+      "--template", "bug-fix", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    const readme = fs.readFileSync(path.join(parsed.slice.path, "SPEC.md"), "utf8");
+    expect(readme).toMatch(/## Repro/);
+    expect(readme).toMatch(/## Expected/);
+  });
+
+  it("HG-15: created slice frontmatter has a conformant dot-ID", async () => {
+    const r = await run([
+      "slice", "create", "release-0.3.2", "tdd-foo", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    const fm = readFrontmatter(path.join(parsed.slice.path, "SPEC.md"));
+    expect(fm.id).toBe("OPR.0.3.2.2");
+    expect(typeof fm.id === "string" && /^OPR\.0\.3\.2\.\d+$/.test(fm.id as string)).toBe(true);
+  });
+
+  it("AC-1: slice create scaffolds PROGRESS.md by default", async () => {
+    const r = await run([
+      "slice", "create", "release-0.3.2", "scaffold-test", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    const progressPath = path.join(parsed.slice.path, "PROGRESS.md");
+    expect(fs.existsSync(progressPath)).toBe(true);
+    const content = fs.readFileSync(progressPath, "utf8");
+    expect(content).toContain("# Progress");
+    expect(content).toContain("## Current state");
+    expect(content).toContain("## Outcomes");
+    expect(content).toContain("rig proof show <slice>");
+    expect(content).not.toContain("- [ ] Implementation complete");
+  });
+
+  it("OPR.0.4.1.23 AC-1/AC-3: slice create scaffolds root PROOF.md + sibling empty proof/ dir", async () => {
+    const r = await run([
+      "slice", "create", "release-0.3.2", "proof-contract", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    const proofPath = path.join(parsed.slice.path, "PROOF.md");
+    const proofDir = path.join(parsed.slice.path, "proof");
+
+    expect(fs.existsSync(proofPath)).toBe(true);
+    expect(fs.statSync(proofPath).isFile()).toBe(true);
+    expect(fs.existsSync(proofDir)).toBe(true);
+    expect(fs.statSync(proofDir).isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(proofDir, "PROOF.md"))).toBe(false);
+    expect(fs.readdirSync(proofDir)).toEqual([]);
+
+    const proof = fs.readFileSync(proofPath, "utf8");
+    expect(proof).toContain("# PROOF — OPR.0.3.2.2 Proof Contract");
+    expect(proof).toContain("Closed by:");
+    expect(proof).toContain("## What this proves");
+    expect(proof).toContain("## Artifacts (media in proof/)");
+    expect(proof).toContain("## Residue / caveats (if any)");
+  });
+
+  it("adds a new slice to explicit mission composition in stable order", async () => {
+    seedMissionComposition(env.missionsRoot, "release-0.3.2", [
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+    ]);
+
+    const r = await run([
+      "slice", "create", "release-0.3.2", "composed", "--json",
+    ], env.missionsRoot);
+
+    expect(r.exitCode).toBe(0);
+    expect(readMissionComposition(env.missionsRoot, "release-0.3.2")).toEqual([
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+      { ref: "slices/02-composed/slice.yaml", order: 20, active: true },
+    ]);
+  });
+
+  it("refuses malformed explicit composition before creating any slice", async () => {
+    const manifestPath = seedMissionComposition(env.missionsRoot, "release-0.3.2", [
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+    ]);
+    const malformed = "kind: mission\ncomposition:\n  slices:\n    - ref: slices/01-existing/slice.yaml\n      order: 10\n    - ref: slices/01-existing/slice.yaml\n      order: 20\n";
+    fs.writeFileSync(manifestPath, malformed, "utf8");
+    const before = fs.readdirSync(path.join(env.missionsRoot, "release-0.3.2", "slices"));
+
+    const r = await run([
+      "slice", "create", "release-0.3.2", "must-not-exist", "--json",
+    ], env.missionsRoot);
+
+    expect(r.exitCode).toBe(1);
+    expect(fs.readFileSync(manifestPath, "utf8")).toBe(malformed);
+    expect(fs.readdirSync(path.join(env.missionsRoot, "release-0.3.2", "slices"))).toEqual(before);
+  });
+
+  it("AC-1: slice create --readme-only writes marker instead of PROGRESS.md", async () => {
+    const r = await run([
+      "slice", "create", "release-0.3.2", "no-progress", "--readme-only", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    const progressPath = path.join(parsed.slice.path, "PROGRESS.md");
+    expect(fs.existsSync(progressPath)).toBe(false);
+    const readme = fs.readFileSync(path.join(parsed.slice.path, "SPEC.md"), "utf8");
+    expect(readme).toMatch(/progress_rail:\s*readme-only/);
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-5 + HG-9: rig scope slice ship — git mv + frontmatter update
+// ---------------------------------------------------------------------
+
+describe("rig scope slice rollback snapshots", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  // Root can read mode-000 files, so it cannot exercise this refusal.
+  it.skipIf(process.getuid?.() === 0).each([
+    { operation: "close", unreadable: "source" },
+    { operation: "ship", unreadable: "source" },
+    { operation: "move", unreadable: "source" },
+    { operation: "ship", unreadable: "target" },
+    { operation: "move", unreadable: "target" },
+  ])("preserves composition when $operation cannot snapshot $unreadable", async ({ operation, unreadable }) => {
+    const sourceManifest = seedMissionComposition(env.missionsRoot, "backlog", [
+      { ref: "slices/01-debt-foo/slice.yaml", order: 10, active: true },
+    ]);
+    const targetManifest = seedMissionComposition(env.missionsRoot, "release-0.3.2", [
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+    ]);
+    commitFixture(env.root);
+    const sourceSlice = path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo");
+    const sourceNode = path.join(sourceSlice, "README.md");
+    const targetNode = path.join(env.missionsRoot, "release-0.3.2", "README.md");
+    const sourceBefore = fs.readFileSync(sourceManifest, "utf8");
+    const targetBefore = fs.readFileSync(targetManifest, "utf8");
+    const sourceNodeBefore = fs.readFileSync(sourceNode, "utf8");
+    const targetNodeBefore = fs.readFileSync(targetNode, "utf8");
+    const deniedPath = unreadable === "source" ? sourceNode : targetNode;
+    const originalMode = fs.statSync(deniedPath).mode;
+    const args = operation === "close"
+      ? ["slice", "close", "01-debt-foo", "--reason", "wontfix"]
+      : ["slice", operation, "01-debt-foo", "release-0.3.2"];
+    let result: CaptureResult;
+    fs.chmodSync(deniedPath, 0o000);
+    try {
+      result = await run([...args, "--mission", "backlog", "--json"], env.missionsRoot);
+    } finally {
+      fs.chmodSync(deniedPath, originalMode);
+    }
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout + result.stderr).toContain("EACCES");
+    expect(fs.readFileSync(sourceManifest, "utf8")).toBe(sourceBefore);
+    expect(fs.readFileSync(targetManifest, "utf8")).toBe(targetBefore);
+    expect(fs.readFileSync(sourceNode, "utf8")).toBe(sourceNodeBefore);
+    expect(fs.readFileSync(targetNode, "utf8")).toBe(targetNodeBefore);
+    expect(fs.existsSync(sourceSlice)).toBe(true);
+    const destination = operation === "close"
+      ? path.join(env.missionsRoot, "backlog", "closed", "01-debt-foo")
+      : path.join(env.missionsRoot, "release-0.3.2", "slices", "02-debt-foo");
+    expect(fs.existsSync(destination)).toBe(false);
+    expect(execFileSync("git", ["-C", env.root, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+    expect(execFileSync("git", ["-C", env.root, "diff", "--cached", "--name-only"], { encoding: "utf8" })).toBe("");
+  });
+});
+
+describe("rig scope slice ship (HG-5)", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("git mv + frontmatter status: shipped-to-release-X.Y", async () => {
+    seedMissionComposition(env.missionsRoot, "backlog", [
+      { ref: "slices/01-debt-foo/slice.yaml", order: 10, active: true },
+    ]);
+    seedMissionComposition(env.missionsRoot, "release-0.3.2", [
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+    ]);
+    commitFixture(env.root);
+    const r = await run([
+      "slice", "ship", "01-debt-foo", "release-0.3.2",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok, r.stderr || r.stdout).toBe(true);
+    expect(parsed.shipped.git.usedGit).toBe(true);
+    // Source removed; target present.
+    expect(fs.existsSync(path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo"))).toBe(false);
+    expect(fs.existsSync(parsed.shipped.to.path)).toBe(true);
+    const fm = readFrontmatter(path.join(parsed.shipped.to.path, "README.md"));
+    expect(fm.status).toBe("shipped-to-release-0.3.2");
+    expect(fm.mission).toBe("release-0.3.2");
+    expect(readMissionComposition(env.missionsRoot, "backlog")).toEqual([]);
+    expect(readMissionComposition(env.missionsRoot, "release-0.3.2")).toEqual([
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+      { ref: "slices/02-debt-foo/slice.yaml", order: 20, active: true },
+    ]);
+  });
+
+  it("refuses a malformed target manifest without changing source membership or files", async () => {
+    const sourceManifest = seedMissionComposition(env.missionsRoot, "backlog", [
+      { ref: "slices/01-debt-foo/slice.yaml", order: 10, active: true },
+    ]);
+    const targetManifest = seedMissionComposition(env.missionsRoot, "release-0.3.2", [
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+    ]);
+    fs.writeFileSync(targetManifest, "kind: mission\ncomposition:\n  slices: invalid\n", "utf8");
+    const sourceBefore = fs.readFileSync(sourceManifest, "utf8");
+    const targetBefore = fs.readFileSync(targetManifest, "utf8");
+
+    const r = await run([
+      "slice", "ship", "01-debt-foo", "release-0.3.2",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+
+    expect(r.exitCode).toBe(1);
+    expect(fs.readFileSync(sourceManifest, "utf8")).toBe(sourceBefore);
+    expect(fs.readFileSync(targetManifest, "utf8")).toBe(targetBefore);
+    expect(fs.existsSync(path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo"))).toBe(true);
+    expect(fs.existsSync(path.join(env.missionsRoot, "release-0.3.2", "slices", "02-debt-foo"))).toBe(false);
+  });
+
+  it("refuses an explicit source composition that does not own the slice", async () => {
+    const sourceManifest = seedMissionComposition(env.missionsRoot, "backlog", []);
+    seedMissionComposition(env.missionsRoot, "release-0.3.2", [
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+    ]);
+    const sourceBefore = fs.readFileSync(sourceManifest, "utf8");
+
+    const r = await run([
+      "slice", "ship", "01-debt-foo", "release-0.3.2",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("does not contain slices/01-debt-foo/slice.yaml");
+    expect(fs.readFileSync(sourceManifest, "utf8")).toBe(sourceBefore);
+    expect(fs.existsSync(path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo"))).toBe(true);
+    expect(fs.existsSync(path.join(env.missionsRoot, "release-0.3.2", "slices", "02-debt-foo"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-6: rig scope slice close --reason
+// ---------------------------------------------------------------------
+
+describe("rig scope slice close (HG-6)", () => {
+
+  it.each(["status", "'status'", '\"status\"', "status ", '\"sta\\u0074us\"', "? status\n", "flow", "flow-trailing"])("retains a slice identity after updating the YAML key %j", async (key) => {
+    const source = path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo", "README.md");
+    const custom = key.startsWith("flow") ? "custom: 'retain: exactly', folded: 'keep this spelling'" : "# retain this comment\ncustom: 'retain: exactly'\nfolded: >-\n  keep this\n  spelling\n";
+    const body = "\n# debt\n\nOwned fixture bytes.\n";
+    const mapping = key.startsWith("flow") ? `{id: OPR.99.0.1.1, status: active, ${custom}${key === "flow-trailing" ? ", " : ""}}` : `id: OPR.99.0.1.1\n${key}: active # field comment\n${custom}`;
+    const content = `---\n${mapping}\n---\n${body}`;
+    fs.writeFileSync(source, content, "utf8");
+    expect(readFrontmatter(source)).toMatchObject({ id: "OPR.99.0.1.1", status: "active" });
+    commitFixture(env.root);
+    const result = await run(["slice", "close", "01-debt-foo", "--mission", "backlog", "--reason", "wontfix", "--json"], env.missionsRoot);
+    expect(result.exitCode).toBe(0);
+    const destination = path.join(env.missionsRoot, "backlog", "closed", "01-debt-foo", "README.md");
+    expect(readFrontmatter(destination)).toMatchObject({ id: "OPR.99.0.1.1", status: "closed-wontfix", custom: "retain: exactly", folded: "keep this spelling" });
+    expect(fs.readFileSync(destination, "utf8")).toContain(custom);
+    expect(fs.readFileSync(destination, "utf8").endsWith(body)).toBe(true);
+    const listed = await run(["slice", "ls", "--mission", "backlog", "--state", "closed", "--json"], env.missionsRoot);
+    expect(JSON.parse(listed.stdout).slices).toEqual([expect.objectContaining({ id: "OPR.99.0.1.1", status: "closed-wontfix" })]);
+  });
+
+  it.each([
+    "title: Fix: the parser\nstatus: active",
+    "status: &state active\nrelated: *state",
+  ])("closes with a named warning and writes the field when YAML cannot be spliced: %j", async (block) => {
+    const source = path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo", "README.md");
+    fs.writeFileSync(source, `---\nid: OPR.99.0.1.1\n${block}\n---\n\n# owned body\n`, "utf8");
+    commitFixture(env.root);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await run(["slice", "close", "01-debt-foo", "--mission", "backlog", "--reason", "wontfix", "--json"], env.missionsRoot);
+      const destination = path.join(env.missionsRoot, "backlog", "closed", "01-debt-foo", "README.md");
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).ok).toBe(true);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(destination));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("frontmatter isn't valid YAML"));
+      expect(fs.existsSync(source)).toBe(false);
+      const updated = fs.readFileSync(destination, "utf8");
+      expect(updated).toContain("status: closed-wontfix");
+      expect(updated.endsWith("---\n\n# owned body\n")).toBe(true);
+    } finally { warn.mockRestore(); }
+  });
+
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("moves to closed/ + sets status: closed-<reason>", async () => {
+    seedMissionComposition(env.missionsRoot, "backlog", [
+      { ref: "slices/01-debt-foo/slice.yaml", order: 10, active: true },
+    ]);
+    commitFixture(env.root);
+    const r = await run([
+      "slice", "close", "01-debt-foo",
+      "--mission", "backlog",
+      "--reason", "wontfix",
+      "--note", "obsolete by design",
+      "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok, r.stderr || r.stdout).toBe(true);
+    expect(fs.existsSync(path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo"))).toBe(false);
+    expect(fs.existsSync(path.join(env.missionsRoot, "backlog", "closed", "01-debt-foo"))).toBe(true);
+    const fm = readFrontmatter(path.join(env.missionsRoot, "backlog", "closed", "01-debt-foo", "README.md"));
+    expect(fm.status).toBe("closed-wontfix");
+    expect(fm["closure-note"]).toBe("obsolete by design");
+    expect(readMissionComposition(env.missionsRoot, "backlog")).toEqual([]);
+  });
+
+  it("rejects unknown --reason values", async () => {
+    const r = await run([
+      "slice", "close", "01-debt-foo",
+      "--mission", "backlog",
+      "--reason", "fishy",
+      "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-7: rig scope slice move
+// ---------------------------------------------------------------------
+
+describe("rig scope slice move (HG-7)", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it.each([true, false])("warns about source siblings whose dependency becomes dangling (json=%s)", async (json) => {
+    const dependent = path.join(env.missionsRoot, "backlog", "slices", "02-tests", "README.md");
+    writeFile(dependent, "---\nid: OPR.99.0.1.2\ndepends_on: [OPR.99.0.1.1]\n---\n# tests\n");
+    const original = fs.readFileSync(dependent, "utf8");
+    const args = ["slice", "move", "01-debt-foo", "release-0.3.2", "--mission", "backlog"];
+    if (json) args.push("--json");
+    const result = await run(args, env.missionsRoot);
+    expect(result.exitCode).toBe(0);
+    expect(fs.readFileSync(dependent, "utf8")).toBe(original);
+    expect(result.stdout).toContain("OPR.99.0.1.2");
+    expect(result.stdout).toContain("OPR.99.0.1.1");
+    expect(result.stdout).toContain("depends_on");
+    if (json) expect(JSON.parse(result.stdout).warnings).toEqual([
+      expect.stringContaining("OPR.99.0.1.2"),
+    ]);
+    else expect(result.stdout).toContain("Warning:");
+  });
+
+  it("moves between missions; auto-renumber; frontmatter.mission updates", async () => {
+    seedMissionComposition(env.missionsRoot, "backlog", [
+      { ref: "slices/01-debt-foo/slice.yaml", order: 10, active: true },
+    ]);
+    seedMissionComposition(env.missionsRoot, "release-0.3.2", [
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+    ]);
+    commitFixture(env.root);
+    const r = await run([
+      "slice", "move", "01-debt-foo", "release-0.3.2",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok, r.stderr || r.stdout).toBe(true);
+    expect(parsed.moved.to.name).toMatch(/^02-/); // 01 was taken
+    expect(parsed.moved.to.id).toBe("OPR.0.3.2.2");
+    const fm = readFrontmatter(path.join(parsed.moved.to.path, "README.md"));
+    expect(fm.mission).toBe("release-0.3.2");
+    expect(readMissionComposition(env.missionsRoot, "backlog")).toEqual([]);
+    expect(readMissionComposition(env.missionsRoot, "release-0.3.2")).toEqual([
+      { ref: "slices/01-existing/slice.yaml", order: 10, active: true },
+      { ref: "slices/02-debt-foo/slice.yaml", order: 20, active: true },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Scope moves treat repository-relative paths as operands, including '-'.
+// ---------------------------------------------------------------------
+
+describe("rig scope slice moves in a dash-prefixed workspace", () => {
+  let env: { root: string; missionsRoot: string };
+  afterEach(() => { if (env) fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it.each([
+    ["move", "docs"], ["ship", "docs"], ["close", "docs"],
+    ["move", "-docs"], ["ship", "-docs"], ["close", "-docs"],
+  ])("%s preserves the Git rename under %s", async (operation, folder) => {
+    env = seedSubstrate(folder);
+    const source = path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo");
+    const args = operation === "close"
+      ? ["slice", operation, "01-debt-foo", "--reason", "wontfix"]
+      : ["slice", operation, "01-debt-foo", "release-0.3.2"];
+    const result = await run([...args, "--mission", "backlog", "--json"], env.missionsRoot);
+    expect(result.exitCode, result.stderr || result.stdout).toBe(0);
+    const payload = JSON.parse(result.stdout);
+    expect(payload.ok).toBe(true);
+    const destination = operation === "close" ? payload.closed.path : payload[operation === "move" ? "moved" : "shipped"].to.path;
+    expect(fs.existsSync(source)).toBe(false);
+    expect(fs.existsSync(path.join(destination, "README.md"))).toBe(true);
+    const renames = execFileSync("git", ["-C", env.root, "diff", "--cached", "--name-status", "-M"], { encoding: "utf8" });
+    expect(renames).toContain(`R100\t${folder}/missions/backlog/slices/01-debt-foo/README.md\t`);
+    const frontmatter = readFrontmatter(path.join(destination, "README.md"));
+    expect(frontmatter.status).toBe(operation === "close" ? "closed-wontfix" : operation === "ship" ? "shipped-to-release-0.3.2" : "active");
+  });
+
+  // Root can write a mode-0444 file, so it cannot exercise this failure boundary.
+  it.skipIf(process.getuid?.() === 0)("rolls back the Git rename after a real read-only node write fails", async () => {
+    env = seedSubstrate("-docs");
+    const source = path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo", "README.md");
+    const original = fs.readFileSync(source, "utf8");
+    fs.chmodSync(source, 0o444);
+    try {
+      const result = await run([
+        "slice", "close", "01-debt-foo", "--reason", "wontfix", "--mission", "backlog", "--json",
+      ], env.missionsRoot);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout + result.stderr).toContain("EACCES");
+      expect(fs.readFileSync(source, "utf8")).toBe(original);
+      expect(fs.existsSync(path.join(env.missionsRoot, "backlog", "closed", "01-debt-foo"))).toBe(false);
+      expect(execFileSync("git", ["-C", env.root, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+    } finally {
+      if (fs.existsSync(source)) fs.chmodSync(source, 0o644);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-8: rig scope mission ls
+// ---------------------------------------------------------------------
+
+describe("rig scope mission ls (HG-8)", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("--json lists missions with id + slice counts", async () => {
+    const r = await run(["mission", "ls", "--json"], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    const names = parsed.missions.map((m: { name: string }) => m.name).sort();
+    expect(names).toEqual(["backlog", "release-0.3.2"]);
+  });
+});
+
+describe("rig scope mission show", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("renders frontmatter + README + slice inventory", async () => {
+    const r = await run(["mission", "show", "release-0.3.2", "--json"], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.mission.id).toBe("OPR.0.3.2");
+    expect(parsed.mission.slices.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-14 + HG-15: rig scope mission create (PROMOTED to v0 per Amendment §B)
+// ---------------------------------------------------------------------
+
+describe("rig scope mission create (HG-14 + HG-15)", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("HG-14: mission create is invocable with the SAME pattern as slice create", async () => {
+    // Symmetry test: both verbs take (positional name) + (--template) +
+    // (--json) and emit { ok, [tier]: { name, id, template, path } }.
+    const r = await run([
+      "mission", "create", "release-0.4.0", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.mission.name).toBe("release-0.4.0");
+    expect(parsed.mission.path).toBeTruthy();
+    expect(parsed.mission.template).toBe("release");
+  });
+
+  it("HG-15: created mission frontmatter has a conformant dot-ID per §1", async () => {
+    const r = await run(["mission", "create", "release-0.5.0", "--json"], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.mission.id).toBe("OPR.0.5.0");
+    const fm = readFrontmatter(path.join(parsed.mission.path, "SPEC.md"));
+    expect(fm.id).toBe("OPR.0.5.0");
+  });
+
+  it("HG-15: non-release names get an escape-band ID (uniform-numeric)", async () => {
+    const r = await run([
+      "mission", "create", "experiments-foo", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.mission.id).toMatch(/^OPR\.99\.0\.\d+$/);
+  });
+
+  it("HG-15: accepts an explicit --id override and rejects malformed ones", async () => {
+    const ok = await run([
+      "mission", "create", "weird-thing",
+      "--id", "OPR.99.0.42", "--json",
+    ], env.missionsRoot);
+    expect(JSON.parse(ok.stdout).mission.id).toBe("OPR.99.0.42");
+
+    const bad = await run([
+      "mission", "create", "another-weird-thing",
+      "--id", "OPR.A.1", "--json",
+    ], env.missionsRoot);
+    expect(bad.exitCode).toBe(1);
+  });
+
+  it("BLOCK 1 discriminator: mission create rejects slice-depth --id (OPR.0.3.2.12)", async () => {
+    // Per guard BC verdict: a 4-segment slice-shape must NOT pass
+    // mission --id validation. Without tier-aware validation this
+    // would succeed and create a mission with a slice-shaped id.
+    const r = await run([
+      "mission", "create", "wrong-tier",
+      "--id", "OPR.0.3.2.12", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.fact).toMatch(/not a mission-tier dot-ID/);
+  });
+
+  it("BLOCK 1 follow-up: mission create still accepts valid mission shapes (escape band + release)", async () => {
+    const eb = await run([
+      "mission", "create", "exp-band",
+      "--id", "OPR.99.0.42", "--json",
+    ], env.missionsRoot);
+    expect(eb.exitCode).toBe(0);
+    expect(JSON.parse(eb.stdout).mission.id).toBe("OPR.99.0.42");
+
+    const rel = await run([
+      "mission", "create", "release-0.6.0", "--json",
+    ], env.missionsRoot);
+    expect(rel.exitCode).toBe(0);
+    expect(JSON.parse(rel.stdout).mission.id).toBe("OPR.0.6.0");
+  });
+
+  it("BC-2 BLOCK 1 discriminator: rejects escape-band with non-zero middle segment (OPR.99.7.8)", async () => {
+    const r = await run([
+      "mission", "create", "bad-eb",
+      "--id", "OPR.99.7.8", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    expect(JSON.parse(r.stdout).ok).toBe(false);
+  });
+
+  it("mission create auto-scaffolds NOTES.md with placeholders substituted", async () => {
+    const r = await run(["mission", "create", "release-0.6.0", "--json"], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.mission.notesPath).toBeTruthy();
+    expect(parsed.mission.notesResolvedFrom).toBe("built-in");
+    const mnPath = parsed.mission.notesPath as string;
+    expect(fs.existsSync(mnPath)).toBe(true);
+    const content = fs.readFileSync(mnPath, "utf8");
+    // Placeholders must be substituted.
+    expect(content).not.toMatch(/\{\{mission_id\}\}/);
+    expect(content).not.toMatch(/\{\{mission_name\}\}/);
+    expect(content).not.toMatch(/\{\{created_date\}\}/);
+    // Substituted values present.
+    expect(content).toMatch(/mission: OPR\.0\.6\.0/);
+    // titleFromSlug("0.6.0") → "0.6.0" (no separators to titlecase); the
+    // bare version string is what lands in mission_name.
+    expect(content).toMatch(/name: "0\.6\.0"/);
+    expect(content).toMatch(/# Notes — 0\.6\.0/);
+    expect(content).toContain("`SPEC.md` contract");
+  });
+
+  it("legacy --no-mission-notes alias opts out — SPEC created, NOTES.md is not", async () => {
+    const r = await run([
+      "mission", "create", "release-0.7.0",
+      "--no-mission-notes", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    // SPEC still produced.
+    expect(fs.existsSync(parsed.mission.readmePath)).toBe(true);
+    expect(path.basename(parsed.mission.readmePath)).toBe("SPEC.md");
+    expect(parsed.mission.notesPath).toBeNull();
+    expect(parsed.mission.notesResolvedFrom).toBeNull();
+    expect(fs.existsSync(path.join(parsed.mission.path, "NOTES.md"))).toBe(false);
+  });
+
+  it("OPENRIG_NOTES_TEMPLATE_PATH overrides the built-in template", async () => {
+    // Write a custom template at a temp path containing a distinctive marker.
+    const customTemplatePath = path.join(env.root, "custom-mission-notes-template.md");
+    fs.writeFileSync(
+      customTemplatePath,
+      "---\nmission: {{mission_id}}\n---\n\n# CUSTOM TEMPLATE — {{mission_name}}\n\nCREATED ON {{created_date}}\n",
+      "utf8",
+    );
+    const prior = process.env.OPENRIG_NOTES_TEMPLATE_PATH;
+    process.env.OPENRIG_NOTES_TEMPLATE_PATH = customTemplatePath;
+    try {
+      const r = await run(["mission", "create", "release-0.8.0", "--json"], env.missionsRoot);
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(r.stdout);
+      expect(parsed.mission.notesResolvedFrom).toBe("env");
+      const content = fs.readFileSync(parsed.mission.notesPath as string, "utf8");
+      expect(content).toMatch(/CUSTOM TEMPLATE — 0\.8\.0/);
+      expect(content).toMatch(/mission: OPR\.0\.8\.0/);
+      // Built-in canonical sections must NOT appear (proves we used the custom one).
+      expect(content).not.toMatch(/## §1\. Top-of-mind context/);
+    } finally {
+      if (prior === undefined) delete process.env.OPENRIG_NOTES_TEMPLATE_PATH;
+      else process.env.OPENRIG_NOTES_TEMPLATE_PATH = prior;
+    }
+  });
+
+  it("FR-3: OPENRIG_MISSION_NOTES_TEMPLATE_PATH pointing at a missing file fails with a 3-part error and no mission dir leaked", async () => {
+    const prior = process.env.OPENRIG_MISSION_NOTES_TEMPLATE_PATH;
+    process.env.OPENRIG_MISSION_NOTES_TEMPLATE_PATH = path.join(env.root, "does-not-exist.md");
+    try {
+      const r = await run(["mission", "create", "release-0.9.0", "--json"], env.missionsRoot);
+      expect(r.exitCode).toBe(1);
+      const parsed = JSON.parse(r.stdout);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error.fact).toMatch(/OPENRIG_MISSION_NOTES_TEMPLATE_PATH/);
+      // Discriminator (guard catch qitem-20260601121058): the failed scaffold
+      // MUST NOT leave a half-created mission dir behind. Without the
+      // verify-first-then-write reorder, the mission dir + README would
+      // exist after this command, and a retry would hit
+      // "Mission folder already exists." which the operator would
+      // reasonably read as a CLI bug.
+      const leakedPath = path.join(env.missionsRoot, "release-0.9.0");
+      expect(fs.existsSync(leakedPath), `expected no half-created mission at ${leakedPath} after stale env-var failure`).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.OPENRIG_MISSION_NOTES_TEMPLATE_PATH;
+      else process.env.OPENRIG_MISSION_NOTES_TEMPLATE_PATH = prior;
+    }
+  });
+
+  it("AC-1: mission create scaffolds PROGRESS.md by default", async () => {
+    const r = await run(["mission", "create", "release-0.6.1", "--json"], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    const progressPath = path.join(parsed.mission.path, "PROGRESS.md");
+    expect(fs.existsSync(progressPath)).toBe(true);
+    const content = fs.readFileSync(progressPath, "utf8");
+    expect(content).toContain("# Progress");
+    expect(content).toContain("Scope complete");
+  });
+
+  it("mission create emits only the current mission surfaces", async () => {
+    const r = await run(["mission", "create", "release-0.6.2", "--json"], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(fs.existsSync(path.join(parsed.mission.path, "SPEC.md"))).toBe(true);
+    expect(fs.existsSync(path.join(parsed.mission.path, "PROGRESS.md"))).toBe(true);
+    expect(fs.existsSync(path.join(parsed.mission.path, "NOTES.md"))).toBe(true);
+    expect(fs.existsSync(path.join(parsed.mission.path, "MISSION_BRIEF.md"))).toBe(false);
+    expect(fs.existsSync(path.join(parsed.mission.path, "MISSION_NOTES.md"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------
+// BC-2 BLOCK 2: README-less dirs are rejected at every mutation surface
+// ---------------------------------------------------------------------
+
+describe("BC-2 BLOCK 2 — README-less dirs are not declared missions at any mutation surface", () => {
+  let env: { root: string; missionsRoot: string };
+
+  beforeEach(() => {
+    env = seedSubstrate();
+    // Sneak a README-less directory into missions/ to verify every
+    // surface rejects it consistently with listMissions.
+    fs.mkdirSync(path.join(env.missionsRoot, "no-readme"), { recursive: true });
+  });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("mission ls omits no-readme (already in HG-8 above; sanity check here)", async () => {
+    const r = await run(["mission", "ls", "--json"], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.missions.map((m: { name: string }) => m.name)).not.toContain("no-readme");
+  });
+
+  it("mission show no-readme exits 1 with the 3-part 'not a declared mission' error", async () => {
+    const r = await run(["mission", "show", "no-readme", "--json"], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.fact).toMatch(/no SPEC\.md or README\.md|no README\.md|not a declared mission/);
+  });
+
+  it("slice create no-readme exits 1 + does NOT create slices/foo/", async () => {
+    const r = await run([
+      "slice", "create", "no-readme", "foo", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    expect(fs.existsSync(path.join(env.missionsRoot, "no-readme", "slices", "01-foo"))).toBe(false);
+  });
+
+  it("slice ship to no-readme target exits 1; source slice unmoved", async () => {
+    const srcAbs = path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo");
+    expect(fs.existsSync(srcAbs)).toBe(true);
+    const r = await run([
+      "slice", "ship", "01-debt-foo", "no-readme",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    // Source unchanged.
+    expect(fs.existsSync(srcAbs)).toBe(true);
+  });
+
+  it("slice move to no-readme target exits 1; source slice unmoved", async () => {
+    const srcAbs = path.join(env.missionsRoot, "backlog", "slices", "01-debt-foo");
+    const r = await run([
+      "slice", "move", "01-debt-foo", "no-readme",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    expect(fs.existsSync(srcAbs)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------
+// BLOCK 3 discriminator: ship + move persist target.id back to target README
+// ---------------------------------------------------------------------
+
+describe("BLOCK 3 — ship/move persist target mission id into target README", () => {
+  let env: { root: string; missionsRoot: string };
+
+  beforeEach(() => {
+    env = seedSubstrate();
+    // Replace release-0.3.2/README.md with an ID-LESS variant so we
+    // can observe the lazy-adopt-and-persist behavior.
+    fs.writeFileSync(
+      path.join(env.missionsRoot, "release-0.3.2", "README.md"),
+      "# release-0.3.2\n\n(no id frontmatter yet)\n",
+      "utf8",
+    );
+    execFileSync("git", ["-C", env.root, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", env.root, "commit", "-m", "strip-target-id", "-q"], { stdio: "ignore" });
+  });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("slice ship: target mission gains a persisted id; child id = targetId.NN", async () => {
+    const r = await run([
+      "slice", "ship", "01-debt-foo", "release-0.3.2",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    // Target README now has id: OPR.0.3.2 written back.
+    const targetFm = readFrontmatter(path.join(env.missionsRoot, "release-0.3.2", "README.md"));
+    expect(targetFm.id).toBe("OPR.0.3.2");
+    // Child id matches parent.NN.
+    expect(parsed.shipped.to.id).toBe("OPR.0.3.2.2");
+  });
+
+  it("slice move: target mission gains a persisted id; child id = targetId.NN", async () => {
+    const r = await run([
+      "slice", "move", "01-debt-foo", "release-0.3.2",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(true);
+    const targetFm = readFrontmatter(path.join(env.missionsRoot, "release-0.3.2", "README.md"));
+    expect(targetFm.id).toBe("OPR.0.3.2");
+    expect(parsed.moved.to.id).toBe("OPR.0.3.2.2");
+  });
+
+  it("sibling missions without id remain UNCHANGED after a ship/move (narrow lazy adoption, not mass-migrate)", async () => {
+    // Spawn an unrelated id-less mission alongside; assert it survives
+    // untouched through a ship to a different mission.
+    fs.mkdirSync(path.join(env.missionsRoot, "untouched-mission"), { recursive: true });
+    fs.writeFileSync(
+      path.join(env.missionsRoot, "untouched-mission", "README.md"),
+      "# untouched\n",
+      "utf8",
+    );
+    execFileSync("git", ["-C", env.root, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", env.root, "commit", "-m", "seed-sibling", "-q"], { stdio: "ignore" });
+    const before = fs.readFileSync(path.join(env.missionsRoot, "untouched-mission", "README.md"), "utf8");
+    await run([
+      "slice", "ship", "01-debt-foo", "release-0.3.2",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    const after = fs.readFileSync(path.join(env.missionsRoot, "untouched-mission", "README.md"), "utf8");
+    expect(after).toBe(before);
+    expect(readFrontmatter(path.join(env.missionsRoot, "untouched-mission", "README.md")).id).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-10: 3-part error shape
+// ---------------------------------------------------------------------
+
+describe("3-part error shape (HG-10)", () => {
+  let env: { root: string; missionsRoot: string };
+  beforeEach(() => { env = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(env.root, { recursive: true, force: true }); });
+
+  it("ship to nonexistent target mission yields fact/consequence/action", async () => {
+    const r = await run([
+      "slice", "ship", "01-debt-foo", "release-9.9.9",
+      "--mission", "backlog", "--json",
+    ], env.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.fact).toBeTruthy();
+    expect(parsed.error.consequence).toBeTruthy();
+    expect(parsed.error.action).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------
+// HG-12: --help exists for every command
+// ---------------------------------------------------------------------
+
+describe("--help is present on every command (HG-12)", () => {
+  it("every tier and verb has help text", () => {
+    const cmd = scopeCommand();
+    expect(cmd.description()).toBeTruthy();
+    const tiers = cmd.commands;
+    expect(tiers.map((c) => c.name()).sort()).toEqual(["audit", "mission", "resolve-notes", "slice"]);
+    for (const tier of tiers) {
+      expect(tier.description()).toBeTruthy();
+      for (const verb of tier.commands) {
+        expect(verb.description()).toBeTruthy();
+      }
+    }
+  });
+});
+
+describe("rig scope audit ordinal naming", () => {
+  let root: string;
+  let mission: string;
+  const missionReadme = "---\nid: OPR.99.0.1\n---\n# Owned legacy mission\n";
+  beforeEach(() => {
+    root = mktemp();
+    mission = path.join(root, "workspace", "missions", "backlog");
+    writeFile(path.join(mission, "README.md"), missionReadme);
+    writeFile(path.join(mission, "PROGRESS.md"), "# Progress\n");
+    writeFile(path.join(mission, "NOTES.md"), "# Notes\n");
+  });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  async function publicScope(args: string[]): Promise<CaptureResult> {
+    const home = path.join(root, "owned-cli-home");
+    fs.mkdirSync(home, { recursive: true });
+    const command = [fileURLToPath(new URL("../dist/index.js", import.meta.url)), "scope", ...args,
+      "--workspace", path.join(root, "workspace"), "--json"];
+    const options = { encoding: "utf8" as const, timeout: 15000, env: {
+      PATH: process.env.PATH, HOME: home, TMPDIR: root,
+      OPENRIG_HOME: path.join(home, ".openrig"), CODEX_HOME: path.join(home, "codex"),
+      CLAUDE_CONFIG_DIR: path.join(home, "claude"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull,
+    } };
+    try {
+      const result = await promisify(execFile)(process.execPath, command, options);
+      return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
+    } catch (error) {
+      const failure = error as Error & { code: unknown; stdout: string; stderr: string };
+      if (typeof failure.code !== "number") throw error;
+      return { exitCode: failure.code, stdout: failure.stdout, stderr: failure.stderr };
+    }
+  }
+
+  it.each([1, 98, 99, 999])("accepts the generated slice ordinal after %i in public audit", async (previous) => {
+    writeFile(path.join(mission, "closed", `${String(previous).padStart(2, "0")}-existing`, "README.md"),
+      `---\nid: OPR.99.0.1.${previous}\nstatus: closed-wontfix\n---\n# Closed prior slice\n`);
+    const created = await publicScope(["slice", "create", "backlog", "next"]);
+    expect(created.exitCode).toBe(0);
+    const payload = JSON.parse(created.stdout);
+    expect(payload.slice.name).toBe(`${String(previous + 1).padStart(2, "0")}-next`);
+    expect(payload.slice.id).toBe(`OPR.99.0.1.${previous + 1}`);
+    const audited = await publicScope(["audit", "--mission", "backlog"]);
+    expect(audited.exitCode).toBe(0);
+    const audit = JSON.parse(audited.stdout);
+    expect(audit.ok).toBe(true);
+    expect(audit.slices).toHaveLength(1);
+    expect(audit.slices[0].name).toBe(payload.slice.name);
+    expect(audit.slices[0].findings.some((f: { kind: string }) => f.kind === "id_convention_violation")).toBe(false);
+    expect(fs.readFileSync(path.join(mission, "README.md"), "utf8")).toBe(missionReadme);
+  });
+
+  it.each(["9-single", "bad-name"])("still flags a malformed slice directory %s in public audit", async (name) => {
+    writeFile(path.join(mission, "slices", name, "README.md"),
+      "---\nid: OPR.99.0.1.9\nprogress_rail: readme-only\n---\n# Owned malformed dirname\n");
+    const audited = await publicScope(["audit", "--mission", "backlog"]);
+    expect(audited.exitCode).toBe(1);
+    const audit = JSON.parse(audited.stdout);
+    expect(audit.ok).toBe(false);
+    const slice = audit.slices.find((s: { name: string }) => s.name === name);
+    expect(slice).toBeDefined();
+    expect(slice.findings.some((f: { kind: string; message: string }) =>
+      f.kind === "id_convention_violation" && f.message.startsWith("Directory "))).toBe(true);
+    expect(fs.readFileSync(path.join(mission, "README.md"), "utf8")).toBe(missionReadme);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Guard BLOCKING: audit edge cases
+// ---------------------------------------------------------------------
+
+describe("rig scope audit edge cases (guard BLOCKING fixes)", () => {
+  let substrate: { root: string; missionsRoot: string };
+  beforeEach(() => {
+    substrate = seedSubstrate();
+  });
+  afterEach(() => {
+    fs.rmSync(substrate.root, { recursive: true, force: true });
+  });
+
+  it("uses one notes precedence across current-only, legacy-only, both, and neither", async () => {
+    for (const [name, files, missing] of [
+      ["current", ["NOTES.md"], false],
+      ["legacy", ["MISSION_NOTES.md"], false],
+      ["both", ["NOTES.md", "MISSION_NOTES.md"], false],
+      ["neither", [], true],
+    ] as const) {
+      const missionName = `notes-${name}`;
+      const missionDir = path.join(substrate.missionsRoot, missionName);
+      writeFile(path.join(missionDir, "SPEC.md"), `---\nid: OPR.8.8.${name.length}\nintent: notes\n---\n# notes\n`);
+      writeFile(path.join(missionDir, "PROGRESS.md"), "# Progress\n");
+      for (const file of files) writeFile(path.join(missionDir, file), file);
+      const result = await run(["audit", "--mission", missionName, "--json"], substrate.missionsRoot);
+      const parsed = JSON.parse(result.stdout);
+      const finding = parsed.mission.findings.find((item: { kind: string }) => item.kind === "missing_mission_notes");
+      expect(Boolean(finding), name).toBe(missing);
+      if (finding) expect(finding.message).toMatch(/NOTES\.md.*MISSION_NOTES\.md/);
+    }
+  });
+
+  it("README-less mission with PROGRESS.md emits orphan_progress (not a false clear)", async () => {
+    const missionDir = path.join(substrate.missionsRoot, "no-readme-mission");
+    fs.mkdirSync(missionDir, { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "PROGRESS.md"), "# Progress\n", "utf8");
+    const result = await run(["audit", "--mission", "no-readme-mission", "--json"], substrate.missionsRoot);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.mission.findings.some((f: { kind: string }) => f.kind === "orphan_progress")).toBe(true);
+  });
+
+  it("NN-slug slice dir with no README and no PROGRESS emits findings (not skipped)", async () => {
+    const sliceDir = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "02-bare");
+    fs.mkdirSync(sliceDir, { recursive: true });
+    const result = await run(["audit", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const parsed = JSON.parse(result.stdout);
+    const sliceEntry = parsed.slices.find((s: { name: string }) => s.name === "02-bare");
+    expect(sliceEntry).toBeDefined();
+    expect(sliceEntry.findings.some((f: { kind: string }) => f.kind === "missing_id")).toBe(true);
+    expect(sliceEntry.findings.some((f: { kind: string }) => f.kind === "missing_progress")).toBe(true);
+  });
+
+  it("non-slice-shaped dir in slices/ with README + PROGRESS emits finding", async () => {
+    const sliceDir = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "random-notes");
+    fs.mkdirSync(sliceDir, { recursive: true });
+    fs.writeFileSync(path.join(sliceDir, "README.md"), "---\nid: OPR.0.3.2.99\n---\n# notes\n", "utf8");
+    fs.writeFileSync(path.join(sliceDir, "PROGRESS.md"), "# Progress\n", "utf8");
+    const result = await run(["audit", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const parsed = JSON.parse(result.stdout);
+    const sliceEntry = parsed.slices.find((s: { name: string }) => s.name === "random-notes");
+    expect(sliceEntry).toBeDefined();
+    expect(sliceEntry.findings.some((f: { kind: string }) => f.kind === "id_convention_violation" || f.kind === "slice_naming_convention")).toBe(true);
+  });
+
+  it("done slice without proof emits advisory missing_proof with exact fix guidance", async () => {
+    const missionDir = path.join(substrate.missionsRoot, "release-0.4.1");
+    fs.mkdirSync(missionDir, { recursive: true });
+    writeFile(path.join(missionDir, "README.md"), "---\nid: OPR.0.4.1\n---\n# release-0.4.1\n");
+    writeFile(path.join(missionDir, "PROGRESS.md"), "# Progress\n");
+    writeFile(path.join(missionDir, "MISSION_NOTES.md"), "# Notes\n");
+    writeFile(path.join(missionDir, "MISSION_BRIEF.md"), [
+      "# release-0.4.1 — Brief",
+      "",
+      "## What & why",
+      "## Building",
+      "## Progress",
+      "## Proven",
+      "## Needs you",
+      "## Pointers",
+    ].join("\n"));
+    const doneSlice = path.join(missionDir, "slices", "01-done");
+    writeFile(path.join(doneSlice, "README.md"), "---\nid: OPR.0.4.1.1\nstatus: done\n---\n# done\n");
+    writeFile(path.join(doneSlice, "PROGRESS.md"), "# Progress\n");
+    fs.mkdirSync(path.join(doneSlice, "proof"), { recursive: true });
+    const wipSlice = path.join(missionDir, "slices", "02-wip");
+    writeFile(path.join(wipSlice, "README.md"), "---\nid: OPR.0.4.1.2\nstatus: wip\n---\n# wip\n");
+    writeFile(path.join(wipSlice, "PROGRESS.md"), "# Progress\n");
+
+    const result = await run(["audit", "--mission", "release-0.4.1", "--json"], substrate.missionsRoot);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(true);
+    const doneEntry = parsed.slices.find((s: { name: string }) => s.name === "01-done");
+    const wipEntry = parsed.slices.find((s: { name: string }) => s.name === "02-wip");
+    const proofFinding = doneEntry.findings.find((f: { kind: string }) => f.kind === "missing_proof");
+    expect(proofFinding).toMatchObject({
+      severity: "medium",
+      path: path.join(doneSlice, "PROOF.md"),
+    });
+    expect(proofFinding.remediation).toMatch(/proof\//);
+    expect(wipEntry.findings.some((f: { kind: string }) => f.kind === "missing_proof")).toBe(false);
+  });
+
+  it("proof-packet-backed proven slice without root proof emits missing_proof", async () => {
+    const missionDir = path.join(substrate.missionsRoot, "release-0.4.1");
+    fs.mkdirSync(missionDir, { recursive: true });
+    writeFile(path.join(missionDir, "README.md"), "---\nid: OPR.0.4.1\n---\n# release-0.4.1\n");
+    writeFile(path.join(missionDir, "PROGRESS.md"), "# Progress\n");
+    writeFile(path.join(missionDir, "MISSION_NOTES.md"), "# Notes\n");
+    writeFile(path.join(missionDir, "MISSION_BRIEF.md"), [
+      "# release-0.4.1 — Brief",
+      "",
+      "## What & why",
+      "## Building",
+      "## Progress",
+      "## Proven",
+      "## Needs you",
+      "## Pointers",
+    ].join("\n"));
+    const sliceDir = path.join(missionDir, "slices", "03-proof-backed");
+    writeFile(path.join(sliceDir, "README.md"), "---\nid: OPR.0.4.1.3\nstatus: active\n---\n# proof backed\n");
+    writeFile(path.join(sliceDir, "PROGRESS.md"), "# Progress\n");
+    const dogfoodRoot = path.join(path.dirname(substrate.missionsRoot), "dogfood-evidence");
+    writeFile(path.join(dogfoodRoot, "03-proof-backed-20260625", "capture.md"), "proof packet exists\n");
+
+    const result = await run(["audit", "--mission", "release-0.4.1", "--json"], substrate.missionsRoot);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(true);
+    const entry = parsed.slices.find((s: { name: string }) => s.name === "03-proof-backed");
+    const proofFinding = entry.findings.find((f: { kind: string }) => f.kind === "missing_proof");
+    expect(proofFinding).toMatchObject({
+      severity: "medium",
+      path: path.join(sliceDir, "PROOF.md"),
+    });
+  });
+});
+
+// ---------------------------------------------------------------------
+// S17 fix round 1 — PROGRESS is an acceptance checklist, not a commit log.
+// ---------------------------------------------------------------------
+
+describe("rig scope audit — no per-commit PROGRESS enforcement", () => {
+  let substrate: { root: string; missionsRoot: string };
+  beforeEach(() => { substrate = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(substrate.root, { recursive: true, force: true }); });
+
+  it("a commit may touch a slice without rewriting its acceptance checklist", async () => {
+    const sliceDir = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "01-existing");
+    // Baseline: give the slice a PROGRESS.md and commit it.
+    writeFile(path.join(sliceDir, "PROGRESS.md"), "# Progress\n- baseline\n");
+    execFileSync("git", ["-C", substrate.root, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", substrate.root, "commit", "-m", "baseline progress", "-q"], { stdio: "ignore" });
+    // HEAD: change ONLY the slice README (no PROGRESS.md touch).
+    fs.appendFileSync(path.join(sliceDir, "README.md"), "\nmore work here\n");
+    execFileSync("git", ["-C", substrate.root, "add", path.join(sliceDir, "README.md")], { stdio: "ignore" });
+    execFileSync("git", ["-C", substrate.root, "commit", "-m", "work without progress", "-q"], { stdio: "ignore" });
+
+    const result = await run(["audit", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const parsed = JSON.parse(result.stdout);
+    const entry = parsed.slices.find((s: { name: string }) => s.name === "01-existing");
+    expect(entry.findings.map((f: { kind: string }) => f.kind)).not.toContain("progress_not_updated_on_commit");
+  });
+});
+
+// ---------------------------------------------------------------------
+// OPR.0.4.1.6 — FR-1 stage verb (deterministic maturity)
+// ---------------------------------------------------------------------
+
+describe("rig scope <tier> stage (OPR.0.4.1.6 FR-1)", () => {
+  let substrate: { root: string; missionsRoot: string };
+  beforeEach(() => { substrate = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(substrate.root, { recursive: true, force: true }); });
+
+  const sliceReadme = () => path.join(substrate.missionsRoot, "release-0.3.2", "slices", "01-existing", "README.md");
+
+  it("AC-1: sets stage surgically, preserving id + other fields", async () => {
+    const r = await run(["slice", "stage", "01-existing", "provisional", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const fm = readFrontmatter(sliceReadme());
+    expect(fm.stage).toBe("provisional");
+    expect(fm.id).toBe("OPR.0.3.2.1"); // untouched
+    expect(fm.status).toBe("active");  // untouched
+  });
+
+  it("AC-1: rejects an invalid stage value and names the valid enum", async () => {
+    const r = await run(["slice", "stage", "01-existing", "shape", "--mission", "release-0.3.2"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toMatch(/wip.*provisional.*established.*canonical.*superseded.*retired/s);
+    expect(readFrontmatter(sliceReadme()).stage).toBeUndefined(); // not written
+  });
+
+  it("AC-1: superseded WITHOUT --successor is rejected (names the rule)", async () => {
+    const r = await run(["slice", "stage", "01-existing", "superseded", "--mission", "release-0.3.2"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toMatch(/successor/i);
+    expect(readFrontmatter(sliceReadme()).stage).toBeUndefined();
+  });
+
+  it("AC-1: superseded WITH --successor sets stage + records the successor", async () => {
+    const r = await run(["slice", "stage", "01-existing", "superseded", "--successor", "OPR.0.3.2.7", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const fm = readFrontmatter(sliceReadme());
+    expect(fm.stage).toBe("superseded");
+    expect(fm["superseded-by"]).toBe("OPR.0.3.2.7");
+  });
+
+  it("retired sets the stage and warns (exit 0)", async () => {
+    const r = await run(["slice", "stage", "01-existing", "retired", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    expect(readFrontmatter(sliceReadme()).stage).toBe("retired");
+  });
+
+  it("mission stage sets the mission README stage", async () => {
+    const r = await run(["mission", "stage", "release-0.3.2", "established", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const fm = readFrontmatter(path.join(substrate.missionsRoot, "release-0.3.2", "README.md"));
+    expect(fm.stage).toBe("established");
+    expect(fm.id).toBe("OPR.0.3.2");
+  });
+});
+
+// ---------------------------------------------------------------------
+// OPR.0.4.1.6 — FR-2 verified verb (provenance-stamped freshness)
+// ---------------------------------------------------------------------
+
+describe("rig scope <tier> verified (OPR.0.4.1.6 FR-2)", () => {
+  let substrate: { root: string; missionsRoot: string };
+  beforeEach(() => { substrate = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(substrate.root, { recursive: true, force: true }); });
+
+  const sliceReadme = () => path.join(substrate.missionsRoot, "release-0.3.2", "slices", "01-existing", "README.md");
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  it("AC-2: stamps verified: <today> against <source>, preserving id", async () => {
+    const r = await run(["slice", "verified", "01-existing", "--against", "runtime (npm+tag)", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const fm = readFrontmatter(sliceReadme());
+    expect(fm.verified).toBe(`${today()} against runtime (npm+tag)`);
+    expect(fm.id).toBe("OPR.0.3.2.1");
+  });
+
+  it("AC-2: rejects empty/whitespace --against (no bare timestamps)", async () => {
+    const r = await run(["slice", "verified", "01-existing", "--against", "   ", "--mission", "release-0.3.2"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toMatch(/against|provenance|source/i);
+    expect(readFrontmatter(sliceReadme()).verified).toBeUndefined();
+  });
+
+  it("AC-2: rejects a missing --against entirely", async () => {
+    const r = await run(["slice", "verified", "01-existing", "--mission", "release-0.3.2"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(1);
+  });
+
+  it("AC-2: overwrites a prior verified line in place", async () => {
+    await run(["slice", "verified", "01-existing", "--against", "first source", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    await run(["slice", "verified", "01-existing", "--against", "second source", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const fm = readFrontmatter(sliceReadme());
+    expect(fm.verified).toBe(`${today()} against second source`);
+  });
+
+  it("mission verified stamps the mission README", async () => {
+    const r = await run(["mission", "verified", "release-0.3.2", "--against", "founder review", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    expect(readFrontmatter(path.join(substrate.missionsRoot, "release-0.3.2", "README.md")).verified).toBe(`${today()} against founder review`);
+  });
+});
+
+// ---------------------------------------------------------------------
+// OPR.0.4.1.6 — FR-4 repair frontmatter-conformance backfill
+// ---------------------------------------------------------------------
+
+describe("rig scope repair frontmatter conformance (OPR.0.4.1.6 FR-4)", () => {
+  let substrate: { root: string; missionsRoot: string };
+  beforeEach(() => { substrate = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(substrate.root, { recursive: true, force: true }); });
+
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  it("adds current surfaces while preserving every legacy byte", async () => {
+    const mission = path.join(substrate.missionsRoot, "legacy-tree");
+    const missionReadme = path.join(mission, "README.md");
+    const missionNotes = path.join(mission, "MISSION_NOTES.md");
+    const slice = path.join(mission, "slices", "01-legacy");
+    const sliceReadme = path.join(slice, "README.md");
+    const legacyPrd = path.join(slice, "IMPLEMENTATION-PRD.md");
+    writeFile(missionReadme, "---\nmission: legacy-tree\n---\n# Legacy mission\n");
+    writeFile(missionNotes, "# irreplaceable legacy notes\n");
+    writeFile(sliceReadme, "---\nstatus: active\n---\n# Legacy slice\n");
+    writeFile(legacyPrd, "# irreplaceable legacy plan\n");
+    const before = new Map([
+      [missionReadme, fs.readFileSync(missionReadme)],
+      [missionNotes, fs.readFileSync(missionNotes)],
+      [sliceReadme, fs.readFileSync(sliceReadme)],
+      [legacyPrd, fs.readFileSync(legacyPrd)],
+    ]);
+
+    const r = await run(["mission", "repair", "legacy-tree", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    for (const [file, bytes] of before) expect(fs.readFileSync(file)).toEqual(bytes);
+
+    expect(readFrontmatter(path.join(mission, "SPEC.md"))).toMatchObject({ intent: "Legacy mission", depends_on: [] });
+    expect(fs.readFileSync(path.join(mission, "NOTES.md"))).toEqual(before.get(missionNotes));
+    expect(readFrontmatter(path.join(slice, "SPEC.md"))).toMatchObject({ intent: "Legacy slice", depends_on: [] });
+    expect(fs.existsSync(path.join(slice, "PROGRESS.md"))).toBe(true);
+    expect(fs.existsSync(path.join(slice, "PROOF.md"))).toBe(true);
+    expect(fs.statSync(path.join(slice, "proof")).isDirectory()).toBe(true);
+  });
+
+  it("keeps current NOTES.md authoritative when both names exist", async () => {
+    const mission = path.join(substrate.missionsRoot, "both-notes");
+    writeFile(path.join(mission, "README.md"), "---\nid: OPR.8.7.6\n---\n# Both notes\n");
+    writeFile(path.join(mission, "NOTES.md"), "current\n");
+    writeFile(path.join(mission, "MISSION_NOTES.md"), "legacy\n");
+
+    const result = await run(["mission", "repair", "both-notes", "--json"], substrate.missionsRoot);
+    expect(result.exitCode).toBe(0);
+    expect(fs.readFileSync(path.join(mission, "NOTES.md"), "utf8")).toBe("current\n");
+    expect(fs.readFileSync(path.join(mission, "MISSION_NOTES.md"), "utf8")).toBe("legacy\n");
+  });
+
+  it("AC-4: backfills a missing id + stage + verified on a ghost slice (idempotent re-run)", async () => {
+    const ghost = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "05-ghost");
+    writeFile(path.join(ghost, "README.md"), "---\nstatus: placeholder\n---\n# ghost\n");
+    const ghostReadme = path.join(ghost, "README.md");
+
+    const r1 = await run(["slice", "repair", "05-ghost", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(r1.exitCode).toBe(0);
+    const ghostSpec = path.join(ghost, "SPEC.md");
+    const fm1 = readFrontmatter(ghostSpec);
+    expect(fm1.id).toBe("OPR.0.3.2.5");                 // minted from parent + NN, registered
+    expect(fm1.stage).toBe("wip");                      // placeholder -> wip (migration map)
+    expect(fm1.verified).toBe(`${today()} against backfill (rig scope repair)`);
+
+    // Idempotent: a second run changes nothing.
+    await run(["slice", "repair", "05-ghost", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const fm2 = readFrontmatter(ghostSpec);
+    expect(fm2.id).toBe("OPR.0.3.2.5");
+    expect(fm2.stage).toBe("wip");
+    expect(fm2.verified).toBe(`${today()} against backfill (rig scope repair)`);
+  });
+
+  it("AC-4: does NOT clobber an existing real verified line", async () => {
+    const slice = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "06-has-verified");
+    writeFile(path.join(slice, "README.md"), "---\nid: OPR.0.3.2.6\nstage: established\nverified: 2026-01-02 against runtime (npm+tag)\n---\n# v\n");
+    await run(["slice", "repair", "06-has-verified", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const fm = readFrontmatter(path.join(slice, "SPEC.md"));
+    expect(fm.verified).toBe("2026-01-02 against runtime (npm+tag)"); // untouched
+    expect(fm.stage).toBe("established");                              // untouched
+  });
+
+  // OPR.0.5.5.8 writer census: repair reaches frontmatter through the CLI's
+  // updateFrontmatter helper; approve reaches it through the daemon's
+  // writeFrontmatterFields helper. The remaining scope frontmatter consumers
+  // are readers. This fixture pins the repair half of the class at its real
+  // command surface rather than accepting semantic YAML equality: author bytes
+  // are the asset, including quoting, folding, ordering, and provenance.
+  it("S08 RED: repair appends conformance fields without rewriting any authored frontmatter byte", async () => {
+    const slice = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "07-additive-repair");
+    const spec = path.join(slice, "SPEC.md");
+    const before = `---
+id: OPR.0.3.2.7
+slice: 07-additive-repair
+mission: release-0.3.2
+status: intent
+stage: established
+verified: >-
+  2026-08-26 against authored sha 012345
+created: '2026-08-26'
+tags: ["a b", 'c,d']
+---
+
+# Additive repair
+
+## Intent
+
+Preserve the author's bytes.
+`;
+    writeFile(spec, before);
+
+    const r = await run(["slice", "repair", "07-additive-repair", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const after = fs.readFileSync(spec, "utf8");
+    const stripped = after
+      .replace(/^intent:[^\n]*\n/m, "")
+      .replace(/^depends_on:[^\n]*\n(?:[ \t]+[^\n]*\n)*/m, "");
+
+    expect(stripped).toBe(before);
+    expect(after).toContain("verified: >-\n  2026-08-26 against authored sha 012345");
+    expect(after).toContain('tags: ["a b", \'c,d\']');
+  });
+
+  it("S08 RED: malformed repair-owned data is conformed losslessly under a named preserved field", async () => {
+    const slice = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "08-lossless-repair");
+    const spec = path.join(slice, "SPEC.md");
+    writeFile(spec, `---
+id: 8
+status: active
+stage: tomorrow
+verified: [not, provenance]
+intent:
+  authored: as-an-object
+depends_on: OPR.0.3.2.7
+---
+
+# Lossless repair
+`);
+
+    const r = await run(["slice", "repair", "08-lossless-repair", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const fm = readFrontmatter(spec);
+
+    expect(fm.id).toBe("OPR.0.3.2.8");
+    expect(fm.stage).toBe("established");
+    expect(fm.verified).toMatch(/against backfill \(rig scope repair\)$/);
+    expect(fm.intent).toBe("Lossless repair");
+    expect(fm.depends_on).toEqual([]);
+    expect(fm["repair-original-id"]).toBe(8);
+    expect(fm["repair-original-stage"]).toBe("tomorrow");
+    expect(fm["repair-original-verified"]).toEqual(["not", "provenance"]);
+    expect(fm["repair-original-intent"]).toEqual({ authored: "as-an-object" });
+    expect(fm["repair-original-depends-on"]).toBe("OPR.0.3.2.7");
+    expect(Object.keys(fm)).toEqual(expect.arrayContaining([
+      "id",
+      "stage",
+      "verified",
+      "intent",
+      "depends_on",
+      "repair-original-id",
+      "repair-original-stage",
+      "repair-original-verified",
+      "repair-original-intent",
+      "repair-original-depends-on",
+    ]));
+  });
+
+  it("S08 fix-round RED: lossless normalization spans an internal blank line and is idempotent", async () => {
+    const slice = path.join(substrate.missionsRoot, "release-0.3.2", "slices", "09-multiline-repair");
+    const spec = path.join(slice, "SPEC.md");
+    const body = `# Multiline repair
+
+Body bytes stay exact.
+`;
+    writeFile(spec, `---
+id: OPR.0.3.2.9
+stage: established
+verified: 2026-08-27 against authored fixture
+intent: "Multiline repair"
+depends_on: |-
+  OPR.9.8.7.1
+
+  OPR.9.8.7.2
+custom-key: 'keep: exact'
+---
+
+${body}`);
+
+    const first = await run(["slice", "repair", "09-multiline-repair", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(first.exitCode).toBe(0);
+    const afterFirst = fs.readFileSync(spec, "utf8");
+    const fm = readFrontmatter(spec);
+    expect(fm.depends_on).toEqual([]);
+    expect(fm["repair-original-depends-on"]).toBe("OPR.9.8.7.1\n\nOPR.9.8.7.2");
+    expect(afterFirst).toContain("custom-key: 'keep: exact'\n");
+    expect(afterFirst.endsWith(`---\n\n${body}`)).toBe(true);
+
+    const second = await run(["slice", "repair", "09-multiline-repair", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    expect(second.exitCode).toBe(0);
+    expect(fs.readFileSync(spec, "utf8")).toBe(afterFirst);
+  });
+
+  it("AC-4: mission repair conforms the additive mission SPEC frontmatter too (lazy parent-id)", async () => {
+    // A mission whose README has no id/stage/verified, plus a ghost slice.
+    const m = path.join(substrate.missionsRoot, "backlog-new");
+    writeFile(path.join(m, "README.md"), "---\nmission: backlog-new\n---\n# new\n");
+    writeFile(path.join(m, "slices", "01-foo", "README.md"), "---\nstatus: active\n---\n# foo\n");
+    const r = await run(["mission", "repair", "backlog-new", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const mfm = readFrontmatter(path.join(m, "SPEC.md"));
+    expect(typeof mfm.id).toBe("string");          // escape-band id minted
+    expect(mfm.stage).toBe("wip");
+    expect(mfm.verified).toBe(`${today()} against backfill (rig scope repair)`);
+    const sfm = readFrontmatter(path.join(m, "slices", "01-foo", "SPEC.md"));
+    expect(typeof sfm.id).toBe("string");          // child id = parentId.1
+    expect(sfm.id).toBe(`${mfm.id}.1`);
+    expect(sfm.stage).toBe("established");          // active -> established (migration map)
+  });
+});
+
+// ---------------------------------------------------------------------
+// OPR.0.4.1.6 — FR-5 read-time-trust in show (DERIVE, never store)
+// ---------------------------------------------------------------------
+
+describe("rig scope show read-time trust (OPR.0.4.1.6 FR-5)", () => {
+  let substrate: { root: string; missionsRoot: string };
+  beforeEach(() => { substrate = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(substrate.root, { recursive: true, force: true }); });
+
+  const dAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  function seedSlice(name: string, fm: string): string {
+    const dir = path.join(substrate.missionsRoot, "release-0.3.2", "slices", name);
+    writeFile(path.join(dir, "README.md"), fm);
+    return path.join(dir, "README.md");
+  }
+
+  it("AC-5: established + STALE verified shows effectively provisional (derived)", async () => {
+    seedSlice("07-stale", `---\nid: OPR.0.3.2.7\nstage: established\nverified: ${dAgo(200)} against runtime\n---\n# stale\n`);
+    const r = await run(["slice", "show", "07-stale", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const p = JSON.parse(r.stdout);
+    expect(p.slice.trust.declaredStage).toBe("established");
+    expect(p.slice.trust.effectiveStage).toBe("provisional");
+    expect(p.slice.trust.downgraded).toBe(true);
+    expect(p.slice.trust.verified.status).toBe("stale_verified");
+  });
+
+  it("AC-5: established + FRESH verified stays established", async () => {
+    seedSlice("08-fresh", `---\nid: OPR.0.3.2.8\nstage: established\nverified: ${dAgo(5)} against runtime\n---\n# fresh\n`);
+    const r = await run(["slice", "show", "08-fresh", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const p = JSON.parse(r.stdout);
+    expect(p.slice.trust.effectiveStage).toBe("established");
+    expect(p.slice.trust.downgraded).toBe(false);
+    expect(p.slice.trust.verified.status).toBe("verified");
+  });
+
+  it("AC-5: established + SCAFFOLD provenance shows effectively provisional regardless of date", async () => {
+    seedSlice("09-scaffold", `---\nid: OPR.0.3.2.9\nstage: established\nverified: ${dAgo(1)} against scaffold (rig scope create)\n---\n# s\n`);
+    const r = await run(["slice", "show", "09-scaffold", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const p = JSON.parse(r.stdout);
+    expect(p.slice.trust.effectiveStage).toBe("provisional");
+    expect(p.slice.trust.verified.status).toBe("unverified_provenance");
+  });
+
+  it("AC-5: show DERIVES trust and does NOT write it back to disk (no stored composite)", async () => {
+    const readmePath = seedSlice("10-nowrite", `---\nid: OPR.0.3.2.10\nstage: canonical\nverified: ${dAgo(200)} against runtime\n---\n# n\n`);
+    const before = fs.readFileSync(readmePath, "utf8");
+    await run(["slice", "show", "10-nowrite", "--mission", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const after = fs.readFileSync(readmePath, "utf8");
+    expect(after).toBe(before); // byte-identical — nothing written back
+    const fm = readFrontmatter(readmePath);
+    expect(fm.trust).toBeUndefined();
+    expect(fm.effectiveStage).toBeUndefined();
+  });
+
+  it("mission show also derives read-time trust", async () => {
+    writeFile(
+      path.join(substrate.missionsRoot, "release-0.3.2", "README.md"),
+      `---\nid: OPR.0.3.2\nstage: canonical\nverified: ${dAgo(300)} against design\n---\n# release-0.3.2\n`,
+    );
+    const r = await run(["mission", "show", "release-0.3.2", "--json"], substrate.missionsRoot);
+    const p = JSON.parse(r.stdout);
+    expect(p.mission.trust.effectiveStage).toBe("provisional");
+    expect(p.mission.trust.downgraded).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------
+// OPR.0.4.1.6 — FR-3 create regression-lock (already ships; guard the templates)
+// ---------------------------------------------------------------------
+
+describe("rig scope create regression-lock (OPR.0.4.1.6 FR-3)", () => {
+  let substrate: { root: string; missionsRoot: string };
+  beforeEach(() => { substrate = seedSubstrate(); });
+  afterEach(() => { fs.rmSync(substrate.root, { recursive: true, force: true }); });
+
+  const WELL_FORMED_VERIFIED = /^\d{4}-\d{2}-\d{2} against .+$/;
+
+  it("AC-3: fresh slice create writes id + stage + a well-formed verified line", async () => {
+    const r = await run(["slice", "create", "release-0.3.2", "new-feature", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const fm = readFrontmatter(path.join(substrate.missionsRoot, "release-0.3.2", "slices", "02-new-feature", "SPEC.md"));
+    expect(fm.id).toBe("OPR.0.3.2.2");
+    expect(fm.stage).toBe("wip");
+    expect(String(fm.verified)).toMatch(WELL_FORMED_VERIFIED);
+  });
+
+  // Requirement 4 — new scaffolds author the CURRENT node filename. Pinned explicitly rather than
+  // implied by the reads above: those would also pass if create wrote both files, and a scaffold
+  // that leaves two authored files behind is the collision state the resolver has to arbitrate.
+  it("fresh create authors SPEC.md and does not also leave a README.md", async () => {
+    const r = await run(["slice", "create", "release-0.3.2", "spec-named", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const slicePath = JSON.parse(r.stdout).slice.path as string;
+    expect(fs.existsSync(path.join(slicePath, "SPEC.md"))).toBe(true);
+    expect(fs.existsSync(path.join(slicePath, "README.md"))).toBe(false);
+
+    const m = await run(["mission", "create", "release-0.9.9", "--json"], substrate.missionsRoot);
+    expect(m.exitCode).toBe(0);
+    const missionPath = JSON.parse(m.stdout).mission.path as string;
+    expect(fs.existsSync(path.join(missionPath, "SPEC.md"))).toBe(true);
+    expect(fs.existsSync(path.join(missionPath, "README.md"))).toBe(false);
+  });
+
+  it("AC-3: fresh mission create writes id + stage + a well-formed verified line", async () => {
+    const r = await run(["mission", "create", "release-0.5.0", "--json"], substrate.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const fm = readFrontmatter(path.join(substrate.missionsRoot, "release-0.5.0", "SPEC.md"));
+    expect(typeof fm.id).toBe("string");
+    expect((fm.id as string).length).toBeGreaterThan(0);
+    expect(fm.stage).toBe("wip");
+    expect(String(fm.verified)).toMatch(WELL_FORMED_VERIFIED);
+  });
+});
+
+// ---------------------------------------------------------------------
+// OPR.0.4.1.6 — FR-6 help teaches the new verbs + enforcement rules
+// ---------------------------------------------------------------------
+
+describe("OPR.0.4.1.6 FR-6 — help", () => {
+  const renderHelp = (cmd: Command) => cmd.helpInformation().replace(/\s+/g, " ");
+
+  it("stage + verified verbs are registered on both tiers with descriptions", () => {
+    const cmd = scopeCommand();
+    for (const tierName of ["slice", "mission"]) {
+      const tier = cmd.commands.find((c) => c.name() === tierName)!;
+      const verbs = tier.commands.map((c) => c.name());
+      expect(verbs).toContain("stage");
+      expect(verbs).toContain("verified");
+      for (const verb of tier.commands) expect(verb.description()).toBeTruthy();
+    }
+  });
+
+  it("stage help teaches the superseded-needs-successor rule + the valid enum", () => {
+    const stage = scopeCommand().commands.find((c) => c.name() === "slice")!.commands.find((c) => c.name() === "stage")!;
+    const help = renderHelp(stage);
+    expect(help).toMatch(/superseded/i);
+    expect(help).toMatch(/successor/i);
+    expect(help).toMatch(/wip.*provisional.*established.*canonical/i);
+  });
+
+  it("verified help teaches provenance-mandatory", () => {
+    const verified = scopeCommand().commands.find((c) => c.name() === "slice")!.commands.find((c) => c.name() === "verified")!;
+    const help = renderHelp(verified);
+    expect(help).toMatch(/against|provenance|mandatory|source/i);
+  });
+});
+
+describe("scope create dependency identity", () => {
+  let root: string;
+  let missionsRoot: string;
+  beforeEach(() => { ({ root, missionsRoot } = seedSubstrate()); });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  it("rejects a mission depending on itself before creating its folder", async () => {
+    const result = await run(["mission", "create", "release-1.2.3", "--no-notes", "--depends-on", "OPR.1.2.3"], missionsRoot);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("itself");
+    expect(fs.existsSync(path.join(missionsRoot, "release-1.2.3"))).toBe(false);
+  });
+
+  it("rejects a slice depending on its freshly minted ID without changing its parent", async () => {
+    const missionPath = path.join(missionsRoot, "release-0.3.2");
+    const original = fs.readFileSync(path.join(missionPath, "README.md"), "utf8");
+    const result = await run(["slice", "create", "release-0.3.2", "self", "--depends-on", "OPR.0.3.2.2"], missionsRoot);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("itself");
+    expect(fs.existsSync(path.join(missionPath, "slices", "02-self"))).toBe(false);
+    expect(fs.readFileSync(path.join(missionPath, "README.md"), "utf8")).toBe(original);
+    expect(fs.existsSync(path.join(missionPath, "mission.yaml"))).toBe(false);
+  });
+
+  it("still creates a mission with a sibling dependency", async () => {
+    const result = await run(["mission", "create", "release-1.2.3", "--no-notes", "--depends-on", "OPR.0.3.2"], missionsRoot);
+    expect(result.exitCode).toBe(0);
+    const fm = readFrontmatter(path.join(missionsRoot, "release-1.2.3", "SPEC.md"));
+    expect(fm.depends_on).toEqual(["OPR.0.3.2"]);
+  });
+
+  it("still creates a slice with a sibling dependency", async () => {
+    const result = await run(["slice", "create", "release-0.3.2", "next", "--depends-on", "OPR.0.3.2.1"], missionsRoot);
+    expect(result.exitCode).toBe(0);
+    const fm = readFrontmatter(path.join(missionsRoot, "release-0.3.2", "slices", "02-next", "SPEC.md"));
+    expect(fm.depends_on).toEqual(["OPR.0.3.2.1"]);
+  });
+});

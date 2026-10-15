@@ -1,0 +1,111 @@
+{
+  "name": "@openrig/daemon",
+  "version": "0.6.10",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./bundle-behaviour": { "types": "./dist/bundle-behaviour-surface.d.ts", "import": "./dist/bundle-behaviour-surface.js" },
+    "./spec-validation": {
+      "types": "./dist/spec-validation-surface.d.ts",
+      "import": "./dist/spec-validation-surface.js"
+    },
+    "./bundle-identity": { "types": "./dist/bundle-identity-surface.d.ts", "import": "./dist/bundle-identity-surface.js" },
+    "./stream-classifier": { "types": "./dist/stream-classifier-surface.d.ts", "import": "./dist/stream-classifier-surface.js" },
+    "./attention": { "types": "./dist/attention-surface.d.ts", "import": "./dist/attention-surface.js" },
+    "./project-catalog": { "types": "./dist/project-catalog-surface.d.ts", "import": "./dist/project-catalog-surface.js" },
+    "./daemon-shutdown": {
+      "types": "./dist/daemon-shutdown.d.ts",
+      "import": "./dist/daemon-shutdown.js"
+    },
+    "./crash-cart": {
+      "types": "./dist/crash-cart-surface.d.ts",
+      "import": "./dist/crash-cart-surface.js"
+    },
+    "./gateway-human-registry": {
+      "types": "./dist/gateway-human-registry-surface.d.ts",
+      "import": "./dist/gateway-human-registry-surface.js"
+    },
+    "./gateway-protocol": {
+      "types": "./dist/gateway-protocol-surface.d.ts",
+      "import": "./dist/gateway-protocol-surface.js"
+    },
+    "./spec-conformance": {
+      "types": "./dist/spec-conformance-surface.d.ts",
+      "import": "./dist/spec-conformance-surface.js"
+    },
+    "./seat-recap-store": {
+      "types": "./dist/seat-recap-store-surface.d.ts",
+      "import": "./dist/seat-recap-store-surface.js"
+    },
+    "./gateway-slack": {
+      "types": "./dist/gateway-slack-surface.d.ts",
+      "import": "./dist/gateway-slack-surface.js"
+    },
+    "./context-pack-taxonomy": {
+      "types": "./dist/context-pack-taxonomy-surface.d.ts",
+      "import": "./dist/context-pack-taxonomy-surface.js"
+    },
+    "./skill-loadout": {
+      "types": "./dist/skill-loadout-surface.d.ts",
+      "import": "./dist/skill-loadout-surface.js"
+    },
+    "./composer-prompts": {
+      "types": "./dist/composer-prompts-surface.d.ts",
+      "import": "./dist/composer-prompts-surface.js"
+    },
+    "./instance-initialization": {
+      "types": "./dist/instance-initialization-surface.d.ts",
+      "import": "./dist/instance-initialization-surface.js"
+    },
+    "./system-world": {
+      "types": "./dist/system-world-surface.d.ts",
+      "import": "./dist/system-world-surface.js"
+    },
+    "./project-lifecycle": {
+      "types": "./dist/project-lifecycle-surface.d.ts",
+      "import": "./dist/project-lifecycle-surface.js"
+    },
+    "./health-projection": {
+      "types": "./dist/health-projection-surface.d.ts",
+      "import": "./dist/health-projection-surface.js"
+    },
+    "./health-detectors": {
+      "types": "./dist/health-detectors-surface.d.ts",
+      "import": "./dist/health-detectors-surface.js"
+    },
+    "./local-reading": {
+      "types": "./dist/local-reading-surface.d.ts",
+      "import": "./dist/local-reading-surface.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc && node scripts/copy-workflow-specs.mjs",
+    "gen:control-plane-json": "node scripts/gen-control-plane-json.mjs",
+    "test": "vitest run",
+    "eval": "node --import tsx scripts/run-evals.mjs",
+    "test:watch": "vitest",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "@hono/node-ws": "^1.3.1",
+    "better-sqlite3": "^13.0.3",
+    "hono": "^4.7.0",
+    "smol-toml": "^1.8.0",
+    "tar": "^7.5.13",
+    "ulid": "^2.3.0",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/tar": "^6.1.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": "^22 || ^24"
+  }
+}

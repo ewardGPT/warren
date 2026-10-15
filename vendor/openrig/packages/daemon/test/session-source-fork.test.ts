@@ -1,0 +1,1038 @@
+import { mockShellCommand } from "./helpers/shell-command-mock.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type Database from "better-sqlite3";
+import { createFullTestDb } from "./helpers/test-app.js";
+
+import { RigSpecSchema } from "../src/domain/rigspec-schema.js";
+import { RigSpecCodec } from "../src/domain/rigspec-codec.js";
+import { ClaudeCodeAdapter, type ClaudeAdapterFsOps } from "../src/adapters/claude-code-adapter.js";
+import { shellQuote } from "../src/adapters/shell-quote.js";
+import { CodexRuntimeAdapter } from "../src/adapters/codex-runtime-adapter.js";
+import { TerminalAdapter } from "../src/adapters/terminal-adapter.js";
+import { StartupOrchestrator, type StartupInput } from "../src/domain/startup-orchestrator.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import type { RuntimeAdapter, NodeBinding, ForkSource } from "../src/domain/runtime-adapter.js";
+import type { TmuxAdapter } from "../src/adapters/tmux.js";
+import type { ProjectionPlan } from "../src/domain/projection-planner.js";
+import type { RigSpec, SessionSourceSpec } from "../src/domain/types.js";
+
+// ============================================================================
+// Fixtures
+// ============================================================================
+
+function baseValidSpec(): Record<string, unknown> {
+  return {
+    version: "0.2",
+    name: "fork-test-rig",
+    pods: [
+      {
+        id: "dev",
+        label: "Dev pod",
+        members: [
+          {
+            id: "impl",
+            agent_ref: "local:agents/impl",
+            profile: "default",
+            runtime: "claude-code",
+            cwd: ".",
+          },
+        ],
+        edges: [],
+      },
+    ],
+    edges: [],
+  };
+}
+
+function withMember(spec: Record<string, unknown>, override: Record<string, unknown>): Record<string, unknown> {
+  const next = JSON.parse(JSON.stringify(spec));
+  const pods = next.pods as Array<Record<string, unknown>>;
+  const members = pods[0]!.members as Array<Record<string, unknown>>;
+  members[0] = { ...members[0], ...override };
+  return next;
+}
+
+// ============================================================================
+// Schema validation — Honest Refusal Matrix
+// ============================================================================
+
+describe("session_source schema validation", () => {
+  it("accepts claude-code + fork + native_id + non-empty value", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: {
+        mode: "fork",
+        ref: { kind: "native_id", value: "0b0165d7-cb4d-4650-90de-15c0a1ede9e6" },
+      },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("accepts codex + fork + native_id + non-empty value", () => {
+    const spec = withMember(baseValidSpec(), {
+      runtime: "codex",
+      session_source: { mode: "fork", ref: { kind: "native_id", value: "thread-id-abc" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects terminal runtime with session_source", () => {
+    const spec = withMember(baseValidSpec(), {
+      runtime: "terminal",
+      agent_ref: "builtin:terminal",
+      profile: "none",
+      session_source: { mode: "fork", ref: { kind: "native_id", value: "x" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("terminal runtime has no native fork primitive"))).toBe(true);
+  });
+
+  it("rejects mode != fork", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "snapshot", ref: { kind: "native_id", value: "x" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    // PL-016 Item 4: error message names the now-three valid modes.
+    expect(result.errors.some((e) => e.includes('supports "fork", "rebuild", or "agent_image"'))).toBe(true);
+  });
+
+  it("rejects ref.kind=artifact_path (deferred per dossier)", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork", ref: { kind: "artifact_path", value: "/some/path" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes('"artifact_path" deferred to follow-up slice'))).toBe(true);
+  });
+
+  it("rejects ref.kind=name", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork", ref: { kind: "name", value: "x" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes('weaker than "native_id"'))).toBe(true);
+  });
+
+  it("rejects ref.kind=last", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork", ref: { kind: "last" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes('weaker than "native_id"'))).toBe(true);
+  });
+
+  it("rejects missing ref.value when kind=native_id", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork", ref: { kind: "native_id" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("ref.value: required non-empty string"))).toBe(true);
+  });
+
+  it("rejects empty ref.value", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork", ref: { kind: "native_id", value: "   " } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("ref.value: required non-empty string"))).toBe(true);
+  });
+
+  it("rejects missing ref entirely", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork" },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes(".ref:"))).toBe(true);
+  });
+
+  it("rejects unknown kind value", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork", ref: { kind: "magic" } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes('v1 fork mode supports "native_id" only'))).toBe(true);
+  });
+});
+
+// ============================================================================
+// normalizePod — schema-side typed coercion
+// ============================================================================
+
+describe("session_source normalization", () => {
+  it("normalizes valid session_source onto RigSpecPodMember.sessionSource", () => {
+    const spec = withMember(baseValidSpec(), {
+      session_source: { mode: "fork", ref: { kind: "native_id", value: "abc" } },
+    });
+    const normalized = RigSpecSchema.normalize(spec) as RigSpec;
+    const member = normalized.pods[0]!.members[0]!;
+    expect(member.sessionSource).toEqual({ mode: "fork", ref: { kind: "native_id", value: "abc" } });
+  });
+
+  it("normalizes absent session_source to undefined", () => {
+    const spec = baseValidSpec();
+    const normalized = RigSpecSchema.normalize(spec) as RigSpec;
+    expect(normalized.pods[0]!.members[0]!.sessionSource).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Codec roundtrip — serialize → parse → normalize
+// ============================================================================
+
+describe("session_source codec roundtrip", () => {
+  it("preserves session_source through serialize → parse → normalize", () => {
+    const seed: RigSpec = {
+      version: "0.2",
+      name: "fork-test-rig",
+      pods: [{
+        id: "dev",
+        label: "Dev pod",
+        members: [{
+          id: "impl",
+          agentRef: "local:agents/impl",
+          profile: "default",
+          runtime: "claude-code",
+          cwd: ".",
+          sessionSource: { mode: "fork", ref: { kind: "native_id", value: "0b0165d7-cb4d-4650-90de-15c0a1ede9e6" } },
+        }],
+        edges: [],
+      }],
+      edges: [],
+    };
+    const yaml = RigSpecCodec.serialize(seed);
+    expect(yaml).toContain("session_source:");
+    expect(yaml).toContain("mode: fork");
+    expect(yaml).toContain("kind: native_id");
+    expect(yaml).toContain("0b0165d7-cb4d-4650-90de-15c0a1ede9e6");
+
+    const parsed = RigSpecCodec.parse(yaml);
+    const validation = RigSpecSchema.validate(parsed);
+    expect(validation.valid).toBe(true);
+
+    const normalized = RigSpecSchema.normalize(parsed as Record<string, unknown>) as RigSpec;
+    expect(normalized.pods[0]!.members[0]!.sessionSource).toEqual(seed.pods[0]!.members[0]!.sessionSource);
+  });
+});
+
+// ============================================================================
+// Claude adapter fork branch
+// ============================================================================
+
+function mockTmux(): TmuxAdapter {
+  return {
+    sendText: vi.fn(async () => ({ ok: true as const })),
+    hasSession: vi.fn(async () => true),
+    getPaneCommand: vi.fn(async () => "claude"),
+    capturePaneContent: vi.fn(async () => ""),
+    createSession: vi.fn(async () => ({ ok: true as const })),
+    killSession: vi.fn(async () => ({ ok: true as const })),
+    listSessions: vi.fn(async () => []),
+    listWindows: vi.fn(async () => []),
+    listPanes: vi.fn(async () => []),
+    sendKeys: vi.fn(async () => ({ ok: true as const })),
+  } as unknown as TmuxAdapter;
+}
+
+function mockClaudeFs(captured?: string): ClaudeAdapterFsOps {
+  const store: Record<string, string> = {};
+  return {
+    readFile: (p: string) => {
+      if (captured && p.includes(`12345.json`)) {
+        return JSON.stringify({ pid: 12345, sessionId: captured, name: "dev-impl@test-rig" });
+      }
+      if (p in store) return store[p]!;
+      throw new Error(`Not found: ${p}`);
+    },
+    writeFile: (p: string, c: string) => { store[p] = c; },
+    exists: (p: string) => p in store || (captured ? p.includes("sessions") : false),
+    mkdirp: () => {},
+    copyFile: () => {},
+    listFiles: () => [],
+    readdir: () => (captured ? ["12345.json"] : []),
+    homedir: "/mock-home",
+  } as ClaudeAdapterFsOps;
+}
+
+function makeBinding(): NodeBinding {
+  return {
+    id: "b1", nodeId: "n1", tmuxSession: "r01-impl", tmuxWindow: null, tmuxPane: null,
+    cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", cwd: "/project",
+  };
+}
+
+describe("ClaudeCodeAdapter.launchHarness fork branch", () => {
+  it("builds claude --resume <parent> --fork-session --session-id <new> for forkSource.kind=native_id and returns the NEW id", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockClaudeFs(), sessionIdFactory: () => "33333333-3333-4333-8333-333333333333" });
+
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "PARENT-TOKEN-ABC" },
+    });
+
+    expect(result.ok).toBe(true);
+    const sendText = tmux.sendText as ReturnType<typeof vi.fn>;
+    expect(sendText).toHaveBeenCalledWith(
+      "r01-impl",
+      "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode acceptEdits --resume 'PARENT-TOKEN-ABC' --fork-session --session-id 33333333-3333-4333-8333-333333333333 --name dev-impl@test-rig",
+    );
+    if (result.ok) {
+      // The returned token MUST be the fork's own new id, NOT the parent.
+      expect(result.resumeToken).toBe("33333333-3333-4333-8333-333333333333");
+      expect(result.resumeToken).not.toBe("PARENT-TOKEN-ABC");
+      expect(result.resumeType).toBe("claude_id");
+    }
+  });
+
+  it("keeps the fork's own id when another same-name session file exists (an earlier occupant or another seat)", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockClaudeFs("STALE-SAME-NAME-ID"), sessionIdFactory: () => "33333333-3333-4333-8333-333333333333" });
+
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "PARENT-TOKEN-ABC" },
+    });
+
+    expect(result).toMatchObject({ ok: true, resumeToken: "33333333-3333-4333-8333-333333333333", resumeType: "claude_id" });
+  });
+
+  it("quotes a hostile fork parent id so it cannot leave the --resume argument (the pane shell is the sink)", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockClaudeFs(), sessionIdFactory: () => "33333333-3333-4333-8333-333333333333" });
+
+    const hostileParent = "ABC-123'; touch /tmp/OPENRIG_PWNED; '";
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: hostileParent },
+    });
+
+    expect(result.ok).toBe(true);
+    const sendText = tmux.sendText as ReturnType<typeof vi.fn>;
+    const command = sendText.mock.calls[0]?.[1] as string;
+    // The parent id must arrive as ONE quoted shell word — same treatment
+    // as --model/--effort in the same template and as the codex fork path.
+    expect(command).toContain(`--resume ${shellQuote(hostileParent)}`);
+    // The raw payload must not sit unquoted behind --resume, or the pane
+    // shell would execute everything after the first quote terminator.
+    expect(command).not.toContain("--resume ABC-123");
+    if (result.ok) {
+      expect(result.resumeToken).toBe("33333333-3333-4333-8333-333333333333");
+    }
+  });
+
+  it("refuses forkSource.kind=artifact_path (defensive — schema also rejects)", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockClaudeFs() });
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "artifact_path", value: "/some/path" },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain('ref.kind="artifact_path" is not supported in v1');
+    }
+  });
+
+  it("refuses both resumeToken and forkSource together", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockClaudeFs() });
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      resumeToken: "abc",
+      forkSource: { kind: "native_id", value: "xyz" },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("mutually exclusive");
+    }
+  });
+
+  it("refuses forkSource with empty value", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockClaudeFs() });
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "  " },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("forkSource.value is required");
+    }
+  });
+
+  it("does not break the existing fresh and resume paths", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeCodeAdapter({
+      tmux,
+      fsOps: mockClaudeFs(),
+      sessionIdFactory: () => "fresh-uuid-aaa",
+    });
+    const fresh = await adapter.launchHarness(makeBinding(), { name: "dev-impl@test-rig" });
+    expect(fresh.ok).toBe(true);
+
+    const resume = await adapter.launchHarness(makeBinding(), { name: "dev-impl@test-rig", resumeToken: "resume-abc" });
+    expect(resume.ok).toBe(true);
+  });
+});
+
+// OPR.0.3.4.5 — pod-aware consumer guard: ClaudeCodeAdapter.launchHarness
+// on a resume-selection menu returns attention_required with ZERO numeric
+// selection keystrokes (the governance BLOCKING safety line).
+describe("ClaudeCodeAdapter.launchHarness resume-selection menu (OPR.0.3.4.5)", () => {
+  it("returns attention_required with evidence, sends ZERO numeric selection keys", async () => {
+    const menuContent = [
+      "Choose a conversation to resume:",
+      "",
+      "  1. project-foo",
+      "  2. project-bar",
+      "",
+      "Enter your choice (1-2):",
+    ].join("\n");
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const tmux = {
+      ...mockTmux(),
+      sendText,
+      sendKeys,
+      getPaneCommand: vi.fn(async () => "claude"),
+      capturePaneContent: vi.fn(async () => menuContent),
+    } as unknown as TmuxAdapter;
+    const adapter = new ClaudeCodeAdapter({
+      tmux,
+      fsOps: mockClaudeFs(),
+      sleep: async () => {},
+    });
+
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      resumeToken: "resume-tok",
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.recovery).toBe("attention_required");
+      expect(result.evidence).toBeTruthy();
+      expect(result.evidence).toContain("Choose a conversation");
+    }
+    // THE GUARD: no numeric selection keystroke was sent.
+    const allSendKeysArgs = sendKeys.mock.calls.flatMap((c) => {
+      const arg = c[1];
+      return Array.isArray(arg) ? arg : [String(arg ?? "")];
+    });
+    const allSendTextArgs = sendText.mock.calls.map((c) => String(c[1] ?? ""));
+    for (const s of [...allSendKeysArgs, ...allSendTextArgs]) {
+      expect(s).not.toMatch(/^[0-9]+$/);
+    }
+  });
+});
+
+// ============================================================================
+// Codex adapter fork branch
+// ============================================================================
+
+describe("CodexRuntimeAdapter.launchHarness fork branch", () => {
+  function makeMinimalCodexFs() {
+    return {
+      readFile: () => "",
+      writeFile: () => {},
+      exists: () => false,
+      mkdirp: () => {},
+      listFiles: () => [],
+    } as unknown as Parameters<typeof CodexRuntimeAdapter>[0]["fsOps"];
+  }
+
+  function makeCodexAdapter(captureThreadId?: string) {
+    const tmux = {
+      sendText: vi.fn(async () => ({ ok: true as const })),
+      hasSession: vi.fn(async () => true),
+      getPaneCommand: vi.fn(async () => "codex"),
+      capturePaneContent: vi.fn(async () => "OpenAI Codex (v0.0.0)"),
+      createSession: vi.fn(async () => ({ ok: true as const })),
+      killSession: vi.fn(async () => ({ ok: true as const })),
+      listSessions: vi.fn(async () => []),
+      listWindows: vi.fn(async () => []),
+      listPanes: vi.fn(async () => []),
+      sendKeys: vi.fn(async () => ({ ok: true as const })),
+      getPanePid: vi.fn(async () => 900),
+    } as unknown as TmuxAdapter;
+    const adapter = new CodexRuntimeAdapter({
+      tmux: mockShellCommand(tmux),
+      fsOps: makeMinimalCodexFs(),
+      listProcesses: () => [
+        { pid: 900, ppid: 1, command: "-zsh" },
+        { pid: 901, ppid: 900, command: "codex" },
+      ],
+      readThreadIdByPid: (pid) => (pid === 901 && captureThreadId ? captureThreadId : undefined),
+      sleep: async () => {},
+    });
+    return { tmux, adapter };
+  }
+
+  it("builds codex fork <parent> for forkSource.kind=native_id and captures the NEW thread id", async () => {
+    const { tmux, adapter } = makeCodexAdapter("NEW-CODEX-THREAD-XYZ");
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "PARENT-THREAD-ABC" },
+    });
+    expect(result.ok).toBe(true);
+    const sendText = tmux.sendText as ReturnType<typeof vi.fn>;
+    const sentCmd = sendText.mock.calls[0]?.[1] as string;
+    // The no-profile floor and managed update setting precede the fork subcommand.
+    expect(sentCmd).toMatch(/^codex -s workspace-write '-c' 'check_for_update_on_startup=false' fork/);
+    expect(sentCmd).toContain("PARENT-THREAD-ABC");
+    if (result.ok) {
+      expect(result.resumeToken).toBe("NEW-CODEX-THREAD-XYZ");
+      expect(result.resumeToken).not.toBe("PARENT-THREAD-ABC");
+      expect(result.resumeType).toBe("codex_id");
+    }
+  });
+
+  it("refuses forkSource.kind=artifact_path", async () => {
+    const { adapter } = makeCodexAdapter();
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "artifact_path", value: "/x" },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain('ref.kind="artifact_path" is not supported in v1');
+    }
+  });
+
+  it("refuses both resumeToken and forkSource together", async () => {
+    const { adapter } = makeCodexAdapter();
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      resumeToken: "r",
+      forkSource: { kind: "native_id", value: "p" },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("mutually exclusive");
+    }
+  });
+
+  it("refuses fork when capture fails (identity-honesty: no token == no honest seat)", async () => {
+    const { adapter } = makeCodexAdapter(); // no thread id captured
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "PARENT-X" },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("could not capture new post-fork thread id");
+    }
+  });
+
+  it("for a handover (pendingIdAllowed) a missed capture is pending metadata: ok with no token", async () => {
+    const { adapter } = makeCodexAdapter(); // no thread id captured
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "PARENT-X", pendingIdAllowed: true },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resumeToken).toBeUndefined();
+      expect(result.resumeType).toBeUndefined();
+    }
+  });
+
+  it("preserves Codex hook review consent during fork", async () => {
+    const hookReviewContent = [
+      "Hooks need review",
+      "3 hooks are new or changed.",
+      "1. Review hooks",
+      "2. Trust all and continue",
+      "3. Continue without trusting (hooks won't run)",
+    ].join("\n");
+
+    let callCount = 0;
+    const tmux = {
+      sendText: vi.fn(async () => ({ ok: true as const })),
+      hasSession: vi.fn(async () => true),
+      getPaneCommand: vi.fn(async () => "codex"),
+      capturePaneContent: vi.fn(async () => {
+        callCount++;
+        if (callCount <= 3) return hookReviewContent;
+        return "OpenAI Codex (v0.0.0)";
+      }),
+      createSession: vi.fn(async () => ({ ok: true as const })),
+      killSession: vi.fn(async () => ({ ok: true as const })),
+      listSessions: vi.fn(async () => []),
+      listWindows: vi.fn(async () => []),
+      listPanes: vi.fn(async () => []),
+      sendKeys: vi.fn(async () => ({ ok: true as const })),
+      getPanePid: vi.fn(async () => 900),
+    } as unknown as TmuxAdapter;
+
+    const adapter = new CodexRuntimeAdapter({
+      tmux: mockShellCommand(tmux),
+      fsOps: makeMinimalCodexFs(),
+      listProcesses: () => [
+        { pid: 900, ppid: 1, command: "-zsh" },
+        { pid: 901, ppid: 900, command: "codex" },
+      ],
+      readThreadIdByPid: (pid) => (pid === 901 ? "NEW-THREAD-AFTER-TRUST" : undefined),
+      sleep: async () => {},
+    });
+
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "PARENT-THREAD-ABC" },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resumeToken).toBe("NEW-THREAD-AFTER-TRUST");
+      expect(result.resumeType).toBe("codex_id");
+    }
+
+    const sendTextCalls = (tmux.sendText as ReturnType<typeof vi.fn>).mock.calls;
+    const trustDismissal = sendTextCalls.find((c) => c[1] === "2");
+    expect(trustDismissal).toBeUndefined();
+  });
+
+  it("preserves delayed hook-trust consent while waiting for a new fork identity", async () => {
+    const hookReviewContent = [
+      "Hooks need review",
+      "3 hooks are new or changed.",
+      "1. Review hooks",
+      "2. Trust all and continue",
+      "3. Continue without trusting (hooks won't run)",
+    ].join("\n");
+
+    let captureCount = 0;
+    let threadIdAvailable = false;
+    const tmux = {
+      sendText: vi.fn(async (_sess: string, text: string) => {
+        if (text === "2") threadIdAvailable = true;
+        return { ok: true as const };
+      }),
+      hasSession: vi.fn(async () => true),
+      getPaneCommand: vi.fn(async () => "codex"),
+      capturePaneContent: vi.fn(async () => {
+        captureCount++;
+        if (captureCount <= 2) return "OpenAI Codex (v0.0.0)";
+        if (!threadIdAvailable) return hookReviewContent;
+        return "OpenAI Codex (v0.0.0)";
+      }),
+      createSession: vi.fn(async () => ({ ok: true as const })),
+      killSession: vi.fn(async () => ({ ok: true as const })),
+      listSessions: vi.fn(async () => []),
+      listWindows: vi.fn(async () => []),
+      listPanes: vi.fn(async () => []),
+      sendKeys: vi.fn(async () => ({ ok: true as const })),
+      getPanePid: vi.fn(async () => 900),
+    } as unknown as TmuxAdapter;
+
+    const adapter = new CodexRuntimeAdapter({
+      tmux: mockShellCommand(tmux),
+      fsOps: makeMinimalCodexFs(),
+      listProcesses: () => [
+        { pid: 900, ppid: 1, command: "-zsh" },
+        { pid: 901, ppid: 900, command: "codex" },
+      ],
+      readThreadIdByPid: (pid) => (pid === 901 && threadIdAvailable ? "DELAYED-TRUST-THREAD" : undefined),
+      sleep: async () => {},
+    });
+
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "dev-impl@test-rig",
+      forkSource: { kind: "native_id", value: "PARENT-DELAYED" },
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("could not capture new post-fork thread id");
+    expect(threadIdAvailable).toBe(false);
+
+    const sendTextCalls = (tmux.sendText as ReturnType<typeof vi.fn>).mock.calls;
+    const trustDismissal = sendTextCalls.find((c) => c[1] === "2");
+    expect(trustDismissal).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Terminal adapter — defensive refusal
+// ============================================================================
+
+describe("TerminalAdapter.launchHarness fork refusal", () => {
+  it("refuses forkSource (terminal has no native fork primitive)", async () => {
+    const adapter = new TerminalAdapter();
+    const result = await adapter.launchHarness(makeBinding(), {
+      name: "term@rig",
+      forkSource: { kind: "native_id", value: "x" },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("terminal runtime has no native fork primitive");
+    }
+  });
+
+  it("still succeeds for the no-fork path", async () => {
+    const adapter = new TerminalAdapter();
+    const result = await adapter.launchHarness(makeBinding(), { name: "term@rig" });
+    expect(result.ok).toBe(true);
+  });
+});
+
+// ============================================================================
+// Startup orchestrator — forkSource → continuityOutcome="forked" + new token
+// persisted; identity prompt NOT replayed (forked seat carries parent context)
+// ============================================================================
+
+function mockOrchTmux(): TmuxAdapter {
+  return {
+    sendText: vi.fn(async () => ({ ok: true as const })),
+    hasSession: vi.fn(async () => true),
+    createSession: vi.fn(async () => ({ ok: true as const })),
+    killSession: vi.fn(async () => ({ ok: true as const })),
+    listSessions: vi.fn(async () => []),
+    listWindows: vi.fn(async () => []),
+    listPanes: vi.fn(async () => []),
+    sendKeys: vi.fn(async () => ({ ok: true as const })),
+  } as unknown as TmuxAdapter;
+}
+
+function makeStubAdapter(forkResumeToken: string): RuntimeAdapter {
+  return {
+    runtime: "claude-code",
+    listInstalled: vi.fn(async () => []),
+    project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+    deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+    checkReady: vi.fn(async () => ({ ready: true })),
+    launchHarness: vi.fn(async (_binding, opts) => {
+      // Honest identity rule: the captured token IS the new post-fork token.
+      if (opts.forkSource) {
+        return { ok: true, resumeToken: forkResumeToken, resumeType: "claude_id" };
+      }
+      if (opts.resumeToken) {
+        // Match ClaudeCodeAdapter's successful, verified resume result.
+        return { ok: true, resumeToken: opts.resumeToken, resumeType: "claude_id" };
+      }
+      return { ok: true };
+    }),
+  };
+}
+
+function emptyPlan(): ProjectionPlan {
+  return { runtime: "claude-code", cwd: ".", entries: [], startup: { files: [], actions: [] }, conflicts: [], noOps: [], diagnostics: [] };
+}
+
+describe("StartupOrchestrator forkSource integration", () => {
+  let db: Database.Database;
+  let sessionRegistry: SessionRegistry;
+  let eventBus: EventBus;
+  let rigRepo: RigRepository;
+
+  beforeEach(() => {
+    db = createFullTestDb();
+    sessionRegistry = new SessionRegistry(db);
+    eventBus = new EventBus(db);
+    rigRepo = new RigRepository(db);
+  });
+  afterEach(() => { db.close(); });
+
+  function seed(): { rigId: string; nodeId: string; sessionId: string } {
+    const rig = rigRepo.createRig("fork-rig");
+    const node = rigRepo.addNode(rig.id, "impl", { runtime: "claude-code" });
+    const session = sessionRegistry.registerSession(node.id, "r01-impl");
+    sessionRegistry.updateStatus(session.id, "running");
+    return { rigId: rig.id, nodeId: node.id, sessionId: session.id };
+  }
+
+  function makeInput(s: { rigId: string; nodeId: string; sessionId: string }, overrides?: Partial<StartupInput>): StartupInput {
+    return {
+      rigId: s.rigId,
+      nodeId: s.nodeId,
+      sessionId: s.sessionId,
+      binding: { id: "b1", nodeId: s.nodeId, tmuxSession: "r01-impl", tmuxWindow: null, tmuxPane: null, cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", cwd: "." },
+      adapter: makeStubAdapter("NEW-POST-FORK-TOKEN-aaa"),
+      plan: emptyPlan(),
+      resolvedStartupFiles: [],
+      startupActions: [],
+      isRestore: false,
+      ...overrides,
+    };
+  }
+
+  function createOrch(): StartupOrchestrator {
+    return new StartupOrchestrator({
+      db, sessionRegistry, eventBus,
+      tmuxAdapter: mockOrchTmux(),
+      sleep: async () => {},
+    });
+  }
+
+  it("sets continuityOutcome=forked when forkSource is provided and launch succeeds", async () => {
+    const s = seed();
+    const orch = createOrch();
+    const forkSource: ForkSource = { kind: "native_id", value: "PARENT-TOKEN-ABC" };
+    const result = await orch.startNode(makeInput(s, { forkSource }));
+    expect(result).toEqual({
+      ok: true,
+      startupStatus: "ready",
+      continuityOutcome: "forked",
+    });
+  });
+
+  it("persists the NEW post-fork token onto the seat, NOT the parent", async () => {
+    const s = seed();
+    const orch = createOrch();
+    const forkSource: ForkSource = { kind: "native_id", value: "PARENT-TOKEN-ABC" };
+    await orch.startNode(makeInput(s, { forkSource }));
+
+    const row = db.prepare("SELECT resume_token FROM sessions WHERE id = ?").get(s.sessionId) as { resume_token: string };
+    expect(row.resume_token).toBe("NEW-POST-FORK-TOKEN-aaa");
+    expect(row.resume_token).not.toBe("PARENT-TOKEN-ABC");
+  });
+
+  it("passes forkSource through to adapter.launchHarness opts (not resumeToken)", async () => {
+    const s = seed();
+    const orch = createOrch();
+    const adapter = makeStubAdapter("any-token");
+    const launchSpy = adapter.launchHarness as ReturnType<typeof vi.fn>;
+    const forkSource: ForkSource = { kind: "native_id", value: "PARENT-TOKEN" };
+
+    await orch.startNode(makeInput(s, { adapter, forkSource }));
+
+    expect(launchSpy).toHaveBeenCalledTimes(1);
+    const opts = launchSpy.mock.calls[0]![1];
+    expect(opts.forkSource).toEqual(forkSource);
+    expect(opts.resumeToken).toBeUndefined();
+  });
+
+  // The spec member (session_source: fork) and agent-image entrances both reach the adapter through
+  // startNode with a plain fork source: a missed capture still fails the start, as before.
+  it("a member or agent-image fork whose new id isn't captured still fails its start (no pending success)", async () => {
+    const s = seed();
+    const orch = createOrch();
+    const tmux = {
+      sendText: vi.fn(async () => ({ ok: true as const })), hasSession: vi.fn(async () => true),
+      getPaneCommand: vi.fn(async () => "codex"), capturePaneContent: vi.fn(async () => "OpenAI Codex (v0.0.0)"),
+      createSession: vi.fn(async () => ({ ok: true as const })), killSession: vi.fn(async () => ({ ok: true as const })),
+      listSessions: vi.fn(async () => []), listWindows: vi.fn(async () => []), listPanes: vi.fn(async () => []),
+      sendKeys: vi.fn(async () => ({ ok: true as const })), getPanePid: vi.fn(async () => 900),
+    } as unknown as TmuxAdapter;
+    const adapter = new CodexRuntimeAdapter({
+      tmux: mockShellCommand(tmux),
+      fsOps: { readFile: () => "", writeFile: () => {}, exists: () => false, mkdirp: () => {}, listFiles: () => [] } as unknown as Parameters<typeof CodexRuntimeAdapter>[0]["fsOps"],
+      listProcesses: () => [{ pid: 900, ppid: 1, command: "-zsh" }, { pid: 901, ppid: 900, command: "codex" }],
+      readThreadIdByPid: () => undefined, sleep: async () => {},
+    });
+    const result = await orch.startNode(makeInput(s, { adapter, forkSource: { kind: "native_id", value: "PARENT-TOKEN-ABC" } }));
+    expect(result.ok).toBe(false);
+    const row = db.prepare("SELECT resume_token FROM sessions WHERE id = ?").get(s.sessionId) as { resume_token: string | null };
+    expect(row.resume_token).toBeNull();
+  });
+
+  it("fresh path (no resumeToken, no forkSource) is unchanged: continuityOutcome=fresh", async () => {
+    const s = seed();
+    const orch = createOrch();
+    const result = await orch.startNode(makeInput(s));
+    expect(result).toEqual({ ok: true, startupStatus: "ready", continuityOutcome: "fresh" });
+  });
+
+  it("resume path (resumeToken set) is unchanged: continuityOutcome=resumed", async () => {
+    const s = seed();
+    const orch = createOrch();
+    const result = await orch.startNode(makeInput(s, {
+      resumeToken: "stored-token-xyz",
+      isRestore: true,
+    }));
+    expect(result).toEqual({ ok: true, startupStatus: "ready", continuityOutcome: "resumed" });
+    expect(db.prepare("SELECT status, startup_status, resume_type, resume_token, resume_provenance FROM sessions WHERE id = ?").get(s.sessionId)).toEqual({
+      status: "running", startup_status: "ready", resume_type: "claude_id",
+      resume_token: "stored-token-xyz", resume_provenance: "scrape",
+    });
+  });
+
+  it("does not certify resume when the adapter succeeds without identity evidence", async () => {
+    const s = seed();
+    const adapter = makeStubAdapter("unused-fork-token");
+    vi.mocked(adapter.launchHarness).mockResolvedValue({ ok: true });
+    const result = await createOrch().startNode(makeInput(s, {
+      adapter, resumeToken: "stored-token-xyz", isRestore: true,
+    }));
+    expect(result).toMatchObject({ ok: false, startupStatus: "attention_required" });
+    expect(adapter.launchHarness).toHaveBeenCalledTimes(1);
+    expect(db.prepare("SELECT status, startup_status, resume_type, resume_token, resume_provenance FROM sessions WHERE id = ?").get(s.sessionId)).toEqual({
+      status: "running", startup_status: "attention_required", resume_type: null,
+      resume_token: null, resume_provenance: null,
+    });
+  });
+});
+
+// ============================================================================
+// rig-expansion-service session_source pass-through (structured spec)
+// ============================================================================
+
+// OPR.0.3.3.24: expand passes a structured spec OBJECT (no synthetic YAML
+// round-trip) through materializeStructured + launchValidatedSpec. This is the
+// session_source analogue of the realigned starterRef pass-through tests: assert
+// snake_case session_source on the structured spec member, not a YAML string.
+describe("rig-expansion session_source pass-through (structured spec)", () => {
+  it("emits session_source on the structured spec member when member.sessionSource is set", async () => {
+    const { RigExpansionService } = await import("../src/domain/rig-expansion-service.js");
+    const fakeRigRepo = { getRig: () => ({ rig: { name: "rig-x" }, nodes: [] }) } as never;
+    const fakeEventBus = { emit: () => {} } as never;
+    const capturedSpecs: Array<Record<string, unknown>> = [];
+    const fakePodInstantiator = {
+      materializeStructured: async (raw: Record<string, unknown>) => {
+        capturedSpecs.push(raw);
+        return { ok: true as const, result: { nodes: [] } };
+      },
+      launchValidatedSpec: async () => ({ ok: true as const, result: { nodes: [], warnings: [] } }),
+    } as never;
+
+    const svc = new RigExpansionService({
+      db: {} as never,
+      rigRepo: fakeRigRepo,
+      eventBus: fakeEventBus,
+      nodeLauncher: {} as never,
+      podInstantiator: fakePodInstantiator,
+      sessionRegistry: {} as never,
+    });
+    const result = await svc.expand({
+      rigId: "rig-x",
+      pod: {
+        id: "dev",
+        label: "Dev",
+        members: [{
+          id: "impl",
+          runtime: "claude-code",
+          agentRef: "local:impl",
+          profile: "default",
+          cwd: ".",
+          sessionSource: { mode: "fork", ref: { kind: "native_id", value: "fork-source-id" } },
+        }],
+        edges: [],
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(capturedSpecs).toHaveLength(1);
+    const spec = capturedSpecs[0]! as { pods: Array<{ members: Array<Record<string, unknown>> }> };
+    const member = spec.pods[0]!.members[0]!;
+    const ss = member["session_source"] as { mode: string; ref: { kind: string; value: string } } | undefined;
+    expect(ss).toBeDefined();
+    expect(ss!.mode).toBe("fork");
+    expect(ss!.ref.kind).toBe("native_id");
+    expect(ss!.ref.value).toBe("fork-source-id");
+  });
+});
+
+// ============================================================================
+// Honest UX literal — continuityOutcome union includes "forked"
+// ============================================================================
+
+describe("identity-honesty literal contract", () => {
+  it('continuityOutcome union accepts "forked" alongside "resumed" and "fresh"', () => {
+    const r1 = { ok: true as const, startupStatus: "ready" as const, continuityOutcome: "forked" as const };
+    const r2 = { ok: true as const, startupStatus: "ready" as const, continuityOutcome: "resumed" as const };
+    const r3 = { ok: true as const, startupStatus: "ready" as const, continuityOutcome: "fresh" as const };
+    expect(r1.continuityOutcome).toBe("forked");
+    expect(r2.continuityOutcome).toBe("resumed");
+    expect(r3.continuityOutcome).toBe("fresh");
+  });
+
+  it("does NOT reuse 'restored', 'resumed', or 'snapshot' wording for the fork path", () => {
+    const fork: SessionSourceSpec = { mode: "fork", ref: { kind: "native_id", value: "x" } };
+    expect(fork.mode).toBe("fork");
+    expect(["restored", "resumed", "snapshot", "snapshot_copy"]).not.toContain(fork.mode as string);
+  });
+});
+
+// ============================================================================
+// OPR.0.4.6.PI1 — Pi rows: runtime "pi" + session_source fork, launch-command
+// shape via the runner (CLI --fork whole-session fork, NEW child token rule)
+// ============================================================================
+
+describe("session_source Pi rows (OPR.0.4.6.PI1)", () => {
+  const PI_STATE_ROOT = "/openrig-home/state/pi";
+  const PI_RUNNER = "/daemon-dist/adapters/pi-runner.js";
+  const PI_SESSION = "dev-impl@fork-test-rig";
+  const PI_PARENT = "/prior-seat/sessions/parent_0196.jsonl";
+  const PI_CHILD = `${PI_STATE_ROOT}/${PI_SESSION}/sessions/child_0197.jsonl`;
+
+  it("accepts runtime pi + fork + native_id (schema)", () => {
+    const spec = withMember(baseValidSpec(), {
+      runtime: "pi",
+      session_source: { mode: "fork", ref: { kind: "native_id", value: PI_PARENT } },
+    });
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("builds the runner command with --fork <parent> and persists the NEW child token", async () => {
+    const { PiRuntimeAdapter } = await import("../src/adapters/pi-runtime-adapter.js");
+    const { piSeatPaths } = await import("../src/adapters/pi-runner-protocol.js");
+
+    const files: Record<string, string> = {};
+    const dirs = new Set<string>();
+    let typedCommand = "";
+    const tmux = {
+      sendText: vi.fn(async (_t: string, text: string) => {
+        typedCommand = text;
+        const launchId = /--launch-id '([^']+)'/.exec(text)![1];
+        // The runner "starts" and reports the CHILD session file via the
+        // launch-stamped sidecar.
+        files[piSeatPaths(PI_STATE_ROOT, PI_SESSION).runnerStatePath] = JSON.stringify({
+          ready: true, launchId, sessionFile: PI_CHILD, sessionId: "0197c", updatedAt: "t",
+        });
+        return { ok: true as const };
+      }),
+      sendKeys: vi.fn(async () => ({ ok: true as const })),
+      capturePaneContent: vi.fn(async () => ""),
+      hasSession: vi.fn(async () => true),
+    } as unknown as TmuxAdapter;
+
+    const adapter = new PiRuntimeAdapter({
+      tmux: mockShellCommand(tmux),
+      fsOps: {
+        readFile: (p: string) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; },
+        writeFile: (p: string, c: string) => { files[p] = c; },
+        exists: (p: string) => p in files || dirs.has(p),
+        mkdirp: (p: string) => { dirs.add(p); },
+      },
+      stateRoot: PI_STATE_ROOT,
+      runnerEntryPath: PI_RUNNER,
+      sleep: async () => {},
+    });
+
+    const result = await adapter.launchHarness(
+      { tmuxSession: PI_SESSION, cwd: "/work" } as NodeBinding,
+      { name: PI_SESSION, forkSource: { kind: "native_id", value: PI_PARENT } },
+    );
+
+    // Launch-command shape: the runner is typed into the pane with --fork.
+    expect(typedCommand).toContain("pi-runner.js");
+    expect(typedCommand).toContain(`--fork '${PI_PARENT}'`);
+    expect(typedCommand).not.toContain("--session '");
+    expect(typedCommand).toMatch(/--(no-)?approve/); // explicit trust, always
+
+    // Post-fork token rule: the NEW child file is persisted, never the parent.
+    expect(result).toEqual({
+      ok: true,
+      resumeToken: PI_CHILD,
+      resumeType: "pi_session_file",
+      appliedLaunch: {
+        runtime: "pi",
+        axis: "resource_trust",
+        state: "observed",
+        value: "no-approve",
+      },
+    });
+  });
+});

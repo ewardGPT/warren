@@ -1,0 +1,170 @@
+import nodePath from "node:path";
+import { Command } from "commander";
+import { DaemonClient } from "../client.js";
+import { getDaemonStatus, getDaemonUrl, daemonStatusGuard } from "../daemon-lifecycle.js";
+import { realDeps } from "./daemon.js";
+import type { StatusDeps } from "./status.js";
+import { bundleRoutingSummary, getCliVersion } from "./bundle.js";
+
+const LONG_RUNNING_BOOTSTRAP_TIMEOUT_MS = 120_000;
+
+function logStageDetailErrors(data: Record<string, unknown>) {
+  const stages = (data["stages"] as Array<{ stage: string; status: string; detail?: unknown }>) ?? [];
+  for (const stage of stages) {
+    if (stage.status !== "failed" && stage.status !== "blocked") continue;
+    if (!stage.detail || typeof stage.detail !== "object") continue;
+    const detail = stage.detail as Record<string, unknown>;
+    const nestedErrors = Array.isArray(detail["errors"]) ? detail["errors"] as string[] : [];
+    for (const err of nestedErrors) {
+      console.error(`  DETAIL: ${err}`);
+    }
+    if (nestedErrors.length === 0 && typeof detail["error"] === "string") {
+      console.error(`  DETAIL: ${detail["error"]}`);
+    }
+  }
+}
+
+export function bootstrapCommand(depsOverride?: StatusDeps): Command {
+  const cmd = new Command("bootstrap").description("Bootstrap a rig from a spec file or bundle");
+  const getDeps = () => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
+
+  async function getTarget(deps: StatusDeps) {
+    const status = await getDaemonStatus(deps.lifecycleDeps);
+    if (!daemonStatusGuard(status)) return null;
+    // Only the recorded local-daemon branch has a PID; URL/config targets may be remote.
+    return { client: deps.clientFactory(getDaemonUrl(status)), local: status.pid !== undefined };
+  }
+
+  cmd
+    .argument("<spec>", "Path to rig spec YAML file or .rigbundle archive")
+    .option("--plan", "Plan mode — show reviewed plan without executing")
+    .option("--yes", "Auto-approve trusted deterministic actions")
+    .option("--cwd <path>", "Override launch working directory for all members for this run only")
+    .option("--target <path>", "Bundle install directory (defaults to current directory)")
+    .option("--skip-version-check", "Override the archive install compatibility check")
+    .option("--force", "Override archive install conflicts (may produce partial install state)")
+    .option("--json", "Output as parseable JSON")
+    .action(async (spec: string, opts: { plan?: boolean; yes?: boolean; cwd?: string; target?: string; skipVersionCheck?: boolean; force?: boolean; json?: boolean }) => {
+      const deps = getDeps();
+      const target = await getTarget(deps);
+      if (!target) { process.exitCode = 1; return; }
+      const { client, local } = target;
+
+      // Library name resolution: if spec looks like a name (not a path), check library
+      const isPath = spec.includes("/") || /\.(ya?ml|rigbundle)$/i.test(spec);
+      // Resolve caller paths only for the local daemon. Explicit URLs (even loopback
+      // tunnels), stateless targets and catalog sources keep daemon-side addressing.
+      let sourceRef = isPath && local ? nodePath.resolve(spec) : spec;
+      if (!isPath) {
+        try {
+          const { resolveLibrarySpec } = await import("./specs.js");
+          const entry = await resolveLibrarySpec(client, spec);
+          sourceRef = entry.sourcePath;
+        } catch (resolveErr) {
+          if ((resolveErr as Error).message?.includes("ambiguous")) {
+            console.error((resolveErr as Error).message);
+            process.exitCode = 1;
+            return;
+          }
+          // Not found — fall through to use spec as-is (existing behavior)
+        }
+      }
+
+      // Reuse bundle install's source-kind, compatibility checks, audit and
+      // stable materialization. The archive's extraction directory is temporary.
+      const bundleRequest = /\.rigbundle$/i.test(sourceRef) ? {
+        bundlePath: nodePath.resolve(sourceRef),
+        plan: opts.plan ?? false,
+        autoApprove: opts.yes ?? false,
+        targetRoot: nodePath.resolve(opts.target ?? process.cwd()),
+        cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : undefined,
+        cliVersion: getCliVersion(),
+        skipVersionCheck: opts.skipVersionCheck ?? false,
+        force: opts.force ?? false,
+      } : undefined;
+
+      if (opts.plan) {
+        // Plan mode
+        const res = await client.post<Record<string, unknown>>(bundleRequest ? "/api/bundles/install" : "/api/bootstrap/plan", bundleRequest ?? {
+          sourceRef,
+          cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : undefined,
+        }, bundleRequest ? { timeoutMs: LONG_RUNNING_BOOTSTRAP_TIMEOUT_MS } : undefined);
+
+        if (opts.json) {
+          console.log(JSON.stringify(res.data));
+        } else if (res.status === 200) {
+          const stages = (res.data["stages"] as Array<{ stage: string; status: string }>) ?? [];
+          console.log("BOOTSTRAP PLAN");
+          for (const s of stages) {
+            console.log(`  ${s.stage}: ${s.status}`);
+          }
+          const actionKeys = (res.data["actionKeys"] as string[]) ?? [];
+          if (actionKeys.length > 0) {
+            console.log(`\n  ${actionKeys.length} action(s) pending approval`);
+          }
+        } else {
+          const stages = (res.data["stages"] as Array<{ stage: string; status: string }>) ?? [];
+          for (const s of stages) {
+            console.log(`  ${s.stage}: ${s.status}`);
+          }
+          const errors = (res.data["errors"] as string[]) ?? [];
+          if (errors.length > 0) {
+            for (const e of errors) {
+              console.error(`  ERROR: ${e}`);
+            }
+          } else if (typeof res.data["error"] === "string") {
+            console.error(`  ERROR: ${res.data["error"]}`);
+          }
+          logStageDetailErrors(res.data);
+        }
+        if (res.status === 409) process.exitCode = 1;
+        else if (res.status >= 400) process.exitCode = 2;
+        return;
+      }
+
+      // Apply mode
+      const res = await client.post<Record<string, unknown>>(bundleRequest ? "/api/bundles/install" : "/api/bootstrap/apply", bundleRequest ?? {
+        sourceRef,
+        cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : undefined,
+        autoApprove: opts.yes ?? false,
+      }, { timeoutMs: LONG_RUNNING_BOOTSTRAP_TIMEOUT_MS });
+
+      if (opts.json) {
+        console.log(JSON.stringify(res.data));
+      } else {
+        const status = res.data["status"] as string;
+        const stages = (res.data["stages"] as Array<{ stage: string; status: string }>) ?? [];
+        for (const s of stages) {
+          console.log(`  ${s.stage}: ${s.status}`);
+        }
+        const rigId = res.data["rigId"] as string | undefined;
+        if (rigId) console.log(`\nRig: ${rigId}`);
+        console.log(`Status: ${status}`);
+
+        const errors = (res.data["errors"] as string[]) ?? [];
+        if (errors.length > 0) {
+          for (const e of errors) {
+            console.error(`  ERROR: ${e}`);
+          }
+        } else if (typeof res.data["error"] === "string") {
+          console.error(`  ERROR: ${res.data["error"]}`);
+        }
+        logStageDetailErrors(res.data);
+        if (bundleRequest) {
+          for (const line of bundleRoutingSummary(res.data)) console.log(line);
+        }
+        for (const warning of (res.data["warnings"] as string[] | undefined) ?? []) console.log(`Warning: ${warning}`);
+      }
+
+      const resultStatus = (res.data["status"] as string) ?? "";
+      if (res.status === 409) {
+        process.exitCode = 1; // blocked
+      } else if (res.status >= 400) {
+        process.exitCode = 2; // failure (same convention as --plan)
+      } else if (resultStatus === "partial") {
+        process.exitCode = 1; // partial is not clean success
+      }
+    });
+
+  return cmd;
+}

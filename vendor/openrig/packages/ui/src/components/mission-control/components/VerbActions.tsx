@@ -1,0 +1,372 @@
+// PL-005 Phase A: 7-verb action sub-component.
+//
+// Per PRD § Acceptance Criteria item 2: each of 7 verbs is one atomic
+// transaction. The 4-step `handoff` shape is daemon-internal (not visible
+// here); UI just submits the verb + required fields.
+
+import { useState } from "react";
+import {
+  MISSION_CONTROL_VERBS,
+  type MissionControlVerb,
+  useMissionControlAction,
+} from "../hooks/useMissionControlAction.js";
+import { useMissionControlDestinations } from "../hooks/useMissionControlDestinations.js";
+import { ACTION_VERB_META } from "../action-verb-meta.js";
+import { cn } from "../../../lib/utils.js";
+import type { FeedActionOutcome } from "../../for-you/FeedCard.js";
+
+export interface VerbActionsProps {
+  qitemId: string;
+  actorSession: string;
+  /** CORRECTIVE §7.1 (founder 2026-07-05): render ONLY the verb button(s) —
+   *  no "Choose response" header/explainer chrome; buttons are self-evident.
+   *  The mutation + receipt + error paths are identical. */
+  bare?: boolean;
+  /** OPR.0.4.4.15 FR-4 — the item's ORIGIN host (from the aggregated feed
+   *  card). Remote ids ride the mutation so the daemon forwards the verb to
+   *  where the qitem lives; absent/'local' changes nothing. */
+  hostId?: string;
+  /** Restrict the verbs offered (e.g., my-queue may only show approve/deny). */
+  enabledVerbs?: MissionControlVerb[];
+  /**
+   * OPR.0.3.3.20 — verbs that submit DIRECTLY on click (no select+confirm
+   * step), firing the same mutation + optimistic-receipt + held-error paths.
+   * APPROVE-ONLY by contract (PRD scope + section S): the type narrows the
+   * prop to "approve", and ONE_CLICK_SAFE_VERBS enforces the same allowlist
+   * at runtime — a verb outside it (including input-free verbs like deny)
+   * is NEVER one-clicked even if a caller forces it in; it falls back to the
+   * controlled select+confirm flow. For-You passes ["approve"].
+   */
+  oneClickVerbs?: Array<Extract<MissionControlVerb, "approve">>;
+  onSettled?: () => void;
+  /**
+   * 0.3.1 demo-bug fix — optimistic outcome callback. Fires on
+   * mutation success with a FeedActionOutcome built from the input
+   * verb + destination + actor. Parent (Feed.tsx) stashes this in a
+   * local Map so the ActionOutcomePanel renders instantly without
+   * waiting for the audit-log roundtrip. The audit query re-fetch
+   * reconciles to the same shape later.
+   */
+  onOptimisticOutcome?: (outcome: FeedActionOutcome) => void;
+}
+
+/** The one-click ALLOWLIST (OPR.0.3.3.20, approve-only by scope ruling).
+ *  Being input-free is necessary but NOT sufficient — deny needs no input yet
+ *  stays in the controlled select+confirm flow. A verb one-clicks only if the
+ *  caller lists it AND it is in this set. */
+const ONE_CLICK_SAFE_VERBS: ReadonlySet<MissionControlVerb> = new Set(["approve"]);
+
+function extractMutationErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  return "Action failed.";
+}
+
+// Vellum-coherent verb buttons: bordered-no-fill at rest; hover inverts
+// to filled. Active state stays filled to signal the operator's
+// selection while filling out the verb's required fields.
+//
+// Tone classes are mapped to design tokens (success / warning / tertiary
+// / secondary / stone-900) — never off-brand emerald/rose/sky/amber
+// utilities.
+const verbToneClass: Record<MissionControlVerb, { idle: string; active: string }> = {
+  approve: {
+    idle: "border-success text-success hover:bg-success hover:text-white",
+    active: "border-success bg-success text-white",
+  },
+  deny: {
+    idle: "border-tertiary text-tertiary hover:bg-tertiary hover:text-white",
+    active: "border-tertiary bg-tertiary text-white",
+  },
+  route: {
+    idle: "border-on-surface text-on-surface hover:bg-inverse-surface hover:text-background",
+    active: "border-on-surface bg-inverse-surface text-background",
+  },
+  annotate: {
+    idle: "border-on-surface text-on-surface hover:bg-inverse-surface hover:text-background",
+    active: "border-on-surface bg-inverse-surface text-background",
+  },
+  hold: {
+    idle: "border-warning text-warning hover:bg-warning hover:text-white",
+    active: "border-warning bg-warning text-white",
+  },
+  drop: {
+    idle: "border-on-surface text-on-surface hover:bg-inverse-surface hover:text-background",
+    active: "border-on-surface bg-inverse-surface text-background",
+  },
+  handoff: {
+    idle: "border-on-surface text-on-surface hover:bg-inverse-surface hover:text-background",
+    active: "border-on-surface bg-inverse-surface text-background",
+  },
+};
+
+export function VerbActions({
+  qitemId,
+  actorSession,
+  bare = false,
+  hostId,
+  enabledVerbs = [...MISSION_CONTROL_VERBS],
+  oneClickVerbs,
+  onSettled,
+  onOptimisticOutcome,
+}: VerbActionsProps) {
+  const mutation = useMissionControlAction();
+  const [activeVerb, setActiveVerb] = useState<MissionControlVerb | null>(null);
+  const [destinationSession, setDestinationSession] = useState("");
+  const [manualDestination, setManualDestination] = useState(false);
+  const [annotation, setAnnotation] = useState("");
+  const [reason, setReason] = useState("");
+  // Demo-bug fix #2 — inline error state. Cleared on verb selection +
+  // explicit reset; held across mutation state transitions so the
+  // operator sees what failed instead of a silent revert.
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const needsDestination = activeVerb === "route" || activeVerb === "handoff";
+  const needsAnnotation = activeVerb === "annotate";
+  const needsReason = activeVerb === "hold" || activeVerb === "drop";
+
+  function reset() {
+    setActiveVerb(null);
+    setDestinationSession("");
+    setManualDestination(false);
+    setAnnotation("");
+    setReason("");
+    setErrorMessage(null);
+  }
+
+  function selectVerb(verb: MissionControlVerb) {
+    setActiveVerb(verb);
+    setDestinationSession("");
+    setManualDestination(false);
+    setAnnotation("");
+    setReason("");
+    setErrorMessage(null);
+  }
+
+  // Shared by the select+confirm submit AND the one-click path so both fire
+  // the identical mutation + optimistic-receipt + held-error behavior.
+  function performSubmit(verb: MissionControlVerb, inputs: { dest?: string; annotationText?: string; reasonText?: string }) {
+    const { dest, annotationText, reasonText } = inputs;
+    mutation.mutate(
+      {
+        verb,
+        qitemId,
+        actorSession,
+        destinationSession: dest,
+        annotation: annotationText,
+        reason: reasonText,
+        // G15-CF6-1: remote cards carry their origin so the daemon
+        // forwards; local/absent adds NOTHING to the body (byte-parity).
+        ...(hostId && hostId !== "local" ? { hostId } : {}),
+      },
+      {
+        // Demo-bug fix #1 — split onSuccess / onError so the error
+        // path doesn't reset the selection (silent-revert symptom).
+        // Optimistic outcome fires on success so ActionOutcomePanel
+        // renders without waiting for the audit-log roundtrip.
+        onSuccess: () => {
+          onOptimisticOutcome?.({
+            verb,
+            actorSession,
+            actedAt: new Date().toISOString(),
+            destinationSession: dest ?? null,
+            reason: reasonText ?? null,
+          });
+          reset();
+          onSettled?.();
+        },
+        onError: (err) => {
+          setErrorMessage(extractMutationErrorMessage(err));
+        },
+      },
+    );
+  }
+
+  function submit() {
+    if (!activeVerb) return;
+    performSubmit(activeVerb, {
+      dest: needsDestination ? destinationSession : undefined,
+      annotationText: needsAnnotation ? annotation : undefined,
+      reasonText: needsReason ? reason : undefined,
+    });
+  }
+
+  // OPR.0.3.3.20 — one-click submit, approve-only: both the caller's list AND
+  // the ONE_CLICK_SAFE_VERBS allowlist must contain the verb. Act-driven:
+  // fires on the operator's click, never on a timer.
+  function isOneClick(verb: MissionControlVerb): boolean {
+    return Boolean((oneClickVerbs as MissionControlVerb[] | undefined)?.includes(verb)) && ONE_CLICK_SAFE_VERBS.has(verb);
+  }
+
+  const destinationsQuery = useMissionControlDestinations(needsDestination);
+  const destinationOptions = destinationsQuery.data?.destinations ?? [];
+  const destinationListLoading = needsDestination && destinationsQuery.isLoading;
+  const showDestinationSelect = needsDestination && (destinationOptions.length > 0 || destinationListLoading);
+  const showManualDestinationInput =
+    needsDestination &&
+    (manualDestination || destinationsQuery.isError || (destinationsQuery.isFetched && destinationOptions.length === 0));
+
+  return (
+    <div data-testid="mc-verb-actions" className="space-y-2">
+      {/* CORRECTIVE §7.1 (founder 2026-07-05): `bare` renders ONLY the verb
+          button(s) — buttons are self-evident, no explainer chrome. The
+          mutation + receipt + error paths are byte-identical. */}
+      {!bare ? (
+      <div className="flex flex-wrap items-start justify-between gap-2 border border-outline-variant bg-surface-lowest/40 px-2 py-1.5 backdrop-blur-sm">
+        <div>
+          <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-on-surface">Choose response</div>
+          <div className="mt-0.5 font-mono text-[10px] leading-relaxed text-on-surface-variant">
+            Pick the next move for this queue item.
+          </div>
+        </div>
+        {activeVerb ? (
+          <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-on-surface-variant">
+            Selected: <span className="text-on-surface">{ACTION_VERB_META[activeVerb].label}</span>
+          </div>
+        ) : null}
+      </div>
+      ) : null}
+      <div className="flex flex-wrap gap-1">
+        {enabledVerbs.map((verb) => {
+          const meta = ACTION_VERB_META[verb];
+          const Icon = meta.icon;
+          const oneClick = isOneClick(verb);
+          return (
+            <button
+              key={verb}
+              type="button"
+              data-testid={`mc-verb-${verb}`}
+              data-one-click={oneClick ? "true" : undefined}
+              onClick={() => {
+                // OPR.0.3.3.20 — one-click verbs record immediately (no
+                // select+confirm step); input-needing verbs always go
+                // through the controlled flow.
+                if (oneClick) {
+                  setErrorMessage(null);
+                  performSubmit(verb, {});
+                  return;
+                }
+                selectVerb(verb);
+              }}
+              disabled={mutation.isPending}
+              title={oneClick ? `${meta.description} (records immediately)` : meta.description}
+              className={cn(
+                "inline-flex min-h-[44px] items-center gap-1 border px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] transition-colors disabled:opacity-50",
+                activeVerb === verb ? verbToneClass[verb].active : verbToneClass[verb].idle,
+              )}
+            >
+              <Icon className="h-3 w-3" strokeWidth={1.7} />
+              {meta.label}
+            </button>
+          );
+        })}
+      </div>
+      {activeVerb && (
+        <div className="space-y-1 border border-outline-variant bg-background p-2">
+          <div data-testid="mc-verb-guidance" className="font-mono text-[10px] leading-relaxed text-on-surface-variant">
+            {ACTION_VERB_META[activeVerb].description}
+          </div>
+          {needsDestination && (
+            <div className="space-y-1">
+              {showDestinationSelect ? (
+                <select
+                  data-testid="mc-verb-destination-select"
+                  aria-label="Destination session"
+                  value={manualDestination ? "__manual__" : destinationSession}
+                  disabled={destinationListLoading}
+                  onChange={(e) => {
+                    if (e.target.value === "__manual__") {
+                      setManualDestination(true);
+                      setDestinationSession("");
+                      return;
+                    }
+                    setManualDestination(false);
+                    setDestinationSession(e.target.value);
+                  }}
+                  className="w-full border border-outline-variant bg-surface-lowest px-2 py-1 font-mono text-xs"
+                >
+                  <option value="">
+                    {destinationListLoading ? "loading destinations..." : "choose destination"}
+                  </option>
+                  {destinationOptions.map((destination) => (
+                    <option key={destination.sessionName} value={destination.sessionName}>
+                      {destination.label}
+                    </option>
+                  ))}
+                  <option value="__manual__">manual entry</option>
+                </select>
+              ) : null}
+              {showManualDestinationInput ? (
+                <input
+                  type="text"
+                  data-testid="mc-verb-destination-input"
+                  value={destinationSession}
+                  onChange={(e) => setDestinationSession(e.target.value)}
+                  placeholder="destination session (member@rig)"
+                  className="w-full border border-outline-variant px-2 py-1 font-mono text-xs"
+                />
+              ) : null}
+              {destinationsQuery.isError ? (
+                <div className="font-mono text-[10px] text-amber-700">destination list unavailable</div>
+              ) : null}
+            </div>
+          )}
+          {needsAnnotation && (
+            <textarea
+              data-testid="mc-verb-annotation-input"
+              value={annotation}
+              onChange={(e) => setAnnotation(e.target.value)}
+              placeholder="annotation"
+              rows={2}
+              className="w-full border border-outline-variant px-2 py-1 font-mono text-xs"
+            />
+          )}
+          {needsReason && (
+            <input
+              type="text"
+              data-testid="mc-verb-reason-input"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder={`${activeVerb} reason`}
+              className="w-full border border-outline-variant px-2 py-1 font-mono text-xs"
+            />
+          )}
+          <div className="flex items-center justify-end gap-1">
+            <button
+              type="button"
+              onClick={reset}
+              data-testid="mc-verb-cancel"
+              className="border border-outline-variant px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-on-surface-variant"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={submit}
+              data-testid="mc-verb-submit"
+              disabled={
+                mutation.isPending ||
+                (needsDestination && !destinationSession) ||
+                (needsAnnotation && !annotation) ||
+                (needsReason && !reason)
+              }
+              className="border border-on-surface bg-inverse-surface px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-background disabled:opacity-50"
+            >
+              {mutation.isPending ? "..." : `Confirm ${ACTION_VERB_META[activeVerb].label}`}
+            </button>
+          </div>
+        </div>
+      )}
+      {errorMessage ? (
+        <div
+          data-testid="mc-verb-error"
+          role="alert"
+          className="truncate border border-tertiary bg-background/40 px-3 py-2 font-mono text-[10px] uppercase tracking-[0.12em] text-tertiary"
+          title={errorMessage}
+        >
+          {errorMessage}
+        </div>
+      ) : null}
+    </div>
+  );
+}

@@ -1,0 +1,178 @@
+// Slice Story View v0 + v1 — Topology tab.
+//
+// v0: per-rig session-name list grouped by rig with click-through to
+// the main topology surface. The tab remains a read-current-state view
+// and links out to the canonical topology surface for deeper action.
+//
+// v1 dimension #1: when a workflow_instance is bound to the slice,
+// renders the spec graph (one node per spec step; edges from each
+// step's next_hop.suggested_roles). Composes with the v0 per-rig
+// listing. The current step is highlighted, the entry step is marked,
+// terminal steps are marked, and loop-back edges are styled differently
+// from forward edges.
+//
+// v1 dimension #4: edges carry a routingType field. Phase D's spec
+// format does NOT yet have a routing_type metadata field (per audit-
+// row-6 carve-out from the PRD), so all edges are routingType=`direct`
+// at v1. The styling differentiates loop-back vs. forward; richer
+// routing-type styling (artifact-pool, async, fan-out, etc.) is
+// v2+ territory.
+
+import { Link } from "@tanstack/react-router";
+import { useState } from "react";
+import type { SliceDetail, SpecGraphPayload } from "../../../hooks/useSlices.js";
+import { ProgressiveTerminal } from "../../terminal/ProgressiveTerminal.js";
+import { SliceWorkflowGraph } from "./SliceWorkflowGraph.js";
+import { useSelectedHostId } from "../../../hooks/useHosts.js";
+import { LOCAL_HOST_ID } from "../../../lib/host-param.js";
+
+export function TopologyTab({ topology }: { topology: SliceDetail["topology"] }) {
+  const { affectedRigs, totalSeats, specGraph } = topology;
+  const runtimeGraph = specGraph ?? deriveRuntimeGraph(affectedRigs);
+  const hasAnything = affectedRigs.length > 0 || specGraph !== null;
+  if (!hasAnything) {
+    return (
+      <div className="p-4 font-mono text-[10px] text-on-surface-variant" data-testid="topology-empty">
+        No seats found for this slice's qitem chain.
+      </div>
+    );
+  }
+  return (
+    <div data-testid="topology-tab" className="p-4 space-y-4">
+      <header className="flex items-center justify-between border-b border-outline-variant pb-2">
+        <div className="font-mono text-[11px] uppercase tracking-[0.12em] text-on-surface">
+          Workflow
+        </div>
+        <div className="font-mono text-[10px] text-on-surface-variant" data-testid="topology-aggregate">
+          {totalSeats} seat{totalSeats === 1 ? "" : "s"}
+          {" · "}{affectedRigs.length} rig{affectedRigs.length === 1 ? "" : "s"}
+          {specGraph && (
+            <>
+              {" · spec "}
+              <span data-testid="topology-spec-name">{specGraph.specName}</span>
+              {" v"}{specGraph.specVersion}
+            </>
+          )}
+        </div>
+      </header>
+
+      {runtimeGraph && <SliceWorkflowGraph specGraph={runtimeGraph} />}
+
+      {affectedRigs.length > 0 && (
+        <div data-testid="topology-rig-listing" className="space-y-3">
+          {runtimeGraph && (
+            <div className="font-mono text-[10px] uppercase tracking-[0.10em] text-on-surface-variant">
+              Active seats
+            </div>
+          )}
+          {affectedRigs.map((rig) => (
+            <section
+              key={rig.rigName}
+              data-testid={`topology-rig-${rig.rigName}`}
+              className="border border-outline-variant bg-surface-lowest"
+            >
+              <header className="flex items-center justify-between border-b border-outline-variant bg-background px-3 py-2">
+                <div className="font-mono text-[10px] font-bold text-on-surface">{rig.rigName}</div>
+                <Link
+                  to="/rigs/$rigId"
+                  params={{ rigId: rig.rigId }}
+                  data-testid={`topology-rig-${rig.rigName}-open`}
+                  className="font-mono text-[9px] uppercase tracking-[0.10em] text-blue-700 hover:underline"
+                >
+                  Open topology →
+                </Link>
+              </header>
+              <ul className="divide-y divide-outline-variant">
+                {rig.sessionNames.map((session) => (
+                  <SeatRow key={session} session={session} />
+                ))}
+              </ul>
+            </section>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function deriveRuntimeGraph(affectedRigs: SliceDetail["topology"]["affectedRigs"]): SpecGraphPayload | null {
+  if (affectedRigs.length === 0) return null;
+  const nodes = affectedRigs.map((rig, index) => ({
+    stepId: rig.rigName || rig.rigId || `rig-${index + 1}`,
+    label: rig.rigName || rig.rigId || `Rig ${index + 1}`,
+    role: `${rig.sessionNames.length} seat${rig.sessionNames.length === 1 ? "" : "s"}`,
+    preferredTarget: rig.sessionNames[0] ?? null,
+    isEntry: index === 0,
+    isCurrent: index === affectedRigs.length - 1,
+    isTerminal: index === affectedRigs.length - 1,
+  }));
+  return {
+    specName: "runtime-handoff-map",
+    specVersion: "derived",
+    nodes,
+    edges: nodes.slice(0, -1).map((node, index) => ({
+      fromStepId: node.stepId,
+      toStepId: nodes[index + 1]!.stepId,
+      routingType: "direct",
+      isLoopBack: false,
+    })),
+  };
+}
+
+// Preview Terminal v0 (PL-018) — clickable seat row.
+// Click toggles inline preview for the seat using the session-keyed
+// preview alias. Operator wanting persistent / multi-pin behavior
+// pins from the node-detail drawer (separate flow).
+function SeatRow({ session }: { session: string }) {
+  const [open, setOpen] = useState(false);
+  // OPR.0.4.6.MH2 rev1-r2 B1: the inline preview is a LOCAL session-name
+  // read (ProgressiveTerminal, click-to-live typeable) — under a remote
+  // selection the seat renders as plain read data with no preview
+  // affordance, so a same-named LOCAL session never renders under the
+  // remote label.
+  const seatIsRemote = useSelectedHostId() !== LOCAL_HOST_ID;
+  if (seatIsRemote) {
+    return (
+      <li
+        data-testid={`topology-seat-${session}`}
+        data-remote-readonly="true"
+        className="px-3 py-1"
+      >
+        <span className="flex w-full items-baseline gap-2 font-mono text-[10px] text-on-surface">
+          <span className="flex-1 truncate">{session}</span>
+        </span>
+      </li>
+    );
+  }
+  return (
+    <li
+      data-testid={`topology-seat-${session}`}
+      data-open={open ? "true" : "false"}
+      className="px-3 py-1"
+    >
+      <button
+        type="button"
+        data-testid={`topology-seat-${session}-toggle`}
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-baseline gap-2 text-left font-mono text-[10px] text-on-surface hover:bg-background -mx-3 px-3 py-0.5"
+      >
+        <span className="flex-1 truncate">{session}</span>
+        <span className="text-on-surface-variant shrink-0">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div data-testid={`topology-seat-${session}-preview`} className="mt-1">
+          {/* OPR.0.4.0.1 forward-fix: the shared progressive terminal (default-
+              static -> click-inside-to-go-live) under the global cap, replacing
+              the raw static SessionPreviewPane. terminalKey is session-scoped in
+              the topology-tab namespace so the same seat on another surface is a
+              distinct registry entry (matches the node-detail:/topology-grid: pattern). */}
+          <ProgressiveTerminal
+            sessionName={session}
+            terminalKey={`topology-tab:${session}`}
+            testIdPrefix={`topology-preview-${session}`}
+          />
+        </div>
+      )}
+    </li>
+  );
+}

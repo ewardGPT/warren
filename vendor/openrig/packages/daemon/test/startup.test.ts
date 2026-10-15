@@ -1,0 +1,925 @@
+import type { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
+import { resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { collectAllowlistedProviderAuthEnv, createDaemon } from "../src/startup.js";
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { coreSchema } from "../src/db/migrations/001_core_schema.js";
+import { bindingsSessionsSchema } from "../src/db/migrations/002_bindings_sessions.js";
+import { eventsSchema } from "../src/db/migrations/003_events.js";
+import { nodeSpecFieldsSchema } from "../src/db/migrations/007_node_spec_fields.js";
+import { checkpointsSchema } from "../src/db/migrations/005_checkpoints.js";
+import { agentspecRebootSchema } from "../src/db/migrations/014_agentspec_reboot.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { StreamStore } from "../src/domain/stream-store.js";
+import type { CmuxTransportFactory } from "../src/adapters/cmux.js";
+import type { ExecFn } from "../src/adapters/tmux.js";
+import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
+import { RigSpecCodec } from "../src/domain/rigspec-codec.js";
+import { DEFAULT_SYSTEM_WORLD_MANIFEST } from "../src/domain/system-world.js";
+
+function saveEnv(...names: string[]): Record<string, string | undefined> {
+  return Object.fromEntries(names.map((name) => [name, process.env[name]]));
+}
+
+function restoreEnv(saved: Record<string, string | undefined>): void {
+  for (const [name, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
+
+function seedDbWithStaleSessions(dbPath: string, rigs: { rigName: string; logicalId: string; sessionName: string }[]) {
+  const db = createDb(dbPath);
+  migrate(db, [coreSchema, bindingsSessionsSchema, eventsSchema, nodeSpecFieldsSchema, checkpointsSchema, agentspecRebootSchema]);
+  const rigRepo = new RigRepository(db);
+  const sessionRegistry = new SessionRegistry(db);
+
+  for (const r of rigs) {
+    const rig = rigRepo.createRig(r.rigName);
+    const node = rigRepo.addNode(rig.id, r.logicalId);
+    const session = sessionRegistry.registerSession(node.id, r.sessionName);
+    // Seed the old schema directly; createDaemon must apply newer migrations.
+    db.prepare("UPDATE sessions SET status = 'running', last_seen_at = datetime('now') WHERE id = ?").run(session.id);
+  }
+
+  db.close();
+}
+
+describe("createDaemon startup composition", () => {
+  // V0.3.1 slice 05 kernel-rig-as-default — startup tests construct
+  // the daemon without booting the kernel rig. The kernel-boot path
+  // is exercised separately in kernel-boot.test.ts (unit) +
+  // kernel-rig-spec-validate.test.ts (variant gate); these tests
+  // assert the surrounding daemon-composition contract, so the
+  // OPENRIG_NO_KERNEL=1 escape hatch keeps them fast + deterministic
+  // regardless of the host's runtime-auth state.
+  beforeAll(() => {
+    process.env.OPENRIG_NO_KERNEL = "1";
+  });
+  afterAll(() => {
+    delete process.env.OPENRIG_NO_KERNEL;
+  });
+
+  it("calls cmuxAdapter.connect() during startup", async () => {
+    const connectCalled = vi.fn();
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      connectCalled();
+      const err = new Error("no socket") as Error & { code?: string };
+      err.code = "ENOENT";
+      throw err;
+    };
+    const tmuxExec: ExecFn = async () => "";
+
+    const { db } = await createDaemon({ cmuxFactory, tmuxExec });
+
+    // Factory was called during startup (connect() invoked)
+    expect(connectCalled).toHaveBeenCalled();
+
+    db.close();
+  });
+
+  // Slice 51-01 stub-runtime — STEP 2 (Registry-B composition, RED-first): the PRODUCTION runtime-adapter
+  // registry assembled by createDaemon must register the "stub" adapter, so a runtime:stub seat resolves at
+  // the exposed AppDeps.runtimeAdapters map (NOT only via a test-injected instantiator map). RED now:
+  // startup.ts:898 runtimeAdapters = {claude-code, codex, pi, terminal} — no stub; goes green when the stub
+  // adapter is constructed + registered (step 4). Drives the REAL createDaemon composition, not a mock.
+  it("STEP2: createDaemon registers the stub adapter in the production runtimeAdapters registry [RED until startup.ts:898 adds stub]", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error("no socket"), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+    const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+    try {
+      expect(deps.runtimeAdapters, "AppDeps.runtimeAdapters exposed").toBeDefined();
+      expect(deps.runtimeAdapters!["stub"], "production runtimeAdapters registry must register the stub adapter").toBeDefined();
+    } finally {
+      db.close();
+    }
+  }, 30000); // createDaemon full composition can exceed the 5s default on a cold start
+
+  it("wires staged replacement into the production Claude collector adapter", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error("no socket"), { code: "ENOENT" });
+    };
+    const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec: async () => "" });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "startup-collector-wiring-"));
+    const copy = vi.spyOn(fs, "copyFileSync");
+    const rename = vi.spyOn(fs, "renameSync");
+    try {
+      const adapter = deps.runtimeAdapters!["claude-code"] as ClaudeCodeAdapter;
+      adapter.ensureContextCollector({ cwd });
+      adapter.ensureContextCollector({ cwd });
+      const dest = path.join(cwd, ".openrig/context-collector.cjs");
+      expect(rename).toHaveBeenCalledTimes(2);
+      expect(rename).toHaveBeenCalledWith(expect.any(String), dest);
+      expect(copy).toHaveBeenCalledTimes(2);
+      expect(copy.mock.calls.every(call => call[1] !== dest && call[2] === fs.constants.COPYFILE_EXCL)).toBe(true);
+      expect(fs.readFileSync(dest, "utf8")).toBe(fs.readFileSync(copy.mock.calls[0]![0], "utf8"));
+    } finally {
+      copy.mockRestore(); rename.mockRestore(); db.close(); fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  // GHOST-STAGE (e/Class-B) seam-coexist pin: dev-driver's fold added the invalidateRetiringOccupant
+  // CALL at SeatHandoverService.commit() but no concrete invalidator was ever wired, so in production
+  // the call was a silent no-op. This asserts createDaemon now constructs + injects a real
+  // OccupantInvalidator — so the re-key invalidation actually FIRES (the service-level call-fires is
+  // pinned separately in seat-handover-service.test.ts). Never lose a live call while deduping.
+  it("wires a concrete OccupantInvalidator so the seat-handover re-key invalidation FIRES in production", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error("no socket"), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+    const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+    try {
+      expect(deps.occupantInvalidator, "AppDeps.occupantInvalidator must be constructed + injected").toBeDefined();
+      expect(typeof deps.occupantInvalidator!.invalidateRetiringOccupant).toBe("function");
+    } finally {
+      db.close();
+    }
+  }, 30000);
+
+  // Slice 51-01 stub-runtime — STEP 3 (first PRODUCTION dispatch proof, RED-first): the assembled
+  // PodRigInstantiator's PRIVATE adapters map (startup.ts:710 — a SEPARATE literal from the :898
+  // runtimeAdapters map STEP2 checks) must DISPATCH a runtime:stub seat to the stub adapter so its
+  // project() lifecycle method is REACHED. Drives the REAL createDaemon composition + the production
+  // instantiate() entry (NOT a test-injected adapters map; NOT error-string absence). RED now:
+  // adapters[:710] = {claude-code,codex,pi,terminal}, no stub → instantiate hits "No adapter for
+  // runtime stub" (rigspec-instantiator.ts:1669) and startNode/project (:130) are never reached.
+  // GREEN when step 4 registers the stub adapter at :710. The 30s timeout is HARNESS BUDGET (cold
+  // createDaemon compose), not product readiness.
+  it("STEP3: the assembled instantiator dispatches runtime:stub → the stub adapter's project() is REACHED [RED until startup.ts:710 adds stub]", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error("no socket"), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+
+    // REAL fs: the assembled instantiator uses fs.readFileSync (startup.ts:709), so agent_ref must
+    // resolve to a real file at <rigRoot>/agents/impl/agent.yaml.
+    const rigRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-stub-dispatch-"));
+    fs.mkdirSync(path.join(rigRoot, "agents", "impl"), { recursive: true });
+    fs.writeFileSync(
+      path.join(rigRoot, "agents", "impl", "agent.yaml"),
+      `name: impl\nversion: "1.0.0"\nresources:\n  skills: []\nprofiles:\n  default:\n    uses:\n      skills: []`,
+    );
+
+    // A real selected World is required before dispatch. Supply the shipped
+    // selector privately instead of relying on the operator's installation.
+    const worldPath = path.join(rigRoot, "world.yaml");
+    fs.writeFileSync(worldPath, DEFAULT_SYSTEM_WORLD_MANIFEST);
+    const saved = saveEnv("OPENRIG_CONTEXT_SYSTEM_WORLD");
+    process.env.OPENRIG_CONTEXT_SYSTEM_WORLD = worldPath;
+    let db: ReturnType<typeof createDb> | undefined;
+    try {
+      const daemon = await createDaemon({ cmuxFactory, tmuxExec });
+      db = daemon.db;
+      const { deps } = daemon;
+      // Reach the PRODUCTION instantiator's private adapters map (startup.ts:710).
+      const adapters = (deps.podInstantiator as unknown as {
+        deps: { adapters: Record<string, RuntimeAdapter> };
+      }).deps.adapters;
+
+      const stub = adapters["stub"];
+      // RED-now guard: pre-step-4 the production instantiator adapters map has no stub adapter.
+      expect(stub, "production instantiator adapters map (startup.ts:710) must register the stub adapter").toBeDefined();
+
+      // Observe the NAMED lifecycle method on the REAL production adapter (spy calls through).
+      const projectSpy = vi.spyOn(stub!, "project");
+
+      const specYaml = RigSpecCodec.serialize({
+        version: "0.2",
+        name: "stub-dispatch-rig",
+        pods: [{
+          id: "dev",
+          label: "Dev",
+          members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "stub", cwd: "." }],
+          edges: [],
+        }],
+        edges: [],
+      });
+
+      const result = await deps.podInstantiator.instantiate(specYaml, rigRoot);
+
+      // Load-bearing assertion: dispatch reached the stub adapter's project() (startup-orchestrator.ts:130).
+      expect(projectSpy, `instantiate must dispatch project() to the production stub adapter: ${JSON.stringify(result)}`).toHaveBeenCalled();
+    } finally {
+      restoreEnv(saved);
+      db?.close();
+      fs.rmSync(rigRoot, { recursive: true, force: true });
+    }
+  }, 30000); // harness budget (cold createDaemon compose), not product readiness
+
+  it("defaults terminal auth to local-trusted mode without minting a token file", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-terminal-auth-"));
+    const priorHome = process.env.OPENRIG_HOME;
+    const priorToken = process.env.OPENRIG_TERMINAL_BEARER_TOKEN;
+    process.env.OPENRIG_HOME = tmpDir;
+    delete process.env.OPENRIG_TERMINAL_BEARER_TOKEN;
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+
+    try {
+      const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+
+      expect(deps.terminalBearerToken).toBeNull();
+      expect(fs.existsSync(path.join(tmpDir, "terminal-token"))).toBe(false);
+
+      db.close();
+    } finally {
+      if (priorHome === undefined) delete process.env.OPENRIG_HOME;
+      else process.env.OPENRIG_HOME = priorHome;
+      if (priorToken === undefined) delete process.env.OPENRIG_TERMINAL_BEARER_TOKEN;
+      else process.env.OPENRIG_TERMINAL_BEARER_TOKEN = priorToken;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("createDaemon app: GET /api/rigs/:rigId/sessions returns 200 (session routes mounted)", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+
+    const { app, db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+
+    // Seed a rig so the sessions endpoint has something to query
+    const rig = deps.rigRepo.createRig("r01");
+
+    const res = await app.request(`/api/rigs/${rig.id}/sessions`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body)).toBe(true);
+
+    db.close();
+  });
+
+  it("createDaemon queue validation accepts first-class human seats without a materialized kernel rig", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+
+    const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+
+    const canonical = await deps.queueRepo.create({
+      sourceSession: "dev-qa@implementation-pair",
+      destinationSession: "human-operator@kernel",
+      body: "human gate smoke",
+      tier: "human-gate",
+      summary: "test summary (FR-4 human-routed fixture)",
+      evidenceRef: "proof/test-evidence.md",
+      nudge: false,
+    });
+    const generic = await deps.queueRepo.create({
+      sourceSession: "dev-qa@implementation-pair",
+      destinationSession: "human@host",
+      body: "human host smoke",
+      tier: "human-gate",
+      summary: "test summary (FR-4 human-routed fixture)",
+      evidenceRef: "proof/test-evidence.md",
+      nudge: false,
+    });
+
+    expect(canonical.destinationSession).toBe("human-operator@kernel");
+    expect(generic.destinationSession).toBe("human@host");
+    await expect(
+      deps.queueRepo.create({
+        sourceSession: "dev-qa@implementation-pair",
+        destinationSession: "driver@phantom-rig",
+        body: "must still reject phantom rigs",
+        nudge: false,
+      }),
+    ).rejects.toThrow(/unknown rig/);
+
+    db.close();
+  });
+
+  it("queue admission advises on missing local seats while preserving destinations", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error("no socket"), { code: "ENOENT" });
+    };
+    const daemon = await createDaemon({ cmuxFactory, tmuxExec: async () => "" });
+    const { app, db, deps } = daemon;
+    try {
+      const source = deps.rigRepo.createRig("membership-source");
+      deps.rigRepo.addNode(source.id, "sender.ba", { runtime: null });
+      const target = deps.rigRepo.createRig("membership-target");
+      deps.rigRepo.addNode(target.id, "product.ba", { runtime: null });
+      const stopped = deps.rigRepo.addNode(target.id, "product.stopped", { runtime: null });
+      const session = deps.sessionRegistry.registerSession(stopped.id, "product-stopped@membership-target");
+      deps.sessionRegistry.updateStatus(session.id, "exited");
+      deps.rigRepo.addNode(target.id, "product.member.dot", { runtime: null });
+      deps.rigRepo.addNode(target.id, "flat", { runtime: null });
+      const adopted = deps.rigRepo.addNode(target.id, "product.adopted", { runtime: null });
+      deps.sessionRegistry.registerSession(adopted.id, "adopted-alias@membership-target");
+      const sender = "sender-ba@membership-source";
+      const post = (url: string, body: Record<string, unknown>) => app.request(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-OpenRig-Session": sender },
+        body: JSON.stringify({ nudge: false, ...body }),
+      });
+      const create = (destinationSession: string) => post("/api/queue/create", {
+        destinationSession, body: "queue membership fixture",
+      });
+      const counts = () => ({
+        items: (db.prepare("SELECT COUNT(*) count FROM queue_items").get() as { count: number }).count,
+        transitions: (db.prepare("SELECT COUNT(*) count FROM queue_transitions").get() as { count: number }).count,
+      });
+
+      for (const destination of ["product-ba@unknown", "bare-seat"]) {
+        const before = counts();
+        const response = await create(destination);
+        expect(response.status).toBe(400);
+        expect((await response.json()).error).toBe("unknown_destination_rig");
+        expect(counts()).toEqual(before);
+      }
+      for (const destination of ["product-ba@membership-target", "product-stopped@membership-target",
+        "product-member.dot@membership-target", "flat@membership-target", "adopted-alias@membership-target"]) {
+        const response = await create(destination);
+        expect(response.status, destination).toBe(201);
+        expect((await response.json()).advisories, destination).toBeUndefined();
+      }
+      const membershipReads = vi.spyOn(db, "prepare");
+      for (const destination of ["product-ba@membership-target", "product-stopped@membership-target",
+        "product-member.dot@membership-target", "flat@membership-target", "adopted-alias@membership-target"]) {
+        expect(deps.queueRepo.destinationAdvisory(destination)).toBeNull();
+      }
+      const membershipSql = membershipReads.mock.calls.map(([query]) => query).join("\n");
+      membershipReads.mockRestore();
+      expect(membershipSql).not.toMatch(/\b(?:snapshots|events|node_startup_context)\b/);
+      expect(membershipSql).not.toContain("SELECT n.logical_id, s.session_name");
+      db.prepare("INSERT INTO snapshots (id, rig_id, kind, status, data) VALUES (?, ?, ?, ?, ?)")
+        .run("advisory-unrelated-snapshot", target.id, "manual", "complete", JSON.stringify({ sessions: { unexpected: true } }));
+      const withSnapshot = await create("product-ba@membership-target");
+      expect(withSnapshot.status).toBe(201);
+      expect((await withSnapshot.json()).advisories).toBeUndefined();
+      const dotted = "product.ba@membership-target";
+      expect(resolveGuardTarget(db, dotted)).toBeNull();
+      expect(resolveGuardTarget(db, "product-ba@membership-target")).not.toBeNull();
+      const dottedResponse = await create(dotted);
+      expect(dottedResponse.status).toBe(201);
+      const dottedResult = await dottedResponse.json();
+      expect(dottedResult.destinationSession).toBe(dotted);
+      expect(dottedResult.advisories[0].availableDestinations).toContain("product-ba@membership-target");
+      expect(dottedResult.advisories[0].message).toContain("matches no session address");
+      expect(deps.queueRepo.getById(dottedResult.qitemId)?.destinationSession).toBe(dotted);
+      const dottedAlias = deps.rigRepo.addNode(target.id, "pod.adopted-dot", { runtime: null });
+      deps.sessionRegistry.registerSession(dottedAlias.id, "adopted.dot@membership-target");
+      const aliasResponse = await create("adopted.dot@membership-target");
+      expect(aliasResponse.status).toBe(201);
+      expect((await aliasResponse.json()).advisories).toBeUndefined();
+      const typo = "prodcut-ba@membership-target";
+      const response = await create(typo);
+      expect(response.status).toBe(201);
+      const accepted = await response.json();
+      expect(accepted.destinationSession).toBe(typo);
+      expect(accepted.advisories[0]).toMatchObject({ code: "unmatched_destination_seat", destinationSession: typo });
+      expect(accepted.advisories[0].availableDestinations).toContain("product-ba@membership-target");
+      expect(accepted.advisories[0].message).toContain("does not guarantee pickup or delivery");
+      expect(deps.queueRepo.getById(accepted.qitemId)?.destinationSession).toBe(typo);
+      const transactional = db.transaction(() => deps.queueRepo.createWithinTransaction({
+        sourceSession: sender, destinationSession: typo,
+        body: "transaction membership fixture", nudge: false,
+      }))();
+      expect(transactional.destinationSession).toBe(typo);
+
+      for (const verb of ["handoff", "handoff-and-complete"]) {
+        const original = await create(sender);
+        expect(original.status).toBe(201);
+        const { qitemId } = await original.json() as { qitemId: string };
+        const row = () => db.prepare("SELECT * FROM queue_items WHERE qitem_id = ?").get(qitemId);
+        const accepted = await post(`/api/queue/${qitemId}/${verb}`, { toSession: typo });
+        expect(accepted.status).toBe(201);
+        const result = await accepted.json();
+        expect(result.created.destinationSession).toBe(typo);
+        expect(result.advisories[0].code).toBe("unmatched_destination_seat");
+        expect(deps.queueRepo.getById(result.created.qitemId)?.destinationSession).toBe(typo);
+        expect((row() as { state: string }).state).toBe(verb === "handoff" ? "handed-off" : "done");
+      }
+    } finally {
+      daemon.eventLoopMonitor.stop();
+      daemon.contextMonitor.stop();
+      deps.seatActivityService?.stop();
+      db.close();
+    }
+  }, 30000);
+
+  it("createDaemon app: GET /api/adapters/cmux/status returns 200 (adapter routes mounted)", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+
+    const { app, db } = await createDaemon({ cmuxFactory, tmuxExec });
+
+    const res = await app.request("/api/adapters/cmux/status");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveProperty("available");
+
+    db.close();
+  });
+
+  it("passes daemon CLI reachability env and PATH into launched tmux sessions", async () => {
+    vi.stubEnv("PATH", "/proof/openrig/bin:/usr/bin:/bin");
+    vi.stubEnv("OPENRIG_PORT", "17433");
+    vi.stubEnv("OPENRIG_HOST", "127.0.0.1");
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec = vi.fn<ExecFn>(async () => "");
+
+    try {
+      const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+      const rig = deps.rigRepo.createRig("path-env-rig");
+      deps.rigRepo.addNode(rig.id, "worker", { runtime: "codex" });
+
+      const result = await deps.nodeLauncher.launchNode(rig.id, "worker");
+
+      expect(result.ok).toBe(true);
+      const newSessionCmd = tmuxExec.mock.calls
+        .map((call) => call[0])
+        .find((cmd) => cmd.includes("tmux new-session"));
+      expect(newSessionCmd).toBeDefined();
+      expect(newSessionCmd).toContain("-e 'PATH=/proof/openrig/bin:/usr/bin:/bin'");
+      expect(newSessionCmd).toContain("-e 'OPENRIG_PORT=17433'");
+      expect(newSessionCmd).toContain("-e 'OPENRIG_HOST=127.0.0.1'");
+
+      db.close();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("GAP-7 projects the daemon HOME and default absolute CODEX_HOME into the production launch env", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-gap7-default-"));
+    const daemonHome = path.join(root, "daemon-home");
+    fs.mkdirSync(daemonHome, { recursive: true });
+    const saved = saveEnv("HOME", "CODEX_HOME", "PATH", "OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST", "OPENAI_API_KEY");
+    process.env.HOME = daemonHome;
+    delete process.env.CODEX_HOME;
+    process.env.PATH = "/proof/openrig/bin:/usr/bin:/bin";
+    process.env.OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST = "OPENAI_API_KEY";
+    process.env.OPENAI_API_KEY = "gap7-openai-key";
+    const tmuxExec = vi.fn<ExecFn>(async () => "");
+    let result: Awaited<ReturnType<typeof createDaemon>> | undefined;
+
+    try {
+      result = await createDaemon({
+        cmuxFactory: async () => { throw Object.assign(new Error(""), { code: "ENOENT" }); },
+        tmuxExec,
+      });
+      expect(result.deps.sessionEnv).toMatchObject({
+        HOME: daemonHome,
+        CODEX_HOME: path.join(daemonHome, ".codex"),
+        PATH: "/proof/openrig/bin:/usr/bin:/bin",
+        OPENAI_API_KEY: "gap7-openai-key",
+      });
+
+      const rig = result.deps.rigRepo.createRig("gap7-default");
+      result.deps.rigRepo.addNode(rig.id, "worker", { runtime: "codex" });
+      expect((await result.deps.nodeLauncher.launchNode(rig.id, "worker")).ok).toBe(true);
+      const command = tmuxExec.mock.calls.map((call) => call[0]).find((line) => line.includes("tmux new-session"));
+      expect(command).toContain(`-e 'HOME=${daemonHome}'`);
+      expect(command).toContain(`-e 'CODEX_HOME=${path.join(daemonHome, ".codex")}'`);
+      expect(command).toContain("-e 'PATH=/proof/openrig/bin:/usr/bin:/bin'");
+      expect(command).toContain("-e 'OPENAI_API_KEY=gap7-openai-key'");
+    } finally {
+      result?.db.close();
+      restoreEnv(saved);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GAP-7 shares one custom absolute CODEX_HOME between production session env and adapter config writes", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-gap7-custom-"));
+    const daemonHome = path.join(root, "daemon-home");
+    const codexHome = path.join(root, "daemon-codex");
+    const workspace = path.join(root, "workspace");
+    fs.mkdirSync(workspace, { recursive: true });
+    const saved = saveEnv("HOME", "CODEX_HOME");
+    process.env.HOME = daemonHome;
+    process.env.CODEX_HOME = codexHome;
+    let result: Awaited<ReturnType<typeof createDaemon>> | undefined;
+
+    try {
+      result = await createDaemon({
+        cmuxFactory: async () => { throw Object.assign(new Error(""), { code: "ENOENT" }); },
+        tmuxExec: async () => "",
+      });
+      expect(result.deps.sessionEnv).toMatchObject({ HOME: daemonHome, CODEX_HOME: codexHome });
+      const adapter = result.deps.runtimeAdapters?.codex;
+      expect(adapter).toBeDefined();
+      await adapter!.deliverStartup([], {
+        id: "gap7-binding", nodeId: "gap7-node", tmuxSession: "gap7-session",
+        tmuxWindow: null, tmuxPane: null, cmuxWorkspace: null, cmuxSurface: null,
+        updatedAt: "", cwd: workspace,
+      });
+      const configPath = path.join(codexHome, "config.toml");
+      expect(fs.readFileSync(configPath, "utf8")).toContain(`[projects."${workspace}"]`);
+      expect(fs.existsSync(path.join(daemonHome, ".codex", "config.toml"))).toBe(false);
+    } finally {
+      result?.db.close();
+      restoreEnv(saved);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GAP-7 rejects relative CODEX_HOME during composition before any tmux session launch", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-gap7-relative-"));
+    const saved = saveEnv("HOME", "CODEX_HOME");
+    process.env.HOME = path.join(root, "daemon-home");
+    process.env.CODEX_HOME = "relative-codex-home";
+    const tmuxExec = vi.fn<ExecFn>(async () => "");
+    let result: Awaited<ReturnType<typeof createDaemon>> | undefined;
+    let thrown: unknown;
+
+    try {
+      try {
+        result = await createDaemon({
+          cmuxFactory: async () => { throw Object.assign(new Error(""), { code: "ENOENT" }); },
+          tmuxExec,
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toMatch(/CODEX_HOME.*absolute/i);
+      expect(tmuxExec.mock.calls.some((call) => call[0].includes("tmux new-session"))).toBe(false);
+    } finally {
+      result?.db.close();
+      restoreEnv(saved);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // OPR.0.4.3.28 Blocker 2 — the self-provisioned OPENRIG_URL must honor an
+  // explicit daemon bind host (the daemon binds only that host), not a hardcoded
+  // loopback that a tailnet/hostname-bound daemon is not listening on.
+  it("self-provisions OPENRIG_URL from an explicit bind host into launched tmux sessions", async () => {
+    vi.stubEnv("OPENRIG_PORT", "17433");
+    vi.stubEnv("OPENRIG_HOST", "100.64.0.5");
+    vi.stubEnv("OPENRIG_URL", ""); // NOT operator-supplied → daemon derives it
+    vi.stubEnv("OPENRIG_ACTIVITY_HOOK_TOKEN", "");
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec = vi.fn<ExecFn>(async () => "");
+    try {
+      const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+      const rig = deps.rigRepo.createRig("url-derive-rig");
+      deps.rigRepo.addNode(rig.id, "worker", { runtime: "codex" });
+      const result = await deps.nodeLauncher.launchNode(rig.id, "worker");
+      expect(result.ok).toBe(true);
+      const newSessionCmd = tmuxExec.mock.calls
+        .map((call) => call[0])
+        .find((cmd) => cmd.includes("tmux new-session"));
+      expect(newSessionCmd).toBeDefined();
+      expect(newSessionCmd).toContain("-e 'OPENRIG_URL=http://100.64.0.5:17433'");
+      db.close();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("passes only explicitly allowlisted provider auth env into launched tmux sessions", async () => {
+    vi.stubEnv("OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST", "ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN,OPENAI_API_KEY,BOGUS_TOKEN");
+    vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test-key");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-test-token");
+    vi.stubEnv("OPENAI_API_KEY", "openai-test-key");
+    vi.stubEnv("BOGUS_TOKEN", "must-not-leak");
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec = vi.fn<ExecFn>(async () => "");
+
+    try {
+      const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+      const rig = deps.rigRepo.createRig("provider-auth-env-rig");
+      deps.rigRepo.addNode(rig.id, "worker", { runtime: "claude-code" });
+
+      const result = await deps.nodeLauncher.launchNode(rig.id, "worker");
+
+      expect(result.ok).toBe(true);
+      const newSessionCmd = tmuxExec.mock.calls
+        .map((call) => call[0])
+        .find((cmd) => cmd.includes("tmux new-session"));
+      expect(newSessionCmd).toBeDefined();
+      expect(newSessionCmd).toContain("-e 'ANTHROPIC_API_KEY=anthropic-test-key'");
+      expect(newSessionCmd).toContain("-e 'CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-test-token'");
+      expect(newSessionCmd).toContain("-e 'OPENAI_API_KEY=openai-test-key'");
+      expect(newSessionCmd).not.toContain("BOGUS_TOKEN");
+
+      db.close();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("forwards the Codex Bedrock bearer token into a launched session only when the operator names it (#194)", async () => {
+    const launchCommand = async (allowlist: string) => {
+      vi.stubEnv("OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST", allowlist);
+      vi.stubEnv("AWS_BEARER_TOKEN_BEDROCK", "synthetic-bedrock-token");
+      vi.stubEnv("AWS_SECRET_ACCESS_KEY", "synthetic-unrelated-secret");
+      const cmuxFactory: CmuxTransportFactory = async () => {
+        throw Object.assign(new Error(""), { code: "ENOENT" });
+      };
+      const tmuxExec = vi.fn<ExecFn>(async () => "");
+      const { db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+      try {
+        const rig = deps.rigRepo.createRig("bedrock-forwarding-rig");
+        deps.rigRepo.addNode(rig.id, "worker", { runtime: "codex" });
+        expect((await deps.nodeLauncher.launchNode(rig.id, "worker")).ok).toBe(true);
+        return tmuxExec.mock.calls.map((call) => call[0]).find((cmd) => cmd.includes("tmux new-session")) ?? "";
+      } finally {
+        db.close();
+      }
+    };
+
+    try {
+      const optedIn = await launchCommand("AWS_BEARER_TOKEN_BEDROCK,AWS_SECRET_ACCESS_KEY");
+      expect(optedIn).toContain("-e 'AWS_BEARER_TOKEN_BEDROCK=synthetic-bedrock-token'");
+      expect(optedIn).not.toContain("AWS_SECRET_ACCESS_KEY");
+
+      const notNamed = await launchCommand("OPENAI_API_KEY");
+      expect(notNamed).toContain("tmux new-session");
+      expect(notNamed).not.toContain("AWS_BEARER_TOKEN_BEDROCK");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("collectAllowlistedProviderAuthEnv ignores empty, invalid, and unknown names", () => {
+    expect(collectAllowlistedProviderAuthEnv(
+      "ANTHROPIC_API_KEY, nope, ../BAD, OPENAI_API_KEY, BOGUS_TOKEN, CLAUDE_CODE_OAUTH_TOKEN",
+      {
+        ANTHROPIC_API_KEY: "anthropic-test-key",
+        OPENAI_API_KEY: "",
+        BOGUS_TOKEN: "must-not-leak",
+        CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth-test-token",
+      },
+    )).toEqual({
+      ANTHROPIC_API_KEY: "anthropic-test-key",
+      CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth-test-token",
+    });
+  });
+
+  it("collectAllowlistedProviderAuthEnv forwards ANTHROPIC_BASE_URL only when named", () => {
+    const env = {
+      ANTHROPIC_API_KEY: "gateway-test-key",
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:11434",
+    };
+    expect(collectAllowlistedProviderAuthEnv("ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL", env)).toEqual({
+      ANTHROPIC_API_KEY: "gateway-test-key",
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:11434",
+    });
+    expect(collectAllowlistedProviderAuthEnv("ANTHROPIC_API_KEY", env)).toEqual({
+      ANTHROPIC_API_KEY: "gateway-test-key",
+    });
+  });
+
+  it("createDaemon wires node cmux service for POST /api/rigs/:rigId/nodes/:logicalId/open-cmux", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => ({
+      request: async (method: string) => {
+        if (method === "capabilities") return { capabilities: ["workspace.current", "surface.create", "surface.focus"] };
+        if (method === "workspace.current") return { workspace_id: "workspace:1" };
+        if (method === "surface.create") return { created_surface_ref: "surface:99" };
+        return {};
+      },
+      close: () => {},
+    });
+    const tmuxExec: ExecFn = async () => "";
+
+    const { app, db, deps } = await createDaemon({ cmuxFactory, tmuxExec });
+    const rig = deps.rigRepo.createRig("r01");
+    const node = deps.rigRepo.addNode(rig.id, "dev1-impl");
+    deps.sessionRegistry.registerSession(node.id, "r01-dev1-impl");
+    deps.sessionRegistry.updateBinding(node.id, {
+      attachmentType: "tmux",
+      tmuxSession: "r01-dev1-impl",
+    });
+
+    const res = await app.request(`/api/rigs/${rig.id}/nodes/dev1-impl/open-cmux`, { method: "POST" });
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body["ok"]).toBe(true);
+    expect(body["action"]).toBe("created_new");
+
+    const binding = deps.sessionRegistry.getBindingForNode(node.id);
+    expect(binding?.cmuxWorkspace).toBe("workspace:1");
+    expect(binding?.cmuxSurface).toBe("surface:99");
+
+    db.close();
+  });
+
+  it("createDaemon accepts cmuxExec, connect() probes the live cmux surface through it", async () => {
+    const cmuxExec = vi.fn<ExecFn>().mockRejectedValue(
+      Object.assign(new Error("command not found"), { code: "ENOENT" })
+    );
+    const tmuxExec: ExecFn = async () => "";
+
+    const { db } = await createDaemon({ cmuxExec, tmuxExec });
+
+    // The injected cmuxExec was called during startup connect().
+    // The transport now probes the live command surface via `cmux --help`
+    // before issuing version-adaptive requests.
+    expect(cmuxExec).toHaveBeenCalled();
+    const helpCall = cmuxExec.mock.calls.find(
+      (c: unknown[]) => typeof c[0] === "string" && (c[0] as string).includes("cmux --help")
+    );
+    expect(helpCall).toBeDefined();
+
+    db.close();
+  });
+
+  it("createDaemon with cmuxExec that throws -> still degrades cleanly", async () => {
+    const cmuxExec = vi.fn<ExecFn>().mockRejectedValue(
+      Object.assign(new Error("command not found"), { code: "ENOENT" })
+    );
+    const tmuxExec: ExecFn = async () => "";
+
+    const { app, db } = await createDaemon({ cmuxExec, tmuxExec });
+
+    const res = await app.request("/api/adapters/cmux/status");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.available).toBe(false);
+
+    db.close();
+  });
+
+  it("startup reconciles stale session: status=detached + event row in DB", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rigged-test-"));
+    const dbPath = path.join(tmpDir, "test.sqlite");
+
+    seedDbWithStaleSessions(dbPath, [
+      { rigName: "r01", logicalId: "dev1-impl", sessionName: "r01-dev1-impl" },
+    ]);
+
+    // tmux reports no sessions (session is gone):
+    // list-sessions returns empty; has-session throws (session not found)
+    const tmuxExec: ExecFn = async (cmd: string) => {
+      if (cmd.includes("has-session")) throw new Error("session not found");
+      return "";
+    };
+    const cmuxExec: ExecFn = async () => { throw Object.assign(new Error(""), { code: "ENOENT" }); };
+
+    const { db } = await createDaemon({ dbPath, tmuxExec, cmuxExec });
+
+    // After createDaemon returns, session should be detached
+    const sessions = db.prepare("SELECT status FROM sessions").all() as { status: string }[];
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.status).toBe("detached");
+
+    // Event row should exist
+    const events = db.prepare("SELECT type FROM events WHERE type = 'session.detached'").all();
+    expect(events).toHaveLength(1);
+
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
+  it("startup reconciles multiple rigs: all stale sessions detached", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rigged-test-"));
+    const dbPath = path.join(tmpDir, "test.sqlite");
+
+    seedDbWithStaleSessions(dbPath, [
+      { rigName: "r01", logicalId: "dev1-impl", sessionName: "r01-dev1-impl" },
+      { rigName: "r02", logicalId: "dev2-impl", sessionName: "r02-dev2-impl" },
+    ]);
+
+    const tmuxExec: ExecFn = async (cmd: string) => {
+      if (cmd.includes("has-session")) throw new Error("session not found");
+      return "";
+    };
+    const cmuxExec: ExecFn = async () => { throw Object.assign(new Error(""), { code: "ENOENT" }); };
+
+    const { db } = await createDaemon({ dbPath, tmuxExec, cmuxExec });
+
+    // Both sessions should be detached
+    const sessions = db.prepare("SELECT status FROM sessions ORDER BY session_name").all() as { status: string }[];
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0]!.status).toBe("detached");
+    expect(sessions[1]!.status).toBe("detached");
+
+    // Both events should exist
+    const events = db.prepare("SELECT type FROM events WHERE type = 'session.detached'").all();
+    expect(events).toHaveLength(2);
+
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
+  it("startup reconcile with empty DB runs without error", async () => {
+    const tmuxExec: ExecFn = async () => "";
+    const cmuxExec: ExecFn = async () => { throw Object.assign(new Error(""), { code: "ENOENT" }); };
+
+    const { db } = await createDaemon({ tmuxExec, cmuxExec });
+
+    // No sessions, no events, no errors
+    const sessions = db.prepare("SELECT * FROM sessions").all();
+    expect(sessions).toHaveLength(0);
+
+    db.close();
+  });
+
+  // L1 cold-start tmux truth repair: startup must surface a compact reconcile
+  // summary so silent reconciliation drift is visible in daemon output.
+  it("startup logs compact reconcile summary line", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rigged-test-"));
+    const dbPath = path.join(tmpDir, "test.sqlite");
+
+    seedDbWithStaleSessions(dbPath, [
+      { rigName: "r01", logicalId: "dev1-impl", sessionName: "r01-dev1-impl" },
+    ]);
+
+    const tmuxExec: ExecFn = async (cmd: string) => {
+      if (cmd.includes("has-session")) throw new Error("session not found");
+      return "";
+    };
+    const cmuxExec: ExecFn = async () => { throw Object.assign(new Error(""), { code: "ENOENT" }); };
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { db } = await createDaemon({ dbPath, tmuxExec, cmuxExec });
+
+      const calls = logSpy.mock.calls.map((c: unknown[]) => String(c[0]));
+      const summary = calls.find((line) => line.startsWith("startup reconcile:"));
+      expect(summary).toBeDefined();
+      expect(summary).toMatch(/rigs=1\b/);
+      expect(summary).toMatch(/checked=1\b/);
+      expect(summary).toMatch(/detached=1\b/);
+      expect(summary).toMatch(/errors=0\b/);
+
+      db.close();
+    } finally {
+      logSpy.mockRestore();
+      fs.rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it("does not let a throwing setDegradedHandler registration abort createDaemon", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+    const recorder = {
+      setDegradedHandler() {
+        throw new Error("registration boom");
+      },
+      snapshot: () => ({ healthy: true }),
+    };
+    const { db, eventLoopMonitor } = await createDaemon({
+      cmuxFactory,
+      tmuxExec,
+      slowOpRecorder: recorder,
+    } as never);
+    eventLoopMonitor.stop();
+    db.close();
+  });
+
+  it("isolates a throwing degradation callback body (streamStore.emit) from later work", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+    const originalEmit = StreamStore.prototype.emit;
+    const spy = vi
+      .spyOn(StreamStore.prototype, "emit")
+      .mockImplementation(function (this: StreamStore, item: Parameters<StreamStore["emit"]>[0]) {
+        if (typeof item?.body === "string" && item.body.includes("slow-operation instrumentation degraded")) {
+          throw new Error("emit boom");
+        }
+        return originalEmit.call(this, item);
+      });
+    let captured: ((snapshot: { reason: string; site: string }) => void) | undefined;
+    const recorder = {
+      setDegradedHandler(handler: (snapshot: { reason: string; site: string }) => void) {
+        captured = handler;
+      },
+      snapshot: () => ({ healthy: true }),
+    };
+    try {
+      const { db, eventLoopMonitor } = await createDaemon({
+        cmuxFactory,
+        tmuxExec,
+        slowOpRecorder: recorder,
+      } as never);
+      expect(captured).toBeTypeOf("function");
+      // A later degradation fires the supplied callback; a throwing emit inside
+      // its body must be swallowed, never escaping into wrapped work.
+      expect(() => captured!({ reason: "recorder_worker_failed", site: "recorder.worker" })).not.toThrow();
+      eventLoopMonitor.stop();
+      db.close();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

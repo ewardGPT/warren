@@ -1,0 +1,671 @@
+import os from "node:os";
+import fs from "node:fs";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import http from "node:http";
+import nodePath from "node:path";
+import { Command } from "commander";
+import { bundleCommand } from "../src/commands/bundle.js";
+import { DaemonClient } from "../src/client.js";
+import { STATE_FILE, type LifecycleDeps, type DaemonState } from "../src/daemon-lifecycle.js";
+import type { StatusDeps } from "../src/commands/status.js";
+
+function mockLifecycleDeps(overrides?: Partial<LifecycleDeps>): LifecycleDeps {
+  return {
+    spawn: vi.fn(() => ({ pid: 1, unref: vi.fn() }) as never),
+    fetch: vi.fn(async () => ({ ok: true })),
+    kill: vi.fn(() => true),
+    readFile: vi.fn(() => null),
+    writeFile: vi.fn(),
+    removeFile: vi.fn(),
+    exists: vi.fn(() => false),
+    mkdirp: vi.fn(),
+    openForAppend: vi.fn(() => 3),
+    isProcessAlive: vi.fn(() => true),
+    ...overrides,
+  };
+}
+
+function captureLogs(fn: () => Promise<void>): Promise<{ logs: string[]; stdout: string[]; exitCode: number | undefined }> {
+  return new Promise(async (resolve) => {
+    const logs: string[] = [];
+    const stdout: string[] = [];
+    const origLog = console.log;
+    const origErr = console.error;
+    const origWarn = console.warn;
+    const origExitCode = process.exitCode;
+    process.exitCode = undefined;
+    console.log = (...args: unknown[]) => { const line = args.join(" "); logs.push(line); stdout.push(line); };
+    console.error = (...args: unknown[]) => logs.push(args.join(" "));
+    // The drift banner goes to stderr via console.warn — stdout stays clean for piping. Capture it
+    // here or a test asserting the operator SEES the warning would pass on an empty transcript.
+    console.warn = (...args: unknown[]) => logs.push(args.join(" "));
+    try { await fn(); } finally { console.log = origLog; console.error = origErr; console.warn = origWarn; }
+    const exitCode = process.exitCode;
+    process.exitCode = origExitCode;
+    resolve({ logs, stdout, exitCode });
+  });
+}
+
+function runningDeps(port: number): StatusDeps {
+  return {
+    lifecycleDeps: mockLifecycleDeps({
+      exists: vi.fn((p: string) => p === STATE_FILE),
+      readFile: vi.fn((p: string) => {
+        if (p === STATE_FILE) return JSON.stringify({ pid: 123, port, db: "test.sqlite", startedAt: "2026-03-26T00:00:00Z" } as DaemonState);
+        return null;
+      }),
+      fetch: vi.fn(async () => ({ ok: true })),
+    }),
+    clientFactory: (baseUrl) => new DaemonClient(baseUrl),
+  };
+}
+
+// Captured create bodies for assertion
+let capturedCreateBodies: Record<string, unknown>[] = [];
+// Captured install bodies for assertion (Item 2 Checkpoint 3.3)
+let capturedInstallBodies: Record<string, unknown>[] = [];
+let capturedInspectBodies: Record<string, unknown>[] = [];
+
+describe("Bundle CLI", () => {
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+
+      if (req.url === "/api/bundles/create" && req.method === "POST") {
+        const parsed = JSON.parse(body || "{}");
+        capturedCreateBodies.push(parsed);
+        if (String(parsed.specPath ?? "").includes("missing")) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing package" }));
+          return;
+        }
+        // Drift fixtures: the daemon refuses a spec that would drop live topology, unless the
+        // operator passed --allow-drift, in which case it succeeds and returns the warning.
+        if (String(parsed.specPath ?? "").includes("drifted") && parsed.allowDrift !== true) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Refusing to bundle: spec declares 1 pods/1 seats; live rig has 2/3" }));
+          return;
+        }
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          bundleName: parsed.bundleName ?? "test",
+          bundleVersion: parsed.bundleVersion ?? "0.1.0",
+          archiveHash: "abc123",
+          packages: 1,
+          ...(String(parsed.specPath ?? "").includes("drifted")
+            ? { warning: "WARNING: this bundle describes the SPEC, not the live rig — spec declares 1 pods/1 seats; live rig has 2/3" }
+            : {}),
+        }));
+      } else if (req.url === "/api/bundles/inspect" && req.method === "POST") {
+        const parsed = JSON.parse(body || "{}");
+        capturedInspectBodies.push(parsed);
+        if (String(parsed.bundlePath ?? "").includes("bad")) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Inspect failed" }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ manifest: { name: "test", version: "0.1.0" }, digestValid: true, integrityResult: { passed: true } }));
+      } else if (req.url === "/api/bundles/install" && req.method === "POST") {
+        const parsed = JSON.parse(body);
+        capturedInstallBodies.push(parsed);
+        if (String(parsed.bundlePath ?? "").includes("reinstall")) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Bundle install conflict check failed", status: "not_attempted",
+            detail: "Installed team workshop (rig-old): running; offered version 99.0.0.",
+            conflicts: [{ description: "workshop already has a running team" }],
+            resolutions: ["Use the existing team: rig ps --rig workshop --nodes", "Stop with rig down workshop, then retry; the stopped generation is archived", "Cancel this install"],
+          }));
+          return;
+        }
+        if (String(parsed.bundlePath ?? "").includes("blocked")) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "blocked" }));
+          return;
+        }
+        if (parsed.plan) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "planned", runId: "run-1", stages: [] }));
+        } else if (String(parsed.bundlePath ?? "").includes("routed")) {
+          res.writeHead(201, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            status: "completed", runId: "run-3", rigId: "rig-3",
+            contextPacksRouting: {
+              routedCount: 1, rejectedCount: 1,
+              records: [
+                { declaredPath: "context-packs/world/manifest.yaml", status: "routed" },
+                { declaredPath: "context-packs/gone/manifest.yaml", status: "missing" },
+                { declaredPath: "context-packs/openrig-world/manifest.yaml", status: "kept_existing", detail: "a different 'openrig-world' pack is already installed; kept it unchanged. To use the bundle's copy instead, run 'rig context rm openrig-world' and install the bundle again" },
+              ],
+            },
+            routingFailures: [{ kind: "skills", error: "boom" }],
+            projectRegistration: { status: "registered", projectId: "openrig", projectRoot: "/ws/projects/openrig", rigName: "openrig-dev", catalogPath: "/ws/workspace.yaml" },
+            warnings: ["Bundle skills routing failed: boom", "Startup submission unverified in worker@fixture"],
+          }));
+        } else {
+          res.writeHead(201, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "completed", runId: "run-2", rigId: "rig-1" }));
+        }
+      } else if (req.url?.startsWith("/api/bundles/history") && req.method === "GET") {
+        // Capture query for assertion if needed; for now return a static fixture
+        const url = new URL(req.url, "http://x");
+        const rigFilter = url.searchParams.get("rig");
+        const allRecs = [
+          { installedAt: "2026-05-18T10:00:00Z", bundlePath: "/tmp/a.rigbundle", targetRigName: "alpha", outcome: "success" },
+          { installedAt: "2026-05-18T11:00:00Z", bundlePath: "/tmp/b.rigbundle", targetRigName: "beta", outcome: "failed" },
+        ];
+        const recs = rigFilter ? allRecs.filter((r) => r.targetRigName === rigFilter) : allRecs;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ records: recs, total: recs.length }));
+      } else {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+      }
+    });
+    await new Promise<void>((resolve) => { server.listen(0, resolve); });
+    port = (server.address() as { port: number }).port;
+  });
+
+  afterAll(() => { server.close(); });
+
+  function makeCmd(): Command {
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(bundleCommand(runningDeps(port)));
+    return prog;
+  }
+
+  it("reinstall renders daemon facts and all actionable choices, retaining the error exit", async () => {
+    const { logs, exitCode } = await captureLogs(() => makeCmd().parseAsync(["node", "rig", "bundle", "install", "reinstall.rigbundle", "--target", "/tmp/project"]).then(() => {}));
+    const text = logs.join("\n");
+    expect(exitCode).toBe(2);
+    expect(text).toContain("running; offered version 99.0.0");
+    expect(text).toContain("rig ps --rig workshop --nodes");
+    expect(text).toContain("rig down workshop");
+    expect(text).toContain("Cancel this install");
+  });
+
+  // T11: create produces output
+  it("bundle create prints confirmation", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/rig.yaml", "-o", "/tmp/test.rigbundle"]);
+    });
+    expect(logs.some((l) => l.includes("Bundle created"))).toBe(true);
+    expect(logs.some((l) => l.includes("abc123"))).toBe(true);
+  });
+
+  // The daemon has returned a drift `warning` on the 201 since Build B; the human success path
+  // printed Bundle created / Name / Hash and dropped it. Detected-then-hidden is indistinguishable
+  // from never-detected for the operator holding the artifact.
+  it("bundle create surfaces the daemon's drift warning on the human success path", async () => {
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/drifted.yaml", "-o", "/tmp/d.rigbundle", "--allow-drift"]);
+    });
+    expect(logs.some((l) => l.includes("Bundle created"))).toBe(true);
+    expect(logs.some((l) => l.includes("live rig has 2/3"))).toBe(true);
+    expect(exitCode).toBeUndefined();
+  });
+
+  // PRESERVE — --json already exposed the warning by printing the whole response. The human-path
+  // repair must not change what a script parsing this output receives.
+  it("bundle create --json still prints the entire response including the warning", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/drifted.yaml", "-o", "/tmp/d.rigbundle", "--allow-drift", "--json"]);
+    });
+    const parsed = JSON.parse(logs.find((l) => l.trim().startsWith("{"))!);
+    expect(parsed.warning).toContain("live rig has 2/3");
+    expect(parsed.archiveHash).toBe("abc123");
+  });
+
+  it("bundle create refuses drift by default and shows the operator why", async () => {
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/drifted.yaml", "-o", "/tmp/d.rigbundle"]);
+    });
+    expect(logs.some((l) => l.includes("Refusing to bundle"))).toBe(true);
+    expect(logs.some((l) => l.includes("Bundle created"))).toBe(false);
+    expect(exitCode).toBe(2);
+  });
+
+  it("bundle create --allow-drift wires allowDrift into the request body", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/drifted.yaml", "-o", "/tmp/d.rigbundle", "--allow-drift"]);
+    });
+    expect(capturedCreateBodies[0]!.allowDrift).toBe(true);
+
+    // Absent by default — an override must be asked for, never defaulted on.
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/rig.yaml", "-o", "/tmp/t.rigbundle"]);
+    });
+    expect(capturedCreateBodies[0]!.allowDrift).toBeUndefined();
+  });
+
+  it("bundle create uses --bundle-version without colliding with the CLI version flag", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node",
+        "rig",
+        "bundle",
+        "create",
+        "/tmp/rig.yaml",
+        "-o",
+        "/tmp/test.rigbundle",
+        "--bundle-version",
+        "2.0.0",
+      ]);
+    });
+    expect(logs.some((l) => l.includes("v2.0.0"))).toBe(true);
+  });
+
+  // T12: inspect prints summary
+  it("bundle inspect prints summary", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "inspect", "/tmp/test.rigbundle"]);
+    });
+    expect(logs.some((l) => l.includes("Bundle:"))).toBe(true);
+    expect(logs.some((l) => l.includes("Integrity: PASS"))).toBe(true);
+  });
+
+  // T13: install runs bootstrap
+  it("bundle install prints status", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "install", "/tmp/test.rigbundle", "--yes", "--target", "/tmp/target"]);
+    });
+    expect(logs.some((l) => l.includes("completed"))).toBe(true);
+    expect(logs.some((l) => l.includes("rig-1"))).toBe(true);
+  });
+
+  // T14: --json output
+  it("bundle inspect --json outputs parseable JSON", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "inspect", "/tmp/test.rigbundle", "--json"]);
+    });
+    const parsed = JSON.parse(logs.join(""));
+    expect(parsed.manifest.name).toBe("test");
+  });
+
+  // T15: --plan shows plan
+  it("bundle install --plan shows planned status", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "install", "/tmp/test.rigbundle", "--plan"]);
+    });
+    expect(logs.some((l) => l.includes("planned"))).toBe(true);
+  });
+
+  it("bundle create --json preserves failure exit code", async () => {
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/missing.rig.yaml", "-o", "/tmp/test.rigbundle", "--json"]);
+    });
+    expect(JSON.parse(logs.join("")).error).toBe("Missing package");
+    expect(exitCode).toBe(2);
+  });
+
+  it("bundle install --json preserves blocked exit code", async () => {
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "install", "/tmp/blocked.rigbundle", "--json"]);
+    });
+    expect(stdout).toHaveLength(1);
+    expect(JSON.parse(stdout[0]!).error).toBe("blocked");
+    expect(exitCode).toBe(1);
+  });
+
+  // The daemon resolves any relative path against ITS OWN cwd, so every path the CLI sends must
+  // already be absolute (resolved against the operator's cwd). Files are not transported.
+  it("bundle create/inspect/install send spec, output, bundle, and target as client-absolute paths", async () => {
+    capturedCreateBodies = [];
+    capturedInspectBodies = [];
+    capturedInstallBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "rel/rig.yaml", "-o", "out/rel.rigbundle"]);
+      await makeCmd().parseAsync(["node", "rig", "bundle", "inspect", "out/rel.rigbundle"]);
+      await makeCmd().parseAsync(["node", "rig", "bundle", "install", "out/rel.rigbundle", "--yes", "--target", "proj"]);
+    });
+    const sent = {
+      specPath: capturedCreateBodies.at(-1)?.["specPath"],
+      outputPath: capturedCreateBodies.at(-1)?.["outputPath"],
+      inspectBundlePath: capturedInspectBodies.at(-1)?.["bundlePath"],
+      installBundlePath: capturedInstallBodies.at(-1)?.["bundlePath"],
+      targetRoot: capturedInstallBodies.at(-1)?.["targetRoot"],
+    };
+    console.log(`[client-paths] cwd=${process.cwd()} sent=${JSON.stringify(sent)}`);
+    expect(sent).toEqual({
+      specPath: nodePath.resolve("rel/rig.yaml"),
+      outputPath: nodePath.resolve("out/rel.rigbundle"),
+      inspectBundlePath: nodePath.resolve("out/rel.rigbundle"),
+      installBundlePath: nodePath.resolve("out/rel.rigbundle"),
+      targetRoot: nodePath.resolve("proj"),
+    });
+  });
+
+  it("bundle create --context-pack (repeatable) sends client-absolute pack directories", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "rigs/dev/rig.yaml", "-o", "out.rigbundle", "--context-pack", ".", "--context-pack", "packs/extra"]);
+    });
+    expect(capturedCreateBodies.at(-1)?.["contextPackDirs"]).toEqual([nodePath.resolve("."), nodePath.resolve("packs/extra")]);
+  });
+
+  it("control: bundle create without --context-pack sends no contextPackDirs", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "rigs/dev/rig.yaml", "-o", "out.rigbundle"]);
+    });
+    expect(capturedCreateBodies.at(-1)?.["contextPackDirs"]).toBeUndefined();
+  });
+
+  it("bundle create --project-dir sends a client-absolute project directory", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "rigs/dev/rig.yaml", "-o", "out.rigbundle", "--project-dir", "project"]);
+    });
+    expect(capturedCreateBodies.at(-1)?.["projectDir"]).toBe(nodePath.resolve("project"));
+  });
+
+  it("bundle install --cwd sends a client-absolute cwdOverride", async () => {
+    capturedInstallBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "install", "/tmp/test.rigbundle", "--yes", "--target", "/tmp/t", "--cwd", "rel/repo"]);
+    });
+    expect(capturedInstallBodies.at(-1)?.["cwdOverride"]).toBe(nodePath.resolve("rel/repo"));
+  });
+
+  it("bundle install prints what each declared kind routed, and the routing warnings", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "install", "/tmp/routed.rigbundle", "--yes", "--target", "/tmp/t"]);
+    });
+    expect(logs).toContain("Context packs: 1 routed; not routed: context-packs/gone/manifest.yaml (missing), context-packs/openrig-world/manifest.yaml (kept_existing)");
+    expect(logs).toContain("  context-packs/openrig-world/manifest.yaml: a different 'openrig-world' pack is already installed; kept it unchanged. To use the bundle's copy instead, run 'rig context rm openrig-world' and install the bundle again");
+    expect(logs).toContain("Warning: Bundle skills routing failed: boom");
+    expect(logs).toContain("Warning: Startup submission unverified in worker@fixture");
+    expect(logs).toContain("Project: openrig (registered) at /ws/projects/openrig; rig openrig-dev is associated with it in /ws/workspace.yaml");
+  });
+
+  it("bundle create --preset builds a staged copy and sends the configuration; the author's folder is unchanged", async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "cli-preset-"));
+    const rig = 'version: "0.2"\nname: r\npods:\n  - id: build\n    members:\n      - { id: lead, agent_ref: "local:a", profile: lead, runtime: claude-code }\n';
+    fs.writeFileSync(nodePath.join(dir, "rig.yaml"), rig);
+    fs.writeFileSync(nodePath.join(dir, "configurations.yaml"), "schema: openrig.bundle-configurations/v1\nrecommended: recommended\nseats:\n  build.lead: { runtimes: { claude-code: lead, pi: lead-pi } }\npresets:\n  recommended: { build.lead: claude-code }\n  all-pi: { build.lead: pi }\n");
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", nodePath.join(dir, "rig.yaml"), "-o", nodePath.join(dir, "out.rigbundle"), "--preset", "all-pi"]);
+    });
+    const body = capturedCreateBodies.at(-1)!;
+    expect(body["configuration"]).toEqual({ id: "build.lead=pi", preset: "all-pi" });
+    expect(String(body["specPath"])).toContain("rig-configuration-");
+    expect(body["bundleName"]).toBe("r");
+    expect(fs.readFileSync(nodePath.join(dir, "rig.yaml"), "utf-8")).toBe(rig);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("bundle create names the bundle after the rig unless --name says otherwise", async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "cli-name-"));
+    fs.writeFileSync(nodePath.join(dir, "rig.yaml"), 'version: "0.2"\nname: tipjar-team\npods: []\n');
+    capturedCreateBodies = [];
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", nodePath.join(dir, "rig.yaml"), "-o", nodePath.join(dir, "a.rigbundle")]);
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", nodePath.join(dir, "rig.yaml"), "-o", nodePath.join(dir, "b.rigbundle"), "--name", "chosen"]);
+    });
+    expect(capturedCreateBodies.map((b) => b["bundleName"])).toEqual(["tipjar-team", "chosen"]);
+    expect(logs).toContain("  Name: tipjar-team v0.1.0");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("bundle create --seat with an undeclared runtime sends nothing and names the allowed set", async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "cli-seat-"));
+    fs.writeFileSync(nodePath.join(dir, "rig.yaml"), 'version: "0.2"\nname: r\npods:\n  - id: build\n    members:\n      - { id: lead, agent_ref: "local:a", profile: lead, runtime: claude-code }\n');
+    fs.writeFileSync(nodePath.join(dir, "configurations.yaml"), "schema: openrig.bundle-configurations/v1\nrecommended: recommended\nseats:\n  build.lead: { runtimes: { claude-code: lead } }\npresets:\n  recommended: { build.lead: claude-code }\n");
+    capturedCreateBodies = [];
+    const { exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", nodePath.join(dir, "rig.yaml"), "-o", nodePath.join(dir, "o.rigbundle"), "--seat", "build.lead=codex"]);
+    });
+    expect(capturedCreateBodies).toHaveLength(0);
+    expect(exitCode).toBe(2);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("bundle configurations refuses a recommended preset that isn't rig.yaml as written", async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "cli-configs-"));
+    fs.writeFileSync(nodePath.join(dir, "rig.yaml"), 'version: "0.2"\nname: r\npods:\n  - id: build\n    members:\n      - { id: lead, agent_ref: "local:a", profile: lead, runtime: claude-code }\n');
+    fs.writeFileSync(nodePath.join(dir, "configurations.yaml"), "schema: openrig.bundle-configurations/v1\nrecommended: all-pi\nseats:\n  build.lead: { runtimes: { claude-code: lead, pi: lead-pi } }\npresets:\n  recommended: { build.lead: claude-code }\n  all-pi: { build.lead: pi }\n");
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "configurations", nodePath.join(dir, "rig.yaml")]);
+    });
+    expect(exitCode).toBe(2);
+    expect(logs.join("\n")).toMatch(/the recommended preset 'all-pi' must be rig.yaml as written \(build\.lead=claude-code\)/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("control: bundle install --plan without --target still sends no targetRoot", async () => {
+    capturedInstallBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "install", "/tmp/test.rigbundle", "--plan"]);
+    });
+    const body = capturedInstallBodies.at(-1)!;
+    expect(body["plan"]).toBe(true);
+    expect(body["targetRoot"]).toBeUndefined();
+    expect(body["bundlePath"]).toBe("/tmp/test.rigbundle");
+  });
+
+  // T6: bundle create --rig-root passes rigRoot in request body
+  it("bundle create --rig-root passes rigRoot in request body", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "create", "/tmp/rig.yaml",
+        "-o", "/tmp/test.rigbundle",
+        "--rig-root", "/my/project",
+      ]);
+    });
+    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
+    expect(createBody).toBeTruthy();
+    expect(createBody!["rigRoot"]).toMatch(/\/my\/project/);
+  });
+
+  // Item 1 / slice-05: --notes flag is captured into provenance in the request body
+  it("bundle create --notes wires the operator note into provenance.notes in the request body", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "create", "/tmp/rig.yaml",
+        "-o", "/tmp/test.rigbundle",
+        "--notes", "checkpoint-2-part-3 fixture",
+      ]);
+    });
+    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
+    expect(createBody).toBeTruthy();
+    const provenance = createBody!["provenance"] as Record<string, unknown> | undefined;
+    expect(provenance).toBeTruthy();
+    expect(provenance!["notes"]).toBe("checkpoint-2-part-3 fixture");
+  });
+
+  // Item 1 / slice-05: provenance auto-includes hostname + cliVersion at invoke time
+  it("bundle create automatically includes hostname + cliVersion in provenance (no flag needed)", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "create", "/tmp/rig.yaml",
+        "-o", "/tmp/test.rigbundle",
+      ]);
+    });
+    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
+    expect(createBody).toBeTruthy();
+    const provenance = createBody!["provenance"] as Record<string, unknown> | undefined;
+    expect(provenance).toBeTruthy();
+    // hostname and cliVersion auto-populate (real os.hostname() + CLI package.json read)
+    expect(typeof provenance!["sourceHost"]).toBe("string");
+    expect((provenance!["sourceHost"] as string).length).toBeGreaterThan(0);
+    expect(typeof provenance!["cliVersion"]).toBe("string");
+    expect((provenance!["cliVersion"] as string).length).toBeGreaterThan(0);
+    // notes is undefined when --notes not passed (no empty string sent)
+    expect(provenance!["notes"]).toBeUndefined();
+  });
+
+  // Item 2 / slice-05: --min-daemon-version + --min-cli-version flags wire into request body compatibility
+  it("bundle create --min-daemon-version and --min-cli-version wire into request body compatibility", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "create", "/tmp/rig.yaml",
+        "-o", "/tmp/test.rigbundle",
+        "--min-daemon-version", "0.3.2",
+        "--min-cli-version", "0.3.2",
+      ]);
+    });
+    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
+    expect(createBody).toBeTruthy();
+    const compatibility = createBody!["compatibility"] as Record<string, unknown> | undefined;
+    expect(compatibility).toBeTruthy();
+    expect(compatibility!["minDaemonVersion"]).toBe("0.3.2");
+    expect(compatibility!["minCliVersion"]).toBe("0.3.2");
+  });
+
+  // Item 2 / slice-05: --min-daemon-version alone (partial) still wires
+  it("bundle create --min-daemon-version alone wires partial compatibility into request body", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "create", "/tmp/rig.yaml",
+        "-o", "/tmp/test.rigbundle",
+        "--min-daemon-version", "0.3.2",
+      ]);
+    });
+    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
+    expect(createBody).toBeTruthy();
+    const compatibility = createBody!["compatibility"] as Record<string, unknown> | undefined;
+    expect(compatibility).toBeTruthy();
+    expect(compatibility!["minDaemonVersion"]).toBe("0.3.2");
+    expect(compatibility!["minCliVersion"]).toBeUndefined();
+  });
+
+  // Item 2 / slice-05 Checkpoint 3.3: bundle install --skip-version-check wires through
+  it("bundle install --skip-version-check sets skipVersionCheck=true in request body", async () => {
+    capturedInstallBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "install", "/tmp/test.rigbundle",
+        "--yes", "--target", "/tmp/target",
+        "--skip-version-check",
+      ]);
+    });
+    const installBody = capturedInstallBodies[capturedInstallBodies.length - 1];
+    expect(installBody).toBeTruthy();
+    expect(installBody!["skipVersionCheck"]).toBe(true);
+    // cliVersion auto-included (read at call time via getCliVersion)
+    expect(typeof installBody!["cliVersion"]).toBe("string");
+    expect((installBody!["cliVersion"] as string).length).toBeGreaterThan(0);
+  });
+
+  it("bundle install without --skip-version-check sets skipVersionCheck=false and still sends cliVersion", async () => {
+    capturedInstallBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "install", "/tmp/test.rigbundle",
+        "--yes", "--target", "/tmp/target",
+      ]);
+    });
+    const installBody = capturedInstallBodies[capturedInstallBodies.length - 1];
+    expect(installBody).toBeTruthy();
+    expect(installBody!["skipVersionCheck"]).toBe(false);
+    expect(typeof installBody!["cliVersion"]).toBe("string");
+  });
+
+  // Item 3 / slice-05 Checkpoint 4.2: --force flag wires through to request body
+  it("bundle install --force sets force=true in request body", async () => {
+    capturedInstallBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "install", "/tmp/test.rigbundle",
+        "--yes", "--target", "/tmp/target",
+        "--force",
+      ]);
+    });
+    const installBody = capturedInstallBodies[capturedInstallBodies.length - 1];
+    expect(installBody).toBeTruthy();
+    expect(installBody!["force"]).toBe(true);
+  });
+
+  it("bundle install without --force sets force=false in request body (operator-explicit opt-in only)", async () => {
+    capturedInstallBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "install", "/tmp/test.rigbundle",
+        "--yes", "--target", "/tmp/target",
+      ]);
+    });
+    const installBody = capturedInstallBodies[capturedInstallBodies.length - 1];
+    expect(installBody).toBeTruthy();
+    expect(installBody!["force"]).toBe(false);
+  });
+
+  // Item 4 / slice-05 Checkpoint 5.2: rig bundle history subcommand
+  it("bundle history renders records as text by default", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "history"]);
+    });
+    expect(logs.some((l) => l.includes("Bundle install history"))).toBe(true);
+    expect(logs.some((l) => l.includes("alpha"))).toBe(true);
+    expect(logs.some((l) => l.includes("beta"))).toBe(true);
+    expect(logs.some((l) => l.includes("success"))).toBe(true);
+  });
+
+  it("bundle history --json outputs parseable JSON with records array", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "history", "--json"]);
+    });
+    const parsed = JSON.parse(logs.join(""));
+    expect(Array.isArray(parsed.records)).toBe(true);
+    expect(parsed.records.length).toBe(2);
+    expect(parsed.total).toBe(2);
+  });
+
+  it("bundle history --rig filter passes through to the query string", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "history", "--rig", "alpha", "--json"]);
+    });
+    const parsed = JSON.parse(logs.join(""));
+    expect(parsed.records).toHaveLength(1);
+    expect(parsed.records[0].targetRigName).toBe("alpha");
+  });
+
+  // Item 2 / slice-05: no flags → compatibility omitted (no empty object sent)
+  it("bundle create with neither min-version flag omits compatibility from request body", async () => {
+    capturedCreateBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync([
+        "node", "rig", "bundle", "create", "/tmp/rig.yaml",
+        "-o", "/tmp/test.rigbundle",
+      ]);
+    });
+    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
+    expect(createBody).toBeTruthy();
+    expect(createBody!["compatibility"]).toBeUndefined();
+  });
+
+  // Item 1 / slice-05: authorSession populates when OPENRIG_SESSION_NAME env is set
+  it("bundle create includes authorSession when OPENRIG_SESSION_NAME env is set", async () => {
+    capturedCreateBodies = [];
+    const origEnv = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "velocity-driver@openrig-velocity";
+    try {
+      await captureLogs(async () => {
+        await makeCmd().parseAsync([
+          "node", "rig", "bundle", "create", "/tmp/rig.yaml",
+          "-o", "/tmp/test.rigbundle",
+        ]);
+      });
+    } finally {
+      if (origEnv === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = origEnv;
+    }
+    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
+    expect(createBody).toBeTruthy();
+    const provenance = createBody!["provenance"] as Record<string, unknown> | undefined;
+    expect(provenance).toBeTruthy();
+    expect(provenance!["authorSession"]).toBe("velocity-driver@openrig-velocity");
+  });
+});

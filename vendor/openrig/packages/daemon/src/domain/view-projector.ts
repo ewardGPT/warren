@@ -1,0 +1,458 @@
+import type { ProjectRead } from "./workspace/project-read.js";
+import type Database from "better-sqlite3";
+import { lastMeaningfulTransition } from "./queue-waiting.js";
+import { derivePickup } from "./queue-pickup.js";
+import { ulid } from "ulid";
+import type { EventBus } from "./event-bus.js";
+import { buildExecutionView, type ExecutionViewDeps } from "./execution-view.js";
+
+/**
+ * View projector (PL-004 Phase B; L5 View — read-only projections).
+ *
+ * Per PRD § L5 + slice IMPL § Guard Checkpoint Focus item 5+6:
+ * - 6 built-in views over Phase A's queue_items + queue_transitions tables.
+ * - Custom view registration via views_custom table.
+ * - Read-only over Phase A state + Phase B state. NO writes to queue_items
+ *   or queue_transitions from this module.
+ * - Sub-100 ms latency target (per PRD § Acceptance Criteria); achieved by
+ *   leaning on Phase A's existing indexes.
+ * - Fixture rig exclusion default: rig names matching `^test-` or `^fixture-`
+ *   are excluded; opt-in via OPENRIG_VIEW_INCLUDE_FIXTURES=1.
+ *
+ * Custom views in views_custom store a SQL string (`definition`) that the
+ * projector executes verbatim. Operator-defined; no taxonomy enforced.
+ *
+ * Pattern mirrors Phase A's queue-repository.ts read-API shape.
+ */
+
+export const BUILT_IN_VIEW_NAMES = [
+  "recently-active",
+  "founder",
+  "pod-load",
+  "escalations",
+  "held",
+  "activity",
+  // S04 (OPR.0.5.5.4) — the pickup lens: claimed rows with the DERIVED receipt.
+  "pickup",
+  // S27 (OPR.0.5.6.27) — the execution view: one derived JSON document
+  // answering the six execution questions; needs setExecutionDeps wiring.
+  "execution",
+] as const;
+
+export type BuiltInViewName = (typeof BUILT_IN_VIEW_NAMES)[number];
+
+export interface ViewQueryResult {
+  viewName: string;
+  generatedAt: string;
+  rows: Record<string, unknown>[];
+  rowCount: number;
+}
+
+interface ViewShowOptions {
+  rig?: string;
+  limit?: number;
+  mission?: string;
+  project?: ProjectRead | null;
+}
+
+export interface CustomView {
+  viewId: string;
+  viewName: string;
+  definition: string;
+  registeredBySession: string;
+  registeredAt: string;
+  lastEvaluatedAt: string | null;
+}
+
+interface CustomViewRow {
+  view_id: string;
+  view_name: string;
+  definition: string;
+  registered_by_session: string;
+  registered_at: string;
+  last_evaluated_at: string | null;
+}
+
+function customDefinitionHasLimit(definition: string): boolean {
+  return definition.toLowerCase().includes("limit");
+}
+
+export class ViewProjectorError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/**
+ * Detect fixture rigs by session name suffix `@<rig>` where <rig> starts
+ * with `test-` or `fixture-`. Used to filter views by default; opt-in via
+ * OPENRIG_VIEW_INCLUDE_FIXTURES=1.
+ */
+function fixtureExclusionClause(): string {
+  if (process.env.OPENRIG_VIEW_INCLUDE_FIXTURES === "1") return "1=1";
+  // Exclude qitems whose source_session OR destination_session has a rig
+  // name starting with test- or fixture-.
+  return `(
+    destination_session NOT LIKE '%@test-%' AND
+    destination_session NOT LIKE '%@fixture-%' AND
+    source_session NOT LIKE '%@test-%' AND
+    source_session NOT LIKE '%@fixture-%'
+  )`;
+}
+
+export class ViewProjector {
+  readonly db: Database.Database;
+  private readonly eventBus: EventBus;
+  private readonly now: () => Date;
+
+  constructor(
+    db: Database.Database,
+    eventBus: EventBus,
+    opts?: { now?: () => Date },
+  ) {
+    this.db = db;
+    this.eventBus = eventBus;
+    this.now = opts?.now ?? (() => new Date());
+  }
+
+  // S27 — execution-view wiring (startup calls this once the slices root
+  // resolves; tests inject fixture roots and a pinned clock).
+  private executionDeps: ExecutionViewDeps | null = null;
+  setExecutionDeps(deps: ExecutionViewDeps): void {
+    this.executionDeps = deps;
+  }
+
+  /**
+   * Run a view by name. Built-in names (BUILT_IN_VIEW_NAMES) dispatch to
+   * hardcoded SQL; other names dispatch to custom-view lookup.
+   * Only execution is asynchronous; SQL views retain their synchronous API.
+   */
+  show(viewName: "execution", opts?: ViewShowOptions): Promise<ViewQueryResult>;
+  show(viewName: Exclude<BuiltInViewName, "execution">, opts?: ViewShowOptions): ViewQueryResult;
+  show(viewName: string, opts?: ViewShowOptions): ViewQueryResult | Promise<ViewQueryResult>;
+  show(viewName: string, opts?: ViewShowOptions): ViewQueryResult | Promise<ViewQueryResult> {
+    const limit = Math.max(1, Math.min(opts?.limit ?? 100, 1000));
+    // S27 — the execution view is document-shaped (rows = [one JSON document])
+    // and derives from fs/git/build-info legs beyond this class's SQL, so it
+    // dispatches to its own module through the wired deps.
+    if (viewName === "execution") {
+      if (!this.executionDeps) {
+        throw new ViewProjectorError(
+          "view_query_failed",
+          "execution view deps are not wired on this daemon (setExecutionDeps was never called)",
+        );
+      }
+      return buildExecutionView(opts?.project ? { ...this.executionDeps, slicesRoot: () => opts.project!.missionsRoot } : this.executionDeps, { mission: opts?.mission, rig: opts?.rig, project: opts?.project?.id })
+        .then(doc => ({ viewName: "execution", generatedAt: this.now().toISOString(), rows: [doc], rowCount: 1 }));
+    }
+    if ((BUILT_IN_VIEW_NAMES as readonly string[]).includes(viewName)) {
+      return this.runBuiltIn(viewName as BuiltInViewName, opts?.rig, limit);
+    }
+    const custom = this.getCustomView(viewName);
+    if (!custom) {
+      throw new ViewProjectorError("view_not_found", `view '${viewName}' is not registered (built-in or custom)`);
+    }
+    return this.runCustom(custom, limit);
+  }
+
+  /** #586: whether showing this view binds `limit` into SQL. The execution view
+   *  never reads it, a custom view with its own LIMIT keeps that one, and an
+   *  unregistered name is refused before any SQL runs. */
+  bindsLimit(viewName: string): boolean {
+    if (viewName === "execution") return false;
+    if ((BUILT_IN_VIEW_NAMES as readonly string[]).includes(viewName)) return true;
+    const custom = this.getCustomView(viewName);
+    return custom !== null && !customDefinitionHasLimit(custom.definition);
+  }
+
+  list(): { builtIn: BuiltInViewName[]; custom: CustomView[] } {
+    return { builtIn: [...BUILT_IN_VIEW_NAMES], custom: this.listCustomViews() };
+  }
+
+  private runBuiltIn(name: BuiltInViewName, rig: string | undefined, limit: number): ViewQueryResult {
+    const fixtureClause = fixtureExclusionClause();
+    const rigClause = rig ? `AND (destination_session LIKE ? ESCAPE '\\' OR source_session LIKE ? ESCAPE '\\')` : "";
+    const rigPattern = rig ? `%@${rig.replace(/[\\%_]/g, "\\$&")}` : undefined;
+    const rigParams: unknown[] = rigPattern ? [rigPattern, rigPattern] : [];
+
+    // S04 — the pickup lens post-processes through the ONE shared derivation rule
+    // (derivePickup), never a second SQL copy of it: claimed live rows, oldest claim first,
+    // each carrying pickup_state and (when stalled) the named pickup_evidence.
+    if (name === "pickup") {
+      const rows = this.db
+        .prepare(
+          `SELECT qitem_id, source_session, destination_session, state, claimed_at, last_heartbeat, ts_updated,
+                  (SELECT COUNT(*) FROM queue_transitions t
+                     WHERE t.qitem_id = queue_items.qitem_id
+                       AND t.ts > queue_items.claimed_at
+                       AND t.transition_note IS NOT 'claimed') AS post_claim_motion
+             FROM queue_items
+            WHERE claimed_at IS NOT NULL
+              AND state IN ('in-progress', 'blocked')
+              AND ${fixtureClause}
+              ${rigClause}
+            ORDER BY claimed_at ASC
+            LIMIT ?`,
+        )
+        .all(...rigParams, limit) as Record<string, unknown>[];
+      const projected = rows.map((r) => {
+        const activity = this.executionDeps?.seatActivity?.getSeatStateBySession(String(r.destination_session));
+        const receipt = derivePickup({
+          lastMeaningfulAt: lastMeaningfulTransition(this.db, String(r.qitem_id))?.at,
+          activity: activity?.activity, needsInput: activity?.needsInput.count,
+          state: String(r.state),
+          claimedAt: (r.claimed_at as string | null) ?? null,
+          lastHeartbeat: (r.last_heartbeat as string | null) ?? null,
+          postClaimMotionCount: Number(r.post_claim_motion ?? 0),
+        });
+        return {
+          ...r,
+          pickup_state: receipt.state,
+          ...(receipt.evidence ? { pickup_evidence: receipt.evidence } : {}),
+        };
+      });
+      return { viewName: name, generatedAt: this.now().toISOString(), rows: projected, rowCount: projected.length };
+    }
+
+    let sql: string;
+    let params: unknown[] = [];
+    switch (name) {
+      case "recently-active":
+        // qitems by ts_updated DESC; live states (pending/in-progress/blocked).
+        sql = `
+          SELECT qitem_id, source_session, destination_session, state, priority, tier, ts_updated, body
+          FROM queue_items
+          WHERE state IN ('pending', 'in-progress', 'blocked')
+            AND ${fixtureClause}
+            ${rigClause}
+          ORDER BY ts_updated DESC
+          LIMIT ?
+        `;
+        params = [...rigParams, limit];
+        break;
+      case "founder":
+        // priority='critical' OR tier='critical' OR tier='fast'.
+        sql = `
+          SELECT qitem_id, source_session, destination_session, state, priority, tier, ts_updated
+          FROM queue_items
+          WHERE (priority = 'critical' OR tier IN ('critical', 'fast'))
+            AND state IN ('pending', 'in-progress', 'blocked')
+            AND ${fixtureClause}
+            ${rigClause}
+          ORDER BY ts_updated DESC
+          LIMIT ?
+        `;
+        params = [...rigParams, limit];
+        break;
+      case "pod-load":
+        // R1 NOTE 4: PRD § L5 names this view "per-pod queue-item counts",
+        // but Phase A's queue_items table does not carry pod metadata —
+        // destination_session is `<member>@<rig>` shape and there is no
+        // pod_id column. v0 interpretation: group by destination_session
+        // (i.e., per-seat counts). When pod metadata becomes available
+        // (Phase D workflow runtime or later), this view should be
+        // upgraded to GROUP BY pod_id with destination_session aggregation
+        // as a sub-grouping. Documented v0 behavior preserves the view
+        // name but reduces the grouping key.
+        sql = `
+          SELECT destination_session AS pod, COUNT(*) AS active_count
+          FROM queue_items
+          WHERE state IN ('pending', 'in-progress', 'blocked')
+            AND ${fixtureClause}
+            ${rigClause}
+          GROUP BY destination_session
+          ORDER BY active_count DESC
+          LIMIT ?
+        `;
+        params = [...rigParams, limit];
+        break;
+      case "escalations":
+        // closure_reason = 'escalation' OR an OPEN S01 wake-escalation aggregate — the
+        // operator rung's delivery floor (AM-R25): the ladder's aggregated escalation
+        // rows surface here so a dead-seat storm is visible without any human sweep.
+        sql = `
+          SELECT qitem_id, source_session, destination_session, state, closure_reason, closure_target, ts_updated
+          FROM queue_items
+          WHERE (closure_reason = 'escalation'
+                 OR (state IN ('pending', 'in-progress', 'blocked') AND tags LIKE '%"wake-escalation"%'))
+            AND ${fixtureClause}
+            ${rigClause}
+          ORDER BY ts_updated DESC
+          LIMIT ?
+        `;
+        params = [...rigParams, limit];
+        break;
+      case "held":
+        // state = 'blocked' OR blocked_on is non-null.
+        sql = `
+          SELECT qitem_id, source_session, destination_session, state, blocked_on, ts_updated, body
+          FROM queue_items
+          WHERE (state = 'blocked' OR blocked_on IS NOT NULL)
+            AND ${fixtureClause}
+            ${rigClause}
+          ORDER BY ts_updated DESC
+          LIMIT ?
+        `;
+        params = [...rigParams, limit];
+        break;
+      case "activity": {
+        // Recent transitions joined with qitem state. Fixture-clause must
+        // reference queue_items columns, so use the prefixed clause.
+        const fixtureClauseQI = fixtureClause === "1=1"
+          ? "1=1"
+          : `(
+              q.destination_session NOT LIKE '%@test-%' AND
+              q.destination_session NOT LIKE '%@fixture-%' AND
+              q.source_session NOT LIKE '%@test-%' AND
+              q.source_session NOT LIKE '%@fixture-%'
+            )`;
+        const rigClauseQI = rig
+          ? `AND (q.destination_session LIKE ? ESCAPE '\\' OR q.source_session LIKE ? ESCAPE '\\')`
+          : "";
+        sql = `
+          SELECT t.transition_id, t.qitem_id, t.ts, t.state, t.actor_session, t.transition_note,
+                 q.destination_session, q.source_session
+          FROM queue_transitions t
+          JOIN queue_items q ON t.qitem_id = q.qitem_id
+          WHERE ${fixtureClauseQI}
+            ${rigClauseQI}
+          ORDER BY t.ts DESC
+          LIMIT ?
+        `;
+        params = [...rigParams, limit];
+        break;
+      }
+      default:
+        // "execution" is intercepted in show() before this dispatch; reaching
+        // here means a name was added to BUILT_IN_VIEW_NAMES without a case.
+        throw new ViewProjectorError("view_query_failed", `built-in view '${name}' has no SQL dispatch case`);
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+    return {
+      viewName: name,
+      generatedAt: this.now().toISOString(),
+      rows,
+      rowCount: rows.length,
+    };
+  }
+
+  private runCustom(view: CustomView, limit: number): ViewQueryResult {
+    // Custom view definitions are operator-supplied SQL. Append LIMIT if
+    // the operator's SQL does not already include one. We do not parse SQL;
+    // operators are responsible for the definition's correctness.
+    const sql = customDefinitionHasLimit(view.definition)
+      ? view.definition
+      : `${view.definition.trim().replace(/;$/, "")} LIMIT ${limit}`;
+    let rows: Record<string, unknown>[];
+    try {
+      rows = this.db.prepare(sql).all() as Record<string, unknown>[];
+    } catch (err) {
+      throw new ViewProjectorError(
+        "view_query_failed",
+        `custom view '${view.viewName}' query failed: ${(err as Error).message}`,
+      );
+    }
+    // Touch last_evaluated_at (best-effort; not transactional).
+    this.db
+      .prepare(`UPDATE views_custom SET last_evaluated_at = ? WHERE view_id = ?`)
+      .run(this.now().toISOString(), view.viewId);
+    return {
+      viewName: view.viewName,
+      generatedAt: this.now().toISOString(),
+      rows,
+      rowCount: rows.length,
+    };
+  }
+
+  /**
+   * Register a custom view. UNIQUE on view_name; re-registration of the
+   * same name updates the definition (operator-friendly: edit views.yaml,
+   * re-register, get the new query).
+   */
+  registerCustomView(input: {
+    viewName: string;
+    definition: string;
+    registeredBySession: string;
+  }): CustomView {
+    if ((BUILT_IN_VIEW_NAMES as readonly string[]).includes(input.viewName)) {
+      throw new ViewProjectorError(
+        "view_name_reserved",
+        `view name '${input.viewName}' is a reserved built-in name; choose a different name`,
+      );
+    }
+    const existing = this.db
+      .prepare(`SELECT * FROM views_custom WHERE view_name = ?`)
+      .get(input.viewName) as CustomViewRow | undefined;
+    const registeredAt = this.now().toISOString();
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE views_custom
+             SET definition = ?, registered_by_session = ?, registered_at = ?
+           WHERE view_id = ?`,
+        )
+        .run(input.definition, input.registeredBySession, registeredAt, existing.view_id);
+      return this.getCustomViewByIdOrThrow(existing.view_id);
+    }
+    const viewId = ulid();
+    this.db
+      .prepare(
+        `INSERT INTO views_custom (
+          view_id, view_name, definition, registered_by_session, registered_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(viewId, input.viewName, input.definition, input.registeredBySession, registeredAt);
+    return this.getCustomViewByIdOrThrow(viewId);
+  }
+
+  getCustomView(viewName: string): CustomView | null {
+    const row = this.db
+      .prepare(`SELECT * FROM views_custom WHERE view_name = ?`)
+      .get(viewName) as CustomViewRow | undefined;
+    return row ? this.rowToCustomView(row) : null;
+  }
+
+  listCustomViews(): CustomView[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM views_custom ORDER BY view_name ASC`)
+      .all() as CustomViewRow[];
+    return rows.map((r) => this.rowToCustomView(r));
+  }
+
+  /**
+   * Used by routes/views.ts to emit view.changed when underlying state
+   * changes. Phase B does not auto-evaluate; callers (route SSE handlers)
+   * subscribe to event-bus events and trigger this notify.
+   */
+  notifyViewChanged(viewName: string, cause: string): void {
+    this.eventBus.persistWithinTransaction({
+      type: "view.changed",
+      viewName,
+      cause,
+    });
+  }
+
+  private getCustomViewByIdOrThrow(viewId: string): CustomView {
+    const row = this.db
+      .prepare(`SELECT * FROM views_custom WHERE view_id = ?`)
+      .get(viewId) as CustomViewRow | undefined;
+    if (!row) {
+      throw new ViewProjectorError("view_not_found", `custom view ${viewId} not found after write`);
+    }
+    return this.rowToCustomView(row);
+  }
+
+  private rowToCustomView(row: CustomViewRow): CustomView {
+    return {
+      viewId: row.view_id,
+      viewName: row.view_name,
+      definition: row.definition,
+      registeredBySession: row.registered_by_session,
+      registeredAt: row.registered_at,
+      lastEvaluatedAt: row.last_evaluated_at,
+    };
+  }
+}

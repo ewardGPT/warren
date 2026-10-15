@@ -1,0 +1,330 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import Database from "better-sqlite3";
+import { QueueRepository, type QueueItem } from "../src/domain/queue-repository.js";
+
+function createTestDb(): Database.Database {
+  const db = new Database(":memory:");
+  db.pragma("journal_mode = WAL");
+  db.exec(`CREATE TABLE IF NOT EXISTS queue_items (
+    qitem_id TEXT PRIMARY KEY,
+    ts_created TEXT NOT NULL,
+    ts_updated TEXT NOT NULL,
+    source_session TEXT NOT NULL,
+    destination_session TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    tier TEXT,
+    tags TEXT,
+    blocked_on TEXT,
+    handed_off_to TEXT,
+    handed_off_from TEXT,
+    expires_at TEXT,
+    chain_of_record TEXT,
+    body TEXT NOT NULL DEFAULT '',
+    summary TEXT,
+    evidence_ref TEXT,
+    closure_reason TEXT,
+    closure_target TEXT,
+    closure_required_at TEXT,
+    claimed_at TEXT,
+    last_nudge_attempt TEXT,
+    last_nudge_result TEXT,
+    last_heartbeat TEXT,
+    resolution TEXT,
+    target_repo TEXT
+  )`);
+  return db;
+}
+
+function seedItem(db: Database.Database, id: string, opts: {
+  source: string;
+  destination: string;
+  state?: string;
+  body?: string;
+  summary?: string | null;
+  evidenceRef?: string | null;
+  tags?: string[];
+  tsCreated?: string;
+}) {
+  const ts = opts.tsCreated ?? new Date().toISOString();
+  db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, body, summary, evidence_ref, tags, chain_of_record)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    id, ts, ts, opts.source, opts.destination,
+    opts.state ?? "pending",
+    opts.body ?? `Body of ${id} - this is a long body that adds token weight and should be excluded in compact mode. `.repeat(10),
+    opts.summary ?? null,
+    opts.evidenceRef ?? null,
+    opts.tags ? JSON.stringify(opts.tags) : null,
+    JSON.stringify([`chain-${id}`]),
+  );
+}
+
+describe("OPR.0.4.0.28 — queue list compact + scope-default", () => {
+  let db: Database.Database;
+  let repo: QueueRepository;
+
+  beforeEach(() => {
+    db = createTestDb();
+    repo = new QueueRepository(db);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("AC-1: compact list is materially smaller than full list", () => {
+    for (let i = 0; i < 20; i++) {
+      seedItem(db, `q-${i}`, {
+        source: `seat-${i % 3}@rig-a`,
+        destination: `seat-${(i + 1) % 3}@rig-a`,
+        body: `Long body for item ${i}. `.repeat(100),
+        tags: ["tag-a", "tag-b", "tag-c"],
+      });
+    }
+
+    const full = repo.list({ limit: 20 });
+    const compact = repo.list({ limit: 20, compact: true });
+
+    expect(compact.length).toBe(full.length);
+
+    const fullSize = JSON.stringify(full).length;
+    const compactSize = JSON.stringify(compact).length;
+    expect(compactSize).toBeLessThan(fullSize / 3);
+  });
+
+  it("AC-2: --all parity — full unscoped list matches today's default", () => {
+    for (let i = 0; i < 5; i++) {
+      seedItem(db, `q-${i}`, {
+        source: `seat-${i}@rig-${i}`,
+        destination: `seat-${i + 1}@rig-${i}`,
+      });
+    }
+
+    const allItems = repo.list({ limit: 100 });
+    expect(allItems.length).toBe(5);
+    expect(allItems[0]!.body.length).toBeGreaterThan(0);
+    expect(allItems[0]!.chainOfRecord).toBeDefined();
+  });
+
+  it("AC-3: caller-scoped default surfaces caller items even when older than fleet LIMIT", () => {
+    const callerSession = "dev1-driver@openrig-delivery";
+
+    // Caller's OLD item (created first, would be beyond LIMIT if unscoped)
+    seedItem(db, "q-caller-old", {
+      source: "orch-lead@openrig-delivery",
+      destination: callerSession,
+      state: "pending",
+      tsCreated: "2026-06-01T00:00:00.000Z",
+    });
+
+    // 10 NEWER fleet items from other rigs (would push caller item beyond LIMIT 5)
+    for (let i = 0; i < 10; i++) {
+      seedItem(db, `q-fleet-${i}`, {
+        source: `seat-${i}@other-rig`,
+        destination: `seat-${i + 1}@other-rig`,
+        state: "pending",
+        tsCreated: `2026-06-19T${String(i).padStart(2, "0")}:00:00.000Z`,
+      });
+    }
+
+    // Unscoped with small limit — caller item is dropped
+    const unscoped = repo.list({ limit: 5 });
+    const unscopedIds = unscoped.map((item) => item.qitemId);
+    expect(unscopedIds).not.toContain("q-caller-old");
+
+    // Scoped with same small limit — caller item appears (WHERE before LIMIT)
+    const scoped = repo.list({ asSession: callerSession, limit: 5 });
+    const scopedIds = scoped.map((item) => item.qitemId);
+    expect(scopedIds).toContain("q-caller-old");
+  });
+
+  it("AC-3 / S4b: destination-only counts obligations while asSession keeps the authored union", () => {
+    const callerSession = "dev1-driver@openrig-delivery";
+
+    seedItem(db, "q-to-me", {
+      source: "orch-lead@openrig-delivery",
+      destination: callerSession,
+      state: "pending",
+    });
+
+    seedItem(db, "q-from-me", {
+      source: callerSession,
+      destination: "dev1-guard@openrig-delivery",
+      state: "in-progress",
+    });
+
+    seedItem(db, "q-unrelated", {
+      source: "rev1-r1@openrig-delivery",
+      destination: "rev1-r2@openrig-delivery",
+      state: "pending",
+    });
+
+    const scoped = repo.list({ asSession: callerSession });
+    const ids = scoped.map((item) => item.qitemId);
+    expect(ids).toContain("q-to-me");
+    expect(ids).toContain("q-from-me");
+    expect(ids).not.toContain("q-unrelated");
+
+    const owned = repo.list({ destinationSession: callerSession });
+    expect(owned.map((item) => item.qitemId)).toEqual(["q-to-me"]);
+  });
+
+  it("AC-4: compact keeps the summary and leaves elided fields out instead of posing as empty content", () => {
+    seedItem(db, "q-1", {
+      source: "a@rig",
+      destination: "b@rig",
+      body: "This body should be excluded in compact mode",
+      summary: "round-2 test, searchable in compact mode",
+      evidenceRef: "proof/PROOF.md",
+      tags: ["slice:OPR.0.4.0.28"],
+    });
+
+    const compact = repo.list({ compact: true });
+    expect(compact.length).toBe(1);
+    const item = compact[0]!;
+    expect(item.qitemId).toBe("q-1");
+    expect(item.state).toBeDefined();
+    expect(item.sourceSession).toBeDefined();
+    expect(item.destinationSession).toBeDefined();
+    expect(item.priority).toBeDefined();
+    expect(item.tier).toBeDefined();
+    expect(item.tags).toBeDefined();
+    // The summary is present text, so it's kept: a grep of the listing finds the row by it.
+    expect(item.summary).toBe("round-2 test, searchable in compact mode");
+    expect(JSON.stringify(compact)).toContain("round-2 test");
+    // Heavy fields are left out entirely, never sent as null or empty.
+    expect(item).not.toHaveProperty("body");
+    expect(item).not.toHaveProperty("evidenceRef");
+    expect(item).not.toHaveProperty("humanDetail");
+    expect(JSON.stringify(compact)).not.toContain("excluded in compact mode");
+    expect(item).not.toHaveProperty("chainOfRecord");
+    expect(item).not.toHaveProperty("humanQuestions");
+    expect(item.fieldsElided).toEqual(["body", "evidenceRef", "humanDetail", "waiting", "chainOfRecord", "replyTo", "humanQuestions", "humanAnswers"]);
+  });
+
+  it("distinguishes a genuinely empty full item from an elided compact item", () => {
+    seedItem(db, "q-empty", {
+      source: "a@rig",
+      destination: "b@rig",
+      body: "",
+      summary: null,
+      evidenceRef: null,
+    });
+
+    const compact = repo.list({ compact: true })[0]!;
+    const full = repo.list({})[0]!;
+
+    expect(compact.fieldsElided).toEqual(["body", "evidenceRef", "humanDetail", "waiting", "chainOfRecord", "replyTo", "humanQuestions", "humanAnswers"]);
+    expect(compact).not.toHaveProperty("body");
+    expect(compact.summary).toBeNull(); // a genuinely absent summary stays null
+    expect(full.body).toBe("");
+    expect(full.summary).toBeNull();
+    expect(full.evidenceRef).toBeNull();
+    expect(full.fieldsElided).toBeUndefined();
+  });
+
+  it("AC-5: existing filters compose with asSession", () => {
+    const callerSession = "dev1-driver@openrig-delivery";
+
+    seedItem(db, "q-pending", {
+      source: "orch@rig",
+      destination: callerSession,
+      state: "pending",
+    });
+    seedItem(db, "q-done", {
+      source: "orch@rig",
+      destination: callerSession,
+      state: "done",
+    });
+
+    const scopedPending = repo.list({
+      asSession: callerSession,
+      state: "pending",
+    });
+    expect(scopedPending.length).toBe(1);
+    expect(scopedPending[0]!.qitemId).toBe("q-pending");
+  });
+
+  it("active-first ordering: pending/in-progress before done items", () => {
+    seedItem(db, "q-done-old", {
+      source: "a@rig",
+      destination: "b@rig",
+      state: "done",
+      tsCreated: "2026-06-19T00:00:00.000Z",
+    });
+    seedItem(db, "q-pending-new", {
+      source: "a@rig",
+      destination: "b@rig",
+      state: "pending",
+      tsCreated: "2026-06-18T00:00:00.000Z",
+    });
+
+    const items = repo.list({ asSession: "b@rig" });
+    expect(items[0]!.qitemId).toBe("q-pending-new");
+    expect(items[1]!.qitemId).toBe("q-done-old");
+  });
+
+  it("daemon API back-compat: no new params = full unscoped (today's behavior)", () => {
+    seedItem(db, "q-1", {
+      source: "a@rig",
+      destination: "b@rig",
+      body: "Full body preserved",
+    });
+
+    const items = repo.list({});
+    expect(items.length).toBe(1);
+    expect(items[0]!.body).toBe("Full body preserved");
+    expect(items[0]!.summary).toBeNull();
+    expect(items[0]!.evidenceRef).toBeNull();
+    expect(items[0]!.fieldsElided).toBeUndefined();
+    expect(items[0]!.chainOfRecord).toBeDefined();
+  });
+});
+
+describe("Slice 15 — findOverdue rig-scoped + bounded + compact (finding 2)", () => {
+  let db: Database.Database;
+  let repo: QueueRepository;
+  const PAST = "2020-01-01T00:00:00.000Z";
+  const FUTURE = "2999-01-01T00:00:00.000Z";
+  const NOW = "2025-01-01T00:00:00.000Z";
+
+  function seedOverdue(id: string, rig: string, opts: { state?: string; body?: string; due?: string } = {}) {
+    db.prepare(
+      `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, body, summary, evidence_ref, closure_required_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(id, PAST, PAST, `src@${rig}`, `dst@${rig}`, opts.state ?? "in-progress", opts.body ?? `long body for ${id} `.repeat(20), "sum", "ev", opts.due ?? PAST);
+  }
+
+  beforeEach(() => { db = createTestDb(); repo = new QueueRepository(db); });
+  afterEach(() => { db.close(); });
+
+  it("unscoped returns all overdue in-progress items (watchdog behavior preserved)", () => {
+    seedOverdue("q1", "rig-a");
+    seedOverdue("q2", "rig-b");
+    seedOverdue("q3", "rig-a", { due: FUTURE }); // not past deadline
+    seedOverdue("q4", "rig-a", { state: "pending" }); // not in-progress
+    expect(repo.findOverdue({ now: NOW }).map((i) => i.qitemId).sort()).toEqual(["q1", "q2"]);
+  });
+
+  it("rig scope filters to a single rig", () => {
+    seedOverdue("q1", "rig-a");
+    seedOverdue("q2", "rig-b");
+    expect(repo.findOverdue({ now: NOW, rig: "rig-a" }).map((i) => i.qitemId)).toEqual(["q1"]);
+  });
+
+  it("limit bounds the result set", () => {
+    for (let i = 0; i < 5; i++) seedOverdue(`q${i}`, "rig-a");
+    expect(repo.findOverdue({ now: NOW, limit: 2 })).toHaveLength(2);
+  });
+
+  it("compact keeps the summary and leaves elided fields out, as the list does; full retains the body", () => {
+    seedOverdue("q1", "rig-a", { body: "SECRET-LONG-BODY-CONTENT" });
+    const compact = repo.findOverdue({ now: NOW, compact: true })[0]!;
+    expect(compact.summary).toBe("sum");
+    expect(compact).not.toHaveProperty("body");
+    expect(compact).not.toHaveProperty("evidenceRef");
+    expect(compact.fieldsElided).toEqual(["body", "evidenceRef", "humanDetail", "waiting", "chainOfRecord", "replyTo", "humanQuestions", "humanAnswers"]);
+    const full = repo.findOverdue({ now: NOW })[0]!;
+    expect(full.body).toContain("SECRET-LONG-BODY-CONTENT");
+  });
+});

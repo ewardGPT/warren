@@ -1,0 +1,657 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { Command } from "commander";
+import type { DaemonClient, DaemonResponse } from "../src/client.js";
+import { runRemoteHttpOp } from "../src/remote-host-ops.js";
+
+function mockClient(responses: Record<string, { status: number; data: unknown }>): DaemonClient & { _calls: Array<{ method: string; path: string; body?: unknown; headers?: Record<string, string>; timeoutMs?: number }> } {
+  const calls: Array<{ method: string; path: string; body?: unknown; headers?: Record<string, string>; timeoutMs?: number }> = [];
+  return {
+    baseUrl: "http://remote:7433",
+    get: async <T>(path: string, options?: { headers?: Record<string, string>; timeoutMs?: number }) => {
+      calls.push({ method: "GET", path, headers: options?.headers, timeoutMs: options?.timeoutMs });
+      const r = responses[path] ?? { status: 404, data: { error: "not found" } };
+      return { status: r.status, data: r.data as T } as DaemonResponse<T>;
+    },
+    post: async <T>(path: string, body?: unknown, options?: { headers?: Record<string, string>; timeoutMs?: number }) => {
+      calls.push({ method: "POST", path, body, headers: options?.headers, timeoutMs: options?.timeoutMs });
+      const r = responses[path] ?? { status: 200, data: { ok: true } };
+      return { status: r.status, data: r.data as T } as DaemonResponse<T>;
+    },
+    _calls: calls,
+  } as unknown as DaemonClient & { _calls: typeof calls };
+}
+
+function mockRegistry(hosts: Array<Record<string, unknown>>) {
+  return () => ({ ok: true as const, registry: { hosts } });
+}
+
+async function captureLogs(fn: () => Promise<void>): Promise<{ stdout: string[]; stderr: string[]; exitCode: number | undefined }> {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  const origStdout = process.stdout.write;
+  const origStderr = process.stderr.write;
+  const origExit = process.exitCode;
+  process.exitCode = undefined;
+  console.log = (...args: unknown[]) => { stdout.push(args.map(String).join(" ")); };
+  console.error = (...args: unknown[]) => { stderr.push(args.map(String).join(" ")); };
+  process.stdout.write = ((c: unknown) => { stdout.push(String(c)); return true; }) as typeof process.stdout.write;
+  process.stderr.write = ((c: unknown) => { stderr.push(String(c)); return true; }) as typeof process.stderr.write;
+  try { await fn(); } catch {}
+  const exitCode = process.exitCode;
+  console.log = origLog;
+  console.error = origErr;
+  process.stdout.write = origStdout;
+  process.stderr.write = origStderr;
+  process.exitCode = origExit;
+  return { stdout, stderr, exitCode };
+}
+
+afterEach(() => { vi.unstubAllEnvs(); });
+
+describe("rig up --host HTTP", () => {
+  it("sends correct body shape with remote bearer and the long-running timeout", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({ "/api/up": { status: 200, data: { ok: true, rigId: "r1" } } });
+    const { upCommand } = await import("../src/commands/up.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(upCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "up", "my-rig.yaml", "--host", "host-b", "--yes", "--cwd", "/work", "--json"]);
+    });
+    const postCalls = client._calls.filter((c) => c.method === "POST" && c.path === "/api/up");
+    expect(postCalls.length).toBe(1);
+    expect(postCalls[0]!.body).toMatchObject({ sourceRef: "my-rig.yaml", autoApprove: true, cwdOverride: "/work" });
+    expect(postCalls[0]!.headers?.Authorization).toBe("Bearer remote-tok");
+    expect(postCalls[0]!.timeoutMs).toBe(120_000);
+  });
+
+  it("sends all body fields including plan/targetRoot/existing/freshLogicalIds", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({ "/api/up": { status: 200, data: { ok: true } } });
+    const { upCommand } = await import("../src/commands/up.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(upCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "up", "spec.yaml", "--host", "host-b", "--plan", "--target", "/tgt", "--existing", "--fresh", "dev.impl", "dev.qa", "--yes", "--cwd", "/w", "--json"]);
+    });
+    const body = client._calls.find((c) => c.path === "/api/up")?.body as Record<string, unknown>;
+    expect(body.sourceRef).toBe("spec.yaml");
+    expect(body.plan).toBe(true);
+    expect(body.autoApprove).toBe(true);
+    expect(body.cwdOverride).toBe("/w");
+    expect(body.targetRoot).toBe("/tgt");
+    expect(body.existing).toBe(true);
+    expect(body.freshLogicalIds).toEqual(["dev.impl", "dev.qa"]);
+  });
+
+  it("missing bearer exits nonzero under --json", async () => {
+    delete process.env.MISSING_TOK;
+    const client = mockClient({});
+    const { upCommand } = await import("../src/commands/up.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(upCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "MISSING_TOK" },
+      ]),
+    } as any));
+    const { exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "up", "spec.yaml", "--host", "host-b", "--json"]);
+    });
+    expect(client._calls.length).toBe(0);
+    expect(exitCode).toBe(1);
+  });
+});
+
+describe("rig down --host HTTP", () => {
+  it("resolves rig name via remote /api/ps then posts resolved id", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/ps?includeArchived=true": { status: 200, data: [{ rigId: "rig-abc", name: "my-rig" }] },
+      "/api/down": { status: 200, data: { ok: true } },
+    });
+    const { downCommand } = await import("../src/commands/down.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(downCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "down", "my-rig", "--host", "host-b", "--json"]);
+    });
+    const downCalls = client._calls.filter((c) => c.method === "POST" && c.path === "/api/down");
+    expect(downCalls.length).toBe(1);
+    expect(downCalls[0]!.body).toMatchObject({ rigId: "rig-abc" });
+    expect(downCalls[0]!.headers?.Authorization).toBe("Bearer remote-tok");
+  });
+
+  it("ambiguous name exits nonzero with no /api/down request", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/ps?includeArchived=true": { status: 200, data: [
+        { rigId: "r1", name: "dup" },
+        { rigId: "r2", name: "dup" },
+      ] },
+    });
+    const { downCommand } = await import("../src/commands/down.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(downCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    const { exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "down", "dup", "--host", "host-b", "--json"]);
+    });
+    const downCalls = client._calls.filter((c) => c.path === "/api/down");
+    expect(downCalls.length).toBe(0);
+    expect(exitCode).toBe(1);
+  });
+
+  it("exact id match takes precedence over same-named rig", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/ps?includeArchived=true": { status: 200, data: [
+        { rigId: "rig-abc", name: "my-rig" },
+        { rigId: "my-rig", name: "other-name" },
+      ] },
+      "/api/down": { status: 200, data: { ok: true } },
+    });
+    const { downCommand } = await import("../src/commands/down.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(downCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "down", "my-rig", "--host", "host-b", "--json"]);
+    });
+    const downCalls = client._calls.filter((c) => c.path === "/api/down");
+    expect(downCalls.length).toBe(1);
+    expect((downCalls[0]!.body as Record<string, unknown>).rigId).toBe("my-rig");
+  });
+
+  it("missing bearer exits nonzero with no /api/down or /api/ps request", async () => {
+    delete process.env.MISSING_TOK;
+    const client = mockClient({});
+    const { downCommand } = await import("../src/commands/down.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(downCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "MISSING_TOK" },
+      ]),
+    } as any));
+    const { exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "down", "some-rig", "--host", "host-b", "--json"]);
+    });
+    expect(client._calls.length).toBe(0);
+    expect(exitCode).toBe(1);
+  });
+});
+
+describe("rig whoami --host HTTP", () => {
+  it("returns remote identity from /api/info + /api/ps with bearer", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/info": { status: 200, data: { installRoot: "/opt/openrig" } },
+      "/api/ps": { status: 200, data: [{ rigId: "r1", name: "my-rig" }] },
+    });
+    const { whoamiCommand } = await import("../src/commands/whoami.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(whoamiCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    const { stdout } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "whoami", "--host", "host-b", "--json"]);
+    });
+    const parsed = JSON.parse(stdout.join(""));
+    expect(parsed.host).toBe("host-b");
+    expect(parsed.installRoot).toBe("/opt/openrig");
+    expect(parsed.rigs).toEqual([{ id: "r1", name: "my-rig" }]);
+    const infoCalls = client._calls.filter((c) => c.path === "/api/info");
+    expect(infoCalls[0]!.headers?.Authorization).toBe("Bearer remote-tok");
+  });
+
+  it("non-2xx /api/info fails without fake identity", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/info": { status: 401, data: { error: "unauthorized" } },
+    });
+    const { whoamiCommand } = await import("../src/commands/whoami.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(whoamiCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "whoami", "--host", "host-b", "--json"]);
+    });
+    expect(exitCode).toBe(1);
+    const output = stdout.join("");
+    expect(output).not.toContain("installRoot");
+  });
+
+  it("non-2xx /api/ps fails without fake identity", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/info": { status: 200, data: { installRoot: "/opt/openrig" } },
+      "/api/ps": { status: 500, data: { error: "internal" } },
+    });
+    const { whoamiCommand } = await import("../src/commands/whoami.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(whoamiCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "whoami", "--host", "host-b", "--json"]);
+    });
+    expect(exitCode).toBe(1);
+    const output = stdout.join("");
+    expect(output).not.toContain("rigs");
+  });
+});
+
+describe("rig whoami --all-hosts fan-out", () => {
+  it("returns per-host identity envelope with partial failure", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/info": { status: 200, data: { installRoot: "/opt/openrig" } },
+      "/api/ps": { status: 200, data: [{ rigId: "r1", name: "my-rig" }] },
+    });
+    const { whoamiCommand } = await import("../src/commands/whoami.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(whoamiCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-a", transport: "http", url: "http://a:7433", bearer_env: "HOST_B_TOKEN" },
+        { id: "host-b", transport: "http", url: "http://b:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    const { stdout } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "whoami", "--all-hosts", "--json"]);
+    });
+    const parsed = JSON.parse(stdout.join(""));
+    expect(parsed.hosts).toBeDefined();
+    expect(parsed.hosts.length).toBe(2);
+    expect(parsed.hosts[0].ok).toBe(true);
+    expect(parsed.hosts[0].identity.installRoot).toBe("/opt/openrig");
+  });
+
+  it("ssh-only host in --hosts gets failure entry", async () => {
+    vi.stubEnv("TOK", "tok");
+    const client = mockClient({
+      "/api/info": { status: 200, data: { installRoot: "/opt" } },
+      "/api/ps": { status: 200, data: [] },
+    });
+    const { whoamiCommand } = await import("../src/commands/whoami.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(whoamiCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "ssh-host", transport: "ssh", target: "vm.local" },
+        { id: "http-host", transport: "http", url: "http://x", bearer_env: "TOK" },
+      ]),
+    } as any));
+    const { stdout } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "whoami", "--hosts", "ssh-host", "--json"]);
+    });
+    const parsed = JSON.parse(stdout.join(""));
+    const ssh = parsed.hosts?.find((h: { host: string }) => h.host === "ssh-host");
+    expect(ssh).toBeDefined();
+    expect(ssh.ok).toBe(false);
+  });
+
+  it("unknown --hosts id returns error", async () => {
+    const { whoamiCommand } = await import("../src/commands/whoami.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(whoamiCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => mockClient({}),
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://x", bearer_env: "TOK" },
+      ]),
+    } as any));
+    const { stderr, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "whoami", "--hosts", "typo", "--json"]);
+    });
+    expect(stderr.some((s) => s.includes("unknown host ids"))).toBe(true);
+    expect(exitCode).toBe(1);
+  });
+});
+
+describe("rig launch --host HTTP", () => {
+  it("single-node launch sends correct API path with bearer", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/rigs/rig-1/nodes/dev.impl/launch": { status: 200, data: { ok: true, sessionName: "dev-impl@rig" } },
+    });
+    const { launchCommand } = await import("../src/commands/launch.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(launchCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "dev.impl", "--host", "host-b", "--json"]);
+    });
+    const launchCalls = client._calls.filter((c) => c.path.includes("/launch"));
+    expect(launchCalls.length).toBe(1);
+    expect(launchCalls[0]!.path).toBe("/api/rigs/rig-1/nodes/dev.impl/launch");
+    expect(launchCalls[0]!.headers?.Authorization).toBe("Bearer remote-tok");
+  });
+
+  it("single-node launch with --hold-reason refuses before remote mutation", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/rigs/rig-1/nodes/dev.impl/launch": { status: 200, data: { ok: true } },
+    });
+    const { launchCommand } = await import("../src/commands/launch.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(launchCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    const output = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "dev.impl", "--host", "host-b", "--hold-reason", "audit test", "--json"]);
+    });
+    const launchCalls = client._calls.filter((c) => c.path.includes("/launch"));
+    expect(launchCalls).toHaveLength(0);
+    expect(output.stderr.join("\n")).toContain("single-seat launch never changes non-targets");
+    expect(output.exitCode).toBe(1);
+  });
+
+  it("subset launch sends launch-subset with seats", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient({
+      "/api/rigs/rig-1/nodes/launch-subset": { status: 200, data: { ok: true } },
+    });
+    const { launchCommand } = await import("../src/commands/launch.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(launchCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    } as any));
+    await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "--seats", "dev.impl,dev.qa", "--host", "host-b", "--json"]);
+    });
+    const subsetCalls = client._calls.filter((c) => c.path.includes("launch-subset"));
+    expect(subsetCalls.length).toBe(1);
+    expect(subsetCalls[0]!.body).toMatchObject({ seats: ["dev.impl", "dev.qa"] });
+  });
+
+  function remoteLaunch(responses: Record<string, { status: number; data: unknown }>) {
+    vi.stubEnv("HOST_B_TOKEN", "remote-tok");
+    const client = mockClient(responses);
+    return import("../src/commands/launch.js").then(({ launchCommand }) => {
+      const prog = new Command();
+      prog.exitOverride();
+      prog.addCommand(launchCommand({
+        lifecycleDeps: {} as any,
+        clientFactory: () => client,
+        hostRegistryLoader: mockRegistry([
+          { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "HOST_B_TOKEN" },
+        ]),
+      } as any));
+      return { prog, client };
+    });
+  }
+  const SUBSET = "/api/rigs/rig-1/nodes/launch-subset";
+  const VERSION = "/api/health-summary/version";
+  const HEALTH = "/healthz";
+
+  it.each([
+    ["an older stamped remote daemon", { [HEALTH]: { status: 200, data: { status: "ok", semver: "0.5.8" } } }],
+    ["an older unstamped remote daemon", { [HEALTH]: { status: 200, data: { status: "ok" } }, [VERSION]: { status: 200, data: { version: "0.5.8" } } }],
+    ["an unstamped remote daemon whose version route says unknown", { [HEALTH]: { status: 200, data: { status: "ok" } }, [VERSION]: { status: 200, data: { version: "unknown" } } }],
+    ["a remote daemon that reports no version", {}],
+  ])("--plan refuses %s before posting", async (_label, responses) => {
+    const { prog, client } = await remoteLaunch(responses);
+    const { stdout, stderr, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "--seats", "dev.impl", "--plan", "--host", "host-b", "--json"]);
+    });
+    expect(client._calls.every((c) => c.method === "GET")).toBe(true);
+    expect(client._calls[0]!.path).toBe(HEALTH);
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).toContain("0.5.9 or later");
+    expect(stdout).toEqual([]);
+  });
+
+  it("--plan on a stamped remote daemon reads /healthz, then prints the plan, even when its version route says unknown", async () => {
+    const plan = { ok: true, planOnly: true, nonTargetEffects: { mode: "unchanged", reason: null, affected: [] } };
+    const { prog, client } = await remoteLaunch({
+      [HEALTH]: { status: 200, data: { status: "ok", semver: "0.6.4-rc.1" } },
+      [VERSION]: { status: 200, data: { version: "unknown" } },
+      [SUBSET]: { status: 200, data: plan },
+    });
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "--seats", "dev.impl", "--plan", "--host", "host-b", "--json"]);
+    });
+    // The rig lookup runs after the plan-support check; this host has no rig list, so the handle goes on as an id.
+    expect(client._calls.map((c) => `${c.method} ${c.path}`)).toEqual([`GET ${HEALTH}`, "GET /api/ps?includeArchived=true", `POST ${SUBSET}`]);
+    expect(client._calls[2]!.body).toMatchObject({ seats: ["dev.impl"], plan: true });
+    expect(exitCode).toBeUndefined();
+    expect(JSON.parse(stdout.join(""))).toMatchObject({ ok: true, data: { planOnly: true } });
+  });
+
+  it.each([[["--json"]], [[]]])("--plan on a remote daemon that answers without planOnly exits non-zero (%j)", async (extra) => {
+    const { prog } = await remoteLaunch({
+      [HEALTH]: { status: 200, data: { status: "ok", semver: "0.6.8" } },
+      [SUBSET]: { status: 201, data: { ok: true, launched: [{ nodeId: "n1", logicalId: "dev.impl", status: "fresh" }] } },
+    });
+    const { stderr, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "--seats", "dev.impl", "--plan", "--host", "host-b", ...extra]);
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).toContain("did not return a plan");
+  });
+
+  it("--plan on a remote daemon that answers 409 without planOnly says it may have acted", async () => {
+    const { prog } = await remoteLaunch({
+      [HEALTH]: { status: 200, data: { status: "ok", semver: "0.6.8" } },
+      [SUBSET]: { status: 409, data: { ok: false, launched: [{ nodeId: "n1", logicalId: "dev.impl", status: "attention_required" }] } },
+    });
+    const { stderr, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "--seats", "dev.impl", "--plan", "--host", "host-b"]);
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).toContain("did not return a plan");
+    expect(stderr.join("\n")).toContain("rig ps --host host-b --nodes -A");
+  });
+
+  it("--plan on a remote daemon that refuses an unmatched seat keeps its own error, not may-have-acted", async () => {
+    const { prog } = await remoteLaunch({
+      [HEALTH]: { status: 200, data: { status: "ok", semver: "0.6.8" } },
+      [SUBSET]: { status: 404, data: { ok: false, code: "no_matching_nodes", error: "no seats match dev.typo" } },
+    });
+    const { stderr, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "--seats", "dev.typo", "--plan", "--host", "host-b"]);
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).not.toContain("may have acted");
+    expect(stderr.join("\n")).toContain("Error on host host-b");
+  });
+
+  it("single nodeRef launch with --plan sends launch-subset with single seat array on remote host (#887)", async () => {
+    const plan = { ok: true, planOnly: true, nonTargetEffects: { mode: "unchanged", reason: null, affected: [] } };
+    const { prog, client } = await remoteLaunch({
+      [HEALTH]: { status: 200, data: { status: "ok", semver: "0.6.8" } },
+      [SUBSET]: { status: 200, data: plan },
+    });
+    const { exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "dev.impl", "--host", "host-b", "--plan", "--json"]);
+    });
+    const subsetCalls = client._calls.filter((c) => c.path.includes("launch-subset"));
+    expect(subsetCalls.length).toBe(1);
+    expect(subsetCalls[0]!.body).toMatchObject({ seats: ["dev.impl"], plan: true, nonTargetMode: "unchanged" });
+    expect(exitCode).toBeUndefined();
+  });
+
+  it("single nodeRef launch with --plan exits non-zero on remote host when daemon answers detach_and_hold (#887)", async () => {
+    const plan = { ok: true, planOnly: true, nonTargetEffects: { mode: "detach_and_hold", reason: "excluded_from_subset", affected: [] } };
+    const { prog } = await remoteLaunch({
+      [HEALTH]: { status: 200, data: { status: "ok", semver: "0.6.8" } },
+      [SUBSET]: { status: 200, data: plan },
+    });
+    const { stderr, stdout, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "dev.impl", "--host", "host-b", "--plan"]);
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).toContain("this daemon can't preview a single-seat launch; upgrade or restart it, or preview the subset with --seats <seat>");
+    expect(stdout.join("\n")).not.toContain("Plan only");
+  });
+
+  it("missing bearer exits nonzero with no HTTP request", async () => {
+    delete process.env.MISSING_TOK;
+    const client = mockClient({});
+    const { launchCommand } = await import("../src/commands/launch.js");
+    const prog = new Command();
+    prog.exitOverride();
+    prog.addCommand(launchCommand({
+      lifecycleDeps: {} as any,
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://remote:7433", bearer_env: "MISSING_TOK" },
+      ]),
+    } as any));
+    const { exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "launch", "rig-1", "dev.impl", "--host", "host-b", "--json"]);
+    });
+    expect(client._calls.length).toBe(0);
+    expect(exitCode).toBe(1);
+  });
+});
+
+describe("SSH fallback", () => {
+  it("cross-host-executor rejects non-ssh transport with honest error", async () => {
+    const { runCrossHostCommand } = await import("../src/cross-host-executor.js");
+    const result = await runCrossHostCommand(
+      { id: "http-host", transport: "http", url: "http://x" } as any,
+      ["rig", "ps"],
+    );
+    expect(result.ok).toBe(false);
+    expect(result.failedStep).toBe("ssh-unreachable");
+  });
+
+  it("SSH host entry still works through the executor", async () => {
+    const { runCrossHostCommand } = await import("../src/cross-host-executor.js");
+    const result = await runCrossHostCommand(
+      { id: "ssh-host", transport: "ssh", target: "nonexistent.local" },
+      ["rig", "ps"],
+      { connectTimeout: 1, spawn: (() => {
+        const { EventEmitter } = require("node:events");
+        const proc = new EventEmitter();
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        proc.stdin = { write: () => {}, end: () => {} };
+        setTimeout(() => {
+          proc.stderr.emit("data", Buffer.from("ssh: Could not resolve hostname"));
+          proc.emit("close", 255);
+        }, 10);
+        return proc;
+      }) as any },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.failedStep).toBe("ssh-unreachable");
+  });
+});
+
+describe("runRemoteHttpOp — anonymous (URL-only) host omits Authorization", () => {
+  it("URL-only http host: request carries NO Authorization header; still succeeds", async () => {
+    const client = mockClient({ "/api/ps": { status: 200, data: [] } });
+    const res = await runRemoteHttpOp("anon-b", "GET", "/api/ps", undefined, {
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([{ id: "anon-b", transport: "http", url: "http://anon-b:7433" }]),
+    }, {});
+    expect(res.ok).toBe(true);
+    const call = client._calls.find((c) => c.path === "/api/ps");
+    expect(call).toBeDefined();
+    expect(call!.headers && "Authorization" in call!.headers).toBeFalsy();
+  });
+
+  it("configured bearer_env host: still sends Authorization", async () => {
+    vi.stubEnv("ANON_CFG_TOKEN", "tok-xyz");
+    const client = mockClient({ "/api/ps": { status: 200, data: [] } });
+    const res = await runRemoteHttpOp("cfg-b", "GET", "/api/ps", undefined, {
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([{ id: "cfg-b", transport: "http", url: "http://cfg-b:7433", bearer_env: "ANON_CFG_TOKEN" }]),
+    }, {});
+    expect(res.ok).toBe(true);
+    const call = client._calls.find((c) => c.path === "/api/ps");
+    expect(call!.headers?.Authorization).toBe("Bearer tok-xyz");
+  });
+
+  it("configured-but-missing bearer_env: fails BEFORE any request (fail-closed)", async () => {
+    delete process.env.ANON_MISSING_TOKEN;
+    const client = mockClient({ "/api/ps": { status: 200, data: [] } });
+    const res = await runRemoteHttpOp("cfg-miss", "GET", "/api/ps", undefined, {
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([{ id: "cfg-miss", transport: "http", url: "http://cfg-miss:7433", bearer_env: "ANON_MISSING_TOKEN" }]),
+    }, {});
+    expect(res.ok).toBe(false);
+    expect(res.failedStep).toBe("permission-gate");
+    expect(client._calls.length).toBe(0);
+  });
+});

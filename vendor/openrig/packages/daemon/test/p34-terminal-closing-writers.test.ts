@@ -1,0 +1,475 @@
+// P34 — TERMINAL-CLOSING WRITERS ONTO THE W1 PRIMITIVES.
+//
+// Lock: qitem-20260809110825-be056197 · SHAPE artifact 4f2b04c161a8da959c…f49f453a
+// Pre-edit rev-2: 2f4710b1512baa41c0c4ed0de09af8fc39e6386378f28941d6d10e4cccd73345
+// Guard CLEAR: qitem-20260809180349-634de805 (verdict 5ba491d7c31cf98b…d085f8)
+//
+// THE ATOM: W1 made executed-but-unwoken impossible to WRITE *via the queue's own
+// terminal verbs*. Mission Control, workflow-runtime and workflow-projector close
+// and create OUTSIDE those verbs, so today the wave's premise holds for one writer
+// and is merely detected for the rest. This suite pins the extension.
+//
+// ── RED 1 (this file, first increment): THE CURRENT MISS ──────────────────────
+// Each ruled site drives a REAL terminal close + successor create through the real
+// writer, with an intent store attached, and asserts the successor's wake intent
+// is durable. Today every one of these FAILS with the intent absent (intents=0) —
+// that failure IS the captured miss. They flip GREEN when the wiring lands.
+//
+// THE FIVE RULED SUCCESSOR SITES (planner ruling 17:57Z; guard CLEAR 18:03Z):
+//   mission-control-write-contract.ts:174   (route / handoff)
+//   workflow-projector.ts:466               (project → routes branch)
+//   workflow-projector.ts:729               (project → failed branch — EXCLUSIVE
+//                                            with :466; nextStatus="failed"
+//                                            requires routes===false, :571-585)
+//   workflow-runtime.ts:992                 (route)
+//   workflow-runtime.ts:791                 (resume redrive)
+//
+// NOT A SITE, deliberately: workflow-runtime.ts:831 closes N exception items with
+// closureReason "no-follow-on" and NO successor — a TERMINAL CLOSE WITH NO
+// SUCCESSOR, the third state. It requires no intent, and pairing it with the :791
+// packet would satisfy the assert against an unrelated successor: a check that can
+// only pass. Its no-false-positive control is RED 4b (next increment).
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type Database from "better-sqlite3";
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { coreSchema } from "../src/db/migrations/001_core_schema.js";
+import { eventsSchema } from "../src/db/migrations/003_events.js";
+import { queueItemsSchema } from "../src/db/migrations/024_queue_items.js";
+import { queueTransitionsSchema } from "../src/db/migrations/025_queue_transitions.js";
+import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
+import { workflowSpecsSchema } from "../src/db/migrations/033_workflow_specs.js";
+import { workflowInstancesSchema } from "../src/db/migrations/034_workflow_instances.js";
+import { workflowStepTrailsSchema } from "../src/db/migrations/035_workflow_step_trails.js";
+import { missionControlActionsSchema } from "../src/db/migrations/037_mission_control_actions.js";
+import { queueTargetRepoSchema } from "../src/db/migrations/039_queue_target_repo.js";
+import { queueItemSummarySchema } from "../src/db/migrations/044_queue_item_summary.js";
+import { queueItemEvidenceRefSchema } from "../src/db/migrations/048_queue_item_evidence_ref.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
+import { OutboxHandler } from "../src/domain/outbox-handler.js";
+import type { QueueNudgeTransport } from "../src/domain/queue-repository.js";
+import { WorkflowRuntime } from "../src/domain/workflow-runtime.js";
+import { MissionControlActionLog } from "../src/domain/mission-control/mission-control-action-log.js";
+import { MissionControlWriteContract } from "../src/domain/mission-control/mission-control-write-contract.js";
+
+/** A two-step spec: the entry step hands off, so project(handoff) exercises the
+ *  projector's ROUTES branch (:466). */
+const SPEC = `workflow:
+  id: p34-two-step
+  version: 1
+  objective: P34 terminal-closing writers
+  entry:
+    role: producer
+  roles:
+    producer:
+      preferred_targets:
+        - producer@rig
+    reviewer:
+      preferred_targets:
+        - reviewer@rig
+  steps:
+    - id: produce
+      actor_role: producer
+      allowed_exits:
+        - handoff
+        - failed
+    - id: review
+      actor_role: reviewer
+      allowed_exits:
+        - done
+  invariants:
+    allowed_exits:
+      - handoff
+      - waiting
+      - done
+      - failed
+`;
+
+interface Harness {
+  db: Database.Database;
+  bus: EventBus;
+  repo: QueueRepository;
+  outbox: OutboxHandler;
+  runtime: WorkflowRuntime;
+  mc: MissionControlWriteContract;
+  specPath: string;
+  tmp: string;
+}
+
+/** Every wake intent is keyed on its SUCCESSOR (queue-repository.ts:616). */
+function intentFor(h: Harness, successorQitemId: string) {
+  return h.outbox.getById(`wake-intent-${successorQitemId}`);
+}
+
+function makeHarness(): Harness {
+  const db = createDb();
+  migrate(db, [
+    coreSchema,
+    eventsSchema,
+    queueItemsSchema,
+    queueTransitionsSchema,
+    outboxEntriesSchema,
+    workflowSpecsSchema,
+    workflowInstancesSchema,
+    workflowStepTrailsSchema,
+    missionControlActionsSchema,
+    queueTargetRepoSchema,
+    queueItemSummarySchema,
+    queueItemEvidenceRefSchema,
+  ]);
+  db.prepare(`INSERT INTO rigs (id, name) VALUES ('r-1', 'rig')`).run();
+  const bus = new EventBus(db);
+  const outbox = new OutboxHandler(db);
+  const transport: QueueNudgeTransport = {
+    async send() {
+      return { ok: true, verified: true };
+    },
+  };
+  const repo = new QueueRepository(db, bus, { validateRig: () => true });
+  repo.attachTransport(transport);
+  // The intent store is ATTACHED on purpose: this suite asks whether the wiring
+  // stages an intent, not whether the store exists. A harness without an outbox
+  // could not tell "not staged" from "nowhere to stage it".
+  repo.attachOutbox(outbox);
+  const runtime = new WorkflowRuntime({
+    db, eventBus: bus, queueRepo: repo,
+    exceptionDial: { hostDefault: () => null, humanFallbackSeat: "human@host" },
+  });
+  const mc = new MissionControlWriteContract({
+    db,
+    eventBus: bus,
+    queueRepo: repo,
+    actionLog: new MissionControlActionLog(db),
+  });
+  const tmp = mkdtempSync(join(tmpdir(), "p34-"));
+  const specPath = join(tmp, "spec.yaml");
+  writeFileSync(specPath, SPEC);
+  return { db, bus, repo, outbox, runtime, mc, specPath, tmp };
+}
+
+describe("P34 RED 1 — the CURRENT MISS: terminal close + successor create stages NO wake intent", () => {
+  let h: Harness;
+
+  beforeEach(() => {
+    h = makeHarness();
+  });
+
+  afterEach(() => {
+    h.db.close();
+    rmSync(h.tmp, { recursive: true, force: true });
+  });
+
+  it("mission-control-write-contract.ts:174 — handoff closes the source and creates the successor with a DURABLE wake intent", async () => {
+    const source = await h.repo.create({
+      sourceSession: "src@rig",
+      destinationSession: "dst@rig",
+      body: "work",
+    });
+    const result = await h.mc.act({
+      verb: "handoff",
+      qitemId: source.qitemId,
+      actorSession: "human-operator@kernel",
+      destinationSession: "next@rig",
+    });
+
+    // The terminal close actually happened — otherwise this test would pass
+    // vacuously by asserting an intent for a close that never occurred.
+    expect(h.repo.getById(source.qitemId)?.state).toBe("handed-off");
+    expect(result.createdQitemId).toBeTruthy();
+
+    expect(intentFor(h, result.createdQitemId!)).not.toBeNull();
+  });
+
+  it("workflow-projector.ts:466 — project(handoff) ROUTES branch stages the next-step packet's wake intent", async () => {
+    const inst = await h.runtime.instantiate({
+      specPath: h.specPath,
+      rootObjective: "x",
+      createdBySession: "ops@rig",
+    });
+    const projected = await h.runtime.project({
+      instanceId: inst.instance.instanceId,
+      currentPacketId: inst.entryQitemId,
+      exit: "handoff",
+      actorSession: "producer@rig",
+      resultNote: "produced",
+    });
+
+    expect(h.repo.getById(inst.entryQitemId)?.state).toBe("handed-off");
+    expect(projected.nextQitemId).toBeTruthy();
+
+    expect(intentFor(h, projected.nextQitemId!)).not.toBeNull();
+  });
+
+  it("workflow-projector.ts:729 — project(failed) FAILED branch stages the exception item's wake intent", async () => {
+    const inst = await h.runtime.instantiate({
+      specPath: h.specPath,
+      rootObjective: "x",
+      createdBySession: "ops@rig",
+    });
+    const projected = await h.runtime.project({
+      instanceId: inst.instance.instanceId,
+      currentPacketId: inst.entryQitemId,
+      exit: "failed",
+      actorSession: "producer@rig",
+      resultNote: "blew up",
+    });
+
+    // EXCLUSIVITY, pinned: nextStatus==="failed" requires routes===false
+    // (workflow-projector.ts:571-585), so the failed branch NEVER also produces a
+    // next-step packet. :466 and :729 are alternatives, never two successors.
+    expect(projected.nextQitemId).toBeNull();
+
+    // The exception item is the successor here. Asserting EXACTLY ONE match keeps
+    // this a lookup of a known row rather than a discovery that could quietly
+    // select the wrong one.
+    const exceptionItems = h.db
+      .prepare(`SELECT qitem_id FROM queue_items WHERE tags LIKE '%workflow-exception%'`)
+      .all() as Array<{ qitem_id: string }>;
+    expect(exceptionItems).toHaveLength(1);
+
+    expect(intentFor(h, exceptionItems[0]!.qitem_id)).not.toBeNull();
+  });
+
+  it("workflow-runtime.ts:992 — route closes the old frontier packet and stages the re-routed packet's wake intent", async () => {
+    const inst = await h.runtime.instantiate({
+      specPath: h.specPath,
+      rootObjective: "x",
+      createdBySession: "ops@rig",
+    });
+    const routed = await h.runtime.route({
+      instanceId: inst.instance.instanceId,
+      toSession: "reviewer@rig",
+      actorSession: "ops@rig",
+      reason: "owner swap",
+    });
+
+    expect(h.repo.getById(routed.closedPacketId)?.state).toBe("handed-off");
+
+    expect(intentFor(h, routed.newPacketId)).not.toBeNull();
+  });
+
+  it("workflow-runtime.ts:791 — resume redrive stages the NEW packet's wake intent (never the exception closes')", async () => {
+    const inst = await h.runtime.instantiate({
+      specPath: h.specPath,
+      rootObjective: "x",
+      createdBySession: "ops@rig",
+    });
+    await h.runtime.project({
+      instanceId: inst.instance.instanceId,
+      currentPacketId: inst.entryQitemId,
+      exit: "failed",
+      actorSession: "producer@rig",
+      resultNote: "blew up",
+    });
+    const resumed = await h.runtime.resume({
+      instanceId: inst.instance.instanceId,
+      decision: "redrive it",
+      actorSession: "ops@rig",
+    });
+
+    // The redrive packet is the ONLY successor in this transaction. The N
+    // exception closes at :831 have no successor of their own.
+    expect(resumed.exceptionItemsClosed).toBeGreaterThan(0);
+
+    expect(intentFor(h, resumed.newPacketId)).not.toBeNull();
+  });
+});
+
+// ── THE CONTROLS ──────────────────────────────────────────────────────────────
+// RED 1 proves the wiring WORKS. These prove it FAILS CORRECTLY — which is the
+// half that decides whether the atom is honest or merely green. A guard that
+// condemns correct callers gets reverted within the hour; a guard that examines
+// nothing reports the same green as one that examines everything.
+
+describe("P34 RED 4 — NO-FALSE-POSITIVE: a PARK is not a closure and requires no intent", () => {
+  let h: Harness;
+  beforeEach(() => { h = makeHarness(); });
+  afterEach(() => { h.db.close(); rmSync(h.tmp, { recursive: true, force: true }); });
+
+  it("mission-control `hold` parks the item and stages NO intent — the park path is untouched", async () => {
+    const source = await h.repo.create({
+      sourceSession: "src@rig",
+      destinationSession: "dst@rig",
+      body: "work",
+      nudge: false, // Isolate the hold action from the setup create's wake intent.
+    });
+    await h.mc.act({
+      verb: "hold",
+      qitemId: source.qitemId,
+      actorSession: "human@rig",
+      reason: "external-gate",
+    });
+
+    const parked = h.repo.getById(source.qitemId);
+    expect(parked?.state).toBe("blocked");
+    // Non-terminal ⇒ nothing to wake. This falls out of the PRIMITIVE (it returns
+    // early on a non-terminal txn-visible source), not out of a condition written
+    // at the call site — which is why no park site needed an edit.
+    expect(intentFor(h, source.qitemId)).toBeNull();
+  });
+
+  it("a human-gated workflow entry PARKS in-txn without tripping the seam", async () => {
+    // The gate park is an in-transaction update on a freshly created packet — the
+    // shape most likely to be mistaken for a closure by an update-keyed guard.
+    const inst = await h.runtime.instantiate({
+      specPath: h.specPath,
+      rootObjective: "x",
+      createdBySession: "ops@rig",
+    });
+    expect(h.repo.getById(inst.entryQitemId)?.state).toBe("pending");
+    expect(intentFor(h, inst.entryQitemId)).toBeNull();
+  });
+});
+
+describe("P34 RED 4b — NO-FALSE-POSITIVE: a TERMINAL CLOSE with NO SUCCESSOR requires no intent", () => {
+  let h: Harness;
+  beforeEach(() => { h = makeHarness(); });
+  afterEach(() => { h.db.close(); rmSync(h.tmp, { recursive: true, force: true }); });
+
+  it("mission-control `approve` closes done/no-follow-on with no successor — no intent, no throw", async () => {
+    const source = await h.repo.create({
+      sourceSession: "src@rig",
+      destinationSession: "dst@rig",
+      body: "work",
+      nudge: false, // Isolate the closure from the setup create's wake intent.
+    });
+    // This is THE THIRD STATE. Not a park (it IS terminal) and not a paired
+    // closure (there is no successor). A guard keyed on "terminal close" alone —
+    // rather than on "terminal close + a create in the same txn" — would fire here
+    // and condemn correct code, one state over from the park case.
+    const result = await h.mc.act({
+      verb: "approve",
+      qitemId: source.qitemId,
+      actorSession: "human@rig",
+    });
+
+    expect(h.repo.getById(source.qitemId)?.state).toBe("done");
+    expect(h.repo.getById(source.qitemId)?.closureReason).toBe("no-follow-on");
+    expect(result.createdQitemId).toBeNull();
+    expect(intentFor(h, source.qitemId)).toBeNull();
+  });
+
+  it("the resume path's exception closes carry no intents of their own", async () => {
+    const inst = await h.runtime.instantiate({
+      specPath: h.specPath,
+      rootObjective: "x",
+      createdBySession: "ops@rig",
+    });
+    await h.runtime.project({
+      instanceId: inst.instance.instanceId,
+      currentPacketId: inst.entryQitemId,
+      exit: "failed",
+      actorSession: "producer@rig",
+      resultNote: "blew up",
+    });
+    const exceptionIds = (
+      h.db.prepare(`SELECT qitem_id FROM queue_items WHERE tags LIKE '%workflow-exception%'`)
+        .all() as Array<{ qitem_id: string }>
+    ).map((r) => r.qitem_id);
+    expect(exceptionIds.length).toBeGreaterThan(0);
+
+    // The assertion is on the DELTA, not on absence. Each exception item already
+    // HAS an intent — it was itself a successor when :729 created it. What must be
+    // true is that terminally CLOSING it adds no new one: the close has no
+    // successor, so there is nothing to wake.
+    const idsBefore = new Set(
+      (h.db.prepare(`SELECT outbox_id FROM outbox_entries`).all() as Array<{ outbox_id: string }>)
+        .map((r) => r.outbox_id),
+    );
+
+    const resumed = await h.runtime.resume({
+      instanceId: inst.instance.instanceId,
+      actorSession: "ops@rig",
+    });
+
+    for (const id of exceptionIds) {
+      expect(h.repo.getById(id)?.state).toBe("done");
+    }
+    const idsAfter = (
+      h.db.prepare(`SELECT outbox_id FROM outbox_entries`).all() as Array<{ outbox_id: string }>
+    ).map((r) => r.outbox_id);
+    const added = idsAfter.filter((id) => !idsBefore.has(id));
+
+    // EXACTLY ONE new intent, and it belongs to the redrive packet — never to any
+    // of the N closes. If the closes were each paired with the redrive packet as
+    // "their" successor, this count would still be one and the test would pass
+    // vacuously, which is why it also names WHICH id was added.
+    expect(added).toEqual([`wake-intent-${resumed.newPacketId}`]);
+  });
+});
+
+describe("P34 — NO DOUBLE SEND: the staged intent is finalized, so recovery cannot re-send it", () => {
+  let h: Harness;
+  beforeEach(() => { h = makeHarness(); });
+  afterEach(() => { h.db.close(); rmSync(h.tmp, { recursive: true, force: true }); });
+
+  it("after a wired close+create, the intent row is FINALIZED and a recovery drain delivers nothing", async () => {
+    const source = await h.repo.create({
+      sourceSession: "src@rig",
+      destinationSession: "dst@rig",
+      body: "work",
+    });
+    const result = await h.mc.act({
+      verb: "handoff",
+      qitemId: source.qitemId,
+      actorSession: "human@rig",
+      destinationSession: "next@rig",
+    });
+
+    // The defect this pins: maybeNudge SENDS without claiming or finalizing, so the
+    // row would still read `pending` and the startup sweep would deliver the same
+    // wake a SECOND time. Delivering through the shared path finalizes it.
+    const intent = intentFor(h, result.createdQitemId!);
+    expect(intent).not.toBeNull();
+    expect(intent!.deliveryState).not.toBe("pending");
+
+    const drained = await h.repo.drainPendingWakeIntents();
+    expect(drained.delivered).toBe(0);
+    expect(drained.indeterminate).toBe(0);
+    expect(drained.failed).toBe(0);
+  });
+});
+
+describe("P34 — THE FALLBACK CONTROL: no intent store ⇒ the wake still happens", () => {
+  it("a writer with NO outbox attached still nudges, and does not silently skip", async () => {
+    // The docstring promised this fallback; the code did not implement it
+    // (deliverWakeIntent returns "skipped" with no store, and a skip is not an
+    // error, so the vanished nudge surfaced nowhere). This is the control that
+    // would have caught it.
+    const h = makeHarness();
+    try {
+      const sends: string[] = [];
+      const repoNoOutbox = new QueueRepository(h.db, h.bus, { validateRig: () => true });
+      repoNoOutbox.attachTransport({
+        async send(session: string) {
+          sends.push(session);
+          return { ok: true, verified: true };
+        },
+      });
+      // Deliberately NO attachOutbox — the test/bootstrap shape.
+      const created = await repoNoOutbox.create({
+        sourceSession: "src@rig",
+        destinationSession: "dst@rig",
+        body: "work",
+      });
+      // create() nudges its destination on its own. Isolate the fallback's send,
+      // or this control would pass on the create's nudge alone and prove nothing
+      // about deliverWakeForSuccessor.
+      sends.length = 0;
+
+      await repoNoOutbox.deliverWakeForSuccessor(created.qitemId, "dst@rig", undefined, "src@rig");
+
+      // Exactly one send, from the fallback itself. Before P34 this was ZERO:
+      // deliverWakeIntent returned "skipped" with no store attached.
+      expect(sends).toEqual(["dst@rig"]);
+    } finally {
+      h.db.close();
+      rmSync(h.tmp, { recursive: true, force: true });
+    }
+  });
+});

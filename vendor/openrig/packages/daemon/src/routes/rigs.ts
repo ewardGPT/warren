@@ -1,0 +1,874 @@
+import { inventoryCaptureOptions, type ShadowCapture } from "../domain/shadow-capture.js";
+import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
+import { Hono } from "hono";
+import { observeInventoryHandler, observeInventoryQuery } from "../domain/request-phase-observer.js";
+import type Database from "better-sqlite3";
+import type { RigRepository } from "../domain/rig-repository.js";
+import type { SessionRegistry } from "../domain/session-registry.js";
+import type { EventBus } from "../domain/event-bus.js";
+import { summarizeSnapshot, type SnapshotRepository } from "../domain/snapshot-repository.js";
+import type { SnapshotCapture } from "../domain/snapshot-capture.js";
+import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
+import { projectRigToGraph, type InventoryOverlay, type CurrentQitemSummary } from "../domain/graph-projection.js";
+import {
+  getNodeInventory,
+  getNodeInventoryForRigs,
+  getNodeInventoryWithContext,
+  attachAgentActivity,
+  attachTerminalActivityAndWork,
+} from "../domain/node-inventory.js";
+import { projectionLane } from "../domain/projection-lane.js";
+import type { TmuxAdapter } from "../adapters/tmux.js";
+import type { AgentActivityStore } from "../domain/agent-activity-store.js";
+import type { SeatActivityService } from "../domain/seat-activity-service.js";
+import type { SeatStructuralActivityService } from "../domain/seat-structural-activity-service.js";
+import { deriveRigLifecycleState, deriveRigLifecycleFromInventory } from "../domain/ps-projection.js";
+import { identityVerdictConfirmsSessionMissing } from "../domain/types.js";
+import { assessCurrentStateRehydrateEligibility, snapshotMatchesCurrentOccupants } from "../domain/rehydrate-eligibility.js";
+import { buildRestorePlanPreview, collectPreviewSessionRows } from "../domain/restore-plan-preview.js";
+import { readFreshOccupantRelations } from "../domain/fresh-occupant-relation.js";
+import { composeRigStatus, type SeatLifecycleInput } from "../domain/rig-status-compose.js";
+import { createRestoreCheckService } from "./restore-check.js";
+import type { KernelBootTracker, KernelState } from "../domain/kernel-boot-tracker.js";
+import type { RecoveryPlan } from "../domain/restore-check-service.js";
+import type { ContextUsageStore } from "../domain/context-usage-store.js";
+import type { TranscriptStore } from "../domain/transcript-store.js";
+import type { Pod, ExpansionPodFragment } from "../domain/types.js";
+import type { RigExpansionService } from "../domain/rig-expansion-service.js";
+import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
+import { convergeOp } from "../domain/topology-converge.js";
+import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
+import type { SelfAttachService } from "../domain/self-attach-service.js";
+
+export const rigsRoutes = new Hono();
+
+// PL-019 item 5: read-side join helper. Returns map of
+// destination_session → in-progress qitems (capped at MAX_QITEMS_PER_NODE
+// per node), keyed by canonicalSessionName so the route can stitch into
+// the InventoryOverlay. Body is excerpted to stay phone-friendly in
+// tooltip / drawer surfaces (item 5's UI consumers).
+const MAX_QITEMS_PER_NODE = 3;
+const BODY_EXCERPT_MAX_CHARS = 80;
+
+export function loadCurrentQitemsForSessions(
+  db: Database.Database,
+  sessionNames: string[]
+): Map<string, CurrentQitemSummary[]> {
+  const out = new Map<string, CurrentQitemSummary[]>();
+  if (sessionNames.length === 0) return out;
+  const placeholders = sessionNames.map(() => "?").join(",");
+  const rows = db.prepare(
+    `SELECT qitem_id, destination_session, body, tier
+       FROM queue_items
+       WHERE state = 'in-progress' AND destination_session IN (${placeholders})
+       ORDER BY ts_updated DESC`
+  ).all(...sessionNames) as Array<{ qitem_id: string; destination_session: string; body: string; tier: string | null }>;
+  for (const row of rows) {
+    const list = out.get(row.destination_session) ?? [];
+    if (list.length < MAX_QITEMS_PER_NODE) {
+      list.push({
+        qitemId: row.qitem_id,
+        bodyExcerpt: row.body.length > BODY_EXCERPT_MAX_CHARS
+          ? `${row.body.slice(0, BODY_EXCERPT_MAX_CHARS)}…`
+          : row.body,
+        tier: row.tier,
+      });
+    }
+    out.set(row.destination_session, list);
+  }
+  return out;
+}
+
+function normalizeExpansionPodFragment(raw: Record<string, unknown>): ExpansionPodFragment | null {
+  if (!raw || typeof raw !== "object") return null;
+  const id = raw["id"];
+  const label = raw["label"];
+  const members = raw["members"];
+  if (typeof id !== "string" || !Array.isArray(members)) return null;
+
+  return {
+    id,
+    label: typeof label === "string" ? label : id,
+    summary: typeof raw["summary"] === "string" ? raw["summary"] : undefined,
+    members: members.map((member) => {
+      const m = (member ?? {}) as Record<string, unknown>;
+      // OPR.0.5.6.3 presence invariant: track KEY PRESENCE, not value shape —
+      // any present sessionSource/session_source (null, primitive, mode-only,
+      // ref:null, unknown mode, malformed ref fields) must reach the ONE
+      // canonical validator; only a truly absent key stays absent (the
+      // permission_policy R2 precedent, applied to session_source).
+      const hasSessionSource = "sessionSource" in m || "session_source" in m;
+      const rawSessionSource: unknown = "sessionSource" in m ? m["sessionSource"] : m["session_source"];
+      let sessionSource: import("../domain/types.js").SessionSourceSpec | undefined;
+      if (rawSessionSource !== undefined && rawSessionSource !== null && typeof rawSessionSource === "object") {
+        const ss = rawSessionSource as Record<string, unknown>;
+        const mode = ss["mode"];
+        const ref = ss["ref"];
+        if (ref !== null && typeof ref === "object") {
+          const refRec = ref as Record<string, unknown>;
+          const kind = refRec["kind"];
+          if (mode === "fork" && (kind === "native_id" || kind === "artifact_path" || kind === "name" || kind === "last")) {
+            const value = typeof refRec["value"] === "string" ? (refRec["value"] as string) : undefined;
+            sessionSource = { mode: "fork", ref: { kind, ...(value !== undefined ? { value } : {}) } };
+          } else if (mode === "rebuild" && kind === "artifact_set" && Array.isArray(refRec["value"])) {
+            const paths: string[] = [];
+            for (const p of refRec["value"] as unknown[]) {
+              if (typeof p === "string" && p.trim() !== "") paths.push(p);
+            }
+            if (paths.length > 0) {
+              sessionSource = { mode: "rebuild", ref: { kind: "artifact_set", value: paths } };
+            }
+          } else if (mode === "agent_image") {
+            // OPR.0.5.6.3 repair: agent_image rides the ingress like fork/rebuild.
+            // Valid v0 shape (image_name kind, non-empty string value, string|number
+            // version) constructs typed with SCHEMA-PARITY String() coercion, exactly
+            // like rigspec-schema.ts normalize (YAML `version: 3` arrives as a JSON
+            // number; omitting it would recreate the silent-default defect).
+            const versionRaw = refRec["version"];
+            const validValue = kind === "image_name"
+              && typeof refRec["value"] === "string" && refRec["value"].trim() !== "";
+            const validVersion = versionRaw === undefined
+              || typeof versionRaw === "string" || typeof versionRaw === "number";
+            if (validValue && validVersion) {
+              const version = versionRaw === undefined ? undefined : String(versionRaw);
+              sessionSource = {
+                mode: "agent_image",
+                ref: { kind: "image_name", value: refRec["value"] as string, ...(version !== undefined ? { version } : {}) },
+              };
+            }
+          }
+        }
+      }
+      // Presence fallthrough: a present value that did not normalize to a valid
+      // typed shape carries RAW so the canonical validator rejects it structurally
+      // — never converted to absence.
+      if (hasSessionSource && sessionSource === undefined) {
+        sessionSource = rawSessionSource as import("../domain/types.js").SessionSourceSpec;
+      }
+      return {
+        id: typeof m["id"] === "string" ? m["id"] : "",
+        runtime: typeof m["runtime"] === "string" ? m["runtime"] : "",
+        agentRef:
+          typeof m["agentRef"] === "string"
+            ? m["agentRef"]
+            : typeof m["agent_ref"] === "string"
+              ? m["agent_ref"]
+              : undefined,
+        profile: typeof m["profile"] === "string" ? m["profile"] : undefined,
+        codexConfigProfile:
+          typeof m["codexConfigProfile"] === "string"
+            ? m["codexConfigProfile"]
+            : typeof m["codex_config_profile"] === "string"
+              ? m["codex_config_profile"]
+              : undefined,
+        cwd: typeof m["cwd"] === "string" ? m["cwd"] : undefined,
+        model: typeof m["model"] === "string" ? m["model"] : undefined,
+        // R2 (4ac243c3): PRESERVE raw presence — a present-invalid value (null, number,
+        // object, …) must reach the canonical RigSpec validator as-is and reject there;
+        // only a truly ABSENT key stays absent. No route-local validation, no coercion.
+        ...("permissionPolicy" in m
+          ? { permissionPolicy: m["permissionPolicy"] }
+          : "permission_policy" in m
+            ? { permissionPolicy: m["permission_policy"] }
+            : {}),
+        restorePolicy:
+          typeof m["restorePolicy"] === "string"
+            ? m["restorePolicy"]
+            : typeof m["restore_policy"] === "string"
+              ? m["restore_policy"]
+              : undefined,
+        label: typeof m["label"] === "string" ? m["label"] : undefined,
+        // Presence-governed, never truthiness: null/false/primitive raw values
+        // must survive to canonical validation, not vanish at a truthy check.
+        ...(hasSessionSource ? { sessionSource } : {}),
+      };
+    }),
+    edges: Array.isArray(raw["edges"])
+      ? raw["edges"].map((edge) => {
+          const e = (edge ?? {}) as Record<string, unknown>;
+          return {
+            from: typeof e["from"] === "string" ? e["from"] : "",
+            to: typeof e["to"] === "string" ? e["to"] : "",
+            kind: typeof e["kind"] === "string" ? e["kind"] : "",
+          };
+        })
+      : [],
+  };
+}
+
+function getRepo(c: { get: (key: string) => unknown }): RigRepository {
+  return c.get("rigRepo" as never) as RigRepository;
+}
+
+function getSessionRegistry(c: { get: (key: string) => unknown }): SessionRegistry {
+  return c.get("sessionRegistry" as never) as SessionRegistry;
+}
+
+function getRigLifecycleService(c: { get: (key: string) => unknown }): RigLifecycleService | undefined {
+  return c.get("rigLifecycleService" as never) as RigLifecycleService | undefined;
+}
+
+function getSelfAttachService(c: { get: (key: string) => unknown }): SelfAttachService | undefined {
+  return c.get("selfAttachService" as never) as SelfAttachService | undefined;
+}
+
+// GET /api/rigs/summary — MUST be registered before /:id to avoid Hono resolving "summary" as a rig ID
+rigsRoutes.get("/summary", (c) => {
+  const repo = getRepo(c);
+  // OPR.0.3.3.19 - default excludes archived; ?includeArchived=true / ?archived=only opt in.
+  const includeArchived = c.req.query("includeArchived") === "true";
+  const archivedOnly = c.req.query("archived") === "only";
+  // slice-04: the WHOLE response (summaries + scoped inventory fold + enrichment +
+  // c.json) runs as ONE cooperative lane job shared with /api/ps, so a concurrent
+  // burst yields the event loop between jobs and /healthz stays responsive. Only the
+  // query flags are parsed before the lane.
+  //   - The inventory fold is SCOPED to the rigs THIS request returns (default
+  //     active-only; archived variants pass their archived rig-ids), so the per-node
+  //     fold never widens to excluded rigs — one fleet startup + one restore scan.
+  //   - Live per request; NO cache/staleness (getRigSummaries + fold read live db).
+  return projectionLane.run(() => {
+    const summaries = repo.getRigSummaries({ includeArchived, archivedOnly });
+    const invByRig = getNodeInventoryForRigs(repo.db, new Set(summaries.map((s) => s.id)));
+    const enriched = summaries.map((s) => {
+      const inventory = invByRig.get(s.id) ?? [];
+      const lifecycleState = deriveRigLifecycleFromInventory(inventory);
+      // Restore eligibility still accounts for every seat, including intentional stops.
+      const restoreLifecycleState = deriveRigLifecycleState(inventory.map((entry) => entry.lifecycleState));
+      const agents = inventory.filter((e) => e.nodeKind === "agent");
+      // Presence is separate from lifecycle/attention, and uses this same inventory fold.
+      const hasLiveAgents = agents.some((e) => e.sessionStatus === "running" || e.sessionStatus === "idle")
+        ? true : agents.every((e) => e.sessionStatus === null || e.sessionStatus === "stopped" || e.sessionStatus === "exited") ? false : null;
+      return { ...s, lifecycleState, restoreLifecycleState, hasLiveAgents };
+    });
+    return c.json(enriched);
+  });
+});
+
+// OPR.0.4.3.22 — GET /api/rigs/:id/status — the composed rig-status object.
+// A pure FOLD (composeRigStatus) of four SHIPPED signals: ps-lifecycle +
+// restore-plan (read-only forecast) + restore-check readiness + kernel-status
+// (kernel rig only). Status is NEVER inferred from pane text or daemon /healthz;
+// `src[]` carries the composed provenance (the non-inference contract). The fold
+// preserves per-seat truth — a rig never globally flips to fresh (the LOCK).
+rigsRoutes.get("/:id/status", (c) => {
+  const repo = getRepo(c);
+  const rig = repo.getRig(c.req.param("id"));
+  if (!rig) return c.json({ error: `Rig "${c.req.param("id")}" not found` }, 404);
+
+  const snapshotRepo = c.get("snapshotRepo" as never) as SnapshotRepository;
+  const snapshot = snapshotRepo.findLatestRestoreUsable(rig.rig.id) ?? null;
+  // Read-only per-seat forecast (mutated:false) — the restore-plan signal.
+  const plan = buildRestorePlanPreview(rig, snapshot, collectPreviewSessionRows(repo.db, rig, snapshot), undefined, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id));
+
+  // ps-lifecycle — per-node lifecycleState (never from pane text).
+  const nodes: SeatLifecycleInput[] = getNodeInventory(repo.db, rig.rig.id).map((e) => ({
+    logicalId: e.logicalId,
+    runtime: e.runtime,
+    lifecycleState: e.lifecycleState,
+  }));
+
+  // restore-check readiness — the RecoveryPlan status. Defensive: a probe throw
+  // contributes nothing (fold still reads plan + lifecycle) rather than 500-ing.
+  let recovery: RecoveryPlan | null = null;
+  try {
+    recovery = createRestoreCheckService(repo, snapshotRepo)
+      .check({ rig: rig.rig.name, noQueue: true, noHooks: true, recoveryOnly: true })
+      .recovery;
+  } catch {
+    recovery = null;
+  }
+
+  // kernel-status — folded ONLY for the kernel rig, from the boot tracker.
+  // NEVER inferred from daemon /healthz (guard 4).
+  const isKernel = rig.rig.name === "kernel";
+  let kernelState: KernelState | null = null;
+  if (isKernel) {
+    const tracker = c.get("kernelBootTracker" as never) as KernelBootTracker | undefined;
+    kernelState = tracker ? tracker.getStatus().kernelState : null;
+  }
+
+  return c.json(
+    composeRigStatus({ rigId: rig.rig.id, rigName: rig.rig.name, isKernel, nodes, plan, recovery, kernelState }),
+  );
+});
+
+// OPR.0.4.3.22 — POST /api/rigs/:id/launch-plan — the READ-ONLY per-seat plan.
+// The launch/recovery modal fetches this BEFORE any mutation. This route NEVER
+// restores, creates/kills/replaces/resumes a session, writes a projection, or
+// captures a snapshot — it only forecasts (buildRestorePlanPreview, mutated:false).
+// Optional freshLogicalIds forecasts the fresh-primed plan for an explicit fresh
+// choice (the LOCK: fresh is only ever a per-seat list, never a global flip).
+rigsRoutes.post("/:id/launch-plan", async (c) => {
+  const repo = getRepo(c);
+  const rig = repo.getRig(c.req.param("id"));
+  if (!rig) return c.json({ error: `Rig "${c.req.param("id")}" not found` }, 404);
+
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const freshLogicalIds = Array.isArray(body["freshLogicalIds"])
+    ? (body["freshLogicalIds"] as unknown[]).filter((v): v is string => typeof v === "string")
+    : undefined;
+
+  const snapshotRepo = c.get("snapshotRepo" as never) as SnapshotRepository;
+  const snapshot = snapshotRepo.findLatestRestoreUsable(rig.rig.id) ?? null;
+  return c.json(
+    buildRestorePlanPreview(rig, snapshot, collectPreviewSessionRows(repo.db, rig, snapshot), freshLogicalIds, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)),
+    200,
+  );
+});
+
+rigsRoutes.post("/", async (c) => {
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const name = body["name"];
+  if (!name || typeof name !== "string") {
+    return c.json({ error: "name is required" }, 400);
+  }
+  const rig = getRepo(c).createRig(name);
+  return c.json(rig, 201);
+});
+
+rigsRoutes.get("/", observeInventoryHandler, (c) => {
+  // OPR.0.3.3.19 - default excludes archived; ?includeArchived=true / ?archived=only opt in.
+  const includeArchived = c.req.query("includeArchived") === "true";
+  const archivedOnly = c.req.query("archived") === "only";
+  const rigs = getRepo(c).listRigs({ includeArchived, archivedOnly }, observeInventoryQuery(c));
+  return c.json(rigs);
+});
+
+rigsRoutes.get("/:id", (c) => {
+  const rig = getRepo(c).getRig(c.req.param("id"));
+  if (!rig) {
+    return c.json({ error: "rig not found" }, 404);
+  }
+  return c.json(rig);
+});
+
+rigsRoutes.get("/:id/graph", async (c) => {
+  const rig = getRepo(c).getRig(c.req.param("id"));
+  if (!rig) {
+    return c.json({ error: "rig not found" }, 404);
+  }
+  const rigId = c.req.param("id");
+  const sessions = getSessionRegistry(c).getSessionsForRig(rigId);
+  // Overlay inventory data for enriched graph fields.
+  const ctxStore = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
+  const transcriptStore = c.get("transcriptStore" as never) as TranscriptStore | undefined;
+  const inventory = ctxStore
+    ? getNodeInventoryWithContext(getRepo(c).db, rigId, ctxStore, transcriptStore)
+    : getNodeInventory(getRepo(c).db, rigId);
+
+  // PL-019 item 4: enrich inventory with agentActivity at graph-payload time
+  // so UI consumers receive activity in a single fetch (no separate
+  // /api/rigs/:id/nodes round-trip just to color the topology dots).
+  const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
+  const agentActivityStore = c.get("agentActivityStore" as never) as AgentActivityStore | undefined;
+  // OPR.0.4.3 healthz-wedge amplification fix: cheap by default (no per-node tmux
+  // capture) — the 30s topology poll colors dots from the snapshot (running/idle) +
+  // hook activity; ?full=true opts into the per-node needs_input capture.
+  const graphFull = c.req.query("full") === "true";
+  const seatStructuralActivityService = c.get("seatStructuralActivityService" as never) as SeatStructuralActivityService | undefined;
+  // ACTIVITY D1+D2 — resolved BEFORE attachAgentActivity now, because the ACTIVITY ladder reads the
+  // same motion observation the TERMINAL column reads. Order matters only for this declaration.
+  //
+  // Sharing that observation does NOT collapse the slice-15 non-inference contract, which is between
+  // `terminalActive` and `hasAssignedWork` — ACTIVITY still reads no queue/assignment state. And the
+  // two surfaces can legitimately disagree: ACTIVITY re-ages the raw timestamp at read time while
+  // TERMINAL projects the poll-time boolean (see the sessions route for why that gap is the
+  // stale-cache protection rather than an inconsistency).
+  const seatActivityService = c.get("seatActivityService" as never) as SeatActivityService | undefined;
+  const inventoryWithActivityOnly = tmuxAdapter
+    ? await attachAgentActivity(inventory, { ...inventoryCaptureOptions(getRepo(c).db, c.get("shadowCapture" as never) as ShadowCapture | undefined), tmuxAdapter, activityStore: agentActivityStore, structuralActivity: seatStructuralActivityService, seatActivity: seatActivityService, captureFallback: graphFull })
+    : inventory;
+  const inventoryWithActivity = attachTerminalActivityAndWork(inventoryWithActivityOnly, {
+    db: getRepo(c).db,
+    seatActivity: seatActivityService,
+  });
+
+  // PL-019 item 5: read-side join for active-qitem enrichment. Cheap by
+  // virtue of the existing idx_queue_items_destination_state index. The
+  // helper is exported so it can be unit-tested without spinning up the
+  // full route stack.
+  const currentQitemsBySession = loadCurrentQitemsForSessions(
+    getRepo(c).db,
+    inventoryWithActivity
+      .map((n) => n.canonicalSessionName)
+      .filter((s): s is string => Boolean(s))
+  );
+
+  const pods = getRepo(c).db
+    .prepare("SELECT id, rig_id, namespace, label, summary, continuity_policy_json, created_at FROM pods WHERE rig_id = ? ORDER BY created_at")
+    .all(rigId) as Array<{ id: string; rig_id: string; namespace: string; label: string; summary: string | null; continuity_policy_json: string | null; created_at: string }>;
+  const overlay: InventoryOverlay[] = inventoryWithActivity.map((n) => ({
+    logicalId: n.logicalId,
+    startupStatus: n.startupStatus,
+    canonicalSessionName: n.canonicalSessionName,
+    restoreOutcome: n.restoreOutcome,
+    oriented: n.oriented,
+    contextUsedPercentage: n.contextUsage?.usedPercentage ?? null,
+    contextFresh: n.contextUsage?.fresh ?? false,
+    contextAvailability: n.contextUsage?.availability ?? "unknown",
+    contextTotalInputTokens: n.contextUsage?.totalInputTokens ?? null,
+    contextTotalOutputTokens: n.contextUsage?.totalOutputTokens ?? null,
+    agentActivity: n.agentActivity ?? null,
+    currentQitems: n.canonicalSessionName
+      ? currentQitemsBySession.get(n.canonicalSessionName) ?? []
+      : [],
+    terminalActive: n.terminalActive,
+    hasAssignedWork: n.hasAssignedWork ?? false,
+    assignedWorkCount: n.assignedWorkCount ?? 0,
+    pendingWorkCount: n.pendingWorkCount ?? 0,
+    inProgressWorkCount: n.inProgressWorkCount ?? 0,
+    blockedWorkCount: n.blockedWorkCount ?? 0,
+    identityVerdict: n.identityVerdict ?? null,
+  }));
+  const projectedPods: Pod[] = pods.map((pod) => ({
+    id: pod.id,
+    rigId: pod.rig_id,
+    namespace: pod.namespace,
+    label: pod.label,
+    summary: pod.summary,
+    continuityPolicyJson: pod.continuity_policy_json,
+    createdAt: pod.created_at,
+  }));
+  return c.json(projectRigToGraph({ ...rig, sessions, pods: projectedPods }, overlay));
+});
+
+rigsRoutes.delete("/:id", async (c) => {
+  const rigId = c.req.param("id");
+  const repo = getRepo(c);
+  const eventBus = c.get("eventBus" as never) as EventBus;
+
+  // Only emit event + delete if rig exists
+  const rig = repo.getRig(rigId);
+  if (!rig) {
+    return c.body(null, 204);
+  }
+
+  // Atomic: event persist + rig delete in one transaction
+  // Uses eventBus.db (same handle as rigRepo.db — enforced by shared AppDeps)
+  const txn = eventBus.db.transaction(() => {
+    const persisted = eventBus.persistWithinTransaction({
+      type: "rig.deleted",
+      rigId,
+    });
+    repo.deleteRig(rigId);
+    return persisted;
+  });
+
+  try {
+    const remove = async () => {
+      const persistedEvent = txn();
+      eventBus.notifySubscribers(persistedEvent);
+      return c.body(null, 204);
+    };
+    const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
+    return guard ? await guard.lifecycle(rig.nodes.map(node => node.id), remove) : await remove();
+  } catch (err) {
+    if (err instanceof DeliveryGuardError) throw err;
+    return c.json({ error: "delete failed" }, 500);
+  }
+});
+
+// OPR.0.3.3.19 - POST /api/rigs/:id/archive - soft, reversible archive (NOT delete).
+// The rigs row + topology rows + snapshots are RETAINED; only `archived_at` is set.
+rigsRoutes.post("/:id/archive", async (c) => {
+  const rigId = c.req.param("id");
+  const repo = getRepo(c);
+  const eventBus = c.get("eventBus" as never) as EventBus;
+  const rig = repo.getRig(rigId);
+  if (!rig) {
+    return c.json({ error: "rig not found" }, 404);
+  }
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const force = body["force"] === true;
+
+  // Preserve main's action decision: only a stored running session with
+  // confirmed absence was attention_required before this read projection.
+  const lifecycleState = deriveRigLifecycleState(getNodeInventory(repo.db, rigId).map((entry) =>
+    entry.storedSessionStatus === "running" && identityVerdictConfirmsSessionMissing(entry.identityVerdict)
+      ? "attention_required"
+      : entry.lifecycleState
+  ));
+  if ((lifecycleState === "running" || lifecycleState === "degraded") && !force) {
+    return c.json({
+      error: {
+        fact: `Rig '${rig.rig.name}' is ${lifecycleState} (it has live sessions).`,
+        consequence: "Archiving it would hide a rig with running seats from the default view.",
+        action: `Stop it first ('rig down ${rigId}'), or re-run with --force to archive anyway.`,
+      },
+    }, 409);
+  }
+
+  const result = eventBus.db.transaction(() => {
+    const changed = repo.archiveRig(rigId);
+    const persisted = changed
+      ? eventBus.persistWithinTransaction({ type: "rig.archived", rigId })
+      : null;
+    return { changed, persisted };
+  })();
+
+  try {
+    if (result.persisted) eventBus.notifySubscribers(result.persisted);
+    return c.json({ ok: true, rigId, archived: result.changed });
+  } catch {
+    return c.json({ error: "archive failed" }, 500);
+  }
+});
+
+// OPR.0.3.3.19 - POST /api/rigs/:id/unarchive - reverse the archive flag.
+rigsRoutes.post("/:id/unarchive", (c) => {
+  const rigId = c.req.param("id");
+  const repo = getRepo(c);
+  const eventBus = c.get("eventBus" as never) as EventBus;
+  const rig = repo.getRig(rigId);
+  if (!rig) {
+    return c.json({ error: "rig not found" }, 404);
+  }
+  const result = eventBus.db.transaction(() => {
+    const changed = repo.unarchiveRig(rigId);
+    const persisted = changed
+      ? eventBus.persistWithinTransaction({ type: "rig.unarchived", rigId })
+      : null;
+    return { changed, persisted };
+  })();
+  if (result.persisted) eventBus.notifySubscribers(result.persisted);
+  return c.json({ ok: true, rigId, unarchived: result.changed });
+});
+
+// POST /api/rigs/:id/release — non-destructive release of claimed sessions
+rigsRoutes.post("/:id/release", async (c) => {
+  const rigId = c.req.param("id")!;
+  const rigLifecycleService = getRigLifecycleService(c);
+  if (!rigLifecycleService) {
+    return c.json({ error: "Rig lifecycle service not available" }, 500);
+  }
+
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const result = await rigLifecycleService.releaseRig(rigId, {
+    delete: body["delete"] === true,
+  });
+
+  if (result.ok) {
+    return c.json(result, result.status === "partial" ? 207 : 200);
+  }
+
+  switch (result.code) {
+    case "rig_not_found":
+      return c.json(result, 404);
+    case "contains_launched_nodes":
+      return c.json(result, 409);
+    default:
+      return c.json(result, 500);
+  }
+});
+
+// POST /api/rigs/:id/attach-self — attach the current shell/agent, tmux-backed or external
+rigsRoutes.post("/:id/attach-self", async (c) => {
+  const rigId = c.req.param("id")!;
+  const selfAttachService = getSelfAttachService(c);
+  if (!selfAttachService) {
+    return c.json({ error: "Self-attach service not available" }, 500);
+  }
+
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const logicalId = typeof body["logicalId"] === "string" ? body["logicalId"].trim() : "";
+  const podNamespace = typeof body["podNamespace"] === "string" ? body["podNamespace"].trim() : "";
+  const memberName = typeof body["memberName"] === "string" ? body["memberName"].trim() : "";
+  const runtime = typeof body["runtime"] === "string" ? body["runtime"].trim() : "";
+  const cwd = typeof body["cwd"] === "string" ? body["cwd"] : undefined;
+  const displayName = typeof body["displayName"] === "string" ? body["displayName"] : undefined;
+  const attachmentType = typeof body["attachmentType"] === "string" ? body["attachmentType"].trim() : "";
+  const tmuxSession = typeof body["tmuxSession"] === "string" ? body["tmuxSession"].trim() : "";
+  const tmuxWindow = typeof body["tmuxWindow"] === "string" ? body["tmuxWindow"].trim() : "";
+  const tmuxPane = typeof body["tmuxPane"] === "string" ? body["tmuxPane"].trim() : "";
+
+  const hasNodeTarget = logicalId.length > 0;
+  const hasPodFields = podNamespace.length > 0 || memberName.length > 0;
+
+  if (hasNodeTarget && hasPodFields) {
+    return c.json({ error: "Specify either logicalId or podNamespace + memberName + runtime" }, 400);
+  }
+  if (!hasNodeTarget && !hasPodFields) {
+    return c.json({ error: "Specify either logicalId or podNamespace + memberName + runtime" }, 400);
+  }
+  if (!hasNodeTarget && (!podNamespace || !memberName)) {
+    return c.json({ error: "podNamespace and memberName are required when attaching into a pod" }, 400);
+  }
+  if (attachmentType && attachmentType !== "tmux" && attachmentType !== "external_cli") {
+    return c.json({ error: "attachmentType must be 'tmux' or 'external_cli'" }, 400);
+  }
+  if (attachmentType === "tmux" && !tmuxSession) {
+    return c.json({ error: "tmuxSession is required when attachmentType is 'tmux'" }, 400);
+  }
+
+  const context = attachmentType === "tmux" || tmuxSession
+    ? {
+        attachmentType: "tmux" as const,
+        tmuxSession,
+        tmuxWindow: tmuxWindow || undefined,
+        tmuxPane: tmuxPane || undefined,
+      }
+    : undefined;
+
+  const result = hasNodeTarget
+    ? await selfAttachService.attachToNode({ rigId, logicalId, runtime: runtime || undefined, cwd, displayName, context })
+    : await selfAttachService.attachToPod({ rigId, podNamespace, memberName, runtime, cwd, displayName, context });
+
+  if (result.ok) {
+    return c.json(result, 201);
+  }
+
+  switch (result.code) {
+    case "rig_not_found":
+    case "node_not_found":
+    case "pod_not_found":
+      return c.json(result, 404);
+    case "runtime_required":
+      return c.json(result, 400);
+    case "already_bound":
+    case "duplicate_logical_id":
+    case "invalid_member_name":
+    case "runtime_mismatch":
+      return c.json(result, 409);
+    default:
+      return c.json(result, 500);
+  }
+});
+
+// POST /api/rigs/:id/up — power-on an existing rig from its latest restore-usable snapshot
+// L3b: prefers `auto-pre-down` when present but falls back to the latest manual
+// snapshot whose structural metadata satisfies pre-validation. Echoes
+// `snapshotKind` so operators see which snapshot was used.
+rigsRoutes.post("/:id/up", async (c) => {
+  const rigId = c.req.param("id")!;
+  const repo = getRepo(c);
+  const rig = repo.getRig(rigId);
+  if (!rig) return c.json({ error: `Rig "${rigId}" not found. List rigs with: rig ps` }, 404);
+
+  // OPR.0.3.4.4 — this independent Explorer restore route previously parsed
+  // NO body, so plan:true was silently ignored and the route always mutated.
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const plan = body["plan"] === true;
+  // OPR.0.3.4.1 — thread freshLogicalIds so the id-based route supports
+  // the awaiting-decision fresh-prime retry (operation B).
+  const freshLogicalIds = Array.isArray(body["freshLogicalIds"])
+    ? (body["freshLogicalIds"] as unknown[]).filter((v): v is string => typeof v === "string")
+    : undefined;
+
+  const snapshotRepo = c.get("snapshotRepo" as never) as SnapshotRepository;
+  const snapshotCapture = c.get("snapshotCapture" as never) as SnapshotCapture;
+  const automaticSelection = snapshotRepo.selectRestoreUsable(rigId);
+  let snapshot = automaticSelection.ok ? automaticSelection.snapshot : null;
+  let snapshotSelection = automaticSelection.ok ? automaticSelection.selection : undefined;
+  let staleSnapshot = false;
+  if (snapshot && !snapshotMatchesCurrentOccupants(repo.db, rig, snapshot)) {
+    snapshot = null;
+    snapshotSelection = undefined;
+    staleSnapshot = true;
+  }
+  let capturedCurrentState = false;
+  if (!snapshot) {
+    const eligibility = assessCurrentStateRehydrateEligibility(repo.db, rig);
+    if (!eligibility.ok) {
+      return c.json({
+        error: `Rig "${rig.rig.name}" exists but ${staleSnapshot ? "its restore snapshots name an older occupant" : "has no restore-usable snapshot"} and current DB state is insufficient for rehydrate. Start fresh with: rig up <spec-path>`,
+        code: "no_snapshot",
+        blockers: eligibility.blockers,
+      }, 404);
+    }
+  }
+
+  // OPR.0.3.4.4 — read-only plan gate BEFORE the auto-rehydrate capture
+  // (the capture is itself a mutation) and before restoreOrch.restore().
+  if (plan) {
+    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(repo.db, rig, snapshot ?? null), undefined, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)), 200);
+  }
+
+  if (!snapshot) {
+    snapshot = snapshotCapture.captureSnapshot(rigId, "auto-rehydrate");
+    snapshotSelection = {
+      ...summarizeSnapshot(snapshot),
+      mode: "automatic",
+      rationale: "automatic rehydrate captured current eligible state because no current-occupant snapshot was usable",
+      newerUsableAlternative: null,
+    };
+    capturedCurrentState = true;
+  }
+
+  const restoreOrch = c.get("restoreOrchestrator" as never) as RestoreOrchestrator | undefined;
+  if (!restoreOrch) {
+    return c.json({ error: "Restore orchestrator not available" }, 500);
+  }
+
+  const adapters = c.get("runtimeAdapters" as never) as Record<string, import("../domain/runtime-adapter.js").RuntimeAdapter> | undefined;
+  const fs = await import("node:fs");
+  const result = await restoreOrch.restore(snapshot.id, {
+    adapters: adapters ?? {},
+    fsOps: { exists: (p: string) => fs.existsSync(p) },
+    freshLogicalIds,
+    snapshotSelection,
+  });
+  if (!result.ok) {
+    if (result.code === "pre_restore_validation_failed") {
+      return c.json({
+        status: "not_attempted",
+        rigId,
+        rigName: rig.rig.name,
+        error: result.message,
+        code: result.code,
+        snapshotKind: snapshot.kind,
+        ...result.result,
+        remediation: result.result.blockers?.map((blocker) => blocker.remediation) ?? [],
+      }, 409);
+    }
+    return c.json({ error: result.message, code: result.code }, result.code === "rig_not_stopped" ? 409 : 400);
+  }
+
+  // Compute attach command from first running/resumed node (same logic as /api/up)
+  const { getNodeInventory } = await import("../domain/node-inventory.js");
+  const inventory = getNodeInventory(repo.db, rigId);
+  const firstRunning = inventory.find((n) => n.canonicalSessionName && n.sessionStatus === "running");
+  const attachCommand = firstRunning?.tmuxAttachCommand ?? inventory.find((n) => n.canonicalSessionName)?.tmuxAttachCommand ?? null;
+
+  return c.json({
+    status: "restored",
+    rigId,
+    rigName: rig.rig.name,
+    snapshotId: snapshot.id,
+    snapshotKind: snapshot.kind,
+    rigResult: result.result.rigResult,
+    nodes: result.result.nodes,
+    warnings: capturedCurrentState
+      ? [staleSnapshot
+          ? "Existing restore snapshots named an older occupant; captured current DB state as auto-rehydrate snapshot for reboot recovery."
+          : "No restore-usable snapshot existed; captured current DB state as auto-rehydrate snapshot for reboot recovery.", ...result.result.warnings]
+      : result.result.warnings,
+    attachCommand,
+  }, 200);
+});
+
+// POST /api/rigs/:rigId/expand — dynamic rig expansion
+rigsRoutes.post("/:rigId/expand", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const expansionService = c.get("rigExpansionService" as never) as RigExpansionService | undefined;
+  if (!expansionService) {
+    return c.json({ error: "Expansion service not available" }, 500);
+  }
+
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const pod = normalizeExpansionPodFragment((body["pod"] ?? {}) as Record<string, unknown>);
+  if (!pod) {
+    return c.json({ error: "pod is required with id and members[]" }, 400);
+  }
+
+  const crossPodEdges = Array.isArray(body["crossPodEdges"]) ? body["crossPodEdges"] as Array<{ from: string; to: string; kind: string }> : undefined;
+  const rigRoot = typeof body["rigRoot"] === "string" ? body["rigRoot"] : undefined;
+
+  const result = await expansionService.expand({ rigId, pod, crossPodEdges, rigRoot });
+
+  if (!result.ok) {
+    switch (result.code) {
+      case "rig_not_found":
+      case "target_rig_not_found":
+        return c.json(result, 404);
+      case "materialize_conflict":
+        return c.json(result, 409);
+      case "validation_failed":
+      case "preflight_failed":
+        return c.json(result, 400);
+      default:
+        return c.json(result, 500);
+    }
+  }
+
+  const httpStatus = result.status === "ok" ? 201 : 207;
+  return c.json(result, httpStatus);
+});
+
+// POST /api/rigs/:rigId/pods/:podNamespace/members — add a single member to an
+// EXISTING pod (OPR.0.3.3.24, the add_member converge op). Imperative sugar over
+// the converge interface; identity-migration-free. The member fragment uses the
+// spec snake_case field names (id, runtime, agent_ref, profile, cwd, ...).
+rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const podNamespace = c.req.param("podNamespace")!;
+  const podInstantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!podInstantiator) {
+    return c.json({ error: "Pod instantiator not available" }, 500);
+  }
+
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const member = body["member"];
+  if (!member || typeof member !== "object" || Array.isArray(member)) {
+    return c.json({ error: "member is required (a member fragment with id, runtime, agent_ref)" }, 400);
+  }
+  const rigRoot = typeof body["rigRoot"] === "string" ? body["rigRoot"] : ".";
+  // Optional pod-local edges (from/to are member ids within the pod). Carried
+  // through to the converge op so declared topology intent is not dropped; the
+  // domain validates kinds + resolves endpoints + persists them (no edge-runtime
+  // behavior yet). A PRESENT-but-non-array edges field is rejected honestly,
+  // never silently treated as absent (governance FM2 no-silent-drop).
+  const rawEdges = body["edges"];
+  if (rawEdges !== undefined && rawEdges !== null && !Array.isArray(rawEdges)) {
+    return c.json({ ok: false, code: "validation_failed", errors: ["edges: must be an array of { from, to, kind }"] }, 400);
+  }
+  const edges = Array.isArray(rawEdges)
+    ? (rawEdges as Array<{ from: string; to: string; kind: string }>)
+    : undefined;
+
+  const converged = await convergeOp(
+    { instantiator: podInstantiator },
+    rigId,
+    { kind: "add_member", pod: podNamespace, member: member as Record<string, unknown>, edges },
+    rigRoot,
+  );
+  // This route is the add_member sugar over the converge interface.
+  if (converged.kind !== "add_member" || !converged.supported) {
+    return c.json({ error: "Unexpected converge result for add_member" }, 500);
+  }
+  const outcome = converged.outcome;
+
+  if (!outcome.ok) {
+    switch (outcome.code) {
+      case "rig_not_found":
+      case "pod_not_found":
+        return c.json(outcome, 404);
+      case "member_conflict":
+        return c.json(outcome, 409);
+      case "edge_unresolved":
+      case "validation_failed":
+      case "preflight_failed":
+        return c.json(outcome, 400);
+      default:
+        return c.json(outcome, 500);
+    }
+  }
+
+  // 201 created. The node may still be failed/attention_required at launch; that
+  // is carried in outcome.result.node.status (mirrors expand's per-node status).
+  return c.json(outcome, 201);
+});
+
+// DELETE /api/rigs/:rigId/pods/:podRef
+rigsRoutes.delete("/:rigId/pods/:podRef", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const podRef = c.req.param("podRef")!;
+  const fallbackDestination = c.req.query("fallback");
+  const lifecycleService = c.get("rigLifecycleService" as never) as RigLifecycleService | undefined;
+  if (!lifecycleService) {
+    return c.json({ error: "Lifecycle service not available" }, 500);
+  }
+
+  const result = await lifecycleService.shrinkPod(rigId, podRef, { fallbackDestination });
+  if (!result.ok) {
+    const status = result.code === "rig_not_found" ? 404
+      : result.code === "pod_not_found" ? 404
+      : result.code === "active_qitems" ? 409
+      : result.code === "fallback_not_running" ? 409
+      : result.code === "fallback_in_target" ? 409
+      : result.code === "kill_failed" ? 409
+      : 500;
+    return c.json(result, status);
+  }
+
+  return c.json(result, result.status === "ok" ? 200 : 207);
+});

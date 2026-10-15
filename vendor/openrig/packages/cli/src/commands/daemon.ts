@@ -1,0 +1,374 @@
+import { Command } from "commander";
+import fs from "node:fs";
+import { createServer } from "node:net";
+import { randomUUID } from "node:crypto";
+import { acquireDaemonStartLock } from "../daemon-start-lock.js";
+import { formatDaemonHostForUrl } from "../client.js";
+import { execFileSync, spawn } from "node:child_process";
+import { fetchWithTimeout } from "../fetch-with-timeout.js";
+import {
+  startDaemon,
+  stopDaemon,
+  getDaemonStatus,
+  readLogs,
+  tailLogs,
+  type LifecycleDeps,
+  type ProcessLiveness,
+  OPENRIG_DIR,
+  STATE_FILE,
+  resolveBindIntent,
+} from "../daemon-lifecycle.js";
+
+interface ProcessAliveDeps {
+  signalCheck: (pid: number) => boolean;
+  readProcessState: (pid: number) => string | null;
+}
+
+export function createIsProcessAlive(deps: ProcessAliveDeps): (pid: number) => boolean {
+  return (pid: number) => {
+    if (!deps.signalCheck(pid)) return false;
+
+    const state = deps.readProcessState(pid)?.trim();
+    if (!state) return false;
+    if (state.startsWith("Z")) return false;
+    return true;
+  };
+}
+
+export type SignalOutcome = "sent" | "missing" | "not-permitted";
+
+/** kill(pid, 0) as an outcome. POSIX: only ESRCH means no such process; EPERM means the process
+ *  EXISTS but this shell may not signal it (another user's process, or a sandbox such as Codex's). */
+export function signalProbe(pid: number, kill: (pid: number, signal: 0) => unknown = process.kill): SignalOutcome {
+  try {
+    kill(pid, 0);
+    return "sent";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" ? "not-permitted" : "missing";
+  }
+}
+
+/** #275 — three-state liveness for status reads. Only a missing process (ESRCH) or a zombie is
+ *  dead. A process that exists but cannot be inspected (EPERM, or `ps` cannot run, as inside
+ *  Codex's macOS sandbox) is UNKNOWN, never dead: calling it dead turned a running daemon into
+ *  `stale` before any health probe. The boolean createIsProcessAlive (start/stop) is unchanged. */
+export function createProcessLiveness(deps: {
+  signal: (pid: number) => SignalOutcome;
+  readProcessState: (pid: number) => string | null;
+}): (pid: number) => ProcessLiveness {
+  return (pid: number) => {
+    if (deps.signal(pid) === "missing") return "dead";
+    const state = deps.readProcessState(pid)?.trim();
+    if (!state) return "unknown";
+    return state.startsWith("Z") ? "dead" : "alive";
+  };
+}
+
+type ExecFile = (file: string, args: string[], options: { encoding: "utf-8" }) => string;
+
+// Windows has no ps(1) and no zombie state, so the signal probe alone decides liveness there.
+export function readProcessState(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  run: ExecFile = execFileSync,
+): string | null {
+  if (platform === "win32") return "R";
+  try {
+    return run("ps", ["-o", "state=", "-p", String(pid)], { encoding: "utf-8" });
+  } catch {
+    return null;
+  }
+}
+
+export function realDeps(): LifecycleDeps {
+  const isProcessAlive = createIsProcessAlive({
+    signalCheck: (pid) => signalProbe(pid) === "sent",
+    readProcessState: (pid) => readProcessState(pid),
+  });
+  const processLiveness = createProcessLiveness({
+    signal: (pid) => signalProbe(pid),
+    readProcessState: (pid) => readProcessState(pid),
+  });
+
+  return {
+    processLiveness,
+    acquireStartLock: () => acquireDaemonStartLock(OPENRIG_DIR),
+    spawn: (cmd, args, opts) => spawn(cmd, args, opts as Parameters<typeof spawn>[2]),
+    fetch: async (url) => {
+      const res = await fetchWithTimeout(globalThis.fetch, url, {}, {
+        timeoutMs: 1_500,
+        timeoutMessage: `Daemon health probe timed out for ${url}`,
+      });
+      // OPR.0.4.3.21 — expose json() so getDaemonStatus can read the enriched
+      // /healthz event-loop evidence. Bound to this Response instance.
+      return { ok: res.ok, json: () => res.json() };
+    },
+    isPortOccupied: (host, port) => new Promise((resolve) => {
+      const server = createServer();
+      server.once("error", (error: NodeJS.ErrnoException) => resolve(error.code === "EADDRINUSE"));
+      try {
+        server.listen({ host, port, exclusive: true }, () => server.close(() => resolve(false)));
+      } catch { resolve(false); }
+    }),
+    fileSize: (p) => { try { return fs.statSync(p).size; } catch { return 0; } },
+    readFileFrom: (p, offset) => {
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(p, "r");
+        const size = fs.fstatSync(fd).size;
+        const start = size < offset ? 0 : offset; // The log may have been truncated.
+        const buffer = Buffer.alloc(size - start);
+        const read = fs.readSync(fd, buffer, 0, buffer.length, start);
+        return buffer.toString("utf-8", 0, read);
+      } catch { return null; }
+      finally { if (fd !== undefined) fs.closeSync(fd); }
+    },
+    kill: (pid, signal) => { process.kill(pid, signal as NodeJS.Signals); return true; },
+    readFile: (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } },
+    writeFile: (p, content) => {
+      if (p !== STATE_FILE) { fs.writeFileSync(p, content, "utf-8"); return; }
+      const temporary = `${p}.${randomUUID()}.tmp`;
+      try {
+        fs.writeFileSync(temporary, content, { encoding: "utf-8", flag: "wx" });
+        fs.renameSync(temporary, p);
+      } finally {
+        try { fs.unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      }
+    },
+    removeFile: (p) => { try { fs.unlinkSync(p); } catch { /* ignore */ } },
+    exists: (p) => fs.existsSync(p),
+    mkdirp: (p) => fs.mkdirSync(p, { recursive: true }),
+    pathKind: (p) => {
+      try {
+        const value = fs.lstatSync(p);
+        if (value.isDirectory()) return "directory";
+        if (value.isFile()) return "file";
+        return "other";
+      } catch {
+        return "missing";
+      }
+    },
+    openForAppend: (p) => fs.openSync(p, "a"),
+    closeFile: (fd) => fs.closeSync(fd),
+    isProcessAlive,
+    // RULING 1ae863d2 — sibling-home scan (home-resolution honesty).
+    listDir: (p) => { try { return fs.readdirSync(p); } catch { return []; } },
+  };
+}
+
+export function daemonCommand(depsOverride?: LifecycleDeps): Command {
+  const getDeps = () => depsOverride ?? realDeps();
+  const cmd = new Command("daemon").description("Manage the OpenRig daemon");
+
+  cmd
+    .command("start")
+    .description("Start the daemon")
+    .addHelpText("after", "\nStartup reserves this local instance before initialization and verifies the spawned child PID on every required listener.\nMissing/mismatched identity or child exit fails startup; failed publication withdraws only this launch's matching state. Use a matching CLI/daemon installation.\nA concurrent start fails without spawning another child. Inspect daemon-start.lock for launcher/child PIDs after an interrupted start;\nonly archive an abandoned reservation after proving both processes absent. A failed cleanup retains it and reports the child PID.\n")
+    .option("--port <port>", "Port to listen on")
+    .option("--host <host>", "Host to bind on")
+    .option("--db <path>", "Database path")
+    // V0.3.1 slice 05 kernel-rig-as-default — skip the kernel auto-boot
+    // path. Used by test fixtures, headless CI, and operators who want
+    // a no-kernel daemon for ad-hoc topology work. The daemon proceeds
+    // and serves its HTTP API normally; just doesn't materialize the
+    // kernel rig.
+    .option("--no-kernel", "Skip the kernel and its operator, which helps you start a team; for automation or when requested. Normal installation keeps the kernel")
+    // V0.3.1 slice 05 kernel-rig-as-default — forward-fix #3 architectural.
+    // After the daemon's healthz binds (current behavior preserved),
+    // additionally poll /api/kernel/status until kernel_state is
+    // ready / partial_ready, or the timeout elapses. Used by operators
+    // who want a "kernel-ready" signal at start-time rather than the
+    // weaker "daemon-ready". Default 60s; override with --wait-for-kernel-ms.
+    .option("--wait-for-kernel", "After daemon binds, also wait for kernel-agent readiness (default timeout 60s)")
+    .option("--wait-for-kernel-ms <ms>", "Override --wait-for-kernel timeout in milliseconds")
+    .action(async (opts: { port?: string; host?: string; db?: string; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
+      try {
+        const { ConfigStore } = await import("../config-store.js");
+        const { SystemPreflight, quietPreflightExec } = await import("../system-preflight.js");
+        const configStore = new ConfigStore();
+        const config = configStore.resolve();
+        const effectivePort = opts.port ? parseInt(opts.port, 10) : config.daemon.port;
+        // --port abc or --port 99999 reached the preflight port check and died
+        // with Node's raw ERR_SOCKET_BAD_PORT. Refuse only ports that cannot be
+        // bound, with the same parseInt and range as the daemon.port config key,
+        // so every --port value that starts a daemon today still does.
+        if (Number.isNaN(effectivePort) || effectivePort < 0 || effectivePort > 65535) {
+          throw new Error(`Invalid --port: must be an integer in [0, 65535], got "${opts.port}"`);
+        }
+        // bug-fix slice auth-bearer-tailscale-trust: distinguish
+        // user-explicit from default-fallback so the daemon can
+        // multi-bind (loopback + tailscale auto-detect) when the operator
+        // never opted in to a specific host.
+        const hostResolution = configStore.resolveWithSource("daemon.host");
+        // S20 — bind intent comes ONLY from the dedicated surfaces: the --host flag,
+        // a FILE-sourced daemon.host, or OPENRIG_BIND_HOST. An env-sourced daemon.host
+        // is the overloaded routing channel (ENV_MAP maps it from OPENRIG_HOST — the
+        // exact injected state a managed environment carries) and never creates intent.
+        const intent = resolveBindIntent({
+          flagHost: opts.host,
+          envBindHost: process.env["OPENRIG_BIND_HOST"],
+          configSource: hostResolution.source,
+          configHost: config.daemon.host,
+        });
+        const hostUserExplicit = intent.explicit;
+        const effectiveHost = intent.host ?? "127.0.0.1";
+        const hostForDaemon = intent.host;
+
+        // Run preflight before starting
+          const preflight = new SystemPreflight({
+            exec: quietPreflightExec,
+            configStore,
+            getDaemonStatus: () => getDaemonStatus(getDeps()),
+            openrigHome: OPENRIG_DIR,
+          });
+        const preflightResult = await preflight.run({ port: effectivePort, host: effectiveHost });
+        if (!preflightResult.ready) {
+          for (const check of preflightResult.checks.filter((c) => !c.ok)) {
+            console.error(`✗ ${check.name}: ${check.error}`);
+            if (check.reason) console.error(`  Why: ${check.reason}`);
+            if (check.fix) console.error(`  Fix: ${check.fix}`);
+          }
+          process.exitCode = 1;
+          return;
+        }
+
+        // V0.3.1 slice 05 — Commander's --no-kernel inverts to opts.kernel === false.
+        const skipKernel = opts.kernel === false;
+        const state = await startDaemon(
+          {
+            port: effectivePort,
+            host: hostForDaemon,
+            db: opts.db ?? config.db.path,
+            transcriptsEnabled: config.transcripts.enabled,
+            transcriptsPath: config.transcripts.path,
+            workspaceRoot: config.workspace.root,
+            contextRoot: config.context.root,
+            skillsRoot: config.skills.root,
+            topologyRoot: config.topology.root,
+            // Live transcript tunables are read from the shared config file.
+            // Only operator-provided environment overrides should mask edits.
+            // V0.3.1 slice 05 kernel-rig-as-default — propagated via
+            // OPENRIG_NO_KERNEL env var so the daemon's kernel-boot
+            // check in startup.ts honors the flag.
+            skipKernelBoot: skipKernel,
+          },
+          getDeps(),
+        );
+        console.log(`Daemon started on port ${state.port} (pid ${state.pid})`);
+
+        // V0.3.1 slice 05 forward-fix #3 architectural — --wait-for-kernel
+        // post-bind polling. Kernel boot is fire-and-forget after the
+        // daemon binds healthz, so without this flag the CLI doesn't
+        // know whether the kernel itself reached ready. Operators who
+        // need a kernel-ready signal opt in here.
+        if (opts.waitForKernel) {
+          const { waitForKernelReady } = await import("../daemon-lifecycle.js");
+          const timeoutMs = opts.waitForKernelMs && /^\d+$/.test(opts.waitForKernelMs)
+            ? parseInt(opts.waitForKernelMs, 10)
+            : 60_000;
+          const baseUrl = `http://${formatDaemonHostForUrl(state.host ?? "127.0.0.1")}:${state.port}`;
+          const result = await waitForKernelReady(baseUrl, timeoutMs);
+          if (result.ok) {
+            console.log(`Kernel ${result.kernelState}; variant=${result.variant ?? "(none)"}`);
+          } else {
+            // Honest 3-part error per banked discipline.
+            console.error(
+              `Error: kernel did not reach ready / partial_ready within ${timeoutMs}ms.\n` +
+                `Reason: kernel_state=${result.kernelState ?? "unknown"}` +
+                (result.detail ? `; ${result.detail}` : "") +
+                "\n" +
+                "Fix: inspect `rig ps --rig kernel` for stalled agents, or run `claude auth status` / `codex login status` to confirm runtime auth.",
+            );
+            process.exitCode = 1;
+          }
+        }
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+      }
+    });
+
+  cmd
+    .command("stop")
+    .description("Stop the daemon (10s shutdown budget; 12s process wait; incomplete drain exits nonzero)")
+    .addHelpText("after", "\nSends at most one SIGTERM to a live target and verifies the original PID and listener. Repeated signals join shutdown.\nFor a recorded target, missing/stale receipts and incomplete drains exit nonzero, including retries.\nTarget state is retained until a matching clean receipt; status reads preserve unverified state.\nNo target is a distinct no-op, never clean-drain certification; unbound incomplete evidence stays unverified.\nInspect OPENRIG_HOME/daemon-shutdown.json and daemon.log for the phase and outcome.\nThe bound covers asynchronous shutdown; an event-loop wedge still requires operator recovery.\n")
+    .action(async () => {
+      try {
+        const outcome = await stopDaemon(getDeps());
+        console.log(outcome === "stopped" ? "Daemon stopped" : "No daemon target recorded; listener refused. Nothing to stop; prior drain not certified.");
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+      }
+    });
+
+  cmd
+    .command("status")
+    .description("Show daemon status")
+    .action(async () => {
+      const status = await getDaemonStatus(getDeps());
+      const pidSuffix = status.pid !== undefined ? ` (pid ${status.pid})` : "";
+      switch (status.state) {
+        case "running":
+          if (status.healthy === false) {
+            // OPR.0.4.3.21 — process-present but unhealthy: name the real
+            // cause (wedged control plane), not a bare "healthz failed", and
+            // attach the event-loop evidence + seat-preserving recovery hint.
+            const cause = status.reason === "unresponsive"
+              ? "unresponsive (event loop may be starved — /healthz timed out)"
+              : status.reason === "event-loop-starved"
+                ? "event-loop starved"
+                : "healthz failed";
+            console.log(`Daemon running on port ${status.port}${pidSuffix} — process present but UNHEALTHY: ${cause}`);
+            if (status.eventLoop) {
+              const el = status.eventLoop;
+              console.log(
+                `  event-loop: lag mean ${el.lagMeanMs.toFixed(1)}ms, p99 ${el.lagP99Ms.toFixed(1)}ms, `
+                + `utilization ${(el.utilization * 100).toFixed(0)}%, last-tick age ${el.lastTickAgeMs.toFixed(0)}ms`,
+              );
+            }
+            console.log("  Recovery: restart the daemon only (`rig daemon stop && rig daemon start`) — this preserves the tmux seats.");
+          } else {
+            console.log(`Daemon running on port ${status.port}${pidSuffix}`);
+          }
+          break;
+        case "stopped":
+          console.log("Daemon stopped");
+          break;
+        case "stale":
+          console.log("Daemon PID is absent (stale state)");
+          break;
+        case "unverified":
+          // 1ae863d2 — C3 semantics: we could NOT confirm up or down; never claim stopped.
+          if (status.siblingHint) {
+            console.log("Daemon state UNVERIFIED — the resolved OPENRIG_HOME has no daemon state, but a live daemon appears under a sibling home:");
+            console.log(`  resolved: ${status.siblingHint.resolvedHome}`);
+            console.log(`  sibling:  ${status.siblingHint.siblingHome}`);
+            console.log("  Fix: point OPENRIG_HOME at the right home (or check your shell env) — this CLI is likely resolving the wrong home.");
+          } else {
+            console.log("Daemon state UNVERIFIED — the probe timed out or was inconclusive (this is NOT evidence the daemon is down).");
+            console.log("  Re-check with: rig daemon status  ·  direct: curl the daemon /healthz");
+          }
+          break;
+      }
+    });
+
+  cmd
+    .command("logs")
+    .description("Show daemon logs")
+    .option("--follow", "Follow log output")
+    .action((opts: { follow?: boolean }) => {
+      if (opts.follow) {
+        tailLogs(getDeps(), { follow: true });
+      } else {
+        const content = readLogs(getDeps());
+        if (content) {
+          console.log(content);
+        } else {
+          console.log("No daemon logs found");
+        }
+      }
+    });
+
+  return cmd;
+}

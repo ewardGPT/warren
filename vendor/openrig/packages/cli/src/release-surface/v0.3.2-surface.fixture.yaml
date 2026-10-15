@@ -1,0 +1,37 @@
+# Known v0.3.2 CLI surface additions - AC-2 self-validation fixture (OPR.0.3.3.13.1).
+#
+# Each entry is INDEPENDENTLY derived from the release notes + corroborating
+# sources, then cross-checked against the parser output. It is the no-false-
+# negative floor AND (by construction here) the exact expected added-flags set,
+# so the test also asserts no parser over/under-reporting at command granularity.
+#
+# Sources (cited; all at main@8b2cb181):
+#   - PRIMARY:       docs/releases/v0.3.2.md
+#   - CORROBORATING: CHANGELOG.md v0.3.2 section
+#   - GROUND TRUTH:  git diff --name-status v0.3.1 v0.3.2 -- packages/cli/src/commands/
+#       (ADDED: scope.ts, rig-policy.ts; MODIFIED: bundle/config-init-workspace/ps/queue/up/workflow/workspace)
+#
+# Registration-name-not-filename: `policy` is `new Command("policy")` at
+# rig-policy.ts:150 - the FILENAME is rig-policy, the command name is policy.
+#
+# AC-2 RECONCILIATION NOTE (parser vs release-doc prose):
+#   `rig up --existing` is NOT listed here. The release doc narrates `--existing`
+#   under the "up paper-cut fixes" story (line 219), but the flag already existed
+#   at v0.3.1 (up.ts:32) and is unchanged at v0.3.2 (up.ts:40), so it is NOT a
+#   v0.3.1->v0.3.2 surface addition. The parser (source-grounded) correctly omits
+#   it; an earlier fixture draft that included it was a prose over-read, caught by
+#   this self-validation. Source/tag-diff is authoritative over release prose.
+added_commands:
+  - name: policy   # rig-policy.ts:150 new Command("policy"); doc L79-86, 166-189
+  - name: scope    # scope.ts:690 new Command("scope"); doc L87-93, 190-205
+added_flags:
+  - command: queue create   # queue.ts:156-158; doc L60-64, 148-164
+    flags: [--body-file, --mission, --slice]
+  - command: workspace      # doc L65-68, 131-146 (new `doctor` subcommand)
+    subcommands: [doctor]
+  - command: bundle         # doc L110, 127-129 (new `history` subcommand)
+    subcommands: [history]
+  - command: bundle create  # doc L104-105 (version-gate + notes flags)
+    flags: [--min-cli-version, --min-daemon-version, --notes]
+  - command: bundle install # doc L109, 122-125 (operator-explicit override flags)
+    flags: [--force, --skip-version-check]

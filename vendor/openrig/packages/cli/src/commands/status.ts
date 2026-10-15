@@ -1,0 +1,207 @@
+import { Command } from "commander";
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+import { DaemonClient } from "../client.js";
+import {
+  getDaemonStatus,
+  getDaemonUrl,
+  type LifecycleDeps,
+  statusGuardMessage,
+} from "../daemon-lifecycle.js";
+import { readLifecycleDescription } from "../daemon-lifecycle-status.js";
+import { realDeps } from "./daemon.js";
+import { ConfigStore } from "../config-store.js";
+
+export interface StatusDeps {
+  lifecycleDeps: LifecycleDeps;
+  clientFactory: (baseUrl: string) => DaemonClient;
+}
+
+function formatSnapshotAge(snapshotAt: string | null): string {
+  if (!snapshotAt) return "none";
+  const now = Date.now();
+  const then = new Date(snapshotAt).getTime();
+  const diffMs = now - then;
+  const diffMin = Math.floor(diffMs / 60_000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
+export function statusCommand(depsOverride?: StatusDeps): Command {
+  const cmd = new Command("status").description("Show rig status")
+    .option("--json", "JSON output");
+
+  cmd.action(async (opts: { json?: boolean }) => {
+    const json = opts.json === true;
+    // JSON mode: one object, same keys on every path; sections the command did not
+    // (or could not) read are null rather than absent.
+    const emit = (daemon: Record<string, unknown>, rest: Record<string, unknown> = {}): void => {
+      console.log(JSON.stringify({ daemon, kernel: null, workspaceRoot: null, rigs: null, cmux: null, ...rest }, null, 2));
+    };
+
+    const deps = depsOverride ?? {
+      lifecycleDeps: realDeps(),
+      clientFactory: (baseUrl: string) => new DaemonClient(baseUrl),
+    };
+
+    const status = await getDaemonStatus(deps.lifecycleDeps);
+
+    if (json && status.state !== "running") {
+      // reachable: false = positively down (stopped, stale); null = not confirmed (unverified).
+      const unverified = status.state === "unverified";
+      const life = unverified ? null : readLifecycleDescription();
+      emit({
+        state: status.state,
+        reachable: unverified ? null : false,
+        message: statusGuardMessage(status).fact,
+        ...(status.pid !== undefined ? { pid: status.pid } : {}),
+        ...(status.probeErrorCode ? { probeErrorCode: status.probeErrorCode } : {}),
+        ...(status.siblingHint ? { siblingHint: status.siblingHint } : {}),
+        ...(life ? { lifecycle: life } : {}),
+      });
+      return;
+    }
+
+    if (status.state === "stopped" || status.state === "stale") {
+      console.log(statusGuardMessage(status).fact); // B8-1b: one language source
+      // P7 — crash-surviving lifecycle read: a clean stop recorded stopped_at; its
+      // ABSENCE (with a boot record) is a crash/kill-9/power-loss. SQLite survives a
+      // dead pid; daemon.json does not — so this reads the db, never daemon.json.
+      const life = readLifecycleDescription();
+      if (life.kind === "clean-shutdown") {
+        console.log(`  cleanly shut down at ${life.stoppedAt}`);
+      } else if (life.kind === "no-clean-shutdown") {
+        console.log(`  ⚠ no clean shutdown recorded — last seen ${life.lastSeen}`);
+      }
+      return;
+    }
+
+    if (status.state === "unverified") {
+      console.log(statusGuardMessage(status).fact);
+      if (status.siblingHint) {
+        console.log(`  note: OPENRIG_HOME may be wrong — resolved ${status.siblingHint.resolvedHome}, live sibling ${status.siblingHint.siblingHome}`);
+      }
+      return;
+    }
+
+    // state === "running"
+    if (json && status.healthy === false) {
+      // The process is up. reachable is true when /healthz answered (a starved loop or a
+      // non-OK reply), null when it did not answer at all ("unresponsive"): not confirmed down.
+      emit({
+        state: "running",
+        reachable: status.reason === "unresponsive" ? null : true,
+        ...(status.pid !== undefined ? { pid: status.pid } : {}),
+        port: status.port,
+        healthy: false,
+        ...(status.reason ? { reason: status.reason } : {}),
+        ...(status.eventLoop ? { eventLoop: status.eventLoop } : {}),
+        ...(status.probeErrorCode ? { probeErrorCode: status.probeErrorCode } : {}),
+      });
+      return;
+    }
+    if (status.healthy === false) {
+      console.log(`Daemon running (pid ${status.pid}) but unhealthy — healthz failed`);
+      return;
+    }
+
+    const client = deps.clientFactory(getDaemonUrl(status));
+
+    // Fetch summary + cmux + kernel readiness
+    const [summaryRes, cmuxRes, kernelRes] = await Promise.all([
+      client.get<Array<{ id: string; name: string; nodeCount: number; latestSnapshotAt: string | null; latestSnapshotId: string | null }>>("/api/rigs/summary"),
+      client.get<{ available: boolean }>("/api/adapters/cmux/status").catch(() => null),
+      client.get<{
+        kernel_state?: string;
+        error?: string;
+        last_boot_failure?: { state: string; detail: string | null; at: string | null } | null;
+      }>("/api/kernel/status").catch(() => null),
+    ]);
+
+    if (json) {
+      let workspaceRoot: { value: string | number | boolean; source: string } | null = null;
+      try {
+        const resolved = new ConfigStore().resolveWithSource("workspace.root");
+        workspaceRoot = { value: resolved.value, source: resolved.source };
+      } catch {
+        // config resolution unavailable - null rather than a guess.
+      }
+      const kernel = kernelRes && kernelRes.status === 200 && kernelRes.data?.kernel_state
+        ? { state: kernelRes.data.kernel_state, lastBootFailure: kernelRes.data.last_boot_failure ?? null }
+        : { state: kernelRes && kernelRes.status === 503 ? "not_tracked" : "unknown", lastBootFailure: null };
+      const daemon = { state: "running", reachable: true, pid: status.pid, port: status.port, healthy: true };
+      if (summaryRes.status !== 200) {
+        emit(daemon, { kernel, workspaceRoot, cmux: { available: cmuxRes?.data?.available ?? false }, error: `Failed to fetch rig summary (HTTP ${summaryRes.status})` });
+        process.exitCode = 1;
+        return;
+      }
+      emit(daemon, { kernel, workspaceRoot, rigs: summaryRes.data, cmux: { available: cmuxRes?.data?.available ?? false } });
+      return;
+    }
+
+    console.log(`Daemon running on port ${status.port}`);
+
+    // OPR.0.3.3.04.2 (AC-2): kernel readiness is a DISTINCT signal from daemon
+    // health - the kernel rig auto-boots on daemon-start, and a daemon can be up
+    // while the kernel is not yet ready (or a kernel agent is unhealthy). Surface
+    // it as "here's what's currently true," never as a guarantee that downstream
+    // agents are healthy.
+    if (kernelRes && kernelRes.status === 200 && kernelRes.data?.kernel_state) {
+      console.log(`Kernel: ${kernelRes.data.kernel_state} (boots on daemon-start; distinct from daemon health)`);
+      // #1042: a boot failure every kernel seat has since recovered from is history, shown apart from the state.
+      const failure = kernelRes.data.last_boot_failure;
+      if (failure) {
+        console.log(`  Recovered from an earlier boot failure (${failure.state}${failure.at ? ` at ${failure.at}` : ""}): ${failure.detail ?? "no detail recorded"}`);
+      }
+    } else if (kernelRes && kernelRes.status === 503) {
+      console.log("Kernel: not tracked (no kernel-boot tracker wired)");
+    } else {
+      console.log("Kernel: unknown (status unavailable)");
+    }
+
+    // OPR.0.3.3.04.2 (AC-2 / gap #7): surface WHICH workspace root is effective
+    // and whether it is the default or an override - the operator never guesses.
+    // This reports what is currently live, NOT that any root is the right one.
+    try {
+      const resolved = new ConfigStore().resolveWithSource("workspace.root");
+      const origin = resolved.source === "default" ? "default" : `override via ${resolved.source}`;
+      console.log(`Workspace root: ${resolved.value} (${origin})`);
+    } catch {
+      // config resolution unavailable - omit rather than guess.
+    }
+
+    if (summaryRes.status !== 200) {
+      console.error(`Failed to fetch rig summary (HTTP ${summaryRes.status})`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const rigs = summaryRes.data;
+    if (rigs.length === 0) {
+      console.log("No rigs");
+    } else {
+      console.log(`${rigs.length} rig(s):`);
+      for (const rig of rigs) {
+        const snap = formatSnapshotAge(rig.latestSnapshotAt);
+        console.log(`  ${rig.name}  ${rig.nodeCount} node(s)  snapshot: ${snap}`);
+      }
+    }
+
+    // cmux status
+    const cmuxAvailable = cmuxRes?.data?.available ?? false;
+    console.log(`cmux: ${cmuxAvailable ? "available" : "unavailable"}`);
+
+    // OPR.0.3.3.04.2 (AC-1): reinforcing HINT back to the one canonical ordered
+    // path - status does not re-author the sequence (that lives in `rig setup`
+    // next-steps + docs/reference/getting-started.md).
+    if (rigs.length === 0) {
+      console.log("\nNext: launch a rig with `rig up <rig-spec>`. Guided path: `rig setup` output or docs/reference/getting-started.md");
+    }
+  });
+
+  return cmd;
+}

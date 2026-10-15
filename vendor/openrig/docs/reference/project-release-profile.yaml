@@ -1,0 +1,86 @@
+schema: openrig.project/v0alpha1
+kind: project
+metadata: { id: example }
+missions: { root: missions }
+lifecycle:
+  profile: release-boundary-v0
+  profiles:
+    release-boundary-v0:
+      required_steps:
+        - mission-outcome
+        - exact-release-candidate
+        - capability-delta
+        - exact-cut-substance
+        - release-verification
+        - git-canonicalization
+        - public-release
+        - parent-adoption
+        - record-shipped
+        - release-boundary
+      workflow:
+        entry: { role: orchestrator }
+        # Entry/ordinary custody and exception selection are separate decisions.
+        # Replace the example target with a declared member (rig ps --nodes --json).
+        # Inspect with workflow compile/show; adopt later corrections with workflow revise.
+        exception_routing: { orchestrator_role: orchestrator }
+        roles:
+          orchestrator: { preferred_targets: [orch@example] }
+        steps:
+          - id: mission-outcome
+            actor_role: orchestrator
+            depends_on: []
+            objective: Judge the mission's promised outcomes against retained evidence; name remaining gaps.
+            allowed_exits: [handoff, waiting, failed]
+          - id: exact-release-candidate
+            actor_role: orchestrator
+            depends_on: [mission-outcome]
+            objective: Establish the exact candidate and tree to which subsequent receipts apply.
+            allowed_exits: [handoff, waiting, failed]
+          - id: capability-delta
+            actor_role: orchestrator
+            depends_on: [exact-release-candidate]
+            objective: Reconcile the shipped capability description with this candidate's actual behavior.
+            allowed_exits: [handoff, waiting, failed]
+          - id: exact-cut-substance
+            actor_role: orchestrator
+            depends_on: [capability-delta]
+            objective: Obtain and judge independent substance admission for the exact release cut.
+            allowed_exits: [handoff, waiting, failed]
+          - id: release-verification
+            actor_role: orchestrator
+            depends_on: [exact-cut-substance]
+            objective: Judge privacy, package shape, conventions and mirrors, builds, tests, and clean-tree evidence for the exact admitted release candidate.
+            allowed_exits: [handoff, waiting, failed]
+          - id: git-canonicalization
+            actor_role: orchestrator
+            depends_on: [release-verification]
+            objective: Obtain the authorized canonical Git identity and reconcile it with the verified candidate.
+            allowed_exits: [handoff, waiting, failed]
+          - id: public-release
+            actor_role: orchestrator
+            depends_on: [git-canonicalization]
+            objective: Obtain publication authorization and the release owner's exact public artifact receipt.
+            allowed_exits: [handoff, waiting, failed]
+          - id: parent-adoption
+            actor_role: orchestrator
+            depends_on: [public-release]
+            objective: Obtain separately authorized parent adoption and judge its effect receipt.
+            allowed_exits: [handoff, waiting, failed]
+          - id: record-shipped
+            actor_role: orchestrator
+            depends_on: [parent-adoption]
+            objective: Record durable shipped truth after judging ceremony receipts; the post-release boundary follows.
+            allowed_exits: [handoff, waiting, failed]
+          - id: release-boundary
+            actor_role: orchestrator
+            depends_on: [record-shipped]
+            objective: >-
+              After the release ceremony, author one attributed disposition record
+              covering seat renewal and re-prime, memory distillation, destination
+              queue sweep, substrate teardown or retention, board freeze and clean-box
+              baseline, capability-delta absorption and expiry, and packaged-product
+              discoverability. These are agent-judged guides, not seven daemon gates.
+              Inspect beyond this packet when useful. Record reasoned not-applicable
+              or deferred dispositions and wait on live dependencies. Finish after
+              this boundary when no successor is authored.
+            allowed_exits: [done, waiting, failed]

@@ -1,0 +1,821 @@
+// User Settings v0 — daemon-side SettingsStore tests.
+//
+// Pins that the daemon's SettingsStore stays in lockstep with the CLI
+// ConfigStore: same VALID_KEYS, same env-map, same env > file > default
+// resolution, same file format. Drift between the two would mean the
+// daemon's UI route surfaces a different value than the CLI.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import {
+  SettingsStore,
+  SETTINGS_VALID_KEYS,
+  DEFAULT_CLAUDE_COMPACTION_EXTRA_INSTRUCTION_FILE_CONTENT,
+  defaultClaudeCompactionExtraInstructionFilePath,
+  ensureDefaultClaudeCompactionFiles,
+  parseNamedPairs,
+} from "../src/domain/user-settings/settings-store.js";
+
+const DEFAULT_PRE_COMPACT_INSTRUCTION_FRAGMENT = "Read the claude-compaction-restore skill";
+const DEFAULT_RESTORE_INSTRUCTION_FRAGMENT = "Read the claude-compaction-restore skill";
+const DEFAULT_AUDIT_INSTRUCTION_FRAGMENT = "Required Read-Depth Audit";
+const DEFAULT_EXTRA_INSTRUCTION_FILE_SUFFIX = "compaction/post-compact-extra.md";
+
+function clearEnv(): () => void {
+  const keys = [
+    "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB",
+    "OPENRIG_TRANSCRIPTS_ENABLED", "OPENRIG_TRANSCRIPTS_PATH",
+    "OPENRIG_TRANSCRIPTS_LINES", "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS",
+    "OPENRIG_WORKSPACE_ROOT", "OPENRIG_WORKSPACE_SLICES_ROOT",
+    "OPENRIG_WORKSPACE_STEERING_PATH", "OPENRIG_WORKSPACE_FIELD_NOTES_ROOT",
+    "OPENRIG_WORKSPACE_SPECS_ROOT", "OPENRIG_DOGFOOD_EVIDENCE_ROOT",
+    "OPENRIG_WORKSPACE_PROJECTS_ROOT", "OPENRIG_WORKSPACE_CATALOG_PATH",
+    "OPENRIG_CONTEXT_ROOT", "OPENRIG_CONTEXT_SYSTEM_WORLD", "OPENRIG_CONTEXT_PACKS_ROOT",
+    "OPENRIG_HEALTH_CONTEXT_PRESSURE_WARNING_PERCENT",
+    "OPENRIG_HEALTH_CONTEXT_PRESSURE_CRITICAL_PERCENT",
+    "OPENRIG_SKILLS_ROOT",
+    "OPENRIG_FILES_ALLOWLIST", "OPENRIG_PROGRESS_SCAN_ROOTS",
+    "OPENRIG_UI_PREVIEW_REFRESH_INTERVAL_SECONDS",
+    "OPENRIG_UI_PREVIEW_MAX_PINS", "OPENRIG_UI_PREVIEW_DEFAULT_LINES",
+    "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS",
+    "OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST",
+    "OPENRIG_AGENTS_ADVISOR_SESSION", "OPENRIG_AGENTS_OPERATOR_SESSION",
+    "OPENRIG_FEED_SUBSCRIPTIONS_ACTION_REQUIRED", "OPENRIG_FEED_SUBSCRIPTIONS_APPROVALS",
+    "OPENRIG_FEED_SUBSCRIPTIONS_SHIPPED", "OPENRIG_FEED_SUBSCRIPTIONS_PROGRESS",
+    "OPENRIG_FEED_SUBSCRIPTIONS_AUDIT_LOG",
+    "OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED",
+    "OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS",
+    // Slice 27 — Claude auto-compaction policy env-map.
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_COMPACT_INSTRUCTION",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_MESSAGE_INLINE",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_MESSAGE_FILE_PATH",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_POST_RESTORE_AUDIT_INSTRUCTION",
+    "OPENRIG_POLICIES_IDLE_GATE_QITEM_SCAN_INTERVAL_SECONDS",
+    "OPENRIG_POLICIES_IDLE_GATE_QITEM_ACTIVE_WAKE_INTERVAL_SECONDS",
+    "RIGGED_PORT", "RIGGED_HOST", "RIGGED_DB",
+    "RIGGED_TRANSCRIPTS_ENABLED", "RIGGED_TRANSCRIPTS_PATH",
+  ];
+  const saved: Record<string, string | undefined> = {};
+  for (const k of keys) {
+    saved[k] = process.env[k];
+    delete process.env[k];
+  }
+  return () => {
+    for (const k of keys) {
+      if (saved[k] !== undefined) process.env[k] = saved[k]!;
+      else delete process.env[k];
+    }
+  };
+}
+
+describe("SettingsStore (User Settings v0)", () => {
+  let tmpDir: string;
+  let configPath: string;
+  let restoreEnv: () => void;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "settings-store-"));
+    configPath = join(tmpDir, "config.json");
+    restoreEnv = clearEnv();
+  });
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    restoreEnv();
+  });
+
+  it("SETTINGS_VALID_KEYS matches the documented settings key set", () => {
+    expect([...SETTINGS_VALID_KEYS]).toEqual([
+      "daemon.port", "daemon.host",
+      // OPR.0.4.6.MH1 FR-1/FR-4 — host-selection pointer + own-host name.
+      "host.selected",
+      "host.name",
+      // OPR.0.4.6.WF5 FR-2 — the host-level maturity-dial default.
+      "workflow.exception_routing",
+      "db.path",
+      "transcripts.enabled", "transcripts.path",
+      // V1 pre-release CLI/daemon Item 1 — capture-pane rotation tunables.
+      "transcripts.lines", "transcripts.poll_interval_seconds",
+      "workspace.root", "workspace.slices_root", "workspace.steering_path",
+      "workspace.specs_root", "workspace.projects_root",
+      "workspace.catalog_path",
+      // OPR.0.5.3.6 D1 — the topology tree root (instance at its top).
+      "topology.root",
+      "context.root",
+      "context.system_world",
+      "skills.root",
+      "onboarding.default_pack.enabled",
+      "launch.non_interruptive",
+      "health.context_pressure.warning_percent",
+      "health.context_pressure.critical_percent",
+      "files.allowlist", "progress.scan_roots",
+      "ui.preview.refresh_interval_seconds", "ui.preview.max_pins", "ui.preview.default_lines", "ui.timezone",
+      "ui.enabled",
+      // OPR.0.4.0.1 — global live-terminal cap.
+      "ui.terminal.max_live_terminals",
+      "recovery.auto_drive_provider_prompts",
+      "recovery.provider_auth_env_allowlist",
+      // V1 attempt-3 Phase 4 — Advisor/Operator placeholders.
+      "agents.advisor_session", "agents.operator_session",
+      // V0.3.1 slice 05 kernel-rig-as-default — operator seat name read
+      // by mission-control read layer + 2 UI sites; default
+      // `operator-${USER}@kernel`.
+      "workspace.operator_seat_name",
+      // V1 attempt-3 Phase 5 P5-3 — For You feed subscription toggles.
+      "feed.subscriptions.action_required",
+      "feed.subscriptions.approvals",
+      "feed.subscriptions.shipped",
+      "feed.subscriptions.progress",
+      "feed.subscriptions.audit_log",
+      // plugin-primitive Phase 3a slice 3.5 — Codex feature flag.
+      "runtime.codex.hooks_enabled",
+      "runtime.readiness_timeout_seconds",
+      // Slice 27 — Claude auto-compaction policy. SC-29 EXCEPTION #10.
+      "policies.claude_compaction.enabled",
+      "policies.claude_compaction.threshold_percent",
+      "policies.claude_compaction.pre_compact_instruction",
+      "policies.claude_compaction.compact_instruction",
+      "policies.claude_compaction.message_inline",
+      "policies.claude_compaction.message_file_path",
+      "policies.claude_compaction.post_restore_audit_instruction",
+      // OPR.0.5.1 51-06 W2c — tunable daemon auto-registration cadence.
+      "policies.idle_gate_qitem.scan_interval_seconds",
+      "policies.idle_gate_qitem.active_wake_interval_seconds",
+      // B6 founder ruling — auto-registration is not default-on.
+      "policies.idle_gate_qitem.auto_register",
+      "policies.idle_gate_qitem.opt_in_sessions",
+      "snapshots.periodic.enabled",
+      "snapshots.periodic.interval_seconds",
+      "snapshots.periodic.retention_keep",
+      // OPR.0.4.6.02 S1 — inner-tmux status-bar launch default (static bool).
+      "terminal.status_bar",
+      // Slice 15 (OPR.0.7.0.15) — compact command-output defaults switch.
+      "output.compact",
+      // Slice 15 P5 — the whoami peer bound under output.compact.
+      "output.whoami_peers",
+      // Slice 01 (OPR.0.7.0.1) — Codex usage windows switch.
+      "provider.usage_windows",
+      "usage.pi_cost_facts",
+      "usage.pi_openrouter_charge",
+      "transport.verify_input_box",
+      // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs.
+      "retention.enabled",
+      "retention.transitions_days",
+      "retention.watchdog_days",
+      "retention.usage_samples_days", // 51-08 A2 (plan-lock rev-1): the PM-ruled 14d telemetry window
+      "retention.watchdog_keep_per_job",
+      "retention.batch_size",
+      "queue.pickup_stall_threshold_minutes",
+      // S02 — standing-stuck-sweep cadence + unclaimed-obligation age.
+      "queue.stuck_sweep_interval_seconds",
+      "queue.stuck_sweep_unclaimed_age_minutes",
+      // S01 — wake-or-escalate ladder knobs.
+      "queue.wake_retry_interval_seconds",
+      "queue.wake_retry_cap",
+      "queue.wake_unconfirmed_window_minutes",
+      "queue.wake_swap_grace_seconds",
+      "queue.wake_human_rung",
+    ]);
+  });
+
+  it("resolves context.root and refuses the removed key, file field, and env", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("context.root")).toMatchObject({
+      value: expect.stringMatching(/context$/),
+      source: "default",
+    });
+
+    process.env["OPENRIG_CONTEXT_ROOT"] = join(tmpDir, "context-library");
+    expect(store.resolveOne("context.root")).toMatchObject({ value: join(tmpDir, "context-library"), source: "env" });
+    delete process.env["OPENRIG_CONTEXT_ROOT"];
+
+    expect(() => store.set("context.packs_root", "/legacy")).toThrow(/removed.*context\.root/i);
+    writeFileSync(configPath, JSON.stringify({ context: { packsRoot: "/legacy" } }));
+    expect(() => store.resolveConfig()).toThrow(/context\.packs_root.*context\.root/i);
+    writeFileSync(configPath, "{}\n");
+    process.env["OPENRIG_CONTEXT_PACKS_ROOT"] = "/legacy-env";
+    expect(() => store.resolveOne("context.root")).toThrow(/OPENRIG_CONTEXT_PACKS_ROOT.*OPENRIG_CONTEXT_ROOT/i);
+  });
+
+  it("defaults the advisor session to the kernel's advisor seat", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("agents.advisor_session")).toMatchObject({ value: "advisor-lead@kernel", source: "default" });
+  });
+
+  it("defaults output.whoami_peers to 8 and accepts only an integer >= 1 (slice 15 P5)", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("output.whoami_peers")).toMatchObject({ value: 8, source: "default" });
+    store.set("output.whoami_peers", "12");
+    expect(store.resolveOne("output.whoami_peers")).toMatchObject({ value: 12, source: "file" });
+    for (const raw of ["0", "-3", "2.5", "8junk", "many"]) {
+      expect(() => store.set("output.whoami_peers", raw)).toThrow(/output\.whoami_peers/);
+    }
+  });
+
+  it("resolves mutable 95/99 context-pressure thresholds and rejects invalid order", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveContextPressurePolicy()).toEqual({ warningPercent: 95, criticalPercent: 99 });
+    expect(store.resolveOne("health.context_pressure.warning_percent")).toMatchObject({
+      value: 95,
+      source: "default",
+      defaultValue: 95,
+    });
+
+    store.set("health.context_pressure.critical_percent", "100");
+    store.set("health.context_pressure.warning_percent", "99");
+    expect(store.resolveContextPressurePolicy()).toEqual({ warningPercent: 99, criticalPercent: 100 });
+    expect(() => store.set("health.context_pressure.critical_percent", "97")).toThrow(/warning.*critical/i);
+    for (const raw of ["0", "101", "95.5", "95junk"]) {
+      expect(() => store.set("health.context_pressure.warning_percent", raw)).toThrow(/integer/i);
+    }
+
+    const persistedBeforeReset = readFileSync(configPath, "utf-8");
+    expect(() => store.reset("health.context_pressure.critical_percent")).toThrow(/warning.*critical/i);
+    expect(readFileSync(configPath, "utf-8")).toBe(persistedBeforeReset);
+    expect(JSON.parse(persistedBeforeReset)).toMatchObject({
+      health: { contextPressure: { warningPercent: 99, criticalPercent: 100 } },
+    });
+    expect(store.resolveOne("health.context_pressure.warning_percent")).toMatchObject({ value: 99, source: "file" });
+    expect(store.resolveOne("health.context_pressure.critical_percent")).toMatchObject({ value: 100, source: "file" });
+
+    store.reset("health.context_pressure.warning_percent");
+    store.reset("health.context_pressure.critical_percent");
+    expect(store.resolveContextPressurePolicy()).toEqual({ warningPercent: 95, criticalPercent: 99 });
+  });
+
+  it("resolves the System World selector through default, file, and env provenance", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("context.system_world")).toMatchObject({ value: "default", source: "default" });
+    store.set("context.system_world", "operator/system-world.yaml");
+    expect(store.resolveOne("context.system_world")).toMatchObject({ value: "operator/system-world.yaml", source: "file" });
+    process.env["OPENRIG_CONTEXT_SYSTEM_WORLD"] = "disabled";
+    expect(store.resolveConfig().systemWorld).toBe("disabled");
+  });
+
+  it("W2c idle-gate-qitem cadence defaults to scan=60 and active-wake=900", () => {
+    const store = new SettingsStore(configPath);
+    expect(() => store.resolveOne("policies.idle_gate_qitem.scan_interval_seconds"))
+      .not.toThrow();
+    expect(() => store.resolveOne("policies.idle_gate_qitem.active_wake_interval_seconds"))
+      .not.toThrow();
+    expect(store.resolveOne("policies.idle_gate_qitem.scan_interval_seconds"))
+      .toMatchObject({ value: 60, source: "default", defaultValue: 60 });
+    expect(store.resolveOne("policies.idle_gate_qitem.active_wake_interval_seconds"))
+      .toMatchObject({ value: 900, source: "default", defaultValue: 900 });
+  });
+
+  it("resolves the launch readiness window from default, file, and env", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("runtime.readiness_timeout_seconds")).toMatchObject({ value: 30, source: "default" });
+    store.set("runtime.readiness_timeout_seconds", "45");
+    expect(store.resolveOne("runtime.readiness_timeout_seconds")).toMatchObject({ value: 45, source: "file" });
+    process.env["OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS"] = "60";
+    expect(store.resolveOne("runtime.readiness_timeout_seconds")).toMatchObject({ value: 60, source: "env" });
+    for (const value of ["0", "601", "2.5", "45junk"]) {
+      expect(() => store.set("runtime.readiness_timeout_seconds", value)).toThrow(/integer in \[1, 600\]/);
+    }
+  });
+
+  it("falls back from an invalid readiness env value to the file value, then the default", () => {
+    const store = new SettingsStore(configPath);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      process.env["OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS"] = "0";
+      expect(store.resolveOne("runtime.readiness_timeout_seconds")).toMatchObject({ value: 30, source: "default" });
+      store.set("runtime.readiness_timeout_seconds", "45");
+      expect(store.resolveOne("runtime.readiness_timeout_seconds")).toMatchObject({ value: 45, source: "file" });
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("env override for runtime.readiness_timeout_seconds rejected"));
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("queue integer settings reject partial and fractional strings", () => {
+    const store = new SettingsStore(configPath);
+    for (const key of [
+      "queue.pickup_stall_threshold_minutes",
+      "queue.stuck_sweep_interval_seconds",
+      "queue.stuck_sweep_unclaimed_age_minutes",
+    ]) {
+      for (const raw of ["3junk", "60.5"]) {
+        expect(() => store.set(key, raw), `${key} must reject ${raw}`)
+          .toThrow(/positive integer/i);
+      }
+    }
+  });
+
+  it("W2c idle-gate-qitem cadence resolves env over file", () => {
+    const store = new SettingsStore(configPath);
+    expect(() => store.set("policies.idle_gate_qitem.scan_interval_seconds", "120")).not.toThrow();
+    expect(() => store.set("policies.idle_gate_qitem.active_wake_interval_seconds", "1800")).not.toThrow();
+    expect(store.resolveOne("policies.idle_gate_qitem.scan_interval_seconds"))
+      .toMatchObject({ value: 120, source: "file" });
+    expect(store.resolveOne("policies.idle_gate_qitem.active_wake_interval_seconds"))
+      .toMatchObject({ value: 1800, source: "file" });
+
+    process.env.OPENRIG_POLICIES_IDLE_GATE_QITEM_SCAN_INTERVAL_SECONDS = "30";
+    process.env.OPENRIG_POLICIES_IDLE_GATE_QITEM_ACTIVE_WAKE_INTERVAL_SECONDS = "450";
+    expect(store.resolveOne("policies.idle_gate_qitem.scan_interval_seconds"))
+      .toMatchObject({ value: 30, source: "env" });
+    expect(store.resolveOne("policies.idle_gate_qitem.active_wake_interval_seconds"))
+      .toMatchObject({ value: 450, source: "env" });
+  });
+
+  it("W2c idle-gate-qitem cadence rejects zero, negative, fractional, and partial numbers", () => {
+    const store = new SettingsStore(configPath);
+    for (const key of [
+      "policies.idle_gate_qitem.scan_interval_seconds",
+      "policies.idle_gate_qitem.active_wake_interval_seconds",
+    ]) {
+      for (const raw of ["0", "-1", "1.5", "60abc"]) {
+        expect(() => store.set(key, raw), `${key} must reject ${raw}`)
+          .toThrow(/positive integer/i);
+      }
+    }
+  });
+
+  it("resolveAllWithSource returns every key with source + default", () => {
+    const store = new SettingsStore(configPath);
+    const all = store.resolveAllWithSource();
+    for (const key of SETTINGS_VALID_KEYS) {
+      expect(all[key]).toBeDefined();
+      expect(["env", "file", "default"]).toContain(all[key].source);
+    }
+  });
+
+  it("default onboarding pack is on and resolves env over file", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("onboarding.default_pack.enabled"))
+      .toMatchObject({ value: true, source: "default", defaultValue: true });
+
+    store.set("onboarding.default_pack.enabled", "false");
+    expect(store.resolveOne("onboarding.default_pack.enabled"))
+      .toMatchObject({ value: false, source: "file", defaultValue: true });
+
+    process.env.OPENRIG_ONBOARDING_DEFAULT_PACK_ENABLED = "true";
+    expect(store.resolveOne("onboarding.default_pack.enabled"))
+      .toMatchObject({ value: true, source: "env", defaultValue: true });
+  });
+
+  it("transport.verify_input_box is off by default and resolves file, then env", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("transport.verify_input_box"))
+      .toMatchObject({ value: false, source: "default", defaultValue: false });
+
+    store.set("transport.verify_input_box", "true");
+    expect(store.resolveOne("transport.verify_input_box")).toMatchObject({ value: true, source: "file" });
+    expect(JSON.parse(readFileSync(configPath, "utf-8")).transport).toEqual({ verifyInputBox: true });
+
+    try {
+      process.env.OPENRIG_TRANSPORT_VERIFY_INPUT_BOX = "0";
+      expect(store.resolveOne("transport.verify_input_box")).toMatchObject({ value: false, source: "env" });
+    } finally {
+      delete process.env.OPENRIG_TRANSPORT_VERIFY_INPUT_BOX;
+    }
+  });
+
+  it("env > file > default for daemon.port", () => {
+    const store = new SettingsStore(configPath);
+    // No file → default
+    expect(store.resolveOne("daemon.port").source).toBe("default");
+    expect(store.resolveOne("daemon.port").value).toBe(7433);
+
+    // File → file
+    store.set("daemon.port", "9999");
+    expect(store.resolveOne("daemon.port").value).toBe(9999);
+    expect(store.resolveOne("daemon.port").source).toBe("file");
+
+    // Env wins
+    process.env["OPENRIG_PORT"] = "8888";
+    try {
+      expect(store.resolveOne("daemon.port").value).toBe(8888);
+      expect(store.resolveOne("daemon.port").source).toBe("env");
+    } finally {
+      delete process.env["OPENRIG_PORT"];
+    }
+  });
+
+  // Constraint gap (Slice 27 residue, lockstep twin of the CLI store):
+  // daemon.port had no KEY_CONSTRAINTS entry, so `rig config set
+  // daemon.port 99999` stored 99999 and the next daemon start died with a
+  // raw ERR_SOCKET_BAD_PORT from serve(). The contract: refuse only ports
+  // that cannot be bound, checked on the value the runtime consumes (the
+  // same parseInt the boot path runs on OPENRIG_PORT), never against a
+  // stricter input format than today's.
+  it("daemon.port refuses ports that cannot be bound; 0 and 65535 stay legal", () => {
+    const store = new SettingsStore(configPath);
+    for (const raw of ["-1", "65536", "99999"]) {
+      expect(() => store.set("daemon.port", raw), `daemon.port must reject ${raw}`)
+        .toThrow(/integer in \[0, 65535\]/);
+    }
+    store.set("daemon.port", "0");
+    expect(store.resolveOne("daemon.port").value).toBe(0);
+    store.set("daemon.port", "65535");
+    expect(store.resolveOne("daemon.port").value).toBe(65535);
+  });
+
+  it("daemon.port keeps resolving every input form that resolves today", () => {
+    const store = new SettingsStore(configPath);
+    for (const [raw, expected] of [
+      ["7433abc", 7433],
+      ["7433.5", 7433],
+      ["+7433", 7433],
+      ["1e4", 1],
+      ["0x1D11", 0],
+    ] as const) {
+      store.set("daemon.port", raw);
+      expect(store.resolveOne("daemon.port").value, `${raw} must keep resolving to ${expected}`).toBe(expected);
+    }
+  });
+
+  it("unusable daemon.port in config.json falls back to the default with a warning", () => {
+    writeFileSync(configPath, JSON.stringify({ daemon: { port: 99999 } }));
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const store = new SettingsStore(configPath);
+      expect(store.resolveOne("daemon.port").value).toBe(7433);
+      expect(store.resolveOne("daemon.port").source).toBe("default");
+      const warns = stderrSpy.mock.calls.map((c) => String(c[0]));
+      expect(warns.some((w) => w.includes("file value for daemon.port rejected"))).toBe(true);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("a quoted in-range port in config.json keeps its port, and the CLI target and daemon bind agree", () => {
+    writeFileSync(configPath, JSON.stringify({ daemon: { port: "7434" } }));
+    const store = new SettingsStore(configPath);
+    // Used as-is, exactly as before this constraint existed: the CLI's
+    // target stays "7434" and startServer binds parseInt of the same value.
+    expect(store.resolveOne("daemon.port").value).toBe("7434");
+    expect(store.resolveOne("daemon.port").source).toBe("file");
+    expect(Number.parseInt(String(store.resolveOne("daemon.port").value), 10)).toBe(7434);
+  });
+
+  it("workspace.root cascades into per-subdir defaults", () => {
+    const store = new SettingsStore(configPath);
+    store.set("workspace.root", "/custom/ws");
+    store.set("skills.root", join(tmpDir, "skills"));
+    const cfg = store.resolveConfig();
+    expect(cfg.workspaceRoot).toBe("/custom/ws");
+    expect(cfg.workspaceSlicesRoot).toBe("/custom/ws/missions");
+    expect(cfg.workspaceSteeringPath).toBe("/custom/ws/STEERING.md");
+    expect(cfg.workspaceSpecsRoot).toBe("/custom/ws/specs");
+    expect(cfg.workspaceProjectsRoot).toBe("/custom/ws/projects");
+    expect(cfg.workspaceCatalogPath).toBe("/custom/ws/workspace.yaml");
+    expect(cfg.skillsRoot).toBe(join(tmpDir, "skills"));
+    expect(cfg.filesAllowlistRaw).toBe("workspace:/custom/ws");
+    expect(cfg.progressScanRootsRaw).toBe("workspace:/custom/ws");
+  });
+
+  it("recovery.auto_drive_provider_prompts defaults false and resolves into daemon config", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("recovery.auto_drive_provider_prompts").value).toBe(false);
+    store.set("recovery.auto_drive_provider_prompts", "true");
+    expect(store.resolveConfig().recoveryAutoDriveProviderPrompts).toBe(true);
+  });
+
+  it("recovery.provider_auth_env_allowlist defaults empty and resolves into daemon config", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("recovery.provider_auth_env_allowlist").value).toBe("");
+    store.set("recovery.provider_auth_env_allowlist", "ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN");
+    expect(store.resolveConfig().recoveryProviderAuthEnvAllowlistRaw).toBe("ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN");
+  });
+
+  it("per-subdir override beats the workspace.root cascade", () => {
+    const store = new SettingsStore(configPath);
+    store.set("workspace.root", "/ws");
+    store.set("workspace.slices_root", "/custom/slices");
+    const cfg = store.resolveConfig();
+    expect(cfg.workspaceSlicesRoot).toBe("/custom/slices");
+    // Other subdirs still cascade from workspace.root:
+    expect(cfg.workspaceProjectsRoot).toBe("/ws/projects");
+    expect(cfg.workspaceCatalogPath).toBe("/ws/workspace.yaml");
+  });
+
+  it("workspace project paths default from workspace.root and support env overrides", () => {
+    const store = new SettingsStore(configPath);
+    store.set("workspace.root", "/custom/ws");
+    expect(store.resolveConfig().workspaceProjectsRoot).toBe("/custom/ws/projects");
+    expect(store.resolveConfig().workspaceCatalogPath).toBe("/custom/ws/workspace.yaml");
+
+    store.set("workspace.projects_root", "/configured/projects");
+    store.set("workspace.catalog_path", "/configured/workspace.yaml");
+    expect(store.resolveOne("workspace.projects_root")).toMatchObject({ value: "/configured/projects", source: "file" });
+    expect(store.resolveOne("workspace.catalog_path")).toMatchObject({ value: "/configured/workspace.yaml", source: "file" });
+
+    process.env["OPENRIG_WORKSPACE_PROJECTS_ROOT"] = "/project/worlds";
+    process.env["OPENRIG_WORKSPACE_CATALOG_PATH"] = "/catalog/workspace.yaml";
+    try {
+      expect(store.resolveOne("workspace.projects_root")).toMatchObject({ value: "/project/worlds", source: "env" });
+      expect(store.resolveOne("workspace.catalog_path")).toMatchObject({ value: "/catalog/workspace.yaml", source: "env" });
+    } finally {
+      delete process.env["OPENRIG_WORKSPACE_PROJECTS_ROOT"];
+      delete process.env["OPENRIG_WORKSPACE_CATALOG_PATH"];
+    }
+  });
+
+  it("treats persisted legacy workspace defaults as default-derived values", () => {
+    writeFileSync(configPath, JSON.stringify({
+      workspace: {
+        root: "/ws",
+        slicesRoot: "/ws/slices",
+        steeringPath: "/ws/steering/STEERING.md",
+      },
+    }));
+    const store = new SettingsStore(configPath);
+    const slices = store.resolveOne("workspace.slices_root");
+    const steering = store.resolveOne("workspace.steering_path");
+    expect(slices).toMatchObject({ value: "/ws/missions", source: "default" });
+    expect(steering).toMatchObject({ value: "/ws/STEERING.md", source: "default" });
+  });
+
+  it("UEP env-var graduation: OPENRIG_FILES_ALLOWLIST resolves files.allowlist", () => {
+    const store = new SettingsStore(configPath);
+    process.env["OPENRIG_FILES_ALLOWLIST"] = "ws:/Users/me";
+    try {
+      expect(store.resolveOne("files.allowlist").value).toBe("ws:/Users/me");
+      expect(store.resolveOne("files.allowlist").source).toBe("env");
+    } finally {
+      delete process.env["OPENRIG_FILES_ALLOWLIST"];
+    }
+  });
+
+  it("set + reset round-trips through the file format", () => {
+    const store = new SettingsStore(configPath);
+    store.set("workspace.slices_root", "/custom/slices");
+    expect(existsSync(configPath)).toBe(true);
+    expect(store.resolveOne("workspace.slices_root").value).toBe("/custom/slices");
+
+    store.reset("workspace.slices_root");
+    expect(store.resolveOne("workspace.slices_root").source).toBe("default");
+
+    store.reset();
+    expect(existsSync(configPath)).toBe(false);
+  });
+
+  it("set rejects unknown keys", () => {
+    const store = new SettingsStore(configPath);
+    expect(() => store.set("workspace.bogus", "x")).toThrow(/Unknown config key/);
+  });
+
+  it("malformed JSON throws with reset hint", () => {
+    writeFileSync(configPath, "{not json");
+    const store = new SettingsStore(configPath);
+    expect(() => store.resolveAllWithSource()).toThrow(/malformed/i);
+  });
+
+  it("file format matches CLI ConfigStore: nested keys persist as JSON", () => {
+    const store = new SettingsStore(configPath);
+    store.set("workspace.slices_root", "/x");
+    store.set("daemon.port", "1234");
+    const raw = JSON.parse(require("node:fs").readFileSync(configPath, "utf-8"));
+    expect(raw.workspace.slicesRoot).toBe("/x");
+    expect(raw.daemon.port).toBe(1234);
+  });
+
+  // Slice 27 — Claude auto-compaction policy resolution.
+  it("HG-5 + HG-10: resolveClaudeCompactionPolicy returns defaults when no file/env present (opt-in default-off)", () => {
+    const store = new SettingsStore(configPath);
+    const policy = store.resolveClaudeCompactionPolicy();
+    expect(policy.enabled).toBe(false);
+    expect(policy.thresholdPercent).toBe(80);
+    expect(policy.preCompactInstruction).toContain(DEFAULT_PRE_COMPACT_INSTRUCTION_FRAGMENT);
+    expect(policy.compactInstruction).toBe("");
+    expect(policy.messageInline).toContain(DEFAULT_RESTORE_INSTRUCTION_FRAGMENT);
+    expect(policy.messageFilePath).toMatch(/^\//);
+    expect(policy.messageFilePath.endsWith(DEFAULT_EXTRA_INSTRUCTION_FILE_SUFFIX)).toBe(true);
+    expect(policy.postRestoreAuditInstruction).toContain(DEFAULT_AUDIT_INSTRUCTION_FRAGMENT);
+  });
+
+  it("HG-10: resolveClaudeCompactionPolicy picks up direct config.json edits without daemon restart (single resolve call rereads file)", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveClaudeCompactionPolicy().enabled).toBe(false);
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        policies: {
+          claudeCompaction: {
+            enabled: true,
+            thresholdPercent: 65,
+            preCompactInstruction: "prepare the map",
+            compactInstruction: "preserve current task and decisions",
+            messageInline: "carry-forward note",
+            messageFilePath: "",
+            postRestoreAuditInstruction: "verify the reads",
+          },
+        },
+      }),
+    );
+
+    const updated = store.resolveClaudeCompactionPolicy();
+    expect(updated.enabled).toBe(true);
+    expect(updated.thresholdPercent).toBe(65);
+    expect(updated.preCompactInstruction).toBe("prepare the map");
+    expect(updated.compactInstruction).toBe("preserve current task and decisions");
+    expect(updated.messageInline).toBe("carry-forward note");
+    expect(updated.messageFilePath.endsWith(DEFAULT_EXTRA_INSTRUCTION_FILE_SUFFIX)).toBe(true);
+    expect(updated.postRestoreAuditInstruction).toBe("verify the reads");
+  });
+
+  it("Slice 27: ensureDefaultClaudeCompactionFiles creates the user-owned extra instruction placeholder without overwriting edits", () => {
+    const openrigHome = join(tmpDir, ".openrig-placeholder");
+    const filePath = ensureDefaultClaudeCompactionFiles(openrigHome);
+    expect(filePath).toBe(defaultClaudeCompactionExtraInstructionFilePath(openrigHome));
+    expect(existsSync(filePath)).toBe(true);
+    expect(require("node:fs").readFileSync(filePath, "utf-8")).toBe(
+      DEFAULT_CLAUDE_COMPACTION_EXTRA_INSTRUCTION_FILE_CONTENT,
+    );
+
+    writeFileSync(filePath, "operator edits\n", "utf-8");
+    ensureDefaultClaudeCompactionFiles(openrigHome);
+    expect(require("node:fs").readFileSync(filePath, "utf-8")).toBe("operator edits\n");
+  });
+
+  it("HG-1: set/get round-trip for each policy key persists to disk and reads back", () => {
+    const store = new SettingsStore(configPath);
+
+    store.set("policies.claude_compaction.enabled", "true");
+    store.set("policies.claude_compaction.threshold_percent", "60");
+    store.set("policies.claude_compaction.pre_compact_instruction", "prepare before compact");
+    store.set("policies.claude_compaction.compact_instruction", "summarize with decisions first");
+    store.set("policies.claude_compaction.message_inline", "rehydrate the agent");
+    store.set("policies.claude_compaction.message_file_path", "/tmp/msg.txt");
+    store.set("policies.claude_compaction.post_restore_audit_instruction", "audit reads");
+
+    const raw = JSON.parse(require("node:fs").readFileSync(configPath, "utf-8"));
+    expect(raw.policies.claudeCompaction.enabled).toBe(true);
+    expect(raw.policies.claudeCompaction.thresholdPercent).toBe(60);
+    expect(raw.policies.claudeCompaction.preCompactInstruction).toBe("prepare before compact");
+    expect(raw.policies.claudeCompaction.compactInstruction).toBe("summarize with decisions first");
+    expect(raw.policies.claudeCompaction.messageInline).toBe("rehydrate the agent");
+    expect(raw.policies.claudeCompaction.messageFilePath).toBe("/tmp/msg.txt");
+    expect(raw.policies.claudeCompaction.postRestoreAuditInstruction).toBe("audit reads");
+
+    expect(store.resolveOne("policies.claude_compaction.enabled").value).toBe(true);
+    expect(store.resolveOne("policies.claude_compaction.threshold_percent").value).toBe(60);
+    expect(store.resolveOne("policies.claude_compaction.pre_compact_instruction").value).toBe("prepare before compact");
+    expect(store.resolveOne("policies.claude_compaction.compact_instruction").value).toBe("summarize with decisions first");
+    expect(store.resolveOne("policies.claude_compaction.message_inline").value).toBe("rehydrate the agent");
+    expect(store.resolveOne("policies.claude_compaction.message_file_path").value).toBe("/tmp/msg.txt");
+    expect(store.resolveOne("policies.claude_compaction.post_restore_audit_instruction").value).toBe("audit reads");
+  });
+
+  it("HG-1: invalid threshold rejected by coerceValue (non-numeric raises)", () => {
+    const store = new SettingsStore(configPath);
+    expect(() => store.set("policies.claude_compaction.threshold_percent", "not-a-number")).toThrow(/expected a number/);
+  });
+
+  // Slice 27 BLOCKING-FIX-2 — env + file source resolution must also
+  // reject invalid threshold values. Without this, an env override
+  // (OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT=80abc) or a
+  // hand-edited config.json poisons the trigger contract because the
+  // write-path validators are bypassed entirely.
+  //
+  // Behavior on bad input: drop the override, warn to stderr, fall
+  // through to file/default (env layer) or default (file layer).
+  describe("BLOCKING-FIX-2: env + file source validation", () => {
+    const reject = ["0", "101", "-1", "80abc", "80.5", "NaN", "Infinity"];
+
+    for (const raw of reject) {
+      it(`env=${JSON.stringify(raw)} → resolveOne returns default 80 (env rejected, NOT coerced)`, () => {
+        process.env["OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT"] = raw;
+        const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        try {
+          const store = new SettingsStore(configPath);
+          const resolved = store.resolveOne("policies.claude_compaction.threshold_percent");
+          // Default value (80), source falls through to "default"
+          expect(resolved.value).toBe(80);
+          expect(resolved.source).toBe("default");
+          // Warning emitted (operator visibility)
+          const calls = stderrSpy.mock.calls.map((c) => String(c[0]));
+          expect(calls.some((c) => c.includes("env override for policies.claude_compaction.threshold_percent rejected"))).toBe(true);
+        } finally {
+          stderrSpy.mockRestore();
+          delete process.env["OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT"];
+        }
+      });
+    }
+
+    it("discriminator: env=80abc (rejected → source=default, warning emitted) vs env=80 (accepted → source=env, no warning)", () => {
+      // Case A: rejected env
+      process.env["OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT"] = "80abc";
+      let stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const a = new SettingsStore(configPath).resolveOne("policies.claude_compaction.threshold_percent");
+        expect(a.value).toBe(80);
+        expect(a.source).toBe("default");
+        const warnCount = stderrSpy.mock.calls
+          .map((c) => String(c[0]))
+          .filter((c) => c.includes("env override for policies.claude_compaction.threshold_percent rejected"))
+          .length;
+        expect(warnCount).toBe(1);
+      } finally {
+        stderrSpy.mockRestore();
+        delete process.env["OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT"];
+      }
+
+      // Case B: accepted env — same RESOLVED VALUE (80) but DIFFERENT
+      // observable: source=env, no warning. This is the discriminator.
+      process.env["OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT"] = "80";
+      stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const b = new SettingsStore(configPath).resolveOne("policies.claude_compaction.threshold_percent");
+        expect(b.value).toBe(80);
+        expect(b.source).toBe("env");
+        const warnCount = stderrSpy.mock.calls
+          .map((c) => String(c[0]))
+          .filter((c) => c.includes("rejected"))
+          .length;
+        expect(warnCount).toBe(0);
+      } finally {
+        stderrSpy.mockRestore();
+        delete process.env["OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT"];
+      }
+    });
+
+    const fileReject: Array<{ name: string; written: unknown }> = [
+      { name: "0", written: 0 },
+      { name: "101", written: 101 },
+      { name: "-1", written: -1 },
+      { name: "80.5 (non-integer JSON number)", written: 80.5 },
+      { name: '"80abc" (JSON string)', written: "80abc" },
+    ];
+
+    for (const { name, written } of fileReject) {
+      it(`file thresholdPercent=${name} → resolveOne returns default 80 + warning`, () => {
+        writeFileSync(configPath, JSON.stringify({
+          policies: { claudeCompaction: { thresholdPercent: written } },
+        }));
+        const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        try {
+          const resolved = new SettingsStore(configPath).resolveOne("policies.claude_compaction.threshold_percent");
+          expect(resolved.value).toBe(80);
+          expect(resolved.source).toBe("default");
+          const calls = stderrSpy.mock.calls.map((c) => String(c[0]));
+          expect(calls.some((c) => c.includes("file value for policies.claude_compaction.threshold_percent rejected"))).toBe(true);
+        } finally {
+          stderrSpy.mockRestore();
+        }
+      });
+    }
+  });
+
+  // Slice 27 BLOCKING-FIX — strict accept/reject matrix for
+  // threshold_percent. Per banked feedback_static_gates_mirror_runtime_validators,
+  // the runtime validator is the source of truth; this test invokes the
+  // same `set()` path the daemon's /api/config POST handler uses so a
+  // future drift gets caught at CI.
+  describe("HG-1 strict threshold validation matrix", () => {
+    const cases = {
+      accept: ["1", "2", "50", "80", "99", "100"],
+      reject: [
+        { raw: "0", reason: /must be in \[1, 100\]/ },
+        { raw: "101", reason: /must be in \[1, 100\]/ },
+        { raw: "-1", reason: /must be in \[1, 100\]/ },
+        { raw: "80abc", reason: /expected an integer/ },
+        { raw: "abc80", reason: /expected a number|expected an integer/ },
+        { raw: "80.5", reason: /expected an integer/ },
+        { raw: "", reason: /expected a number|expected an integer/ },
+        { raw: " ", reason: /expected a number|expected an integer/ },
+        { raw: "NaN", reason: /expected a number|expected an integer/ },
+        { raw: "Infinity", reason: /expected a number|expected an integer/ },
+      ],
+    };
+
+    for (const value of cases.accept) {
+      it(`accepts ${JSON.stringify(value)}`, () => {
+        const store = new SettingsStore(configPath);
+        expect(() => store.set("policies.claude_compaction.threshold_percent", value)).not.toThrow();
+        expect(store.resolveOne("policies.claude_compaction.threshold_percent").value).toBe(Number(value));
+      });
+    }
+
+    for (const { raw, reason } of cases.reject) {
+      it(`rejects ${JSON.stringify(raw)}`, () => {
+        const store = new SettingsStore(configPath);
+        expect(() => store.set("policies.claude_compaction.threshold_percent", raw)).toThrow(reason);
+      });
+    }
+  });
+
+  void existsSync;
+});
+
+describe("parseNamedPairs (daemon copy)", () => {
+  it("decodes name:path,name:path pairs", () => {
+    expect(parseNamedPairs("ws:/abs/a,docs:/abs/b")).toEqual([
+      { name: "ws", path: "/abs/a" },
+      { name: "docs", path: "/abs/b" },
+    ]);
+  });
+  it("returns empty for empty/whitespace", () => {
+    expect(parseNamedPairs("")).toEqual([]);
+    expect(parseNamedPairs("  ")).toEqual([]);
+  });
+});

@@ -1,0 +1,457 @@
+/**
+ * OPR.0.4.6.WF3 FR-2 — the glanceable human renderers for
+ * trace/list/show. RENDER-SIDE ONLY (BR-2): these functions format
+ * daemon payloads the CLI already receives; `--json` paths never come
+ * through here and stay byte-identical to the shipped output.
+ *
+ * Shapes ported from in-repo precedent: the `rig ps` table mechanics
+ * (fitCell/truncate) and the argo-get per-step tree bar (STEP / ACTOR
+ * / EXIT / DURATION columns with status glyphs).
+ *
+ * Present-tolerant fields: WF-2's branch/gate additions
+ * (closureEvidence.branch_taken etc.) render when the payload carries
+ * them and leave no residue when absent — this module never requires
+ * them (WF-3 builds against the pre-WF-2 tip; the fields land with
+ * WF-2).
+ */
+
+import { shellQuote } from "../cross-host-executor.js";
+
+export interface RenderInstance {
+  guidance?: {lines: string[]};
+  instanceId: string;
+  workflowName?: string;
+  workflowVersion?: string;
+  status: string;
+  createdBySession?: string;
+  createdAt?: string;
+  currentStepId?: string | null;
+  currentFrontier?: string[];
+  hopCount?: number;
+  /** OPR.0.4.6.FAC1: the instance's bound rig (API-carried; null/absent = unbound, renders nothing). */
+  boundRig?: string | null;
+  /**
+   * WF-1 FR-2's API-carried classification (present since the
+   * completion fixback at 384e60f1). RAIL 1 (arch ruling): the CLI
+   * CONSUMES this verbatim and never recomputes a threshold or class.
+   */
+  deadline?: {
+    state: string;
+    evidence?: {
+      stepId?: string | null;
+      ownerSession?: string;
+      overdueBySeconds?: number;
+      ageSeconds?: number;
+    } | null;
+  };
+  /** Present on waiting instances that recorded their park decision. */
+  lastContinuationDecision?: { blockedOn?: string | null } | null;
+  /** S06: packet-addressed frontier facts are derived from the live queue row. */
+  frontierPackets?: RenderFrontierPacket[];
+  /** S06: unresolved branch failures remain visible even while siblings run. */
+  failureOccurrences?: RenderFailureOccurrence[];
+  /** Named broken joins; never collapse these to an apparently actionable row. */
+  unknowns?: string[];
+  exceptionObligations?: Array<{ qitemId: string; ownerSession: string; state: string; evidenceRef: string | null; inspectCommand: string }>;
+  exceptionReadiness?: {
+    selection: { state: string; role: string | null; source: string; entryRole: string | null };
+    routes: Array<{ exceptionClass: string; state: string; roleResolution: string; destinationSession: string | null; position: string | null; resolvedVia: string | null; message: string }>;
+    nextAction: string;
+  } | null;
+  reconciliation?: {
+    status: string; adopted: boolean | null; boundDigest: string | null; proposedDigest: string | null;
+    composition: { mode: string; explanation: string; boundSlices: string[]; executableSteps: unknown[] };
+    changes: Array<{ kind: string; ref: string; fields?: string[] }>; reasons: string[];
+    nextAction: string; applyCommand?: string; operationKey?: string;
+  };
+  lifecycleBinding?: { graphSource?: { mode?: string; profileSource?: string | null; missionSource?: string | null } } | null;
+  boundaryObligations?: Array<{ stepId: string; required: boolean; state: string; receiptState: string;
+    receipt: { evidenceRef: string; actorSession: string; closedAt: string } | null }>;
+
+}
+
+export interface RenderFrontierPacket {
+  packetId: string;
+  stepId: string | null;
+  ownerSession: string | null;
+  queueState: string | null;
+  blockedOn: string | null;
+  targetedAction: "project" | "route" | "indeterminate";
+  dependsOn?: string[];
+  receiptRequired?: boolean;
+  acceptance?: {
+    candidate: string;
+    verdicts: string[];
+    evidence_ref: string;
+  } | null;
+}
+
+export interface RenderFailureOccurrence {
+  occurrenceId: string;
+  stepId: string;
+  status: "unresolved" | "resolved";
+  failureReason?: string | null;
+  redrivePacketId?: string | null;
+  targetedAction: "resume" | "none";
+}
+
+export interface RenderTrailRow {
+  stepId: string;
+  stepRole?: string;
+  closedAt?: string;
+  closureReason: string;
+  closureEvidence?: Record<string, unknown> | null;
+  actorSession: string;
+  nextQitemId?: string | null;
+  priorQitemId?: string;
+}
+
+/** One command-shaped owner action, including the typed acceptance contract when present. */
+export function renderProjectAction(instanceId: string, packet: RenderFrontierPacket): string {
+  const base = `rig workflow project --instance ${instanceId} --current-packet ${packet.packetId} --exit <handoff|waiting|done|failed> --actor-session ${packet.ownerSession ?? "<owner>"}${packet.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
+  if (!packet.acceptance) return base;
+  const verdict = packet.acceptance.verdicts.length === 1
+    ? packet.acceptance.verdicts[0]!
+    : `<${packet.acceptance.verdicts.join("|")}>`;
+  return `${base} --acceptance-candidate ${shellQuote(packet.acceptance.candidate)} --acceptance-verdict ${shellQuote(verdict)} --acceptance-evidence-ref ${shellQuote(packet.acceptance.evidence_ref)}`;
+}
+
+function actionableFailures(instance: RenderInstance): RenderFailureOccurrence[] {
+  return (instance.failureOccurrences ?? []).filter(
+    (failure) => failure.status === "unresolved" && failure.targetedAction === "resume",
+  );
+}
+
+const STATUS_GLYPH: Record<string, string> = {
+  completed: "✔",
+  failed: "✖",
+  active: "●",
+  waiting: "◐",
+  aborted: "■",
+};
+
+export function statusGlyph(status: string): string {
+  return STATUS_GLYPH[status] ?? "●";
+}
+
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+function fitCell(value: string, width: number): string {
+  return truncate(value, width).padEnd(width);
+}
+
+/** Compact human duration between two ISO timestamps ("3s", "4m", "2h", "5d"). */
+export function humanDuration(fromIso: string | undefined, toIso: string | undefined): string {
+  if (!fromIso || !toIso) return "";
+  const ms = Date.parse(toIso) - Date.parse(fromIso);
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  // Minutes render up to AND INCLUDING 120 so sub-/at-2h durations keep
+  // their precision ("90m"/"120m" beat a rounded-up "2h" for judging
+  // step latency). Guard prepass catch: `m < 120` excluded exactly 120.
+  if (m <= 120) return `${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
+/** Instance age relative to a supplied "now" (injectable for tests). */
+export function humanAge(createdAt: string | undefined, nowIso: string): string {
+  return humanDuration(createdAt, nowIso);
+}
+
+/** Compact render of a plain seconds quantity (same scale rules). */
+export function humanSeconds(seconds: number): string {
+  return humanDuration("1970-01-01T00:00:00.000Z", new Date(seconds * 1000).toISOString());
+}
+
+/**
+ * The trace tree (mini-req 2's bar: where it is + how it got there,
+ * one screen, no JSON literacy required).
+ */
+export function renderTraceTree(
+  instance: RenderInstance,
+  trail: RenderTrailRow[],
+  nowIso: string = new Date().toISOString(),
+): string[] {
+  const lines: string[] = [];
+  const name = instance.workflowName ? `${instance.workflowName}${instance.workflowVersion ? ` v${instance.workflowVersion}` : ""}` : "";
+  lines.push(`${statusGlyph(instance.status)} ${instance.instanceId}  ${name}  status=${instance.status}${instance.hopCount !== undefined ? `  hops=${instance.hopCount}` : ""}${instance.boundRig ? `  rig=${instance.boundRig}` : ""}`);
+  if (instance.createdAt) {
+    lines.push(`  created ${instance.createdAt}${instance.createdBySession ? ` by ${instance.createdBySession}` : ""}  age ${humanAge(instance.createdAt, nowIso)}`);
+  }
+  lines.push("");
+  lines.push(`  ${fitCell("STEP", 22)}${fitCell("ACTOR", 28)}${fitCell("EXIT", 10)}DURATION`);
+  let prevClosed = instance.createdAt;
+  for (let i = 0; i < trail.length; i++) {
+    const row = trail[i];
+    if (!row) continue;
+    const glyph = row.closureReason === "failed" ? "✖" : "✔";
+    const bar = i === trail.length - 1 && !instance.currentStepId ? "└─" : "├─";
+    const duration = humanDuration(prevClosed, row.closedAt);
+    lines.push(`  ${bar} ${glyph} ${fitCell(row.stepId, 20)}${fitCell(row.actorSession, 28)}${fitCell(row.closureReason, 10)}${duration}`);
+    const branchTaken = row.closureEvidence?.["branch_taken"];
+    if (typeof branchTaken === "string" && branchTaken.length > 0) {
+      lines.push(`  │    ↳ branch: ${branchTaken}`);
+    }
+    prevClosed = row.closedAt ?? prevClosed;
+  }
+  const packetRows = instance.frontierPackets ?? [];
+  if (packetRows.length > 0) {
+    for (let i = 0; i < packetRows.length; i++) {
+      const packet = packetRows[i]!;
+      const bar = i === packetRows.length - 1 ? "└─" : "├─";
+      const step = packet.stepId ?? "INDETERMINATE";
+      const owner = packet.ownerSession ?? "INDETERMINATE";
+      const state = packet.queueState ?? "INDETERMINATE";
+      lines.push(`  ${bar} ▸ ${fitCell(step, 20)}${fitCell(owner, 28)}${fitCell(state, 10)}packet=${packet.packetId}`);
+      if (packet.blockedOn) lines.push(`  │    ↳ blocked on: ${packet.blockedOn}`);
+    }
+  } else if (instance.currentStepId) {
+    const owner = ""; // frontier owner is a queue-side fact; the frontier packet ids are what the payload carries
+    lines.push(`  └─ ▸ ${fitCell(instance.currentStepId, 20)}${fitCell(owner || "(current)", 28)}${fitCell("open", 10)}frontier=[${(instance.currentFrontier ?? []).join(", ")}]`);
+  } else if (trail.length === 0) {
+    lines.push(`  (no steps closed yet)`);
+  }
+  for (const failure of (instance.failureOccurrences ?? []).filter((item) => item.status === "unresolved")) {
+    lines.push(`  ▲ failure ${failure.occurrenceId}  step=${failure.stepId}${failure.failureReason ? `  reason=${failure.failureReason}` : ""}`);
+    lines.push(failure.targetedAction === "resume"
+      ? `      action: rig workflow resume ${instance.instanceId} --occurrence ${failure.occurrenceId} --actor-session <you>`
+      : "      action: none — terminal history");
+  }
+  for (const unknown of instance.unknowns ?? []) lines.push(`  ? ${unknown}`);
+  return lines;
+}
+
+/**
+ * OPR.0.4.6.WF3 FR-3 — the attention marker for a list row (the
+ * single marker home). Classes: failed · stuck (consumed VERBATIM
+ * from the API-carried deadline classification — rail 1: the CLI
+ * never recomputes a threshold or class) · waiting. A row shows its
+ * highest-priority class; the `status` verb shows ALL classes per
+ * instance (exactly-once, combined reasons).
+ */
+export function attentionMarker(instance: RenderInstance): string {
+  if (instance.status === "failed") return "▲ failed";
+  if (actionableFailures(instance).length > 0) return "▲ failed-branch";
+  if (isStuck(instance)) return "▲ stuck";
+  if (instance.status === "waiting") return "▲ waiting";
+  return "";
+}
+
+/** Rail 1: stuck-ness is READ from the API field, never derived. */
+function isStuck(instance: RenderInstance): boolean {
+  const state = instance.deadline?.state;
+  return typeof state === "string" && state.startsWith("overdue");
+}
+
+// ── FR-3 part B: the needs-attention rollup (`rig workflow status`) ──
+
+export interface AttentionRow {
+  instanceId: string;
+  workflowName: string;
+  /** All classes for this instance — exactly-once row, combined. */
+  classes: string[];
+  reasons: string[];
+  /** The actionable affordance (what-to-do-next), per class priority. */
+  affordance: string;
+}
+
+export interface AttentionRollup {
+  counts: { total: number; active: number; waiting: number; completed: number; failed: number; aborted: number };
+  attention: AttentionRow[];
+}
+
+/**
+ * Compose the rollup from list rows. Pure arithmetic over
+ * pre-classified rows (the arch ruling's boundary: counting +
+ * grouping + rendering is render-side; the ONE correctness-rule
+ * composition — the threshold classification — arrives ALREADY DONE
+ * in instance.deadline). Per-instance dedup by instanceId (rail 2):
+ * an instance with multiple attention reasons renders ONCE with all
+ * of them.
+ */
+export function composeAttentionRollup(instances: RenderInstance[]): AttentionRollup {
+  const counts = { total: instances.length, active: 0, waiting: 0, completed: 0, failed: 0, aborted: 0 };
+  const attention: AttentionRow[] = [];
+  for (const inst of instances) {
+    if (inst.status === "active") counts.active += 1;
+    else if (inst.status === "waiting") counts.waiting += 1;
+    else if (inst.status === "completed") counts.completed += 1;
+    else if (inst.status === "failed") counts.failed += 1;
+    else if (inst.status === "aborted") counts.aborted += 1;
+
+    const classes: string[] = [];
+    const reasons: string[] = [];
+    if (inst.status === "failed") {
+      classes.push("failed");
+      reasons.push("workflow failed");
+    }
+    const unresolved = actionableFailures(inst);
+    if (unresolved.length > 0 && inst.status !== "failed") {
+      classes.push("failed-branch");
+      reasons.push(`${unresolved.length} unresolved branch failure${unresolved.length === 1 ? "" : "s"}`);
+    }
+    if (isStuck(inst)) {
+      classes.push("stuck");
+      const ev = inst.deadline?.evidence;
+      reasons.push(
+        `${inst.deadline?.state}${ev?.stepId ? ` at step ${ev.stepId}` : ""}${ev?.ownerSession ? ` (owner ${ev.ownerSession})` : ""}${typeof ev?.overdueBySeconds === "number" ? `, overdue ${humanSeconds(ev.overdueBySeconds)}` : ""}`,
+      );
+    }
+    if (inst.status === "waiting") {
+      classes.push("waiting");
+      const blocker = inst.lastContinuationDecision?.blockedOn;
+      reasons.push(`waiting${blocker ? ` on ${blocker}` : " (blocker unrecorded)"}`);
+    }
+    if (classes.length === 0) continue;
+    // Affordance by highest-priority class. `route` ships in this same
+    // slice (commit 6) — the verbs land together at merge (BR-1 holds
+    // at the shipped boundary).
+    const affordance = classes.includes("failed") || classes.includes("failed-branch")
+      ? `inspect: rig workflow trace ${inst.instanceId}`
+      : classes.includes("stuck")
+        ? `re-route: rig workflow route ${inst.instanceId} --to <seat>`
+        : `resolve the blocker, then the owner projects (rig workflow trace ${inst.instanceId})`;
+    attention.push({
+      instanceId: inst.instanceId,
+      workflowName: inst.workflowName ?? "",
+      classes,
+      reasons,
+      affordance,
+    });
+  }
+  return { counts, attention };
+}
+
+/** Human render of the rollup — proven-empty, never blank. */
+export function renderStatus(rollup: AttentionRollup): string[] {
+  const c = rollup.counts;
+  const lines: string[] = [];
+  lines.push(
+    `${c.total} instance${c.total === 1 ? "" : "s"}: ${c.active} active · ${c.waiting} waiting · ${c.completed} completed · ${c.failed} failed · ${c.aborted} aborted`,
+  );
+  if (rollup.attention.length === 0) {
+    lines.push("No instances need attention (proven empty — every in-flight instance reads healthy).");
+    return lines;
+  }
+  lines.push("");
+  lines.push(`${fitCell("", 2)}${fitCell("INSTANCE", 30)}${fitCell("WORKFLOW", 20)}${fitCell("CLASS", 16)}REASON`);
+  for (const row of rollup.attention) {
+    lines.push(
+      `${fitCell("▲", 2)}${fitCell(row.instanceId, 30)}${fitCell(row.workflowName, 20)}${fitCell(row.classes.join("+"), 16)}${row.reasons.join("; ")}`,
+    );
+    lines.push(`  ${fitCell("", 2)}└ ${row.affordance}`);
+  }
+  return lines;
+}
+
+/** The list table: INSTANCE · WORKFLOW · STATUS · STEP · AGE · ATTN. */
+export function renderInstanceList(
+  instances: RenderInstance[],
+  nowIso: string = new Date().toISOString(),
+): string[] {
+  if (instances.length === 0) return ["No workflow instances."];
+  const lines: string[] = [];
+  lines.push(`${fitCell("", 2)}${fitCell("INSTANCE", 30)}${fitCell("WORKFLOW", 22)}${fitCell("STATUS", 11)}${fitCell("STEP", 20)}${fitCell("AGE", 6)}ATTN`);
+  for (const inst of instances) {
+    lines.push(
+      `${fitCell(statusGlyph(inst.status), 2)}${fitCell(inst.instanceId, 30)}${fitCell(inst.workflowName ?? "", 22)}${fitCell(inst.status, 11)}${fitCell(renderStepCell(inst), 20)}${fitCell(humanAge(inst.createdAt, nowIso), 6)}${attentionMarker(inst)}`,
+    );
+  }
+  return lines;
+}
+
+/** The show summary, headed by the status line. */
+export function renderInstanceShow(
+  instance: RenderInstance,
+  nowIso: string = new Date().toISOString(),
+): string[] {
+  const lines: string[] = [];
+  lines.push(`${statusGlyph(instance.status)} ${instance.instanceId}  status=${instance.status}`);
+  if (instance.workflowName) lines.push(`  workflow: ${instance.workflowName}${instance.workflowVersion ? ` v${instance.workflowVersion}` : ""}`);
+  // OPR.0.4.6.FAC1: the bound rig renders when present (unbound rows unchanged).
+  if (instance.boundRig) lines.push(`  rig:      ${instance.boundRig}`);
+  if (instance.createdAt) lines.push(`  created:  ${instance.createdAt}${instance.createdBySession ? ` by ${instance.createdBySession}` : ""}  (age ${humanAge(instance.createdAt, nowIso)})`);
+  if ((instance.frontierPackets ?? []).length > 0) {
+    lines.push("  frontier:");
+    for (const packet of instance.frontierPackets ?? []) {
+      lines.push(`    ${packet.packetId}  step=${packet.stepId ?? "INDETERMINATE"}  owner=${packet.ownerSession ?? "INDETERMINATE"}  state=${packet.queueState ?? "INDETERMINATE"}${packet.blockedOn ? `  blocked_on=${packet.blockedOn}` : ""}`);
+      const action = packet.targetedAction === "project"
+        ? renderProjectAction(instance.instanceId, packet)
+        : packet.targetedAction === "route"
+          ? `rig workflow route ${instance.instanceId} --packet ${packet.packetId} --to <seat> --actor-session <you>`
+          : "disabled — inspect named unknowns";
+      lines.push(`      action: ${action}`);
+    }
+  } else if (instance.currentStepId) {
+    lines.push(`  at step:  ${instance.currentStepId}  frontier=[${(instance.currentFrontier ?? []).join(", ")}]`);
+  }
+  if (instance.lifecycleBinding?.graphSource) {
+    const source = instance.lifecycleBinding.graphSource;
+    lines.push(`  boundary: ${source.mode} · ${source.profileSource ?? source.missionSource ?? "legacy"}`);
+    if (source.profileSource && source.missionSource) lines.push(`  mission override: ${source.missionSource}`);
+  }
+  for (const step of instance.boundaryObligations ?? []) {
+    lines.push(`    ${step.stepId} · ${step.required ? "required" : "extension"} · ${step.state} · receipt ${step.receiptState}`);
+    if (step.receipt) lines.push(`      ${step.receipt.evidenceRef} · recorded by ${step.receipt.actorSession} at ${step.receipt.closedAt}`);
+  }
+  const unresolved = (instance.failureOccurrences ?? []).filter((failure) => failure.status === "unresolved");
+  if (unresolved.length > 0) {
+    lines.push("  failures:");
+    for (const failure of unresolved) {
+      lines.push(`    ${failure.occurrenceId}  step=${failure.stepId}${failure.failureReason ? `  reason=${failure.failureReason}` : ""}`);
+      lines.push(failure.targetedAction === "resume"
+        ? `      action: rig workflow resume ${instance.instanceId} --occurrence ${failure.occurrenceId} --actor-session <you>`
+        : "      action: none — terminal history");
+    }
+  }
+  for (const unknown of instance.unknowns ?? []) lines.push(`  unknown:  ${unknown}`);
+  if (instance.guidance) lines.push(...instance.guidance.lines);
+  if (instance.exceptionReadiness) {
+    const r = instance.exceptionReadiness;
+    lines.push(`  exception owner: ${r.selection.state} · ${r.selection.role ?? "none selected"} (ordinary entry: ${r.selection.entryRole ?? "implicit"})`);
+    lines.push(`    selection: ${r.selection.source}`);
+    for (const route of r.routes) {
+      lines.push(`    ${route.exceptionClass}: ${route.state} · ${route.position ?? "unknown policy"} via ${route.resolvedVia ?? "unavailable"} · ${route.destinationSession ?? "no verified destination"} · ${route.roleResolution}`);
+      if (route.state !== "ready" || route.position === "fallback") lines.push(`      ${route.message}`);
+    }
+    lines.push(`    advisory: ${r.nextAction}`);
+  }
+  for (const q of instance.exceptionObligations ?? []) {
+    lines.push(`  exception obligation: ${q.qitemId} · owner=${q.ownerSession} · state=${q.state}`);
+    lines.push(`    evidence: ${q.evidenceRef ?? "UNVERIFIED"} · inspect: ${q.inspectCommand}`);
+  }
+  if (instance.reconciliation) lines.push(...renderGraphRevision(instance.reconciliation, false));
+  if (instance.hopCount !== undefined) lines.push(`  hops:     ${instance.hopCount}`);
+  lines.push(`  next:     rig workflow trace ${instance.instanceId}`);
+  return lines;
+}
+
+export function renderGraphRevision(view: NonNullable<RenderInstance["reconciliation"]>, expanded = true): string[] {
+  const lines = [
+    "  graph:    " + view.status + (view.adopted === null ? " · authored comparison unavailable" : view.adopted ? " · running graph matches authored input" : " · authored input has not been adopted"),
+    "  composition: " + view.composition.mode + "; " + view.composition.boundSlices.length + " bound slice manifests; " + view.composition.executableSteps.length + " executable steps",
+    "    " + view.composition.explanation,
+    "  bound:    " + (view.boundDigest ?? "unavailable"),
+    "  proposed: " + (view.proposedDigest ?? "unavailable"),
+  ];
+  if (view.status === "source-only") lines.push("    Source bytes differ; executable steps/policy are unchanged. No completed work needs replay.");
+  if (expanded) for (const change of view.changes) lines.push("    " + change.kind + ": " + change.ref + (change.fields?.length ? " (" + change.fields.join(", ") + ")" : ""));
+  for (const reason of view.reasons) lines.push("    " + reason);
+  lines.push("  inspect:  " + view.nextAction + " (read-only; --json expands complete evidence)");
+  if (expanded && view.applyCommand) lines.push("  apply:    " + view.applyCommand);
+  if (expanded && view.operationKey) lines.push("  recover:  rig workflow operation " + shellQuote(view.operationKey));
+  return lines;
+}
+
+function renderStepCell(instance: RenderInstance): string {
+  const packets = instance.frontierPackets ?? [];
+  if (packets.length === 1) return packets[0]!.stepId ?? "INDETERMINATE";
+  if (packets.length > 1) return `${packets.length} packets`;
+  return instance.currentStepId ?? "-";
+}

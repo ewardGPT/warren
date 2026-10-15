@@ -1,0 +1,680 @@
+// OPR.0.5.3.7 R2 — tests for the package-time context-pack generator.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, symlinkSync, lstatSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = resolve(HERE, "..");
+const GEN = join(HERE, "generate-context-packs.mjs");
+const distUrl = (p) => pathToFileURL(join(REPO, "packages/daemon/dist/domain/context-packs", p)).href;
+const { parseManifest } = await import(distUrl("manifest-parser.js"));
+const { ContextPackLibraryService } = await import(distUrl("context-pack-library-service.js"));
+const { assembleBundle } = await import(distUrl("bundle-assembler.js"));
+const { EXCLUDES } = await import(pathToFileURL(join(HERE, "mirror-skills.mjs")).href);
+const REAL_SKILLS = join(REPO, "packages/daemon/specs/agents/shared/skills");
+const REAL_PLUGIN_SKILLS = join(REPO, "packages/daemon/assets/plugins/openrig-core/skills");
+const REAL_STATIC_PACKS = join(REPO, "packages/daemon/context-packs-src");
+
+// Independent computation of the mirror's exclude-only ship set on a real tree —
+// the discriminator that catches any narrowing of the projection (r2 HIGH-1).
+function mirrorShipSet(dir, rel = "") {
+  const names = new Set(EXCLUDES.filter((p) => !p.includes("/") && !p.includes("*")));
+  const dirs = new Set(EXCLUDES.filter((p) => p.endsWith("/")).map((p) => p.replace(/\/+$/, "")));
+  const globs = EXCLUDES.filter((p) => p.startsWith("*.")).map((p) => p.slice(1));
+  const out = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.isDirectory()) {
+      if (!dirs.has(e.name)) out.push(...mirrorShipSet(join(dir, e.name), rel ? `${rel}/${e.name}` : e.name));
+    } else if (e.isFile() && !names.has(e.name) && !globs.some((s) => e.name.endsWith(s))) {
+      out.push(rel ? `${rel}/${e.name}` : e.name);
+    }
+  }
+  return out.sort();
+}
+
+function skill(root, rel, { name, description, files }) {
+  const dir = join(root, rel);
+  mkdirSync(dir, { recursive: true });
+  const fm = `---\nname: ${name}\ndescription: ${description}\n---\n`;
+  writeFileSync(join(dir, "SKILL.md"), fm + `# ${name}\n\nbody of ${name}\n`);
+  for (const [fname, content] of Object.entries(files || {})) writeFileSync(join(dir, fname), content);
+}
+
+function run(source, out, args = []) {
+  return execFileSync("node", [GEN, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, OPENRIG_SKILLS_SOURCE: source, OPENRIG_PACKS_OUT: out, OPENRIG_PACKAGE_VERSION: "0.5.3" },
+  });
+}
+
+function runProduction(out, args = []) {
+  const env = { ...process.env };
+  delete env.OPENRIG_SKILLS_SOURCE;
+  delete env.OPENRIG_STATIC_PACKS_SOURCE;
+  return execFileSync("node", [GEN, ...args], {
+    encoding: "utf8",
+    env: { ...env, OPENRIG_PACKS_OUT: out, OPENRIG_PACKAGE_VERSION: "0.5.3" },
+  });
+}
+
+function scratch() {
+  const base = mkdtempSync(join(tmpdir(), "s07-genpacks-"));
+  return { source: join(base, "skills"), out: join(base, "out"), base };
+}
+
+test("generates a valid, daemon-parseable pack per skill; SKILL.md is the instruction", () => {
+  const { source, out, base } = scratch();
+  try {
+    skill(source, "core/attention-queue", { name: "attention-queue", description: "Coordinate work.", files: {} });
+    skill(source, "process/tdd", {
+      name: "test-driven-development",
+      description: "Write the test first.",
+      files: {
+        "anti-patterns.md": "# anti-patterns\n",
+        "notes..md": "# Literal filename dots\n",
+        "helper.sh": "#!/bin/sh\necho no\n",
+        "example.ts": "export const x = 1;\n",
+        "feedback.md": "internal\n",       // mirror EXCLUDE
+        "notes.local.md": "local\n",        // mirror EXCLUDE (*.local.md)
+      },
+    });
+    run(source, out);
+
+    // both packs exist under skills/<rel>
+    assert.ok(existsSync(join(out, "skills/core/attention-queue/manifest.yaml")));
+    assert.ok(existsSync(join(out, "skills/process/tdd/manifest.yaml")));
+    assert.ok(!existsSync(join(out, "skills/mission-slice-sop")), "an explicit source override must remain isolated");
+
+    // manifest parses through the DAEMON's parser and SKILL.md leads as instruction
+    const m1 = parseManifest(readFileSync(join(out, "skills/core/attention-queue/manifest.yaml"), "utf8"), "m1");
+    assert.equal(m1.name, "attention-queue");
+    assert.equal(m1.version, "0.5.3");
+    assert.equal(m1.files[0].path, "SKILL.md");
+    assert.equal(m1.files[0].role, "instruction");
+
+    // the .sh/.ts helpers ARE packed + copied (mirror ship set — served as text);
+    // the mirror EXCLUDES (feedback.md, *.local.md) are dropped.
+    const m2 = parseManifest(readFileSync(join(out, "skills/process/tdd/manifest.yaml"), "utf8"), "m2");
+    const paths = m2.files.map((f) => f.path);
+    assert.ok(paths.includes("SKILL.md"));
+    assert.ok(paths.includes("anti-patterns.md"));
+    assert.ok(paths.includes("notes..md"));
+    assert.equal(readFileSync(join(out, "skills/process/tdd/notes..md"), "utf8"), "# Literal filename dots\n");
+    assert.ok(paths.includes("helper.sh"), "helper.sh must be packed (mirror ship set)");
+    assert.ok(paths.includes("example.ts"), "example.ts must be packed (mirror ship set)");
+    assert.ok(existsSync(join(out, "skills/process/tdd/helper.sh")), "helper.sh must be copied");
+    assert.ok(!paths.includes("feedback.md"), "feedback.md is a mirror EXCLUDE");
+    assert.ok(!paths.includes("notes.local.md"), "*.local.md is a mirror EXCLUDE");
+    assert.equal(m2.files.find((f) => f.path === "helper.sh").role, "reference");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("MALFORMED PROJECTION FAILS THE BUILD — a '..' content path is rejected at package time, non-zero exit", () => {
+  const { source, out, base } = scratch();
+  try {
+    skill(source, "core/ok", { name: "ok", description: "fine", files: {} });
+    // A whole '..' segment in a declared static-pack path is traversal.
+    // Literal dots within a filename are valid (covered by the generation test).
+    const staticSource = join(base, "static");
+    const packDir = join(staticSource, "bad");
+    mkdirSync(packDir, { recursive: true });
+    writeFileSync(join(packDir, "manifest.yaml"),
+      'name: bad\nversion: "0"\ntaxonomy: world\nfiles:\n  - path: "../escape.md"\n    role: reference\n');
+    let failed = false;
+    try {
+      runWithStatic(source, staticSource, out);
+    } catch (err) {
+      failed = true;
+      assert.equal(err.status, 1, "exit code must be 1 (build failure)");
+      assert.match(String(err.stderr), /FAILING THE BUILD/);
+      assert.match(String(err.stderr), /no '\.\.' segments/);
+    }
+    assert.ok(failed, "generator must exit non-zero on a malformed projection");
+    // and it must NOT have written a partial/invalid library
+    assert.ok(!existsSync(join(out, "bad")), "no invalid pack should be written");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("--check validates without writing (the build/CI drift gate)", () => {
+  const { source, out, base } = scratch();
+  try {
+    skill(source, "core/x", { name: "x", description: "d", files: {} });
+    const stdout = run(source, out, ["--check"]);
+    assert.match(stdout, /--check OK/);
+    assert.ok(!existsSync(out), "--check must not write the output tree");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("STALENESS BY CONSTRUCTION — editing canon after generation does not change generated bytes", () => {
+  const { source, out, base } = scratch();
+  try {
+    skill(source, "core/x", { name: "x", description: "d", files: {} });
+    run(source, out);
+    const before = readFileSync(join(out, "skills/core/x/SKILL.md"), "utf8");
+    // mutate the CANON after packing
+    writeFileSync(join(source, "core/x/SKILL.md"), "---\nname: x\ndescription: d\n---\n# HACKED\n");
+    const after = readFileSync(join(out, "skills/core/x/SKILL.md"), "utf8");
+    assert.equal(after, before, "packed bytes must be decoupled from canon after generation");
+    assert.doesNotMatch(after, /HACKED/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("deterministic — two runs produce byte-identical manifests", () => {
+  const a = scratch(), b = scratch();
+  try {
+    for (const s of [a, b]) skill(s.source, "core/x", { name: "x", description: "d", files: { "ref.md": "r" } });
+    run(a.source, a.out);
+    run(b.source, b.out);
+    assert.equal(
+      readFileSync(join(a.out, "skills/core/x/manifest.yaml"), "utf8"),
+      readFileSync(join(b.out, "skills/core/x/manifest.yaml"), "utf8"),
+    );
+  } finally {
+    rmSync(a.base, { recursive: true, force: true });
+    rmSync(b.base, { recursive: true, force: true });
+  }
+});
+
+test("REAL CANON: projected membership == the mirror ship set (no narrowing) — r2 HIGH-1", () => {
+  const out = mkdtempSync(join(tmpdir(), "s07-real-"));
+  try {
+    run(REAL_SKILLS, out); // project the real canon
+    const ref = "process/systematic-debugging";
+    const expected = mirrorShipSet(join(REAL_SKILLS, ref));
+    const m = parseManifest(readFileSync(join(out, "skills", ref, "manifest.yaml"), "utf8"), "m");
+    const got = m.files.map((f) => f.path).sort();
+    assert.deepEqual(got, expected, "pack files[] must equal the mirror ship set for the skill (no dropped assets)");
+    // the exact helpers r2 flagged, referenced by the served prose:
+    assert.ok(got.includes("find-polluter.sh"), "find-polluter.sh must be projected");
+    assert.ok(got.includes("condition-based-waiting-example.ts"), "condition-based-waiting-example.ts must be projected");
+    // and copied to disk
+    assert.ok(existsSync(join(out, "skills", ref, "find-polluter.sh")));
+    assert.ok(existsSync(join(out, "skills", ref, "condition-based-waiting-example.ts")));
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test("REAL CANON: referenced helpers are DELIVERED in the served bundle (packed-path proof) — r2 HIGH-1", () => {
+  const out = mkdtempSync(join(tmpdir(), "s07-serve-"));
+  try {
+    run(REAL_SKILLS, out);
+    const lib = new ContextPackLibraryService({ roots: [{ path: out, sourceType: "builtin" }] });
+    lib.scan();
+    const entry = lib.getByRef("skills/process/systematic-debugging");
+    assert.ok(entry, "systematic-debugging must be served from the builtin root");
+    const bundle = assembleBundle({ packEntry: entry });
+    assert.equal(bundle.missingFiles.length, 0, "no dangling files — the referenced helpers are present");
+    // the helper the prose points at must be in the served bundle, header AND content:
+    assert.match(bundle.text, /find-polluter\.sh/, "helper .sh path must be in the served bundle");
+    assert.match(bundle.text, /find-polluter\.sh <file_or_dir_to_check>/, "helper .sh CONTENT must be served");
+    assert.match(bundle.text, /condition-based-waiting-example\.ts/, "helper .ts path must be in the served bundle");
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test("PRODUCTION PUBLIC PLUGIN-ONLY: mission-slice-sop catalogs once and helper assets ship byte-identically", () => {
+  const out = mkdtempSync(join(tmpdir(), "s10-plugin-only-"));
+  try {
+    runProduction(out);
+    const ref = "skills/mission-slice-sop";
+    const projectedSkill = join(out, ref, "SKILL.md");
+    const pluginSkill = join(REAL_PLUGIN_SKILLS, "mission-slice-sop", "SKILL.md");
+    assert.deepEqual(
+      readFileSync(projectedSkill),
+      readFileSync(pluginSkill),
+      "the builtin pack must contain the packaged plugin's exact SKILL.md bytes",
+    );
+
+    const manifest = parseManifest(readFileSync(join(out, ref, "manifest.yaml"), "utf8"), ref);
+    assert.equal(manifest.name, "mission-slice-sop");
+    assert.equal(manifest.files[0].path, "SKILL.md");
+    assert.equal(manifest.files[0].role, "instruction");
+
+    const lib = new ContextPackLibraryService({ roots: [{ path: out, sourceType: "builtin" }] });
+    const scan = lib.scan();
+    assert.deepEqual(scan.errors, []);
+    assert.equal(lib.list().filter((entry) => entry.relativePath === ref).length, 1, "the public skill ref must be unique");
+    const entry = lib.getByRef(ref);
+    assert.ok(entry, "the plugin-only public skill must be retrievable from the catalog");
+    const bundle = assembleBundle({ packEntry: entry });
+    assert.deepEqual(bundle.missingFiles, []);
+    assert.match(bundle.text, /mission-slice-sop/);
+
+    for (const [skillName, helper] of [
+      ["loading-addressable-markdown", "scripts/resolve-markdown.mjs"],
+      ["openrig-operating-model", "scripts/compose.py"],
+    ]) {
+      assert.deepEqual(
+        readFileSync(join(out, "skills", skillName, helper)),
+        readFileSync(join(REAL_PLUGIN_SKILLS, skillName, helper)),
+        `${helper} must remain byte-identical to its packaged plugin source`,
+      );
+    }
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// ── Test-A preflight repair (row 0ac358a9): STATIC packs projection ─────────
+// The builtin library previously carried only skill projections; the world
+// install ships as a STATIC committed pack (manifest + parent files) projected
+// through the same script and validated by the same daemon parser.
+
+function runWithStatic(source, staticSource, out, args = []) {
+  return execFileSync("node", [GEN, ...args], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      OPENRIG_SKILLS_SOURCE: source,
+      OPENRIG_STATIC_PACKS_SOURCE: staticSource,
+      OPENRIG_PACKS_OUT: out,
+      OPENRIG_PACKAGE_VERSION: "0.5.3",
+    },
+  });
+}
+
+function staticWorldPack(root, rel, { withCharged = false } = {}) {
+  const dir = join(root, rel);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "a.md"), `# A\n\nalpha body${withCharged ? " for the founder" : ""}\n`);
+  writeFileSync(join(dir, "b.md"), "# B\n\nbeta body\n");
+  writeFileSync(
+    join(dir, "manifest.yaml"),
+    [
+      'name: "mini-world"',
+      'version: "0"',
+      "taxonomy: world",
+      'purpose: "mini world for the projection pin"',
+      "files:",
+      '  - path: "a.md"',
+      '    role: "world"',
+      '  - path: "b.md"',
+      '    role: "world"',
+      "atoms:",
+      '  - id: alpha',
+      '    address: "a.md"',
+      "    taxonomy: world",
+      "    situations: [fresh]",
+      "    purpose: depth",
+      "    order: 10",
+      "    priority: core",
+      '  - id: beta',
+      '    address: "b.md"',
+      "    taxonomy: world",
+      "    situations: [fresh, post-compaction]",
+      "    purpose: width",
+      "    order: 20",
+      "    priority: core",
+      "",
+    ].join("\n"),
+  );
+}
+
+test("STATIC PACK PROJECTED: a committed world pack lands in the builtin root with its atoms graph, version stamped", () => {
+  const { source, out, base } = scratch();
+  try {
+    skill(source, "core/x", { name: "x", description: "d", files: {} });
+    const staticSrc = join(base, "static");
+    staticWorldPack(staticSrc, "world/install");
+    runWithStatic(source, staticSrc, out);
+    assert.ok(existsSync(join(out, "world/install/manifest.yaml")), "world/install must be projected");
+    assert.ok(existsSync(join(out, "world/install/a.md")), "pack content must be copied");
+    const m = parseManifest(readFileSync(join(out, "world/install/manifest.yaml"), "utf8"), "w");
+    assert.equal(m.version, "0.5.3", "the projection must stamp the package version over the placeholder");
+    assert.equal(m.atoms.length, 2, "the atoms graph must survive projection");
+    assert.deepEqual(m.atoms.map((a) => a.id), ["alpha", "beta"]);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+function expectStaticLeakFailure(base, mutate, label) {
+  const { source, out } = { source: join(base, "skills"), out: join(base, "out") };
+  skill(source, "core/x", { name: "x", description: "d", files: {} });
+  const staticSrc = join(base, "static");
+  staticWorldPack(staticSrc, "world/install");
+  mutate(join(staticSrc, "world/install"));
+  let failed = false;
+  try {
+    runWithStatic(source, staticSrc, out);
+  } catch (err) {
+    failed = true;
+    assert.equal(err.status, 1, `${label}: exit code must be 1 (build failure)`);
+  }
+  assert.ok(failed, `${label}: must fail the build`);
+}
+
+test("STATIC PACK LEAK GUARD runs the FULL committed authority: charged term, path prefix, AND seat/rig identity each FAIL THE BUILD", () => {
+  for (const [label, content] of [
+    ["charged term", "# A\n\nalpha body for the founder\n"],
+    ["internal path prefix", "# A\n\nsee openrig-work/skills for the library\n"],
+    ["instance seat/rig identity", "# A\n\nroute it to dev50@v-openrig-build when done\n"],
+  ]) {
+    const base = mkdtempSync(join(tmpdir(), "s05-leak-"));
+    try {
+      expectStaticLeakFailure(base, (dir) => writeFileSync(join(dir, "a.md"), content), label);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  }
+});
+
+test("STATIC PACK SIDECARS are part of the leak boundary regardless of suffix", () => {
+  const base = mkdtempSync(join(tmpdir(), "s12-sidecar-leak-"));
+  try {
+    expectStaticLeakFailure(
+      base,
+      (dir) => writeFileSync(join(dir, "PROVENANCE.yaml"), "source: openrig-work/rigs/private\n"),
+      "renamed provenance sidecar",
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("STATIC SOURCE provenance sidecars cannot hide beside, rather than inside, a pack", () => {
+  const base = mkdtempSync(join(tmpdir(), "s12-root-provenance-leak-"));
+  try {
+    const source = join(base, "skills");
+    const out = join(base, "out");
+    const staticSrc = join(base, "static");
+    skill(source, "core/x", { name: "x", description: "d", files: {} });
+    staticWorldPack(staticSrc, "world/install");
+    writeFileSync(
+      join(staticSrc, "PROVENANCE-world-install.yaml"),
+      "source: openrig-work/rigs/private\n",
+    );
+
+    let failure;
+    try {
+      runWithStatic(source, staticSrc, out);
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure, "a root-level provenance sidecar must be inside the scanned boundary");
+    assert.equal(failure.status, 1);
+    assert.match(String(failure.stderr), /PROVENANCE-world-install\.yaml/);
+    assert.match(String(failure.stderr), /openrig-work\//i);
+    assert.ok(!existsSync(out), "no projection may be written after provenance refusal");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("LORE PACK REFUSAL is structural even when its content has no leak-rule token", () => {
+  const base = mkdtempSync(join(tmpdir(), "s12-lore-pack-"));
+  try {
+    const source = join(base, "skills");
+    const out = join(base, "out");
+    skill(source, "core/x", { name: "x", description: "d", files: {} });
+    const staticSrc = join(base, "static");
+    staticWorldPack(staticSrc, "lore/private");
+    const manifestPath = join(staticSrc, "lore/private/manifest.yaml");
+    const manifest = readFileSync(manifestPath, "utf8").replace("taxonomy: world", "taxonomy: lore");
+    writeFileSync(manifestPath, manifest);
+
+    let failure;
+    try {
+      runWithStatic(source, staticSrc, out);
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure, "a lore-classed pack must fail before projection");
+    assert.equal(failure.status, 1);
+    assert.match(String(failure.stderr), /lore-class|taxonomy:\s*lore/i);
+    assert.match(String(failure.stderr), /genericize|public home|re-home/i);
+    assert.ok(!existsSync(out), "no projection may be written after lore refusal");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("REF COLLISION across sources FAILS THE BUILD with no output mutation (B3)", () => {
+  const base = mkdtempSync(join(tmpdir(), "s05-collide-"));
+  try {
+    const source = join(base, "skills");
+    const out = join(base, "out");
+    // a skill projecting to ref skills/world/install ...
+    skill(source, "world/install", { name: "world-install-skill", description: "d", files: {} });
+    // ... and a static pack claiming the SAME ref
+    const staticSrc = join(base, "static");
+    staticWorldPack(staticSrc, "skills/world/install");
+    let failed = false;
+    try {
+      runWithStatic(source, staticSrc, out);
+    } catch (err) {
+      failed = true;
+      assert.equal(err.status, 1, "collision must exit 1");
+      assert.match(String(err.stderr), /duplicate|collid/i);
+    }
+    assert.ok(failed, "duplicate pack ref across sources must fail the build");
+    assert.ok(!existsSync(out), "no output may be written on a collision");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("PRODUCTION LIBRARY: only the public help, onboarding-width, reference, world, and example static packs ship", () => {
+  const out = mkdtempSync(join(tmpdir(), "s05-world-"));
+  try {
+    run(REAL_SKILLS, out);
+    assert.deepEqual(readdirSync(REAL_STATIC_PACKS).sort(), ["help", "onboarding-width", "reference", "world-example", "world-public"]);
+    const helpDir = join(out, "help");
+    assert.deepEqual(readdirSync(helpDir).sort(), ["help.md", "manifest.yaml"]);
+    assert.ok(!lstatSync(join(helpDir, "help.md")).isSymbolicLink(), "the projected help pack ships a real file");
+    assert.equal(
+      readFileSync(join(helpDir, "help.md"), "utf8"),
+      readFileSync(join(REPO, "docs/reference/help.md"), "utf8"),
+      "the help pack serves docs/reference/help.md byte for byte (one source)",
+    );
+    assert.ok(
+      !existsSync(join(out, "world/install")),
+      "the production builtin library must not publish the internal world/install pack",
+    );
+    const widthDir = join(out, "onboarding-width");
+    assert.deepEqual(readdirSync(widthDir).sort(), [
+      "manifest.yaml",
+      "public-reference-material.md",
+      "public-what-you-can-do.md",
+    ]);
+    const manifest = parseManifest(readFileSync(join(widthDir, "manifest.yaml"), "utf8"), "onboarding-width");
+    assert.equal(manifest.name, "onboarding-width");
+    assert.deepEqual(manifest.files.map((file) => file.path), [
+      "public-what-you-can-do.md",
+      "public-reference-material.md",
+    ]);
+    const exampleDir = join(out, "world-example");
+    assert.deepEqual(readdirSync(exampleDir).sort(), ["manifest.yaml", "your-world.md"]);
+    const exampleManifest = parseManifest(readFileSync(join(exampleDir, "manifest.yaml"), "utf8"), "world-example");
+    assert.equal(exampleManifest.name, "world-example");
+    assert.deepEqual(exampleManifest.files.map((file) => file.path), ["your-world.md"]);
+    assert.ok(exampleManifest.atoms?.length > 0, "world-example must demonstrate the atom convention");
+    const publicDir = join(out, "world-public");
+    assert.deepEqual(readdirSync(publicDir).sort(), [
+      "boundaries.md",
+      "build-your-world.md",
+      "claims.yaml",
+      "manifest.yaml",
+      "start-here.md",
+      "verify-world.sh",
+    ]);
+    const publicManifest = parseManifest(readFileSync(join(publicDir, "manifest.yaml"), "utf8"), "world-public");
+    assert.equal(publicManifest.name, "world-public");
+    assert.equal(publicManifest.taxonomy, "world");
+    assert.ok(publicManifest.atoms?.length >= 3, "world-public must ship as real atoms");
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// OPR.0.5.6.10 mini-req 3 — the projection stamps its packs "skills": every
+// skill-projected manifest carries the pack-level taxonomy, emitted by the
+// generator (never hand-edited), and still parses through the daemon parser.
+test("OPR.0.5.6.10 GENERATOR STAMPS — skill-projected packs carry pack-level taxonomy: skills", () => {
+  const { source, out, base } = scratch();
+  try {
+    skill(source, "core/attention-queue", { name: "attention-queue", description: "Coordinate work.", files: {} });
+    run(source, out);
+    const m = parseManifest(readFileSync(join(out, "skills/core/attention-queue/manifest.yaml"), "utf8"), "stamp");
+    assert.equal(m.taxonomy, "skills", "generator must stamp pack-level taxonomy: skills (OPR.0.5.6.10)");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("STATIC PACK SYMLINKS: a link into docs/reference ships as a real file; any other link fails the build", () => {
+  const base = mkdtempSync(join(tmpdir(), "r061-static-symlink-"));
+  try {
+    const source = join(base, "skills");
+    skill(source, "core/x", { name: "x", description: "d", files: {} });
+    const staticSrc = join(base, "static");
+    staticWorldPack(staticSrc, "linked");
+    rmSync(join(staticSrc, "linked/b.md"));
+    symlinkSync(join(REPO, "docs/reference/getting-started.md"), join(staticSrc, "linked/b.md"));
+    const out = join(base, "out");
+    runWithStatic(source, staticSrc, out);
+    const shipped = join(out, "linked/b.md");
+    assert.ok(!lstatSync(shipped).isSymbolicLink());
+    assert.equal(readFileSync(shipped, "utf8"), readFileSync(join(REPO, "docs/reference/getting-started.md"), "utf8"));
+
+    rmSync(join(staticSrc, "linked/b.md"));
+    symlinkSync(join(REPO, "README.md"), join(staticSrc, "linked/b.md"));
+    const badOut = join(base, "bad-out");
+    let failure;
+    try {
+      runWithStatic(source, staticSrc, badOut);
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure, "a symlink outside docs/reference must fail the build");
+    assert.match(String(failure.stderr), /must point to a file under docs\/reference/);
+    assert.ok(!existsSync(badOut), "no projection may be written after a refused symlink");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// S07 F1/F2: the help guide's on-demand guide addresses resolve through the daemon's
+// real address route over the generated packs, and a help read stays small.
+const DIST = join(REPO, "packages/daemon/dist");
+async function addressRouteOver(packsRoot) {
+  const { Hono } = await import("hono");
+  const { contextPacksRoutes } = await import(pathToFileURL(join(DIST, "routes/context-packs.js")).href);
+  const { ContextPackLibraryService } = await import(
+    pathToFileURL(join(DIST, "domain/context-packs/context-pack-library-service.js")).href
+  );
+  const lib = new ContextPackLibraryService({ roots: [{ path: packsRoot, sourceType: "builtin" }] });
+  lib.scan();
+  const app = new Hono();
+  app.use("*", async (c, next) => {
+    c.set("contextPackLibrary", lib);
+    await next();
+  });
+  app.route("/api/context-packs", contextPacksRoutes());
+  return app;
+}
+const taughtAddresses = (text) => [...text.matchAll(/`rig context get (reference\/[^`\s]+)`/g)].map((m) => m[1]);
+async function unresolvedAddresses(app, addresses) {
+  const failures = [];
+  for (const address of addresses) {
+    const res = await app.request(`/api/context-packs/library/resolve-address?address=${encodeURIComponent(address)}`);
+    if (res.status !== 200) failures.push({ address, status: res.status });
+  }
+  return failures;
+}
+
+test("HELP ADDRESSES: every guide address taught in help.md resolves through the real address route; help stays small", async () => {
+  const out = mkdtempSync(join(tmpdir(), "r061-help-addr-"));
+  try {
+    runProduction(out);
+    const helpSource = readFileSync(join(REPO, "docs/reference/help.md"), "utf8");
+    const refDir = join(out, "reference");
+    assert.deepEqual(readdirSync(refDir).sort(), ["getting-started.md", "instance-layout.md", "manifest.yaml", "rig-spec.md", "whats-new.md"]);
+    for (const f of ["getting-started.md", "instance-layout.md", "rig-spec.md", "whats-new.md"]) {
+      assert.ok(!lstatSync(join(refDir, f)).isSymbolicLink(), `${f} ships as a real file`);
+      assert.equal(readFileSync(join(refDir, f), "utf8"), readFileSync(join(REPO, "docs/reference", f), "utf8"));
+    }
+    const app = await addressRouteOver(out);
+    const addresses = taughtAddresses(helpSource);
+    assert.deepEqual(addresses.sort(), [
+      "reference/getting-started.md#have-your-agent-configure-permissions",
+      "reference/getting-started.md#incomplete-setup-and-restart",
+      "reference/getting-started.md#open-the-kernel-conversations",
+      "reference/instance-layout.md",
+      "reference/rig-spec.md",
+      "reference/whats-new.md",
+    ]);
+    assert.deepEqual(await unresolvedAddresses(app, addresses), []);
+    const section = await (await app.request(
+      `/api/context-packs/library/resolve-address?address=${encodeURIComponent("reference/getting-started.md#incomplete-setup-and-restart")}`,
+    )).json();
+    assert.match(section.text, /^## Incomplete setup and restart/);
+    assert.ok(!section.text.includes("## Kernel framing"), "a section address returns that section, not the file");
+    const whole = await (await app.request(
+      `/api/context-packs/library/resolve-address?address=${encodeURIComponent("reference/rig-spec.md")}`,
+    )).json();
+    assert.equal(whole.text, readFileSync(join(REPO, "docs/reference/rig-spec.md"), "utf8"));
+    const preview = await (await app.request(`/api/context-packs/library/by-ref/preview?ref=help`)).json();
+    assert.deepEqual(preview.files.map((f) => f.path ?? f), ["help.md"]);
+    assert.ok(preview.bundleText.includes("# Help your user get unstuck"));
+    for (const manual of ["# Getting started: one useful change", "# OpenRig Instance Layout", "# RigSpec Reference", "# What changed in OpenRig"]) {
+      assert.ok(!preview.bundleText.includes(manual), `a help read must not include '${manual}'`);
+    }
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test("HELP ADDRESSES: the checker fails when a taught address has no target", async () => {
+  const base = mkdtempSync(join(tmpdir(), "r061-help-missing-"));
+  try {
+    const packsRoot = join(base, "packs");
+    mkdirSync(join(packsRoot, "reference"), { recursive: true });
+    writeFileSync(join(packsRoot, "reference/manifest.yaml"),
+      'name: reference\nversion: "1"\ntaxonomy: world\nfiles:\n  - path: getting-started.md\n    role: reference\n');
+    writeFileSync(join(packsRoot, "reference/getting-started.md"), "# G\n\n## Incomplete setup and restart\nbody\n");
+    const app = await addressRouteOver(packsRoot);
+    const failures = await unresolvedAddresses(app, taughtAddresses(
+      "`rig context get reference/getting-started.md#incomplete-setup-and-restart` and `rig context get reference/rig-spec.md`",
+    ));
+    assert.deepEqual(failures.map((f) => f.address), ["reference/rig-spec.md"]);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("HELP FALLBACK PATHS: source links resolve, and the installed path matches the package copy", async () => {
+  const { parseAddress, resolveAddress } = await import(pathToFileURL(join(DIST, "domain/markdown-address.js")).href);
+  const helpSource = readFileSync(join(REPO, "docs/reference/help.md"), "utf8");
+  for (const [, target] of helpSource.matchAll(/\]\(([a-z-]+\.md(?:#[a-z0-9-]+)?)\)/g)) {
+    const [file, anchor] = target.split("#");
+    const text = readFileSync(join(REPO, "docs/reference", file), "utf8");
+    if (anchor) resolveAddress(text, parseAddress(`${file}#${anchor}`).headerPath);
+  }
+  const buildPackage = readFileSync(join(REPO, "scripts/build-package.sh"), "utf8");
+  assert.match(buildPackage, /cp -r "\$REPO_ROOT\/docs\/reference\/"\* "\$CLI_DIR\/daemon\/docs\/reference\/"/);
+  const fallbacks = [
+    "docs/reference/help.md",
+    "packages/daemon/assets/guidance/openrig-start.md",
+    "packages/daemon/assets/plugins/openrig-core/skills/openrig-skills/SKILL.md",
+  ].map((p) => readFileSync(join(REPO, p), "utf8").replace(/\s+/g, " "));
+  for (const text of fallbacks) {
+    assert.ok(text.includes("`daemon/docs/reference/help.md` inside the installed `@openrig/cli` package"));
+    assert.ok(!text.includes("read `docs/reference/help.md` in the installed package"));
+    assert.ok(!text.includes("open `docs/reference/help.md` in the installed package"));
+  }
+});

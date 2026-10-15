@@ -1,0 +1,205 @@
+import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
+import type { EventBus } from "../domain/event-bus.js";
+import type { ChatRepository } from "../domain/chat-repository.js";
+import { requireSenderIdentity } from "./require-sender-identity.js";
+import { queryLimit } from "./query-limit.js";
+
+/** Render control characters (newline, ESC, DEL and the C1 range, whose U+009B
+ *  is a single-byte CSI) as visible \x0a / \x1b / \x9b text so a rejected value
+ *  cannot smuggle line breaks or terminal escapes into a diagnostic the CLI
+ *  prints verbatim. */
+function escapeControlChars(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, (ch) => `\\x${ch.charCodeAt(0).toString(16).padStart(2, "0")}`);
+}
+
+export function chatRoutes(): Hono {
+  const app = new Hono();
+
+  function getChatRepo(c: { get: (key: string) => unknown }): ChatRepository {
+    return c.get("chatRepo" as never) as ChatRepository;
+  }
+
+  function getEventBus(c: { get: (key: string) => unknown }): EventBus {
+    return c.get("eventBus" as never) as EventBus;
+  }
+
+  // POST /send — persist message + emit event
+  app.post("/send", async (c) => {
+    const rigId = c.req.param("rigId");
+    if (!rigId) return c.json({ error: "Missing rigId" }, 400);
+
+    const payload: unknown = await c.req.json().catch(() => null);
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return c.json({ error: "Expected a JSON object" }, 400);
+    }
+    const body = payload as { sender?: unknown; body?: unknown };
+    if (body.sender != null && typeof body.sender !== "string") return c.json({ error: "sender must be a string" }, 400);
+    if (!Array.isArray(body.body) && body.body !== undefined && typeof body.body !== "string" && typeof body.body !== "number") return c.json({ error: "body must be a string or number" }, 400);
+    if (!body.body) return c.json({ error: "Missing body" }, 400);
+
+    // P21 I5: the chat sender is the transport-derived identity, never body.sender (the `?? "anonymous"`
+    // silent default). P18 deliver-and-label: a body.sender is SUPERSEDED by the wire (transport:v1),
+    // header-absent + body.sender records claimed:v1, and no header + no body → 400 actor_required.
+    const identity = requireSenderIdentity(c, { verb: "chat send", bodyClaim: body.sender });
+    if (!identity.ok) return identity.response;
+    const sender = identity.session;
+    const chatRepo = getChatRepo(c);
+    const eventBus = getEventBus(c);
+
+    const msg = chatRepo.send(rigId, sender, body.body as string);
+
+    eventBus.emit({
+      type: "chat.message",
+      rigId,
+      messageId: msg.id,
+      sender: msg.sender,
+      kind: msg.kind,
+      body: msg.body,
+    });
+
+    return c.json(msg, 201);
+  });
+
+  // GET /history — query messages
+  app.get("/history", (c) => {
+    const rigId = c.req.param("rigId");
+    if (!rigId) return c.json({ error: "Missing rigId" }, 400);
+
+    const topic = c.req.query("topic");
+    const after = c.req.query("after");
+    const since = c.req.query("since");
+    const sender = c.req.query("sender");
+    const chatRepo = getChatRepo(c);
+    // An unparseable since silently matches no rows (julianday returns NULL),
+    // which reads as an empty room — refuse it instead. An empty value is not a
+    // cutoff: the repository treats a falsy since as no filter, so keep that.
+    if (since && !chatRepo.timestampParses(since)) {
+      return c.json({ error: `since must be a datetime SQLite can parse, such as 'YYYY-MM-DD HH:MM:SS'; got '${escapeControlChars(since)}'` }, 400);
+    }
+    // A topic that hasn't started answers [] before the limit is used.
+    const parsed = queryLimit(c, { used: !topic || chatRepo.topicStarted(rigId, topic) });
+    if (!parsed.ok) return parsed.response;
+    const limit = parsed.limit;
+
+    const messages = chatRepo.history(rigId, { topic, limit, after, since, sender });
+
+    return c.json(messages);
+  });
+
+  // GET /watch — SSE stream of chat messages
+  app.get("/watch", (c) => {
+    const rigId = c.req.param("rigId");
+    if (!rigId) return c.json({ error: "Missing rigId" }, 400);
+
+    const chatRepo = getChatRepo(c);
+    const eventBus = getEventBus(c);
+
+    return streamSSE(c, async (stream) => {
+      // Subscribe FIRST to avoid race between initial batch and new messages
+      const pendingMessages: Array<{ id: string; data: string }> = [];
+      let initialDone = false;
+      const unsubscribe = eventBus.subscribe((event) => {
+        if (event.type === "chat.message" && "rigId" in event && (event as { rigId: string }).rigId === rigId) {
+          const chatEvent = event as { messageId: string; sender: string; kind: string; body: string; topic?: string; rigId: string };
+          const msg = {
+            id: chatEvent.messageId,
+            rigId: chatEvent.rigId,
+            sender: chatEvent.sender,
+            kind: chatEvent.kind,
+            body: chatEvent.body,
+            topic: chatEvent.topic ?? null,
+            createdAt: event.createdAt,
+          };
+          const sseMsg = { id: msg.id, data: JSON.stringify(msg) };
+          if (initialDone) {
+            stream.writeSSE(sseMsg).catch(() => {});
+          } else {
+            pendingMessages.push(sseMsg);
+          }
+        }
+      });
+
+      const aborted = new Promise<void>((resolve) => {
+        stream.onAbort(() => resolve());
+      });
+
+      try {
+        // Send initial batch
+        const initial = chatRepo.latest(rigId, 20);
+        const sentIds = new Set<string>();
+        for (const msg of initial) {
+          await stream.writeSSE({ id: msg.id, data: JSON.stringify(msg) });
+          sentIds.add(msg.id);
+        }
+
+        // Flush any messages received during initial batch, dedup by ID
+        for (const pending of pendingMessages) {
+          if (!sentIds.has(pending.id)) {
+            await stream.writeSSE(pending);
+          }
+        }
+        // Arrivals during an awaited flush must join its tail, not bypass
+        // older buffered messages through the live write path.
+        initialDone = true;
+
+        await aborted;
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+
+  // POST /topic — create topic marker
+  app.post("/topic", async (c) => {
+    const rigId = c.req.param("rigId");
+    if (!rigId) return c.json({ error: "Missing rigId" }, 400);
+
+    const payload: unknown = await c.req.json().catch(() => null);
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return c.json({ error: "Expected a JSON object" }, 400);
+    }
+    const body = payload as { sender?: unknown; topic?: unknown; body?: unknown };
+    if (body.sender != null && typeof body.sender !== "string") return c.json({ error: "sender must be a string" }, 400);
+    // Arrays retain the existing SQLite binding path, including combined topic/body arrays.
+    if (!Array.isArray(body.topic) && !Array.isArray(body.body)) {
+      if (body.topic !== undefined && typeof body.topic !== "string" && typeof body.topic !== "number") return c.json({ error: "topic must be a string or number" }, 400);
+      if (body.body != null && typeof body.body !== "string" && typeof body.body !== "number") return c.json({ error: "body must be a string or number" }, 400);
+    }
+    if (!body.topic) return c.json({ error: "Missing topic" }, 400);
+
+    // P21 I5: the topic sender is the transport-derived identity, never body.sender (P18 deliver-and-label:
+    // the wire supersedes a body.sender; header-absent records claimed:v1; no actor → 400 actor_required).
+    const identity = requireSenderIdentity(c, { verb: "chat topic", bodyClaim: body.sender });
+    if (!identity.ok) return identity.response;
+    const sender = identity.session;
+    const chatRepo = getChatRepo(c);
+    const eventBus = getEventBus(c);
+
+    const msg = chatRepo.sendTopic(rigId, sender, body.topic as string, body.body as string | undefined);
+
+    eventBus.emit({
+      type: "chat.message",
+      rigId,
+      messageId: msg.id,
+      sender: msg.sender,
+      kind: msg.kind,
+      body: msg.body,
+      topic: msg.topic ?? undefined,
+    });
+
+    return c.json(msg, 201);
+  });
+
+  // POST /clear — delete all messages for this rig
+  app.post("/clear", (c) => {
+    const rigId = c.req.param("rigId");
+    if (!rigId) return c.json({ error: "Missing rigId" }, 400);
+
+    const chatRepo = getChatRepo(c);
+    const result = chatRepo.clear(rigId);
+    return c.json({ ok: true, deleted: result.deleted });
+  });
+
+  return app;
+}

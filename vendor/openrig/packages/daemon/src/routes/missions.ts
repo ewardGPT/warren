@@ -1,0 +1,236 @@
+// V0.3.1 slice 12 walk-item 1 — mission scope data layer.
+// V0.3.1 slice 13 walk-item 7 — extended with workflow_spec frontmatter
+// + projected topology spec graph.
+//
+// GET /api/missions/:missionId — returns aggregated mission metadata
+// (missionPath + slices + optional workflow_spec declaration + optional
+// projected topology). Powers the Mission Overview / Progress / Topology
+// tabs in the Project surface; pairs with useScopeMarkdown for README /
+// PROGRESS content via the existing /api/files/read route.
+//
+// Returns:
+//   200 {
+//     missionId, missionPath, slices,
+//     workflow_spec: { name, version } | null,
+//     topology: { specGraph: SpecGraphPayload | null } | null
+//   }
+//   404 { error: "mission_not_found" } when no slices match
+//   503 { error: "slices_indexer_unavailable" } when indexer not wired
+//   503 { error: "slices_root_not_configured" } when indexer not ready
+//
+// workflow_spec is parsed lazily from <missionPath>/README.md frontmatter
+// using the same parser the slice-indexer uses. topology.specGraph is
+// projected via projectSpecGraph(spec, null) when the spec is in the
+// WorkflowSpecCache; { specGraph: null } when declared but not cached;
+// null when nothing is declared.
+
+import { Hono } from "hono";
+import { parseDocument, isScalar } from "yaml";
+import { readMissionReadiness, readSliceReadiness } from "../domain/proof/judgments.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type {
+  SliceIndexer,
+  SliceListEntry,
+  WorkflowSpecRef,
+} from "../domain/slices/slice-indexer.js";
+import { parseWorkflowSpecRef } from "../domain/slices/slice-indexer.js";
+import type { WorkflowSpecCache } from "../domain/workflow-spec-cache.js";
+import { projectSpecGraph } from "../domain/workflow/slice-workflow-projection.js";
+import { resolveNodeFile } from "../domain/scope/node-file.js";
+
+export function missionsRoutes(): Hono {
+  const app = new Hono();
+
+  app.get("/:missionId", (c) => {
+    const indexer = c.get("sliceIndexer" as never) as SliceIndexer | undefined;
+    if (!indexer) {
+      return c.json(
+        {
+          error: "slices_indexer_unavailable",
+          hint: "Mission data layer requires the SliceIndexer to be wired into AppDeps.",
+        },
+        503,
+      );
+    }
+    if (!indexer.isReady()) {
+      return c.json(
+        {
+          error: "slices_root_not_configured",
+          hint: "Run rig config init-workspace, or set workspace.slices_root to workspace/missions. Supported shape: missions/<mission>/slices/<slice>.",
+        },
+        503,
+      );
+    }
+    const missionId = c.req.param("missionId");
+    const allSlices = indexer.list();
+    const slices = allSlices.filter((s) => s.missionId === missionId);
+    if (slices.length === 0) {
+      return c.json({ error: "mission_not_found", missionId }, 404);
+    }
+    const missionPath = computeMissionPath(slices[0]!);
+    const workflowSpec = readMissionWorkflowSpec(missionPath);
+    const topology = computeMissionTopology(
+      workflowSpec,
+      c.get("workflowSpecCache" as never) as WorkflowSpecCache | undefined,
+    );
+    const readiness = readMissionReadiness(missionPath);
+    const status = readiness.historicalStatus ?? readMissionStatus(missionPath);
+    return c.json({
+      missionId,
+      missionPath,
+      readiness,
+      slices: slices.map(s => ({ ...s, readiness: readSliceReadiness(s.slicePath) })),
+      workflow_spec: workflowSpec,
+      topology,
+      status,
+    });
+  });
+
+  // Slice 18 §3.5 — Mark mission complete (Getting Started complete-and-hide).
+  // Writes the authored mission status (manifest, or legacy node frontmatter); the UI
+  // storytelling preview gates on this so completed missions disappear from
+  // the band. The daemon is the audit-trail surface; the UI maintains
+  // an optimistic local mirror via localStorage so the hide is instant.
+  app.post("/:missionId/complete", (c) => {
+    const indexer = c.get("sliceIndexer" as never) as SliceIndexer | undefined;
+    if (!indexer) {
+      return c.json({ error: "slices_indexer_unavailable" }, 503);
+    }
+    const missionId = c.req.param("missionId");
+    const allSlices = indexer.list();
+    const slices = allSlices.filter((s) => s.missionId === missionId);
+    if (slices.length === 0) {
+      return c.json({ error: "mission_not_found", missionId }, 404);
+    }
+    const missionPath = computeMissionPath(slices[0]!);
+    try {
+      writeMissionStatusComplete(missionPath);
+    } catch (err) {
+      return c.json(
+        {
+          error: "mission_complete_write_failed",
+          missionId,
+          message: (err as Error).message,
+        },
+        500,
+      );
+    }
+    // VM-005 B1 (narrow C-vii exception): the write succeeded — drop the
+    // authored-status sidecar cache so the very next /api/slices read serves
+    // the new word (read-after-write coherence). Any future daemon
+    // mission-status mutation route calls this same method.
+    indexer.invalidateMissionStatusCache();
+    return c.json({ missionId, status: "complete" });
+  });
+
+  return app;
+}
+
+/** Complete the status owner used by mission/proof reads. Legacy missions keep
+ *  their node-file frontmatter; authored manifests keep their other fields and comments. */
+function writeMissionStatusComplete(missionPath: string): void {
+  const manifestPath = path.join(missionPath, "mission.yaml");
+  if (fs.existsSync(manifestPath)) {
+    const document = parseDocument(fs.readFileSync(manifestPath, "utf8"));
+    if (document.errors.length) throw document.errors[0];
+    const status = document.getIn(["metadata", "status"], true);
+    if (isScalar(status)) status.value = "complete";
+    else document.setIn(["metadata", "status"], "complete");
+    fs.writeFileSync(manifestPath, document.toString());
+    return;
+  }
+  // Mutate the node file the mission actually has; only a mission with neither gets a new one, and
+  // a new one is authored under the current name.
+  const resolved = resolveNodeFile(missionPath);
+  const readmePath = resolved ?? path.join(missionPath, "SPEC.md");
+  let body = resolved ? fs.readFileSync(resolved, "utf-8") : "";
+  const fmMatch = body.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (fmMatch) {
+    const fmInner = fmMatch[1] ?? "";
+    const statusLineRegex = /^\s*status\s*:\s*[^\r\n]*$/m;
+    let newFm: string;
+    if (statusLineRegex.test(fmInner)) {
+      newFm = fmInner.replace(statusLineRegex, "status: complete");
+    } else {
+      newFm = fmInner.trimEnd() + "\nstatus: complete";
+    }
+    body = body.replace(fmMatch[0], `---\n${newFm}\n---`);
+  } else {
+    body = `---\nstatus: complete\n---\n${body}`;
+  }
+  fs.writeFileSync(readmePath, body);
+}
+
+/** Derive the mission folder's absolute path from any slice's
+ *  `slicePath`. Slices live at
+ *  `<missionsRoot>/<missionId>/slices/<sliceName>` per the workspace
+ *  contract, so going up two levels yields the mission folder. */
+function computeMissionPath(slice: SliceListEntry): string {
+  return path.resolve(slice.slicePath, "..", "..");
+}
+
+/** Slice 18 §3.5 — parse the `status` field from the mission README's
+ *  frontmatter. Returns the string when present (no enum validation —
+ *  v0 callers care primarily about the "complete" value but other
+ *  workflow states may appear), or null when the README is missing /
+ *  the field is absent. Powers the durable storytelling-filter for
+ *  Getting Started complete-and-hide. */
+export function readMissionStatus(missionPath: string): string | null {
+  const readmePath = resolveNodeFile(missionPath);
+  if (!readmePath) return null;
+  const raw = fs.readFileSync(readmePath, "utf-8");
+  const fm = parseSimpleFrontmatter(raw);
+  const value = fm["status"];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** V0.3.1 slice 13 walk-item 7 — parse `workflow_spec` from the mission
+ *  README's frontmatter. Returns null when the README is missing or the
+ *  field is absent / malformed. Uses the same parseWorkflowSpecRef
+ *  helper the slice-indexer uses so both surfaces stay in lockstep. */
+function readMissionWorkflowSpec(missionPath: string): WorkflowSpecRef | null {
+  const readmePath = resolveNodeFile(missionPath);
+  if (!readmePath) return null;
+  const raw = fs.readFileSync(readmePath, "utf-8");
+  const fm = parseSimpleFrontmatter(raw);
+  return parseWorkflowSpecRef(fm["workflow_spec"]);
+}
+
+/** Minimal frontmatter parser. The slice-indexer's parseFrontmatter is
+ *  private; duplicating the v0 shape here is cheaper than exposing
+ *  internal API and keeps the missions route's surface minimal. */
+function parseSimpleFrontmatter(text: string): Record<string, string> {
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return {};
+  const out: Record<string, string> = {};
+  for (const line of m[1]!.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx === -1) continue;
+    const key = trimmed.slice(0, colonIdx).trim();
+    let value = trimmed.slice(colonIdx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/** V0.3.1 slice 13 walk-item 7 — project the spec graph when both the
+ *  declaration AND the cached spec are present. Returns the topology
+ *  envelope with `specGraph: null` when declared but not yet cached;
+ *  returns `null` for the whole envelope when nothing is declared. */
+function computeMissionTopology(
+  workflowSpec: WorkflowSpecRef | null,
+  specCache: WorkflowSpecCache | undefined,
+): { specGraph: ReturnType<typeof projectSpecGraph> | null } | null {
+  if (!workflowSpec) return null;
+  if (!specCache) return { specGraph: null };
+  const row = specCache.getByNameVersion(workflowSpec.name, workflowSpec.version);
+  if (!row) return { specGraph: null };
+  // WorkflowSpecRow.spec is the WorkflowSpec object the projector expects.
+  return { specGraph: projectSpecGraph(row.spec, null) };
+}

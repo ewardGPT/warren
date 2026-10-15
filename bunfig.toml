@@ -1,2 +1,11 @@
 # Bun runtime configuration. Test discovery is the default (src/**/*.test.ts).
 # See https://bun.sh/docs/runtime/bunfig for available options.
+#
+# vendor/openrig/ is a byte-identical copy of upstream OpenRig (see
+# vendor/openrig/UPSTREAM.md for the pinned sha and the update procedure). Its
+# suites are vitest / node:test and belong to the vendored toolchain; running
+# them under `bun test` produced 226 failures and hid our own suite. The kernel
+# boundary is exercised by src/kernel instead, and upstream's own suite is run
+# by scripts/openrig-vendor-sync.sh with its own toolchain.
+[test]
+pathIgnorePatterns = ["vendor/**"]

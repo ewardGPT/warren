@@ -1,0 +1,683 @@
+/* OPR.0.4.1.14 — Dashboard route visual refresh (founder-LOCKED fidelity twin).
+ *
+ * Scoped, component-local stylesheet (precedent: topology-table-shimmer.css).
+ * Every rule is namespaced under `.df-root` so nothing leaks into the rest of
+ * the app or the /lab/vellum-lab experiment (which still drives the legacy
+ * vellum components). Geometry, textures, leaders, halftone, the footer
+ * dissolve and the snap-to-spec hover are byte-faithful to the locked twin
+ * digital-twin/opr-0.4.1.14/dashboard-fidelity.intent.html.
+ *
+ * Palette: the LOCKED twin's paper-draft set (paper / ink / amber / green).
+ * `--df-paper` equals the product's --background (#faf9f5); the others are
+ * carried verbatim because the product tokens diverge (its --tertiary is RED
+ * #b12d2a, not the twin's restrained amber #b9822f, and its ink is lighter).
+ * Colours are UNCHANGED from the locked twin per the art-direction contract.
+ * Header + left rail are the global AppShell chrome (kept as-is, out of scope).
+ */
+
+.df-root {
+  --df-paper: #faf9f5;
+  --df-card: #fbfaf6;
+  --df-ink: #1c1d1a;
+  --df-ink-2: #6b6f67;
+  --df-ink-3: #9a958a;
+  --df-line: #d7d3c7;
+  --df-rule: #cfcabd;
+  --df-amber: #b9822f;
+  --df-green: #2f9e54;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  flex: 1 1 auto;
+  background: var(--df-paper);
+  color: var(--df-ink);
+  font-family: "Inter", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* paper-draft texture: faint dot grid + hairline drafting grain */
+.df-root::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.55;
+  background-image: radial-gradient(rgba(120, 116, 104, 0.13) 1px, transparent 1.3px);
+  background-size: 23px 23px;
+}
+.df-root::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.5;
+  background-image: repeating-linear-gradient(135deg, rgba(120, 116, 104, 0.035) 0 1px, transparent 1px 9px);
+}
+
+.df-main {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 auto;
+  padding: 22px 34px 0;
+}
+
+/* ── header zone: eyebrow + headline + sub (left) · field-environment (right) ── */
+.df-head {
+  position: relative;
+}
+
+.df-eyebrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--df-ink-2);
+}
+.df-eyebrow-l {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.df-gd {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--df-green);
+}
+.df-eyebrow-r {
+  white-space: nowrap;
+}
+
+.df-h1 {
+  font-family: "Space Grotesk Variable", "Space Grotesk", system-ui, sans-serif;
+  font-weight: 700;
+  font-size: 46px;
+  letter-spacing: -0.015em;
+  line-height: 1;
+  text-transform: uppercase;
+  margin: 14px 0 6px;
+}
+.df-sub {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--df-ink-2);
+}
+.df-sub b {
+  color: var(--df-amber);
+  font-weight: 500;
+}
+
+/* ── field environment panel (vintage mono, dotted leaders + globe) ── */
+.df-fieldenv {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 330px;
+  border: 1px solid var(--df-line);
+  background: rgba(251, 250, 246, 0.7);
+  padding: 12px 14px;
+}
+.df-feh {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  color: var(--df-ink-2);
+  margin-bottom: 9px;
+}
+.df-feh .df-feh-mark {
+  width: 14px;
+  height: 14px;
+  color: var(--df-ink-3);
+}
+.df-fe-body {
+  display: flex;
+  gap: 10px;
+}
+.df-fe-list {
+  flex: 1;
+  min-width: 0;
+}
+.df-fe-row {
+  display: flex;
+  align-items: baseline;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--df-ink-2);
+  line-height: 1.85;
+}
+.df-fe-row .df-k {
+  white-space: nowrap;
+}
+.df-fe-row .df-dots {
+  flex: 1;
+  border-bottom: 1px dotted var(--df-rule);
+  margin: 0 6px;
+  transform: translateY(-3px);
+}
+.df-fe-row .df-v {
+  color: var(--df-ink);
+  white-space: nowrap;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.df-fe-globe {
+  flex: 0 0 76px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.df-fe-globe svg {
+  width: 72px;
+  height: 72px;
+  stroke: var(--df-ink-2);
+  fill: none;
+  stroke-width: 1;
+}
+
+.df-reg {
+  position: absolute;
+  top: 50px;
+  right: 14px;
+  width: 14px;
+  height: 14px;
+  border-top: 1px solid var(--df-rule);
+  border-right: 1px solid var(--df-rule);
+  opacity: 0.7;
+  z-index: 2;
+}
+
+/* ── card grid (3 columns; collapses 2 → 1 on narrow viewports) ── */
+.df-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  column-gap: 20px;
+  row-gap: 18px;
+  margin-top: 40px;
+}
+.df-cell {
+  display: flex;
+  flex-direction: column;
+}
+
+.df-card {
+  position: relative;
+  display: block;
+  height: 188px;
+  border: 1px solid var(--df-line);
+  background: var(--df-card);
+  padding: 14px 16px;
+  overflow: hidden;
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.18s, box-shadow 0.18s, transform 0.18s, background 0.18s;
+}
+
+.df-plus {
+  position: absolute;
+  top: 11px;
+  left: 13px;
+  width: 11px;
+  height: 11px;
+}
+.df-plus::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--df-ink-2);
+}
+.df-plus::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--df-ink-2);
+}
+
+.df-idx {
+  position: absolute;
+  top: 11px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--df-ink-2);
+}
+.df-idx-sq {
+  width: 7px;
+  height: 7px;
+  background: var(--df-ink);
+}
+
+.df-glyph {
+  position: absolute;
+  left: 18px;
+  top: 42px;
+  width: 84px;
+  height: 84px;
+  color: var(--df-ink);
+}
+.df-glyph svg {
+  width: 84px;
+  height: 84px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: color 0.2s;
+}
+.df-glyph .df-amf {
+  fill: var(--df-amber);
+  stroke: var(--df-amber);
+}
+
+.df-clabel {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  font-family: "Space Grotesk Variable", "Space Grotesk", system-ui, sans-serif;
+  font-weight: 700;
+  font-size: 21px;
+  letter-spacing: 0.01em;
+  color: var(--df-ink);
+}
+.df-clabel::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 100%;
+  bottom: -4px;
+  height: 2px;
+  background: var(--df-amber);
+  transition: right 0.25s ease;
+}
+
+/* halftone corner cluster */
+.df-half {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 108px;
+  height: 74px;
+  pointer-events: none;
+  opacity: 0.5;
+  background-image: radial-gradient(var(--df-ink-3) 1px, transparent 1.4px);
+  background-size: 8px 8px;
+  -webkit-mask-image: linear-gradient(135deg, transparent 42%, #000 100%);
+  mask-image: linear-gradient(135deg, transparent 42%, #000 100%);
+  transition: opacity 0.18s;
+}
+
+/* extending crop marks on hover (drafting registration) */
+.df-crop {
+  position: absolute;
+  inset: -1px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.18s;
+}
+.df-crop i {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+}
+.df-crop i::before,
+.df-crop i::after {
+  content: "";
+  position: absolute;
+  background: var(--df-amber);
+}
+.df-crop .df-crop-tl {
+  top: -5px;
+  left: -5px;
+}
+.df-crop .df-crop-tl::before {
+  left: 0;
+  top: 6px;
+  width: 14px;
+  height: 1px;
+}
+.df-crop .df-crop-tl::after {
+  top: 0;
+  left: 6px;
+  height: 14px;
+  width: 1px;
+}
+.df-crop .df-crop-br {
+  bottom: -5px;
+  right: -5px;
+}
+.df-crop .df-crop-br::before {
+  right: 0;
+  bottom: 6px;
+  width: 14px;
+  height: 1px;
+}
+.df-crop .df-crop-br::after {
+  bottom: 0;
+  right: 6px;
+  height: 14px;
+  width: 1px;
+}
+
+/* per-card caption footer (glyph + dashed leader + action) */
+.df-cap {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 30px;
+  padding: 0 2px;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--df-ink-2);
+}
+.df-cap-glyph {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  color: var(--df-ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.df-cap-glyph svg {
+  width: 9px;
+  height: 9px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+}
+.df-cap-glyph .df-cap-fill {
+  fill: currentColor;
+  stroke: none;
+}
+.df-lead {
+  flex: 1;
+  border-bottom: 1px dashed var(--df-rule);
+  transform: translateY(-1px);
+}
+.df-cap--amber {
+  color: var(--df-amber);
+}
+.df-cap--amber .df-cap-glyph {
+  color: var(--df-amber);
+}
+
+/* ── hover state — special / fun ("snap to spec") ── */
+.df-card:hover {
+  border-color: var(--df-ink);
+  transform: translateY(-2px);
+  background: #fff;
+  box-shadow: 6px 6px 0 -1px rgba(28, 29, 26, 0.1), 0 0 0 1px var(--df-paper);
+}
+.df-card:hover .df-glyph svg {
+  color: var(--df-amber);
+}
+.df-card:hover .df-clabel::after {
+  right: 0;
+}
+.df-card:hover .df-half {
+  opacity: 0.8;
+}
+.df-card:hover .df-crop {
+  opacity: 1;
+}
+.df-card:focus-visible {
+  outline: 2px solid var(--df-amber);
+  outline-offset: 2px;
+}
+
+/* ── footer (gradient texture + semi-random artifacts) ── */
+.df-foot {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 42px;
+  margin-top: 18px;
+  padding: 0 22px 0 34px;
+  border-top: 1px solid var(--df-line);
+  background: var(--df-paper);
+}
+.df-foot-fl {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--df-ink-2);
+  white-space: nowrap;
+}
+.df-foot-fl .df-foot-sq {
+  width: 7px;
+  height: 7px;
+  background: var(--df-amber);
+}
+.df-plus2 {
+  position: relative;
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+}
+.df-plus2::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--df-ink-2);
+}
+.df-plus2::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--df-ink-2);
+}
+.df-foot-dots {
+  width: 60px;
+  border-bottom: 1px dotted var(--df-rule);
+  transform: translateY(-3px);
+}
+/* halftone gradient dissolve bar */
+.df-dissolve {
+  flex: 1;
+  height: 16px;
+  position: relative;
+  min-width: 40px;
+  background-image: radial-gradient(var(--df-ink-2) 1.1px, transparent 1.4px);
+  background-size: 5px 5px;
+  -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 8%, rgba(0, 0, 0, 0.25) 55%, transparent 92%);
+  mask-image: linear-gradient(90deg, #000 0%, #000 8%, rgba(0, 0, 0, 0.25) 55%, transparent 92%);
+}
+.df-dissolve .df-dissolve-blk {
+  position: absolute;
+  left: 0;
+  top: 1px;
+  width: 16px;
+  height: 14px;
+  background: var(--df-ink-2);
+  opacity: 0.5;
+}
+/* semi-random little artifacts */
+.df-arts {
+  position: relative;
+  width: 150px;
+  height: 24px;
+  flex: 0 0 150px;
+}
+.df-arts i {
+  position: absolute;
+  background: var(--df-ink-2);
+}
+.df-sqs {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+.df-sqs .df-sq-o {
+  width: 8px;
+  height: 8px;
+  border: 1px solid var(--df-ink-2);
+}
+.df-sqs .df-sq-b {
+  width: 8px;
+  height: 8px;
+  background: var(--df-ink);
+}
+
+/* ── responsive: field-env stacks, grid narrows, footer artifacts hide ── */
+@media (max-width: 1100px) {
+  .df-fieldenv {
+    position: static;
+    width: 100%;
+    margin-top: 16px;
+  }
+  .df-grid {
+    grid-template-columns: repeat(2, 1fr);
+    margin-top: 24px;
+  }
+}
+@media (max-width: 680px) {
+  .df-main {
+    padding: 18px 18px 0;
+  }
+  .df-h1 {
+    font-size: 34px;
+  }
+  .df-grid {
+    grid-template-columns: 1fr;
+  }
+  .df-arts,
+  .df-foot-dots {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .df-card,
+  .df-glyph svg,
+  .df-clabel::after,
+  .df-half,
+  .df-crop {
+    transition: none;
+  }
+  .df-card:hover {
+    transform: none;
+  }
+}
+
+/* ============================================================================
+   === OPR.0.4.3.29 — Vellum Dark for the Dashboard's PRIVATE palette ===
+   ----------------------------------------------------------------------------
+   The Dashboard route is NOT token-driven — it paints via its own `--df-*` vars
+   (scoped under `.df-root`), so the global `.dark {}` token overrides never reach
+   it. The real fix is the SAME technique: override the `--df-*` vars for dark.
+   Block pasted verbatim from the slice 29 twin-mockup dark-theme.css (IMPL-FLAG
+   #4). Scoped under `.dark .df-root`, so light stays pixel-identical when off.
+   ========================================================================== */
+
+.dark .df-root {
+  --df-paper: #121412;   /* #faf9f5 → warm near-black ground */
+  --df-card: #181a18;    /* #fbfaf6 → base card, flat (a hair above paper) */
+  --df-ink: #e4e8e0;     /* #1c1d1a → light primary ink */
+  --df-ink-2: #a3a99f;   /* secondary ink */
+  --df-ink-3: #7d827a;   /* faint ink */
+  --df-line: #34382f;    /* #d7d3c7 → dark hairline */
+  --df-rule: #2a2d27;    /* #cfcabd → darker rule */
+  --df-amber: #d9a441;   /* #b9822f → brighter amber for dark contrast */
+  --df-green: #43c684;   /* #2f9e54 → brighter green for dark contrast */
+}
+
+/* Residual hardcoded near-whites that don't read `--df-card` (IMPL-FLAG #4):
+   the FIELD ENVIRONMENT panel bg + the card :hover "pop to white". Co-located
+   dark overrides (real fix), keeping light untouched. */
+.dark .df-root .df-fieldenv { background: rgba(24, 26, 24, 0.7); }
+.dark .df-root .df-card:hover {
+  background: #1e211e;
+  box-shadow: 6px 6px 0 -1px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--df-line);
+}
+
+/* OPR.0.4.6.MH1 FR-5 — the host-config component (own host + added hosts
+   + add affordance + switcher). Same paper-draft discipline as the rest
+   of the surface; monospace rows, no chrome. */
+.df-root .df-hosts {
+  margin: 0 0 24px;
+  max-width: 640px;
+}
+.df-root .df-hosts-own,
+.df-root .df-hosts-row,
+.df-root .df-hosts-add,
+.df-root .df-hosts-pairing,
+.df-root .df-hosts-rename {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  padding: 4px 0;
+}
+.df-root .df-hosts-name { font-weight: 600; }
+.df-root .df-hosts-tag,
+.df-root .df-hosts-transport,
+.df-root .df-hosts-status { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.7; }
+.df-root .df-hosts-status-unreachable { color: #a33d2e; opacity: 1; }
+.df-root .df-hosts-selected { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; border: 1px solid var(--df-line); padding: 1px 6px; }
+.df-root .df-hosts-marker { width: 10px; }
+.df-root .df-hosts-addr { opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.df-root .df-hosts-list { border-top: 1px solid var(--df-line); margin-top: 4px; }
+.df-root .df-hosts-row { border-bottom: 1px dashed var(--df-line); }
+.df-root .df-hosts-btn {
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border: 1px solid var(--df-line);
+  padding: 2px 8px;
+  background: transparent;
+  cursor: pointer;
+}
+.df-root .df-hosts-btn:hover { background: rgba(0, 0, 0, 0.05); }
+.df-root .df-hosts-input {
+  font-family: inherit;
+  font-size: 11px;
+  border: 1px solid var(--df-line);
+  padding: 3px 6px;
+  background: transparent;
+  flex: 1;
+  max-width: 320px;
+}
+.df-root .df-hosts-empty { font-size: 11px; opacity: 0.7; padding: 6px 0; }
+.df-root .df-hosts-banner { font-size: 10px; padding: 4px 0; opacity: 0.85; }
+.df-root .df-hosts-error { color: #a33d2e; font-size: 10px; }
+.dark .df-root .df-hosts-btn:hover { background: rgba(255, 255, 255, 0.08); }

@@ -1,0 +1,718 @@
+// 0.3.1 slice 06 — For You storytelling card primitives.
+//
+// Mobile-first cards for the For You feed: collapsed (~80px) → tap
+// for inline-expanded preview → tap "Open" for drill-in.
+//
+// Iter 2026-05-15 — vellum-coherent redesign.
+// Cards now use the same vellum surface vocabulary as the dashboard
+// destination cards (translucent stone tint, backdrop-blur, ambient
+// shadow, L-shaped corner brackets) but with a LEGIBILITY-FIRST
+// content layout because For You is the human attention queue —
+// readability beats decoration.
+
+import { useState, type ReactNode } from "react";
+import { CornerBracket } from "../../dashboard/vellum/index.js";
+import type { FeedCard } from "../../../lib/feed-classifier.js";
+
+// -----------------------------------------------------------------------------
+// CardShell — shared chrome
+// -----------------------------------------------------------------------------
+
+export interface CardShellProps {
+  testId: string;
+  kind: CardKind;
+  title: string;
+  oneLiner: string;
+  accent: CardAccent;
+  expanded: ReactNode;
+  drillInHref?: string;
+  drillInLabel?: string;
+  /** Inline action row rendered at the top-right of the collapsed view. */
+  inlineActions?: ReactNode;
+  /** Optional accessory rendered to the left of the title (status dot, bar). */
+  leadingAccessory?: ReactNode;
+}
+
+export type CardKind = "shipped" | "incident" | "progress" | "approval" | "concept";
+
+interface CardAccent {
+  stripe: string; // legacy — preserved for backwards compatibility
+  pill: string;
+  ink: string;
+  label: string;
+}
+
+export const ACCENTS: Record<CardKind, CardAccent> = {
+  shipped:  { stripe: "border-l-emerald-600", pill: "bg-emerald-50 border-emerald-300", ink: "text-emerald-800", label: "SHIPPED" },
+  incident: { stripe: "border-l-red-600",     pill: "bg-red-50 border-red-300",         ink: "text-red-800",     label: "INCIDENT" },
+  progress: { stripe: "border-l-sky-600",     pill: "bg-sky-50 border-sky-300",         ink: "text-sky-800",     label: "PROGRESS" },
+  approval: { stripe: "border-l-amber-600",   pill: "bg-amber-50 border-amber-300",     ink: "text-amber-800",   label: "APPROVAL NEEDED" },
+  concept:  { stripe: "border-l-violet-600",  pill: "bg-violet-50 border-violet-300",   ink: "text-violet-800",  label: "CONCEPT" },
+};
+
+// Per-kind colored leading dot — uses design tokens (success/warning/
+// tertiary) NOT off-brand bg-emerald-50 etc. The dot is the ONLY color
+// on the kind tag; the rest is mono black for legibility.
+const KIND_DOT: Record<CardKind, string> = {
+  shipped:  "bg-success",
+  incident: "bg-tertiary",
+  progress: "bg-secondary",
+  approval: "bg-warning",
+  concept:  "bg-outline",
+};
+
+const KIND_LABEL: Record<CardKind, string> = {
+  shipped:  "Shipped",
+  incident: "Incident",
+  progress: "Progress",
+  approval: "Approval",
+  concept:  "Concept",
+};
+
+// Ambient shadow — multi-stop, defines card edges on all 4 sides.
+// Same recipe as the dashboard destination cards.
+const AMBIENT_SHADOW = {
+  boxShadow: [
+    "0 2px 4px rgba(0, 0, 0, 0.14)",
+    "0 8px 20px rgba(0, 0, 0, 0.16)",
+    "0 0 40px rgba(0, 0, 0, 0.12)",
+  ].join(", "),
+};
+
+export function CardShell({ testId, kind, title, oneLiner, expanded, drillInHref, drillInLabel, inlineActions, leadingAccessory }: CardShellProps) {
+  const [open, setOpen] = useState(false);
+  return (
+    <article
+      data-testid={testId}
+      data-card-kind={kind}
+      data-expanded={open}
+      style={AMBIENT_SHADOW}
+      className="relative bg-surface-low/45 backdrop-blur-[10px] overflow-hidden"
+    >
+      {/* L-shaped corner brackets register the card bounds without a hard
+          border — vellum vocabulary from the dashboard. */}
+      <CornerBracket position="tl" />
+      <CornerBracket position="tr" />
+      <CornerBracket position="bl" />
+      <CornerBracket position="br" />
+
+      <div
+        role="button"
+        tabIndex={0}
+        data-testid={`${testId}-toggle`}
+        onClick={() => setOpen((o) => !o)}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOpen((o) => !o); } }}
+        className="flex w-full min-h-[80px] cursor-pointer items-start gap-4 px-5 py-4 text-left"
+        aria-expanded={open}
+      >
+        <div className="flex-1 min-w-0">
+          {/* Kind tag — mono uppercase with leading colored dot. NOT a
+              colored pill; the only color is the dot. */}
+          <div
+            data-testid={`${testId}-pill`}
+            className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.18em] text-on-surface"
+          >
+            <span aria-hidden="true" className={`inline-block w-1.5 h-1.5 rounded-full ${KIND_DOT[kind]}`} />
+            <span>{KIND_LABEL[kind]}</span>
+          </div>
+
+          {/* Title — display weight, sized for legibility (north star) */}
+          <h3
+            data-testid={`${testId}-title`}
+            className="mt-2 flex items-center gap-2 font-headline text-[16px] font-bold leading-tight text-on-surface"
+          >
+            {leadingAccessory}
+            <span className="truncate">{title}</span>
+          </h3>
+
+          {/* One-liner — clear body text */}
+          <p
+            data-testid={`${testId}-one-liner`}
+            className="mt-1.5 font-body text-[12px] leading-relaxed text-on-surface line-clamp-2"
+          >
+            {oneLiner}
+          </p>
+        </div>
+
+        {inlineActions && (
+          <div
+            data-testid={`${testId}-inline-actions`}
+            className="flex shrink-0 items-center gap-2"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {inlineActions}
+          </div>
+        )}
+      </div>
+
+      {open && (
+        <div
+          data-testid={`${testId}-expanded`}
+          className="border-t border-outline-variant/40 px-5 py-4"
+        >
+          {expanded}
+          {drillInHref && (
+            <div className="mt-3 flex justify-end">
+              <a
+                data-testid={`${testId}-drill-in`}
+                href={drillInHref}
+                className="inline-flex items-center gap-1 min-h-[44px] border border-on-surface px-3 py-2 font-mono text-[10px] uppercase tracking-[0.12em] text-on-surface hover:bg-inverse-surface hover:text-background transition-colors"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {drillInLabel ?? "Open"} →
+              </a>
+            </div>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// ShippedCard — feature-shipped narrative
+// -----------------------------------------------------------------------------
+
+export interface ShippedCardSource {
+  sliceId: string;
+  title: string;
+  oneLiner: string;
+  /** Optional numbered sections preview (rendered in inline-expanded). */
+  sections?: Array<{ number: number; heading: string; summary: string }>;
+}
+
+export function ShippedCard({ source }: { source: ShippedCardSource }) {
+  return (
+    <CardShell
+      testId={`feed-card-shipped-${source.sliceId}`}
+      kind="shipped"
+      title={source.title}
+      oneLiner={source.oneLiner}
+      accent={ACCENTS.shipped}
+      drillInHref={`/project/slice/${source.sliceId}`}
+      expanded={
+        source.sections && source.sections.length > 0 ? (
+          <ol className="space-y-2 text-[11px]">
+            {source.sections.slice(0, 3).map((s) => (
+              <li key={s.number} data-testid={`feed-card-shipped-${source.sliceId}-section-${s.number}`} className="flex gap-2">
+                <span className="font-mono text-[10px] font-bold text-on-surface-variant">{s.number}.</span>
+                <div>
+                  <div className="font-semibold text-on-surface">{s.heading}</div>
+                  <div className="text-on-surface">{s.summary}</div>
+                </div>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <div className="text-[11px] text-on-surface-variant">{source.oneLiner}</div>
+        )
+      }
+    />
+  );
+}
+
+// -----------------------------------------------------------------------------
+// IncidentCard — incident-timeline summary
+// -----------------------------------------------------------------------------
+
+export interface IncidentCardSource {
+  sliceId: string;
+  title: string;
+  oneLiner: string;
+  status: "success" | "warning" | "danger" | "info" | "muted";
+  /** Up to 3 timeline entries to preview in inline-expanded. */
+  recentEntries?: Array<{ time: string; title: string; status: "success" | "warning" | "danger" | "info" | "muted" }>;
+}
+
+const STATUS_DOT: Record<IncidentCardSource["status"], string> = {
+  success: "bg-emerald-500",
+  warning: "bg-amber-500",
+  danger:  "bg-red-500",
+  info:    "bg-sky-500",
+  muted:   "bg-outline-variant",
+};
+
+export function IncidentCard({ source }: { source: IncidentCardSource }) {
+  return (
+    <CardShell
+      testId={`feed-card-incident-${source.sliceId}`}
+      kind="incident"
+      title={source.title}
+      oneLiner={source.oneLiner}
+      accent={ACCENTS.incident}
+      drillInHref={`/project/slice/${source.sliceId}`}
+      drillInLabel="Open timeline"
+      leadingAccessory={
+        <span
+          data-testid={`feed-card-incident-${source.sliceId}-dot`}
+          className={`inline-block h-3 w-3 rounded-full shrink-0 ${STATUS_DOT[source.status]}`}
+          aria-hidden="true"
+        />
+      }
+      expanded={
+        source.recentEntries && source.recentEntries.length > 0 ? (
+          <ul className="space-y-2 text-[11px]">
+            {source.recentEntries.slice(0, 3).map((e, i) => (
+              <li key={i} data-testid={`feed-card-incident-${source.sliceId}-entry-${i}`} className="flex items-baseline gap-2">
+                <span className={`inline-block h-2 w-2 rounded-full ${STATUS_DOT[e.status]} shrink-0`} aria-hidden="true" />
+                <span className="font-mono text-[9px] uppercase tracking-[0.10em] text-on-surface-variant shrink-0">{e.time}</span>
+                <span className="text-on-surface">{e.title}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="text-[11px] text-on-surface-variant">No recent entries.</div>
+        )
+      }
+    />
+  );
+}
+
+// -----------------------------------------------------------------------------
+// ProgressCard — mission/slice progress
+// -----------------------------------------------------------------------------
+
+export interface ProgressCardSource {
+  missionId: string;
+  title: string;
+  oneLiner: string;
+  /** 0..100 */
+  percent: number;
+  /** Next-step hint shown on the collapsed view per IMPL-PRD §6
+   *  ("Title + progress bar + next-step"). When omitted, the
+   *  oneLiner stands in. */
+  nextStep?: string;
+  /** What's the active sub-slice doing right now (inline-expanded). */
+  activeSlice?: { id: string; label: string; status: string };
+}
+
+export function ProgressCard({
+  source,
+  onMarkComplete,
+}: {
+  source: ProgressCardSource;
+  /**
+   * Slice 18 §3.5 — when provided, ProgressCard renders a "Mark complete"
+   * inline action. Click fires onMarkComplete(missionId). Parent owns the
+   * actual mutation (daemon endpoint + local optimistic state).
+   */
+  onMarkComplete?: (missionId: string) => void;
+}) {
+  const pct = Math.max(0, Math.min(100, Math.round(source.percent)));
+  const inlineActions = onMarkComplete ? (
+    <button
+      type="button"
+      data-testid="progress-card-mark-complete"
+      onClick={(event) => {
+        event.stopPropagation();
+        onMarkComplete(source.missionId);
+      }}
+      className="min-h-[36px] border border-on-surface px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-on-surface hover:bg-inverse-surface hover:text-background transition-colors focus:outline-none focus:ring-1 focus:ring-on-surface"
+    >
+      Mark complete
+    </button>
+  ) : undefined;
+  return (
+    <CardShell
+      testId={`feed-card-progress-${source.missionId}`}
+      kind="progress"
+      title={source.title}
+      oneLiner={source.nextStep ?? source.oneLiner}
+      accent={ACCENTS.progress}
+      drillInHref={`/project/mission/${source.missionId}`}
+      drillInLabel="Open mission"
+      inlineActions={inlineActions}
+      leadingAccessory={
+        <div
+          data-testid={`feed-card-progress-${source.missionId}-bar`}
+          data-percent={pct}
+          className="h-1.5 w-16 shrink-0 border border-outline-variant bg-surface-low overflow-hidden"
+          aria-label={`Progress ${pct}%`}
+        >
+          <div
+            data-testid={`feed-card-progress-${source.missionId}-bar-fill`}
+            className="h-full bg-sky-500"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      }
+      expanded={
+        source.activeSlice ? (
+          <div data-testid={`feed-card-progress-${source.missionId}-active-slice`} className="border border-outline-variant bg-background px-2 py-2">
+            <div className="font-mono text-[8px] uppercase tracking-[0.18em] text-on-surface-variant">Active slice</div>
+            <div className="mt-1 text-[12px] font-semibold text-on-surface">{source.activeSlice.label}</div>
+            <div className="mt-0.5 font-mono text-[9px] text-on-surface-variant">status: {source.activeSlice.status}</div>
+          </div>
+        ) : (
+          <div className="text-[11px] text-on-surface-variant">No active slice.</div>
+        )
+      }
+    />
+  );
+}
+
+// -----------------------------------------------------------------------------
+// ApprovalCard — queue items with tier: human-gate
+// -----------------------------------------------------------------------------
+
+export interface ApprovalCardSource {
+  qitemId: string;
+  title: string;
+  oneLiner: string;
+  /** Body preview shown when inline-expanded. */
+  bodyPreview?: string;
+  /** Drill-in destination (queue detail or slice). */
+  drillInHref?: string;
+  onApprove?: () => void;
+  onDeny?: () => void;
+}
+
+export function ApprovalCard({ source }: { source: ApprovalCardSource }) {
+  return (
+    <CardShell
+      testId={`feed-card-approval-${source.qitemId}`}
+      kind="approval"
+      title={source.title}
+      oneLiner={source.oneLiner}
+      accent={ACCENTS.approval}
+      drillInHref={source.drillInHref}
+      drillInLabel="Open detail"
+      inlineActions={
+        <>
+          {source.onApprove && (
+            <button
+              type="button"
+              data-testid={`feed-card-approval-${source.qitemId}-approve`}
+              onClick={source.onApprove}
+              className="min-h-[44px] border border-success px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-success hover:bg-success hover:text-white transition-colors"
+            >
+              Approve
+            </button>
+          )}
+          {source.onDeny && (
+            <button
+              type="button"
+              data-testid={`feed-card-approval-${source.qitemId}-deny`}
+              onClick={source.onDeny}
+              className="min-h-[44px] border border-on-surface px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-on-surface hover:bg-inverse-surface hover:text-background transition-colors"
+            >
+              Deny
+            </button>
+          )}
+        </>
+      }
+      expanded={
+        source.bodyPreview ? (
+          <pre data-testid={`feed-card-approval-${source.qitemId}-body`} className="overflow-x-auto whitespace-pre-wrap break-words bg-background p-2 font-body text-[11px] leading-relaxed text-on-surface">
+            {source.bodyPreview}
+          </pre>
+        ) : (
+          <div className="text-[11px] text-on-surface-variant">No body preview.</div>
+        )
+      }
+    />
+  );
+}
+
+// -----------------------------------------------------------------------------
+// ConceptCard — kind: concept-explainer
+// -----------------------------------------------------------------------------
+
+export interface ConceptCardSource {
+  sliceId: string;
+  title: string;
+  oneLiner: string;
+  /** Optional thumbnail URL for the diagram. */
+  thumbnailUrl?: string;
+  /** Optional comparison preview (just rendered as text rows in v0). */
+  comparePreview?: Array<{ label: string; valueOld: string; valueNew: string }>;
+}
+
+export function ConceptCard({ source }: { source: ConceptCardSource }) {
+  return (
+    <CardShell
+      testId={`feed-card-concept-${source.sliceId}`}
+      kind="concept"
+      title={source.title}
+      oneLiner={source.oneLiner}
+      accent={ACCENTS.concept}
+      drillInHref={`/project/slice/${source.sliceId}`}
+      drillInLabel="Open concept"
+      expanded={
+        source.comparePreview && source.comparePreview.length > 0 ? (
+          <table className="w-full border-collapse text-[11px]">
+            <thead>
+              <tr className="bg-background">
+                <th className="border border-outline-variant px-2 py-1 text-left font-mono text-[8px] uppercase tracking-[0.12em] text-on-surface-variant"></th>
+                <th className="border border-outline-variant px-2 py-1 text-left font-mono text-[8px] uppercase tracking-[0.12em] text-on-surface-variant">Old</th>
+                <th className="border border-outline-variant px-2 py-1 text-left font-mono text-[8px] uppercase tracking-[0.12em] text-on-surface-variant">New</th>
+              </tr>
+            </thead>
+            <tbody>
+              {source.comparePreview.slice(0, 3).map((row, i) => (
+                <tr key={i}>
+                  <td className="border border-outline-variant px-2 py-1 font-mono text-[10px] font-semibold text-on-surface">{row.label}</td>
+                  <td className="border border-outline-variant px-2 py-1 text-on-surface">{row.valueOld}</td>
+                  <td className="border border-outline-variant px-2 py-1 text-on-surface">{row.valueNew}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <div className="text-[11px] text-on-surface-variant">{source.oneLiner}</div>
+        )
+      }
+    />
+  );
+}
+
+// -----------------------------------------------------------------------------
+// StorytellingFeed — vertical stack of cards, mobile-first
+// -----------------------------------------------------------------------------
+
+export type FeedCardItem =
+  | { kind: "shipped"; source: ShippedCardSource }
+  | { kind: "incident"; source: IncidentCardSource }
+  | { kind: "progress"; source: ProgressCardSource }
+  | { kind: "approval"; source: ApprovalCardSource }
+  | { kind: "concept"; source: ConceptCardSource };
+
+/** 0.3.1 slice 06 forward-fix #2 — pure adapter that converts the
+ *  daemon-driven mission + slice rows into FeedCardItem[]. Exported
+ *  for unit-test surface: callers can verify the production wire's
+ *  routing (missions → ProgressCard; shipped slices → ShippedCard;
+ *  everything else → IncidentCard with derived status) without
+ *  mounting the full Feed.tsx surface. */
+export interface AdapterMissionRow {
+  name: string;
+  path: string;
+  /**
+   * Slice 18 §3.5 — mission frontmatter status from the daemon
+   * (GET /api/missions/:id). When "complete", the mission is filtered
+   * out of the storytelling preview band even when not in the local
+   * completedMissionIds set — durable source of truth survives
+   * browser/localStorage reset.
+   */
+  status?: string | null;
+}
+export interface AdapterSliceRow {
+  name: string;
+  missionId?: string | null;
+  displayName?: string;
+  status?: string | null;
+  lastActivityAt?: string | null;
+  /**
+   * OPR.0.3.2.17 — raw frontmatter `status` value (preserved alongside
+   * the bucketed `status`) so the adapter can route candidate slices
+   * to ConceptCard without changing the daemon's bucketing logic.
+   * Filled from SliceListEntry.rawStatus when callers thread sliceRows
+   * through.
+   */
+  rawStatus?: string | null;
+  /**
+   * OPR.0.3.2.17 — frontmatter `description` for the slice. Used as
+   * ConceptCard.oneLiner when the slice routes via `rawStatus ===
+   * "candidate"`. Absent values fall back to a stable placeholder so
+   * the band renders gracefully.
+   */
+  description?: string | null;
+}
+// Wired card kinds (post OPR.0.3.2.17 — ConceptCard data source wired):
+//   - progress  ← missions (mapped from useMissionDiscovery rows)
+//   - shipped   ← slices with status shipped/complete/done
+//   - incident  ← slices with status blocked/failed/danger/etc.
+//   - approval  ← FeedCard items with kind === "approval" (from
+//                 useActivityFeed → classifyFeed) — caller threads in
+//                 via the 4th arg.
+//   - concept   ← slices with rawStatus === "candidate" (shaped backlog
+//                 items): title ← displayName; oneLiner ← description;
+//                 drillInHref ← /project/slice/<name>. Capped at 2
+//                 per the curated-band rule (HG-4). Graceful-empty
+//                 when no candidate rows exist (HG-2).
+/**
+ * OPR.0.3.2.17 — predicate for the ConceptCard data source per PRD
+ * Option A. A slice qualifies as a "shaped backlog candidate" when
+ * BOTH conditions hold:
+ *   - frontmatter status is "candidate" (case-insensitive)
+ *   - the slice lives under the `backlog` mission
+ *
+ * Exported so the predicate is a discrete, testable surface — guard
+ * BLOCKING qitem-20260518093643 flagged that the original filter
+ * (rawStatus alone) over-matched any-mission candidate slices.
+ */
+export function isBacklogCandidateSlice(slice: AdapterSliceRow): boolean {
+  const status = (slice.rawStatus ?? "").toLowerCase();
+  if (status !== "candidate") return false;
+  return slice.missionId === "backlog";
+}
+
+export function buildStorytellingFeedItems(
+  missions: AdapterMissionRow[],
+  slices: AdapterSliceRow[],
+  /**
+   * Slice 18 §3.5 — when supplied, missions whose name is in the set are
+   * filtered out of the progress preview. Powers the Getting Started
+   * complete-and-hide flow (operator click → mark complete → mission
+   * disappears from the storytelling band).
+   */
+  completedMissionIds?: Set<string>,
+  /**
+   * 0.3.1 storytelling-adapter wire-up — already-classified FeedCard
+   * items from useActivityFeed/classifyFeed. The adapter filters to
+   * `kind === "approval"` and emits up to 2 ApprovalCards in the
+   * preview band. Other kinds are ignored here (FeedCard.tsx continues
+   * to render the long-form list below).
+   */
+  feedCards?: FeedCard[],
+): FeedCardItem[] {
+  const items: FeedCardItem[] = [];
+  // Two filters: (1) localStorage optimistic hide set; (2) durable
+  // frontmatter status === "complete" (read by the caller from
+  // GET /api/missions/:id and threaded onto the row). The status
+  // filter is the source-of-truth survival across browser/localStorage
+  // reset; the local set is the instant-feedback mirror.
+  const hiddenMissionIds = new Set(completedMissionIds ? Array.from(completedMissionIds) : []);
+  for (const mission of missions ?? []) {
+    if ((mission.status ?? "").toLowerCase() === "complete") {
+      hiddenMissionIds.add(mission.name);
+    }
+  }
+  const eligibleMissions = (missions ?? []).filter((m) => {
+    return !hiddenMissionIds.has(m.name);
+  });
+  for (const mission of eligibleMissions.slice(0, 2)) {
+    items.push({
+      kind: "progress",
+      source: {
+        missionId: mission.name,
+        title: mission.name,
+        oneLiner: `Mission at ${mission.path}`,
+        nextStep: `Open mission for live status + active slices.`,
+        percent: 0,
+      },
+    });
+  }
+  const eligibleSlices = (slices ?? []).filter((slice) => {
+    return !slice.missionId || !hiddenMissionIds.has(slice.missionId);
+  });
+
+  // OPR.0.3.2.17 — ConceptCard routing.
+  // PRD Option A: source is specifically shaped backlog candidates at
+  // `missions/backlog/slices/<slug>/README.md` with `status: candidate`
+  // — NOT any candidate slice across any mission. The predicate
+  // requires BOTH conditions; a `status: candidate` slice under a
+  // different mission (e.g., release-0.3.2) routes through the normal
+  // status-bucket path, not as a concept item. This keeps the
+  // ConceptCard band semantically aligned with the operator's
+  // "shaped backlog" mental model.
+  //
+  // Partition candidates out of the normal status-bucket routing so a
+  // single slice is routed to exactly ONE kind (HG-5: no double-count).
+  // The curated band caps at 2 (HG-4). Graceful-empty (HG-2): when no
+  // candidate rows are present this branch contributes zero items.
+  const candidateSlices = eligibleSlices.filter(isBacklogCandidateSlice);
+  const nonCandidateSlices = eligibleSlices.filter(
+    (s) => !isBacklogCandidateSlice(s),
+  );
+  for (const slice of candidateSlices.slice(0, 2)) {
+    const title = slice.displayName || slice.name;
+    const oneLinerRaw = (slice.description ?? "").trim();
+    const oneLiner = oneLinerRaw.length > 0
+      ? oneLinerRaw
+      : "Shaped candidate — open to explore the proposed change.";
+    items.push({
+      kind: "concept",
+      source: {
+        sliceId: slice.name,
+        title,
+        oneLiner,
+      },
+    });
+  }
+
+  for (const slice of nonCandidateSlices.slice(0, 3)) {
+    const oneLiner = slice.lastActivityAt
+      ? `Last activity ${slice.lastActivityAt}`
+      : `Slice in ${slice.status ?? "unknown"} state`;
+    const title = slice.displayName || slice.name;
+    const sliceId = slice.name;
+    const status = (slice.status ?? "").toLowerCase();
+    if (status === "shipped" || status === "complete" || status === "done") {
+      items.push({ kind: "shipped", source: { sliceId, title, oneLiner } });
+    } else if (status === "blocked" || status === "danger" || status === "failed") {
+      items.push({
+        kind: "incident",
+        source: { sliceId, title, oneLiner, status: status === "blocked" ? "warning" : "danger" },
+      });
+    } else {
+      items.push({ kind: "incident", source: { sliceId, title, oneLiner, status: "info" } });
+    }
+  }
+  // Approval wire-up: classified FeedCards with kind === "approval" are
+  // mapped to ApprovalCardSource. qitemId lives in the source event
+  // payload (FeedCard.id is `${type}-${seq}`, not the qitem id); fall
+  // back to FeedCard.id only if neither key is present so each card
+  // still has a stable React key. Cap at 2 to match the band's tight
+  // preview budget.
+  const approvals = (feedCards ?? []).filter((c) => c.kind === "approval");
+  for (const card of approvals.slice(0, 2)) {
+    const payload = (card.source.payload ?? {}) as Record<string, unknown>;
+    const fromPayload =
+      (typeof payload.qitemId === "string" && payload.qitemId.length > 0)
+        ? payload.qitemId
+        : (typeof payload.qitem_id === "string" && payload.qitem_id.length > 0)
+          ? payload.qitem_id
+          : null;
+    const qitemId = fromPayload ?? card.id;
+    const author = card.authorSession ? ` from ${card.authorSession}` : "";
+    const bodyPreview =
+      card.body && card.body.length > 240
+        ? `${card.body.slice(0, 237)}...`
+        : card.body;
+    items.push({
+      kind: "approval",
+      source: {
+        qitemId,
+        title: card.title,
+        oneLiner: `Needs approval${author}`,
+        bodyPreview,
+        drillInHref: "/for-you",
+      },
+    });
+  }
+  return items;
+}
+
+export function StorytellingFeed({
+  items,
+  onMarkMissionComplete,
+}: {
+  items: FeedCardItem[];
+  /** Slice 18 §3.5 — when supplied, threaded through to ProgressCards
+   *  so the operator can hide a completed mission from the band. */
+  onMarkMissionComplete?: (missionId: string) => void;
+}) {
+  if (items.length === 0) {
+    return (
+      <div data-testid="storytelling-feed-empty" className="border border-dashed border-outline-variant bg-surface-lowest/35 p-4 font-body text-[11px] text-on-surface-variant">
+        No items in the feed.
+      </div>
+    );
+  }
+  return (
+    <div data-testid="storytelling-feed" className="flex flex-col gap-4">
+      {items.map((item, i) => {
+        // OPR.0.3.2.17 — ConceptCard branch re-added. Adapter emits
+        // `kind: "concept"` for shaped backlog candidates
+        // (rawStatus === "candidate"); the switch routes them to
+        // ConceptCard. Other 4 kinds unchanged (HG-5).
+        if (item.kind === "shipped")  return <ShippedCard key={i}  source={item.source} />;
+        if (item.kind === "incident") return <IncidentCard key={i} source={item.source} />;
+        if (item.kind === "progress") return <ProgressCard key={i} source={item.source} onMarkComplete={onMarkMissionComplete} />;
+        if (item.kind === "approval") return <ApprovalCard key={i} source={item.source} />;
+        if (item.kind === "concept")  return <ConceptCard key={i}  source={item.source} />;
+        return null;
+      })}
+    </div>
+  );
+}

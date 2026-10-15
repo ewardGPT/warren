@@ -1,0 +1,674 @@
+import { describe, it, expect, afterEach, vi, beforeEach } from "vitest";
+import { render, screen, cleanup, waitFor, fireEvent } from "@testing-library/react";
+import { createTestRouter } from "./helpers/test-router.js";
+import { LiveNodeDetails } from "../src/components/LiveNodeDetails.js";
+import { DrawerSelectionContext, type DrawerSelection } from "../src/components/AppShell.js";
+import {
+  resetTopologyActivityStoreForTests,
+  useTopologyActivity,
+} from "../src/hooks/useTopologyActivity.js";
+import { buildTopologySessionIndex } from "../src/lib/topology-activity.js";
+import { createMockEventSourceClass, instances } from "./helpers/mock-event-source.js";
+
+const mockFetch = vi.fn();
+let OriginalEventSource: typeof EventSource | undefined;
+
+// V0.3.1 slice 25 — seat detail page now uses a 2-tab Overview +
+// Details layout. Tests target the new structure.
+const NODE_DETAIL = {
+  rigId: "rig-1", rigName: "test-rig", logicalId: "dev.impl", podId: "dev",
+  canonicalSessionName: "dev-impl@test-rig", nodeKind: "agent", runtime: "claude-code",
+  sessionStatus: "running", startupStatus: "ready", restoreOutcome: "n-a",
+  tmuxAttachCommand: "tmux attach -t dev-impl@test-rig", resumeCommand: null,
+  latestError: null, model: "opus", agentRef: "local:agents/impl", profile: "default",
+  resolvedSpecName: "impl", resolvedSpecVersion: "1.0.0", cwd: "/workspace",
+  startupFiles: [{
+    path: "role.md",
+    deliveryHint: "guidance_merge",
+    required: true,
+    absolutePath: "/workspace/specs/agents/impl/guidance/role.md",
+  }],
+  startupActions: [], recentEvents: [],
+  infrastructureStartupCommand: null,
+  binding: { tmuxSession: "dev-impl@test-rig" },
+  peers: [{ logicalId: "dev.qa", canonicalSessionName: "dev-qa@test-rig", runtime: "codex" }],
+  edges: {
+    outgoing: [{ kind: "delegates_to", to: { logicalId: "dev.qa", sessionName: "dev-qa@test-rig" } }],
+    incoming: [],
+  },
+  transcript: { enabled: true, path: "/tmp/test.log", tailCommand: "rig transcript dev-impl --tail 100" },
+  compactSpec: { name: "impl", version: "1.0.0", profile: "default", skillCount: 2, guidanceCount: 1 },
+  agentActivity: {
+    state: "running",
+    reason: "edit",
+    evidenceSource: "runtime_hook",
+    sampledAt: "2026-05-04T07:58:31.057Z",
+    evidence: "edit",
+  },
+  currentQitems: [
+    {
+      qitemId: "qitem-20260504001234-driver",
+      bodyExcerpt: "Implement PL-019 edge activity pulse and graph qitem hover.",
+      tier: "mode-2",
+    },
+  ],
+  contextUsage: {
+    availability: "known",
+    usedPercentage: 42,
+    remainingPercentage: 58,
+    contextWindowSize: 320000,
+    sampledAt: "2026-05-04T07:58:31.057Z",
+    fresh: true,
+    totalInputTokens: 120000,
+    totalOutputTokens: 14000,
+  },
+};
+
+const INFRA_DETAIL = {
+  ...NODE_DETAIL, logicalId: "infra.server", nodeKind: "infrastructure", runtime: "terminal",
+  agentRef: null, profile: null,
+  compactSpec: { name: null, version: null, profile: null, skillCount: 0, guidanceCount: 0 },
+};
+
+describe("LiveNodeDetails (slice 25 Overview + Details)", () => {
+  beforeEach(() => {
+    OriginalEventSource = globalThis.EventSource;
+    globalThis.EventSource = createMockEventSourceClass() as unknown as typeof EventSource;
+    resetTopologyActivityStoreForTests();
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    if (OriginalEventSource) {
+      globalThis.EventSource = OriginalEventSource;
+    } else {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      delete (globalThis as any).EventSource;
+    }
+  });
+
+  function mockNodeDetail(detail: Record<string, unknown>) {
+    mockFetch.mockImplementation(async (url: string) => {
+      if (typeof url === "string" && url.includes("/nodes/")) {
+        return { ok: true, json: async () => detail };
+      }
+      // Library calls return empty
+      if (typeof url === "string" && url.includes("/api/specs/library")) {
+        return { ok: true, json: async () => [] };
+      }
+      return { ok: true, json: async () => ({}) };
+    });
+  }
+
+  function renderDetails(logicalId = "dev.impl") {
+    return render(
+      createTestRouter({
+        component: () => <LiveNodeDetails rigId="rig-1" logicalId={logicalId} />,
+        path: "/test",
+      }),
+    );
+  }
+
+  function renderDetailsWithDrawerSelection(setSelection: (sel: DrawerSelection) => void, logicalId = "dev.impl") {
+    return render(
+      createTestRouter({
+        component: () => (
+          <DrawerSelectionContext.Provider value={{ selection: null, setSelection }}>
+            <LiveNodeDetails rigId="rig-1" logicalId={logicalId} />
+          </DrawerSelectionContext.Provider>
+        ),
+        path: "/test",
+      }),
+    );
+  }
+
+  function TopologyActivityWarmup() {
+    useTopologyActivity(buildTopologySessionIndex([{
+      nodeId: "rig-1::dev.impl",
+      rigId: "rig-1",
+      rigName: "test-rig",
+      logicalId: "dev.impl",
+      canonicalSessionName: "dev-impl@test-rig",
+    }]));
+    return <div data-testid="activity-warmup" />;
+  }
+
+  // HG-1 — default tab is Overview.
+  it("HG-1: default tab is Overview on landing", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+
+    const overviewTab = await screen.findByTestId("live-tab-overview");
+    expect(overviewTab.getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("live-overview-section")).toBeDefined();
+    // Details exists but is not active on first paint.
+    const detailsTab = screen.getByTestId("live-tab-details");
+    expect(detailsTab.getAttribute("aria-selected")).toBe("false");
+  });
+
+  // HG-7 — Terminal tab no longer exists; identity / agent-spec /
+  // startup / transcript tabs no longer exist as named tabs either.
+  it("HG-7: legacy 5-tab structure is gone — only overview + details remain", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    await screen.findByTestId("live-tab-overview");
+
+    expect(screen.queryByTestId("live-tab-terminal")).toBeNull();
+    expect(screen.queryByTestId("live-tab-identity")).toBeNull();
+    expect(screen.queryByTestId("live-tab-agent-spec")).toBeNull();
+    expect(screen.queryByTestId("live-tab-startup")).toBeNull();
+    expect(screen.queryByTestId("live-tab-transcript")).toBeNull();
+    expect(screen.getByTestId("live-tab-overview")).toBeDefined();
+    expect(screen.getByTestId("live-tab-details")).toBeDefined();
+  });
+
+  // HG-2 (follow-on-2) — Overview stack order: notification banner
+  // (optional, real-alert-only) -> info table -> secondary (cwd +
+  // current-work) -> inline terminal -> recent events (at bottom).
+  // LiveNodeCurrentState is REMOVED. Order asserted via
+  // compareDocumentPosition between always-rendered elements.
+  it("HG-2: Overview tab DOM order is notification -> table -> secondary -> terminal -> recent events", async () => {
+    // Inject a startupStatus that surfaces the notification banner so
+    // the assertion covers the full 5-element order.
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      startupStatus: "attention_required",
+      latestError: "synthetic attention",
+      recentEvents: [
+        { type: "agent.activity", createdAt: "2026-05-12T00:00:00Z" },
+      ],
+    });
+    renderDetails();
+
+    const banner = await screen.findByTestId("seat-notification-banner");
+    const table = await screen.findByTestId("seat-overview-table");
+    const secondary = await screen.findByTestId("seat-overview-secondary");
+    const terminal = await screen.findByTestId("live-terminal-shell");
+    const events = await screen.findByTestId("live-node-recent-events");
+
+    expect(banner.compareDocumentPosition(table)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(table.compareDocumentPosition(secondary)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(secondary.compareDocumentPosition(terminal)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(terminal.compareDocumentPosition(events)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+
+    // LiveNodeCurrentState no longer mounts inside Overview (follow-on-1
+    // invariant preserved).
+    expect(screen.queryByTestId("live-node-current-state")).toBeNull();
+  });
+
+  // HG-1 (follow-on-2) — info table renders column-headers + single
+  // data row for 7 fields. The "OVERVIEW" section header row is
+  // removed; column headers are the first row.
+  it("HG-1: info table renders column-headers + single data row (7 fields); no OVERVIEW row", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    const table = await screen.findByTestId("seat-overview-table");
+
+    // 7 column headers
+    const headerRow = screen.getByTestId("seat-overview-header-row");
+    expect(headerRow).toBeDefined();
+    expect(screen.getByTestId("seat-overview-header-runtime")).toBeDefined();
+    expect(screen.getByTestId("seat-overview-header-model")).toBeDefined();
+    expect(screen.getByTestId("seat-overview-header-profile")).toBeDefined();
+    expect(screen.getByTestId("seat-overview-header-spec")).toBeDefined();
+    expect(screen.getByTestId("seat-overview-header-activity")).toBeDefined();
+    expect(screen.getByTestId("seat-overview-header-context-percent")).toBeDefined();
+    expect(screen.getByTestId("seat-overview-header-total-tokens")).toBeDefined();
+
+    // HG-6 (follow-on-2): header label is "tokens" not "total tokens".
+    expect(screen.getByTestId("seat-overview-header-total-tokens").textContent).toBe("tokens");
+
+    const dataRow = screen.getByTestId("seat-overview-data-row");
+    expect(dataRow.getAttribute("data-row-shape")).toBe("data");
+
+    // HG-3 (follow-on-2) section-header row removed — no element with
+    // "OVERVIEW" / "Overview" as its only content inside the table.
+    const tableText = table.textContent ?? "";
+    // The activity COLUMN may show "active" but the legacy section
+    // header was the string "Overview" as standalone div text.
+    expect(tableText.toLowerCase()).not.toContain("overview");
+
+    // HG-5 (follow-on-2) cwd + current-work moved OUT of the table.
+    // No full-width rows inside the column table anymore.
+    expect(screen.queryByTestId("seat-overview-row-cwd")).toBeNull();
+    expect(screen.queryByTestId("seat-overview-row-current-work")).toBeNull();
+
+    // Data-cell content reads from NodeDetailData fields.
+    expect(screen.getByTestId("seat-overview-cell-model").textContent).toContain("opus");
+    expect(screen.getByTestId("seat-overview-cell-profile").textContent).toContain("default");
+    expect(screen.getByTestId("seat-overview-cell-spec").textContent).toContain("impl@1.0.0");
+    expect(screen.getByTestId("seat-overview-cell-context-percent").textContent).toContain("42%");
+  });
+
+  // HG-4 (follow-on-2) — vertical grid lines between column cells.
+  // Every column cell except the last carries `border-r border-outline-variant`.
+  it("HG-4: column cells have vertical grid lines (border-r between columns)", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    await screen.findByTestId("seat-overview-table");
+
+    // Header cells (first 6 of 7 carry border-r; last does not).
+    const headers = [
+      "runtime",
+      "model",
+      "profile",
+      "spec",
+      "activity",
+      "context-percent",
+    ];
+    for (const key of headers) {
+      const cell = screen.getByTestId(`seat-overview-header-${key}`);
+      expect(cell.className).toContain("border-r");
+      expect(cell.className).toContain("border-outline-variant");
+    }
+    // Last header (tokens) — no trailing border-r.
+    expect(screen.getByTestId("seat-overview-header-total-tokens").className).not.toContain("border-r");
+
+    // Data cells mirror.
+    for (const key of headers) {
+      const cell = screen.getByTestId(`seat-overview-cell-${key}`);
+      expect(cell.className).toContain("border-r");
+      expect(cell.className).toContain("border-outline-variant");
+    }
+    expect(screen.getByTestId("seat-overview-cell-total-tokens").className).not.toContain("border-r");
+  });
+
+  // HG-5 (follow-on-2) — cwd + current-work moved into a separate
+  // primitive below the column table; not via colSpan inside the
+  // same table.
+  it("HG-5: cwd + current-work render in a separate primitive (seat-overview-secondary)", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+
+    const secondary = await screen.findByTestId("seat-overview-secondary");
+    expect(secondary).toBeDefined();
+    // Separate primitive — distinct from the column table.
+    const table = screen.getByTestId("seat-overview-table");
+    expect(table.contains(secondary)).toBe(false);
+    expect(secondary.contains(table)).toBe(false);
+
+    // Rows present inside the secondary primitive.
+    expect(screen.getByTestId("seat-overview-secondary-row-cwd")).toBeDefined();
+    expect(screen.getByTestId("seat-overview-secondary-row-current-work")).toBeDefined();
+  });
+
+  // HG-3a — activity row wires to data.agentActivity via
+  // getActivityState (the SAME helper LiveNodeCurrentState uses; the
+  // SAME source the topology baseline reads). When agentActivity.state
+  // is "running", the cell shows label "active" matching topology
+  // graph/table naming.
+  it("HG-3a: activity row wires live and shows 'active' for state=running with shimmer", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    await screen.findByTestId("seat-overview-table");
+
+    const cell = screen.getByTestId("seat-overview-cell-activity");
+    expect(cell.textContent?.trim()).toContain("active");
+    const stateEl = screen.getByTestId("seat-overview-activity-state");
+    expect(stateEl.getAttribute("data-activity-state")).toBe("active");
+    // HG-3c shimmer reuse: slice-14 shimmer class applied on active.
+    expect(stateEl.className).toContain("topology-table-active-shimmer");
+  });
+
+  it("HG-3a: activity row shows 'idle' label and NO shimmer when agentActivity.state=idle", async () => {
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      agentActivity: { ...NODE_DETAIL.agentActivity, state: "idle" },
+      currentQitems: [],
+    });
+    renderDetails();
+    await screen.findByTestId("seat-overview-table");
+    const cell = screen.getByTestId("seat-overview-cell-activity");
+    expect(cell.textContent?.trim()).toContain("idle");
+    const stateEl = screen.getByTestId("seat-overview-activity-state");
+    expect(stateEl.getAttribute("data-activity-state")).toBe("idle");
+    expect(stateEl.className).not.toContain("topology-table-active-shimmer");
+  });
+
+  it("HG-3a: seat page reuses recent topology activity across graph/table -> seat navigation", async () => {
+    const warmup = render(<TopologyActivityWarmup />);
+    await waitFor(() => {
+      expect(instances).toHaveLength(1);
+    });
+
+    instances[0]!.simulateMessage(JSON.stringify({
+      type: "agent.activity",
+      sessionName: "dev-impl@test-rig",
+      activity: { state: "running" },
+    }));
+    warmup.unmount();
+
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      agentActivity: {
+        ...NODE_DETAIL.agentActivity,
+        state: "unknown",
+        reason: "no_activity_signal",
+        fallback: true,
+      },
+      currentQitems: [],
+    });
+    renderDetails();
+    const stateEl = await screen.findByTestId("seat-overview-activity-state");
+    expect(stateEl.textContent).toBe("active");
+    expect(stateEl.getAttribute("data-activity-state")).toBe("active");
+    expect(stateEl.getAttribute("data-activity-source")).toBe("ring");
+    expect(stateEl.className).toContain("topology-table-active-shimmer");
+  });
+
+  // HG-3b (follow-on-2) — current-work wires live in the secondary
+  // primitive below the column table.
+  it("HG-3b: current-work cell wires live and surfaces the in-progress qitem", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    await screen.findByTestId("seat-overview-secondary");
+    const cell = screen.getByTestId("seat-overview-secondary-cell-current-work");
+    expect(cell.textContent).toContain("qitem-20260504001234-driver");
+    expect(cell.textContent).toContain("Implement PL-019 edge activity pulse");
+  });
+
+  it("HG-3b: current-work cell renders em-dash when no in-progress qitem", async () => {
+    mockNodeDetail({ ...NODE_DETAIL, currentQitems: [] });
+    renderDetails();
+    await screen.findByTestId("seat-overview-secondary");
+    const cell = screen.getByTestId("seat-overview-secondary-cell-current-work");
+    expect(cell.textContent).toContain("—");
+  });
+
+  // HG-3d (follow-on-2) — cwd renders in the secondary primitive
+  // with truncate + title tooltip on the row.
+  it("HG-3d: cwd renders in the secondary primitive with truncate + tooltip", async () => {
+    const longCwd = "/Users/example/very/long/workspace/path/that/should/truncate/at/the/end";
+    mockNodeDetail({ ...NODE_DETAIL, cwd: longCwd });
+    renderDetails();
+    const row = await screen.findByTestId("seat-overview-secondary-row-cwd");
+    expect(row.getAttribute("title")).toBe(longCwd);
+    const cell = screen.getByTestId("seat-overview-secondary-cell-cwd");
+    // The cell carries the truncate class so the cwd doesn't overflow.
+    expect(cell.className).toContain("truncate");
+  });
+
+  // HG-4 (preserved) — model graceful absence: column cell shows
+  // em-dash, NOT "undefined". The header row remains; the model cell
+  // in the data row carries the placeholder.
+  it("HG-4: model cell renders em-dash gracefully when model field is absent", async () => {
+    mockNodeDetail({ ...NODE_DETAIL, model: null });
+    renderDetails();
+    await screen.findByTestId("seat-overview-table");
+
+    // Header row still present for model.
+    expect(screen.getByTestId("seat-overview-header-model")).toBeDefined();
+    // Data cell carries placeholder, not literal "undefined".
+    const modelCell = screen.getByTestId("seat-overview-cell-model");
+    expect(modelCell).toBeDefined();
+    expect(modelCell.textContent).not.toContain("undefined");
+    expect(modelCell.textContent).toContain("—");
+  });
+
+  // HG-5 — black-glass terminal renders inline in Overview (not in a
+  // separate tab). The terminal shell wrapper carries the black-glass
+  // chrome class. OPR.0.4.0.1 (round-two QA ruling): the inline terminal now
+  // uses the reusable progressive default-static -> click-inside-to-go-live
+  // ProgressiveTerminal under the global live-terminal cap, so on open it shows
+  // the STATIC preview -- NOT an immediate always-live FocusedTerminal/WebSocket.
+  it("HG-5: black-glass terminal renders inline in Overview (progressive default-static)", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    const terminalShell = await screen.findByTestId("live-terminal-shell");
+    expect(terminalShell.className).toContain("bg-stone-950/65");
+    // Default-static: the ProgressiveTerminal static trigger is present...
+    await screen.findByTestId("node-detail-terminal-static");
+    // ...and NO live xterm/WebSocket terminal is mounted on open.
+    expect(screen.queryByTestId(`focused-terminal-${NODE_DETAIL.canonicalSessionName}`)).toBeNull();
+    // The terminal sits inside the Overview section, NOT a separate
+    // tab body. The Overview section wraps it.
+    const overview = screen.getByTestId("live-overview-section");
+    expect(overview.contains(terminalShell)).toBe(true);
+  });
+
+  // HG-6 (follow-on) — Details tab re-ordered. New top-to-bottom
+  // order: Startup → AgentSpec → Edges → Peers → (Context usage) →
+  // Transcript. Asserted via DOM order between always-rendered
+  // section testids.
+  it("HG-6: Details tab order is Startup -> Spec/Topology (AgentSpec + Edges + Peers) -> Transcript", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    fireEvent.click(await screen.findByTestId("live-tab-details"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("live-details-section")).toBeDefined();
+    });
+    const startup = screen.getByTestId("live-startup-section");
+    const agentSpec = screen.getByTestId("live-agent-spec-section");
+    const edges = screen.getByTestId("detail-edges");
+    const peers = screen.getByTestId("detail-peers");
+    const transcript = screen.getByTestId("live-transcript-section");
+
+    expect(startup.compareDocumentPosition(agentSpec)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(agentSpec.compareDocumentPosition(edges)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(edges.compareDocumentPosition(peers)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(peers.compareDocumentPosition(transcript)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+
+    // PreviewPane is intentionally absent from Startup (terminal lives
+    // in Overview; preserved invariant from the slice-25 baseline).
+    expect(screen.queryByTestId("live-node-preview")).toBeNull();
+  });
+
+  // HG-3 (follow-on) — Notification banner renders only when an
+  // active message exists; nothing renders otherwise.
+  it("HG-3: notification banner renders when latestError + attention_required is set", async () => {
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      startupStatus: "attention_required",
+      latestError: "Synthetic test error.",
+      recoveryGuidance: {
+        summary: "Synthetic guidance summary.",
+        commands: ["rig restore <snap>"],
+        notes: [],
+      },
+    });
+    renderDetails();
+    const banner = await screen.findByTestId("seat-notification-banner");
+    expect(banner.getAttribute("data-startup-status")).toBe("attention_required");
+    expect(screen.getByTestId("seat-notification-headline").textContent).toContain("Attention required");
+    expect(screen.getByTestId("seat-notification-error").textContent).toContain("Synthetic test error");
+    expect(screen.getByTestId("seat-notification-guidance").textContent).toContain("Synthetic guidance summary");
+  });
+
+  it("HG-3: notification banner does NOT render when no active message", async () => {
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      startupStatus: "ready",
+      latestError: null,
+      recoveryGuidance: null,
+    });
+    renderDetails();
+    await screen.findByTestId("seat-overview-table");
+    expect(screen.queryByTestId("seat-notification-banner")).toBeNull();
+  });
+
+  // HG-2 (follow-on-2 critical) — banner does NOT render when only
+  // generic recoveryGuidance is present (no failed / attention_required
+  // / latestError). recoveryGuidance is documentation of recovery
+  // steps, NOT an alert. The follow-on-1 banner triggered on guidance
+  // alone, producing false alerts on every normal seat; this test
+  // guards that regression class.
+  it("HG-2: notification banner does NOT render for normal seat with generic recoveryGuidance only", async () => {
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      startupStatus: "ready",
+      latestError: null,
+      recoveryGuidance: {
+        summary: "Generic recovery guidance documentation.",
+        commands: ["rig restore <snap>"],
+        notes: [],
+      },
+    });
+    renderDetails();
+    await screen.findByTestId("seat-overview-table");
+    // Banner must NOT mount — recoveryGuidance alone is not an alert.
+    expect(screen.queryByTestId("seat-notification-banner")).toBeNull();
+  });
+
+  // HG-2 — banner DOES render for each alert-triggering condition:
+  // failed startupStatus, attention_required startupStatus, or
+  // latestError present (even when startupStatus is "ready").
+  it("HG-2: notification banner renders for startupStatus=failed", async () => {
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      startupStatus: "failed",
+      latestError: null,
+      recoveryGuidance: null,
+    });
+    renderDetails();
+    const banner = await screen.findByTestId("seat-notification-banner");
+    expect(banner.getAttribute("data-startup-status")).toBe("failed");
+    expect(screen.getByTestId("seat-notification-headline").textContent).toContain("Startup failed");
+  });
+
+  it("HG-2: notification banner renders for latestError alone (no startupStatus alert)", async () => {
+    mockNodeDetail({
+      ...NODE_DETAIL,
+      startupStatus: "ready",
+      latestError: "Runtime error occurred.",
+      recoveryGuidance: null,
+    });
+    renderDetails();
+    const banner = await screen.findByTestId("seat-notification-banner");
+    expect(banner.getAttribute("data-startup-status")).toBe("ready");
+    expect(screen.getByTestId("seat-notification-headline").textContent).toContain("Error");
+    expect(screen.getByTestId("seat-notification-error").textContent).toContain("Runtime error occurred");
+  });
+
+  // Infrastructure nodes still have the same 2-tab structure; the
+  // agent-spec section just doesn't render inside Details.
+  it("infrastructure node renders Overview + Details (no agent-spec card inside Details)", async () => {
+    mockNodeDetail(INFRA_DETAIL);
+    renderDetails("infra.server");
+    await screen.findByTestId("live-tab-overview");
+    expect(screen.getByTestId("live-tab-overview")).toBeDefined();
+    expect(screen.getByTestId("live-tab-details")).toBeDefined();
+    expect(screen.queryByTestId("live-tab-agent-spec")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("live-tab-details"));
+    await waitFor(() => {
+      expect(screen.getByTestId("live-details-section")).toBeDefined();
+    });
+    // No live-agent-spec-section for infra nodes.
+    expect(screen.queryByTestId("live-agent-spec-section")).toBeNull();
+  });
+
+  // Agent spec unavailable cases — switch to Details, then exercise the
+  // null + non-local agentRef shapes.
+  it("Details tab: agent spec section shows unavailable when agentRef is null", async () => {
+    mockNodeDetail({ ...NODE_DETAIL, agentRef: null });
+    renderDetails();
+    fireEvent.click(await screen.findByTestId("live-tab-details"));
+    await waitFor(() => {
+      expect(screen.getByTestId("agent-spec-unavailable")).toBeDefined();
+    });
+  });
+
+  it("Details tab: agent spec section shows unavailable when agentRef is non-local form", async () => {
+    mockNodeDetail({ ...NODE_DETAIL, agentRef: "remote:agents/impl" });
+    renderDetails();
+    fireEvent.click(await screen.findByTestId("live-tab-details"));
+    await waitFor(() => {
+      expect(screen.getByTestId("agent-spec-unavailable")).toBeDefined();
+    });
+  });
+
+  // Startup files surface inside Details > Startup section.
+  it("Details tab: Startup section shows startup files", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    fireEvent.click(await screen.findByTestId("live-tab-details"));
+    await waitFor(() => {
+      expect(screen.getByTestId("live-startup-section")).toBeDefined();
+      expect(screen.getByTestId("live-node-status")).toBeDefined();
+      expect(screen.getByText(/role\.md/)).toBeDefined();
+    });
+  });
+
+  it("Details tab: Startup file trigger threads file provenance for drawer loading", async () => {
+    const setSelection = vi.fn();
+    mockNodeDetail(NODE_DETAIL);
+    renderDetailsWithDrawerSelection(setSelection as (sel: DrawerSelection) => void);
+    fireEvent.click(await screen.findByTestId("live-tab-details"));
+    fireEvent.click(await screen.findByTestId("live-startup-file-trigger-role.md"));
+
+    expect(setSelection).toHaveBeenCalledWith({
+      type: "file",
+      data: {
+        path: "role.md",
+        absolutePath: "/workspace/specs/agents/impl/guidance/role.md",
+      },
+    });
+  });
+
+  it("Details tab: Transcript section owns transcript content", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    fireEvent.click(await screen.findByTestId("live-tab-details"));
+    expect(await screen.findByTestId("detail-transcript")).toBeDefined();
+  });
+
+  // Slice 3.3 fix-B preserved — Plugins section inside Details > Agent
+  // spec area. Renders empty state on builds without batch 1.
+  it("slice 3.3 fix-B preserved: Plugins section in Details tab agent-spec area", async () => {
+    mockFetch.mockImplementation(async (url: string) => {
+      if (typeof url === "string" && url.includes("/nodes/")) {
+        return { ok: true, json: async () => NODE_DETAIL };
+      }
+      if (typeof url === "string" && url === "/api/specs/library?kind=agent") {
+        return { ok: true, json: async () => [{ id: "agent-1", kind: "agent", name: "impl", version: "1.0.0", sourceType: "builtin", sourcePath: "/x/agent.yaml", relativePath: "x/agent.yaml" }] };
+      }
+      if (typeof url === "string" && url.includes("/api/specs/library/agent-1/review")) {
+        return { ok: true, json: async () => ({ kind: "agent", name: "impl", version: "1.0.0", raw: "", sourcePath: "/x/agent.yaml", sourceState: "library_item", libraryEntryId: "agent-1", description: null, profiles: [], resources: { plugins: [], skills: [], guidance: [], hooks: [] }, startup: { files: [], actions: [] } }) };
+      }
+      if (typeof url === "string" && url.startsWith("/api/specs/library")) {
+        return { ok: true, json: async () => [] };
+      }
+      if (typeof url === "string" && url === "/api/plugins") {
+        return { ok: true, json: async () => [] };
+      }
+      return { ok: true, json: async () => ({}) };
+    });
+    renderDetails();
+    fireEvent.click(await screen.findByTestId("live-tab-details"));
+    await waitFor(() => {
+      expect(screen.getByTestId("live-agent-plugins-section")).toBeDefined();
+    });
+    expect(screen.getByTestId("agent-plugins-empty")).toBeDefined();
+  });
+
+  // PL-019 preserved (follow-on-2) — activity surfaces in the
+  // Overview info table (column cell); current-work surfaces in the
+  // secondary primitive below the table.
+  it("PL-019 preserved: Overview surfaces activity + current qitem", async () => {
+    mockNodeDetail(NODE_DETAIL);
+    renderDetails();
+    await screen.findByTestId("seat-overview-table");
+
+    // Activity column cell carries the active label (topology naming).
+    expect(screen.getByTestId("seat-overview-cell-activity").textContent?.trim()).toContain("active");
+    // Current-work in the secondary primitive carries qitem + excerpt.
+    const cwCell = screen.getByTestId("seat-overview-secondary-cell-current-work");
+    expect(cwCell.textContent).toContain("04001234-driver");
+    expect(cwCell.textContent).toContain("Implement PL-019 edge activity pulse");
+    // LiveNodeCurrentState card removed (preserved invariant).
+    expect(screen.queryByTestId("live-node-current-state")).toBeNull();
+  });
+
+  // Resume action glyph remains independent of tab structure.
+  it("uses a resume action glyph instead of a runtime mark on the copy resume command", async () => {
+    mockNodeDetail({ ...NODE_DETAIL, resumeCommand: "rig seat resume dev.impl" });
+    renderDetails();
+    const resumeButton = await screen.findByTestId("detail-copy-resume");
+    expect(resumeButton.textContent).toContain("Copy resume command");
+    expect(resumeButton.textContent).not.toContain("Claude");
+    expect(resumeButton.querySelector("svg")).toBeDefined();
+  });
+});
