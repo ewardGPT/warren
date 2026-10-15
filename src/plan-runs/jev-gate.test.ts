@@ -80,7 +80,12 @@ describe("planGateEnabled", () => {
 describe("judgeContinuation (offline provider)", () => {
 	const dirs: string[] = [];
 
-	async function fixtureWith(noul: number): Promise<string> {
+	/**
+	 * A stub fixture plus a decision log inside the same throwaway directory.
+	 * The gate would otherwise append its stub rows to the operator's real
+	 * `~/.warren/decisions.jsonl`, which is the file `jev_tune` reads.
+	 */
+	async function envWith(noul: number): Promise<Record<string, string>> {
 		const dir = await mkdtemp(join(tmpdir(), "jev-gate-"));
 		dirs.push(dir);
 		const path = join(dir, "fixture.json");
@@ -88,7 +93,11 @@ describe("judgeContinuation (offline provider)", () => {
 			path,
 			JSON.stringify({ model: "fake", defaults: { noul: { noul } }, usage: {} }),
 		);
-		return path;
+		return {
+			WARREN_JEV_STUB: "1",
+			WARREN_JEV_STUB_FIXTURE: path,
+			WARREN_DECISION_LOG: join(dir, "decisions.jsonl"),
+		};
 	}
 
 	afterEach(async () => {
@@ -96,13 +105,13 @@ describe("judgeContinuation (offline provider)", () => {
 	});
 
 	test("a confident answer continues", async () => {
-		const env = { WARREN_JEV_STUB: "1", WARREN_JEV_STUB_FIXTURE: await fixtureWith(0.97) };
-		expect(await judgeContinuation(EVIDENCE, { env })).toEqual({ kind: "continue" });
+		expect(await judgeContinuation(EVIDENCE, { env: await envWith(0.97) })).toEqual({
+			kind: "continue",
+		});
 	});
 
 	test("a low answer stops at hold", async () => {
-		const env = { WARREN_JEV_STUB: "1", WARREN_JEV_STUB_FIXTURE: await fixtureWith(0.01) };
-		const verdict = await judgeContinuation(EVIDENCE, { env });
+		const verdict = await judgeContinuation(EVIDENCE, { env: await envWith(0.01) });
 		expect(verdict.kind).toBe("stop");
 		expect(verdict.kind === "stop" ? verdict.band : "").toBe("hold");
 	});
