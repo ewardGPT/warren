@@ -195,6 +195,37 @@ when a host needs depth:
 ssh -t headroom-aws 'sudo -u openrig -H env OPENRIG_HOME=/home/openrig/.openrig rig tui'
 ```
 
+## Fleet health inside warren
+
+Warren now reports the peer kernels it coordinates with. `warren doctor` prints
+one line per box: the address, the semver, the sweep outcome, the event loop
+state and the pid.
+
+`GET /readyz` reports one aggregate line instead. The split exists on purpose.
+
+A peer box is not a dependency of any warren request path. A peer outage must not
+make warren look unhealthy.
+
+The readyz line is always `ok`. It names the hosts that are down and points a
+reader at `warren doctor` for the detail.
+
+The codebase already made this call for burrow under k8s (warren-c128). There, a
+probe that is not a dependency must not degrade readiness.
+
+A decision model scored the alternatives before the code existed. Failing
+readiness on a peer outage scored 0. The risk of coupling readiness to peer state
+scored 0.83.
+
+The registry is the kernel's own `hosts.yaml`. This check reads it through
+`kernelPaths()` and probes only `transport: http` entries.
+
+A missing registry costs `warren doctor` one information line and costs readyz
+nothing. An install without a kernel behaves exactly as before.
+
+The probe reads the bearer token from the file the registry names and drops it
+after the call. The readyz line names host ids only, so no tailnet address
+reaches the wire.
+
 ## Replicating omp onto a box
 
 The fleet boxes run the same harness as the workstation. Per box:

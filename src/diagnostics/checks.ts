@@ -8,6 +8,8 @@
  * the three sibling test files), which all import from `./checks.ts`,
  * keeps resolving unchanged.
  *
+ *   - checks-kernel.ts — the peer kernels warren coordinates with: one line
+ *     per host in `warren doctor`, one always-ok aggregate line in readyz.
  *   - checks-sandbox.ts — bwrap bring-up and the canopy clone's
  *     existence + cleanliness. Burrow socket reachability lives in the
  *     allowlisted `src/runtime/local/diagnostics/burrow.ts` module
@@ -54,6 +56,15 @@ export {
 	checkWarrenDb,
 	type WarrenConfigCheckProject,
 } from "./checks-config.ts";
+export {
+	FLEET_PROBE_TIMEOUT_MS,
+	FLEET_REGISTRY_FILENAME,
+	fleetRegistryPath,
+	type KernelFleetDeps,
+	type KernelFleetHost,
+	kernelFleetChecks,
+	parseFleetRegistry,
+} from "./checks-kernel.ts";
 export {
 	checkPreviewAuthStrength,
 	checkPreviewMaxLive,

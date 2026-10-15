@@ -15,6 +15,7 @@ import {
 	checkWarrenConfig,
 	checkWarrenConfigDeprecations,
 	type DiagnosticCheck,
+	kernelFleetChecks,
 } from "../../diagnostics/checks.ts";
 import { checkStaleBurrowWorkspaces } from "../../diagnostics/stale-workspaces.ts";
 import { DEFAULT_MAX_LIVE } from "../../preview/eviction/index.ts";
@@ -52,6 +53,13 @@ export function readyzHandler(deps: ServerDeps): RouteHandler {
 		// readiness (warren-c128). `burrowReadyzChecks` returns [] under k8s.
 		checks.push(...(await burrowReadyzChecks(deps, spawn)));
 		checks.push(await checkAgentsRegistered(deps));
+		// One aggregate line, always ok: a peer kernel is not a dependency of
+		// warren's own readiness, so its outage must not degrade this endpoint.
+		// `process.env` directly, like the preview-auth check below: the boot
+		// config is resolved once, and the fleet registry path is read live.
+		checks.push(
+			...(await kernelFleetChecks({ env: process.env, mode: "readyz", log: deps.logger })),
+		);
 		const warrenConfigProjects = (await deps.repos.projects.listAll()).map((p) => ({
 			id: p.id,
 			localPath: p.localPath,

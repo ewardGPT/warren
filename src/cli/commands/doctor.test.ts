@@ -157,6 +157,9 @@ describe("runDoctor", () => {
 			"db_reachable",
 			"projects_root",
 			"bwrap",
+			// No OPENRIG_HOME here, so the fleet reports its absence rather than a
+			// host line; a configured fleet adds one `kernel:<id>` per box instead.
+			"kernel-fleet",
 			"warren_config",
 			"warren_config_deprecations",
 			"preview_port_allocator",
