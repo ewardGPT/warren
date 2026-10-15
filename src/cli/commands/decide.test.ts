@@ -1,9 +1,38 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliContext } from "../output.ts";
 import { runDecide } from "./decide.ts";
+
+const dirs: string[] = [];
+
+afterEach(async () => {
+	await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+/**
+ * A fresh temp directory, removed in `afterEach`. Every harness the CLI is
+ * driven through has to point `WARREN_DECISION_LOG` at one: the run would
+ * otherwise append stub rows to the operator's own
+ * `$HOME/.warren/decisions.jsonl`, which is the calibration input `jev_tune`
+ * reads back.
+ */
+async function privateDir(prefix: string): Promise<string> {
+	const dir = await mkdtemp(join(tmpdir(), prefix));
+	dirs.push(dir);
+	return dir;
+}
+
+/** A harness whose `decide` writes its audit row to a private temp log. */
+async function isolatedHarness(env: Record<string, string | undefined> = {}): Promise<{
+	context: CliContext;
+	out: () => string;
+	err: () => string;
+}> {
+	const dir = await privateDir("decide-cli-");
+	return harness({ WARREN_DECISION_LOG: join(dir, "decisions.jsonl"), ...env });
+}
 
 function harness(env: Record<string, string | undefined> = {}): {
 	context: CliContext;
@@ -27,7 +56,7 @@ const QUESTIONS = '{"merge_ok":{"type":"noul","instructions":"May this merge?"}}
 
 describe("warren decide (offline provider)", () => {
 	test("the fixture's 0.81 lands in `ask`: below the act bar, so exit 3", async () => {
-		const h = harness();
+		const h = await isolatedHarness();
 		const code = await runDecide(h.context, {
 			feature: "merge-gate",
 			state: '{"checksGreen":true}',
@@ -40,7 +69,7 @@ describe("warren decide (offline provider)", () => {
 	});
 
 	test("--json prints the whole decision with the folded band", async () => {
-		const h = harness();
+		const h = await isolatedHarness();
 		const code = await runDecide(h.context, {
 			feature: "merge-gate",
 			state: "{}",
@@ -56,13 +85,13 @@ describe("warren decide (offline provider)", () => {
 	});
 
 	test("a `hold` answer exits 4 and a missing provider exits 5", async () => {
-		const dir = await mkdtemp(join(tmpdir(), "decide-test-"));
+		const dir = await privateDir("decide-test-");
 		const fixture = join(dir, "hold.json");
 		await writeFile(
 			fixture,
 			JSON.stringify({ model: "fake", defaults: { noul: { noul: 0.02 } }, usage: {} }),
 		);
-		const h = harness({ WARREN_JEV_STUB_FIXTURE: fixture });
+		const h = await isolatedHarness({ WARREN_JEV_STUB_FIXTURE: fixture });
 		expect(
 			await runDecide(h.context, { feature: "g", state: "{}", questions: QUESTIONS, stub: true }),
 		).toBe(4);
@@ -72,17 +101,16 @@ describe("warren decide (offline provider)", () => {
 			actFixture,
 			JSON.stringify({ model: "fake", defaults: { noul: { noul: 0.96 } }, usage: {} }),
 		);
-		const act = harness({ WARREN_JEV_STUB_FIXTURE: actFixture });
+		const act = await isolatedHarness({ WARREN_JEV_STUB_FIXTURE: actFixture });
 		expect(
 			await runDecide(act.context, { feature: "g", state: "{}", questions: QUESTIONS, stub: true }),
 		).toBe(0);
 
-		const offline = harness({ JEV_PROVIDER: "typesafe" });
+		const offline = await isolatedHarness({ JEV_PROVIDER: "typesafe" });
 		expect(
 			await runDecide(offline.context, { feature: "g", state: "{}", questions: QUESTIONS }),
 		).toBe(5);
 		expect(offline.err()).toContain("decide:");
-		await rm(dir, { recursive: true, force: true });
 	});
 
 	test("bad input is refused before any call", async () => {
