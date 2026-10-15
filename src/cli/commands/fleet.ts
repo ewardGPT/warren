@@ -15,6 +15,7 @@
  * loader's recovery hint, not a stack trace.
  */
 
+import { defaultSpawn } from "../../projects/clone.ts";
 import type { RunHandle, RunSpec } from "../../runtime/contract.ts";
 import type { FleetBoxRuntime } from "../../runtime/local/fleet/index.ts";
 import {
@@ -23,9 +24,11 @@ import {
 	fleetPlacementFromEnv,
 	probeBoxes,
 } from "../../runtime/local/fleet/index.ts";
+import type { SeedsCliDeps } from "../../seeds-cli/extensions.ts";
+import { claimReadySeed, listReadySeeds, type ReadySeed } from "../../seeds-cli/ready.ts";
 import type { CliContext } from "../output.ts";
 
-export type FleetAction = "status" | "dispatch";
+export type FleetAction = "status" | "dispatch" | "pump";
 
 export interface FleetArgs {
 	readonly action: FleetAction;
@@ -41,6 +44,16 @@ export interface FleetArgs {
 	readonly model?: string;
 	/** dispatch: poll until the run reaches a terminal phase. */
 	readonly wait?: boolean;
+	/** pump: how many seeds to take. Defaults to one per configured box. */
+	readonly limit?: number;
+	/** pump: claim lease in minutes. */
+	readonly leaseMinutes?: number;
+	/** pump: list what would be claimed, and write nothing. */
+	readonly dryRun?: boolean;
+	/** pump: the project whose seeds ledger holds the work. Defaults to cwd. */
+	readonly project?: string;
+	/** pump: only claim this issue type. Defaults to `task`. */
+	readonly type?: string;
 	readonly json?: boolean;
 }
 
@@ -58,6 +71,19 @@ export interface FleetCliDeps {
 		terminate(handle: RunHandle): Promise<unknown>;
 	};
 	readonly env?: Record<string, string | undefined>;
+	/** pump: the seeds ledger read/claim seam. Defaults to the sd facade. */
+	readonly seeds?: {
+		listReady(
+			projectPath: string,
+			options: { limit?: number; type?: string },
+		): Promise<readonly ReadySeed[]>;
+		claim(
+			projectPath: string,
+			options: { leaseMinutes?: number; type?: string },
+		): Promise<ReadySeed | null>;
+	};
+	/** pump: the project to read seeds from. Defaults to the process cwd. */
+	readonly projectPath?: string;
 	/** Poll interval + cap for `dispatch --wait`. */
 	readonly pollMs?: number;
 	readonly maxPolls?: number;
@@ -87,9 +113,9 @@ export async function runFleet(
 	if (provider.boxes.length === 0) {
 		return { lines: ["fleet: no boxes configured"], exitCode: 1 };
 	}
-	return args.action === "status"
-		? await statusReport(provider.boxes, args)
-		: await dispatchReport(provider, args, deps);
+	if (args.action === "status") return await statusReport(provider.boxes, args);
+	if (args.action === "pump") return await pumpReport(provider, args, deps);
+	return await dispatchReport(provider, args, deps);
 }
 
 async function statusReport(
@@ -150,6 +176,94 @@ function buildDispatchSpec(args: FleetArgs, repo: string, prompt: string): RunSp
 	if (args.provider !== undefined) frontmatter.provider = args.provider;
 	if (args.model !== undefined) frontmatter.model = args.model;
 	return { ...spec, metadata: { frontmatter } };
+}
+
+/**
+ * `fleet pump`: claim ready seeds and place a run for each, so the boxes fill
+ * without an operator naming one seed at a time.
+ *
+ * The seeds lease is the dedupe. A claimed seed is no longer ready, so a second
+ * pump cannot take it, and two pumps racing split the queue. Placement then
+ * spreads the runs: the provider's in-flight ledger counts each create, so a
+ * single pump puts one run on each box before it reuses one.
+ */
+async function pumpReport(
+	provider: NonNullable<FleetCliDeps["provider"]>,
+	args: FleetArgs,
+	deps: FleetCliDeps,
+): Promise<FleetReport> {
+	if (args.repo === undefined) return { lines: ["fleet pump needs --repo"], exitCode: 1 };
+	const seeds = deps.seeds ?? defaultSeeds();
+	const project = deps.projectPath ?? args.project ?? process.cwd();
+	const limit = args.limit ?? provider.boxes.length;
+	// Task by default: `sd ready --claim` takes the highest-priority ready
+	// issue, so an unfiltered pump would claim an epic and hand an agent a plan.
+	const type = args.type ?? "task";
+	const lines: string[] = [];
+
+	if (args.dryRun === true) {
+		const ready = await seeds.listReady(project, { limit, type });
+		lines.push(`pump: dry run, ${ready.length} ready seed(s), nothing claimed or dispatched`);
+		for (const seed of ready) lines.push(`  ${seed.id} ${seed.title}`);
+		return { lines, exitCode: 0 };
+	}
+
+	let placed = 0;
+	for (let taken = 0; taken < limit; taken += 1) {
+		const step = await placeOne(provider, seeds, project, args, type);
+		if (step === null) {
+			lines.push(`pump: nothing else is ready, ${placed} placed`);
+			break;
+		}
+		lines.push(step.line);
+		if (step.placed) placed += 1;
+	}
+	return { lines, exitCode: placed === 0 ? 1 : 0 };
+}
+
+interface PumpStep {
+	readonly line: string;
+	readonly placed: boolean;
+}
+
+/**
+ * Claim one seed and place a run for it. `null` means nothing was ready, which
+ * ends the pump. A dispatch failure still returns a line, because the claim
+ * stands and its lease runs down: naming the seed is what lets an operator
+ * release it by hand.
+ */
+async function placeOne(
+	provider: NonNullable<FleetCliDeps["provider"]>,
+	seeds: NonNullable<FleetCliDeps["seeds"]>,
+	project: string,
+	args: FleetArgs,
+	type: string,
+): Promise<PumpStep | null> {
+	const seed = await seeds.claim(project, {
+		type,
+		...(args.leaseMinutes === undefined ? {} : { leaseMinutes: args.leaseMinutes }),
+	});
+	if (seed === null) return null;
+	const prompt = `Work seed ${seed.id}: ${seed.title}\n\nRead the seed with \`sd show ${seed.id}\` and complete it.`;
+	try {
+		const spec = buildDispatchSpec(args, args.repo ?? "", prompt);
+		const handle = await provider.create(spec);
+		return {
+			line: `${seed.id} -> ${handle.providerRunId.split("/")[0] ?? "?"} (${handle.runId})`,
+			placed: true,
+		};
+	} catch (error) {
+		return { line: `${seed.id} claimed but not placed: ${describe(error)}`, placed: false };
+	}
+}
+
+/** The real seeds seam: the `sd` facade, read from the operator's PATH. */
+function defaultSeeds(): NonNullable<FleetCliDeps["seeds"]> {
+	const deps: SeedsCliDeps = { sdBinary: "sd", spawn: defaultSpawn };
+	return {
+		listReady: (projectPath, options) => listReadySeeds(deps, projectPath, options),
+		claim: (projectPath, options) => claimReadySeed(deps, projectPath, options),
+	};
 }
 
 async function dispatchReport(

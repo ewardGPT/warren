@@ -13,7 +13,7 @@ import { CLOSURE_REASONS } from "../../seeds-cli/closure.ts";
 import type { CliContext } from "../output.ts";
 import { runClosure } from "./closure.ts";
 import { runDecide } from "./decide.ts";
-import { runFleet } from "./fleet.ts";
+import { type FleetArgs, runFleet } from "./fleet.ts";
 import { type KernelAction, runKernel } from "./kernel.ts";
 
 /**
@@ -134,6 +134,82 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 				process.exit(report.exitCode);
 			},
 		);
+
+	fleetGroup
+		.command("pump")
+		.description("claim ready seeds and place a run for each, so the boxes fill")
+		.requiredOption("--repo <url>", "git origin the runs work on")
+		.option("--limit <n>", "how many seeds to take (default one per box)")
+		.option("--lease <minutes>", "claim lease, so a stalled run's seed returns to the queue")
+		.option("--project <path>", "project holding the seeds ledger (default cwd)")
+		.option("--type <type>", "only claim this issue type (default task)")
+		.option("--dry-run", "list what would be claimed, and write nothing")
+		.option("--runtime <id>", "agent runtime id (default pi)")
+		.option("--provider <name>", "agent provider override (default the runtime's own)")
+		.option("--model <name>", "agent model override (default the runtime's own)")
+		.option("--branch <name>", "branch to work on")
+		.option("--base <name>", "base branch (default main)")
+		.action(
+			async (opts: {
+				repo: string;
+				limit?: string;
+				lease?: string;
+				project?: string;
+				type?: string;
+				dryRun?: boolean;
+				runtime?: string;
+				provider?: string;
+				model?: string;
+				branch?: string;
+				base?: string;
+			}) => {
+				const report = await runFleet(toPumpArgs(opts), context);
+				for (const line of report.lines) console.log(line);
+				process.exit(report.exitCode);
+			},
+		);
+
+	/** `fleet pump` options → the args `runFleet` takes. Extracted to keep the action simple. */
+	function toPumpArgs(opts: {
+		repo: string;
+		limit?: string;
+		lease?: string;
+		project?: string;
+		type?: string;
+		dryRun?: boolean;
+		runtime?: string;
+		provider?: string;
+		model?: string;
+		branch?: string;
+		base?: string;
+	}): FleetArgs {
+		// A draft keyed by FleetArgs field names, so the two tables below stay the
+		// only place a new option has to be added.
+		const draft: Record<string, string | number | boolean> = { action: "pump", repo: opts.repo };
+		const counted: Record<string, string | undefined> = {
+			limit: opts.limit,
+			leaseMinutes: opts.lease,
+		};
+		for (const [key, raw] of Object.entries(counted)) {
+			if (raw !== undefined) draft[key] = Number.parseInt(raw, 10);
+		}
+		const named: Record<string, string | undefined> = {
+			project: opts.project,
+			type: opts.type,
+			runtime: opts.runtime,
+			provider: opts.provider,
+			model: opts.model,
+			branch: opts.branch,
+			baseBranch: opts.base,
+		};
+		for (const [key, value] of Object.entries(named)) {
+			if (value !== undefined) draft[key] = value;
+		}
+		if (opts.dryRun === true) draft.dryRun = true;
+		// Every key above is a FleetArgs key, so the cast only tells the compiler
+		// what the tables already guarantee.
+		return draft as unknown as FleetArgs;
+	}
 
 	program
 		.command("closure")

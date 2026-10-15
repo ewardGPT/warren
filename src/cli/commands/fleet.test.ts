@@ -10,6 +10,7 @@
 import { describe, expect, test } from "bun:test";
 import type { RunHandle, RunSpec } from "../../runtime/contract.ts";
 import type { FleetBoxRuntime } from "../../runtime/local/fleet/index.ts";
+import type { ReadySeed } from "../../seeds-cli/ready.ts";
 import type { CliContext, Stdio } from "../output.ts";
 import { type FleetCliDeps, runFleet } from "./fleet.ts";
 
@@ -88,6 +89,8 @@ function harness(options: {
 	phases?: readonly string[];
 	createError?: string;
 	maxPolls?: number;
+	seeds?: FleetCliDeps["seeds"];
+	projectPath?: string;
 }): FleetHarness {
 	const calls: FleetCalls = { create: [], terminated: [], statusCount: 0 };
 	const phases = options.phases ?? ["succeeded"];
@@ -121,8 +124,38 @@ function harness(options: {
 		env: {},
 		pollMs: 1,
 		maxPolls: options.maxPolls ?? 3,
+		...(options.seeds === undefined ? {} : { seeds: options.seeds }),
+		...(options.projectPath === undefined ? {} : { projectPath: options.projectPath }),
 	};
 	return { context, deps, calls };
+}
+
+/**
+ * A seeds seam over a scripted list of claims. `null` in the list means "nothing
+ * ready", which is how a pump sees an empty queue.
+ */
+function pumpSeeds(claims: readonly (ReadySeed | null)[]): {
+	readonly seam: NonNullable<FleetCliDeps["seeds"]>;
+	readonly calls: { listed: number; claimed: number; types: string[] };
+} {
+	const calls = { listed: 0, claimed: 0, types: [] as string[] };
+	const queue = [...claims];
+	return {
+		calls,
+		seam: {
+			listReady: async (_projectPath: string, options: { limit?: number; type?: string }) => {
+				calls.listed += 1;
+				calls.types.push(options.type ?? "");
+				const limit = options.limit ?? queue.length;
+				return queue.slice(0, limit).filter((seed): seed is ReadySeed => seed !== null);
+			},
+			claim: async (_projectPath: string, options: { leaseMinutes?: number; type?: string }) => {
+				calls.claimed += 1;
+				calls.types.push(options.type ?? "");
+				return queue.shift() ?? null;
+			},
+		},
+	};
 }
 
 describe("warren fleet status", () => {
@@ -360,5 +393,119 @@ describe("warren fleet dispatch", () => {
 		expect(report.exitCode).toBe(1);
 		expect(report.lines).toEqual(["fleet dispatch failed: burrow refused: no capacity"]);
 		expect(h.calls.terminated).toHaveLength(0);
+	});
+});
+
+describe("warren fleet pump", () => {
+	test("a dry run lists the ready seeds and writes nothing", async () => {
+		const seeds = pumpSeeds([
+			{ id: "ubuntu-aaaa", title: "first" },
+			{ id: "ubuntu-bbbb", title: "second" },
+		]);
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" }), fakeBox({ id: "box-b" })],
+			seeds: seeds.seam,
+			projectPath: "/proj",
+		});
+		const report = await runFleet(
+			{ action: "pump", repo: "https://example.test/x.git", dryRun: true },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(0);
+		expect(report.lines[0]).toBe("pump: dry run, 2 ready seed(s), nothing claimed or dispatched");
+		expect(report.lines[1]).toContain("ubuntu-aaaa");
+		// The point of the flag: no lease is taken and no run is created.
+		expect(seeds.calls.claimed).toBe(0);
+		expect(h.calls.create).toHaveLength(0);
+	});
+
+	test("claims one seed per box and places a run for each", async () => {
+		const seeds = pumpSeeds([
+			{ id: "ubuntu-aaaa", title: "first" },
+			{ id: "ubuntu-bbbb", title: "second" },
+		]);
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" }), fakeBox({ id: "box-b" })],
+			seeds: seeds.seam,
+			projectPath: "/proj",
+		});
+		const report = await runFleet(
+			{ action: "pump", repo: "https://example.test/x.git" },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(0);
+		// One per box, because the default limit is the box count.
+		expect(h.calls.create).toHaveLength(2);
+		expect(seeds.calls.claimed).toBe(2);
+		expect(h.calls.create[0]?.prompt).toContain("ubuntu-aaaa");
+		expect(h.calls.create[0]?.prompt).toContain("sd show ubuntu-aaaa");
+		expect(report.lines[0]).toContain("ubuntu-aaaa -> box-a");
+		// Claiming an epic would hand an agent a plan, so the pump asks for tasks.
+		expect(seeds.calls.types).toEqual(["task", "task"]);
+		// The seeds ledger stays the source of truth: no wait, no terminate.
+		expect(h.calls.statusCount).toBe(0);
+		expect(h.calls.terminated).toHaveLength(0);
+	});
+
+	test("reports an empty queue and places nothing", async () => {
+		const seeds = pumpSeeds([null]);
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" })],
+			seeds: seeds.seam,
+			projectPath: "/proj",
+		});
+		const report = await runFleet(
+			{ action: "pump", repo: "https://example.test/x.git" },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(1);
+		expect(report.lines[0]).toBe("pump: nothing else is ready, 0 placed");
+		expect(h.calls.create).toHaveLength(0);
+	});
+
+	test("keeps a claim whose dispatch failed, and still places the next seed", async () => {
+		const seeds = pumpSeeds([
+			{ id: "ubuntu-cccc", title: "doomed" },
+			{ id: "ubuntu-dddd", title: "fine" },
+		]);
+		// The first create throws, the second succeeds.
+		let calls = 0;
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" })],
+			seeds: seeds.seam,
+			projectPath: "/proj",
+		});
+		const provider = h.deps.provider as NonNullable<FleetCliDeps["provider"]>;
+		const realCreate = provider.create.bind(provider);
+		const failing: FleetCliDeps = {
+			...h.deps,
+			provider: {
+				...provider,
+				create: async (spec: RunSpec) => {
+					calls += 1;
+					if (calls === 1) throw new Error("burrow refused: no capacity");
+					return await realCreate(spec);
+				},
+			},
+		};
+		const report = await runFleet(
+			{ action: "pump", repo: "https://example.test/x.git", limit: 2 },
+			h.context,
+			failing,
+		);
+		expect(report.lines[0]).toBe("ubuntu-cccc claimed but not placed: burrow refused: no capacity");
+		expect(report.lines[1]).toContain("ubuntu-dddd -> box-a");
+		expect(report.exitCode).toBe(0);
+	});
+
+	test("needs a repo, because a run works on a clone", async () => {
+		const seeds = pumpSeeds([{ id: "ubuntu-eeee", title: "x" }]);
+		const h = harness({ boxes: [fakeBox({ id: "box-a" })], seeds: seeds.seam });
+		const report = await runFleet({ action: "pump" }, h.context, h.deps);
+		expect(report.exitCode).toBe(1);
+		expect(report.lines).toEqual(["fleet pump needs --repo"]);
 	});
 });

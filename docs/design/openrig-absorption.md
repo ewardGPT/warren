@@ -245,30 +245,36 @@ The fleet boxes run the same harness as the workstation. Per box:
 
 ## Running an agent inside a box's sandbox
 
-A dispatched run executes under `bwrap`, and three properties of that sandbox
-decide whether the agent can start at all. `scripts/agentic-box-llm-shim.sh` and
-`scripts/agentic-box-pi-runtime.sh` install the fixes on each box.
+burrow starts every dispatched run inside `bwrap`, and three properties of that
+sandbox decide whether the agent can start at all.
+`scripts/agentic-box-llm-shim.sh` and `scripts/agentic-box-pi-runtime.sh`
+install the fixes on each box.
 
 burrow mounts exactly one host path per agent: the file `Bun.which("pi")`
 returns. A sibling binary stays invisible, so a wrapper that runs `~/.bun/bin/omp`
-fails with `exec: ... not found`. bwrap always mounts `/usr`, `/etc`, `/lib`,
-`/lib64`, `/bin`, `/sbin` and `/opt`, so the runtime lives there instead: bun at
-`/usr/bin/bun`, and the omp bundle installed under `/usr/local` with
-`BUN_INSTALL=/usr/local`. A plain file copy is not enough, because the bundle
-loses its platform support outside its install tree.
+fails with `exec: ... not found`.
+
+bwrap always mounts `/usr`, `/etc`, `/lib`, `/lib64`, `/bin`, `/sbin` and
+`/opt`, so the runtime lives there instead. bun goes to `/usr/bin/bun`, and the
+omp bundle is installed under `/usr/local` with `BUN_INSTALL=/usr/local`. A
+plain file copy is not enough, because the bundle loses its platform support
+outside its install tree.
 
 Inside the sandbox `HOME` is the run's worktree, and omp reads its model catalog
 from `$HOME/.omp/agent/models.yml`. Without one, every run dies with `Model
-"<provider>/<id>" not found`. The installed `pi` is therefore a wrapper that
-builds a throwaway HOME holding a catalog, then runs the real binary. The catalog
-never lands in a worktree, so a run leaves the tree clean.
+"<provider>/<id>" not found`.
 
-The sandbox receives auth only through the env names its agent runtime declares,
-and burrow's pi runtime declares `ANTHROPIC_*` plus the per-provider key pair
+The installed `pi` is therefore a wrapper that builds a throwaway HOME holding a
+catalog, then runs the real binary. The catalog never lands in a worktree, so a
+run leaves the tree clean.
+
+The sandbox receives auth only through the env names its agent runtime declares.
+burrow's pi runtime declares `ANTHROPIC_*` plus the per-provider key pair
 `OPENAI_API_KEY`/`OPENAI_BASE_URL`. The box gateway demands two custom headers,
-which no env name can carry. A loopback shim adds those headers and forwards, so
-the sandbox authenticates with a plain OpenAI pair and no secret enters a
-workspace.
+which no env name can carry.
+
+A loopback shim adds those headers and forwards, so the sandbox authenticates
+with a plain OpenAI pair and no secret enters a workspace.
 
 omp is a fork of pi with its own flags. burrow always passes `--offline`, which
 omp rejects with `unknown flag` and exit 2, so the wrapper drops it. Every other
@@ -304,9 +310,10 @@ count. Health arrives through a short cache, and a burst inside that window
 would otherwise stack every run on one box.
 
 Recency comes from a shared placement log beside the fleet config. A finished
-run leaves its box idle again, and the in-flight ledger dies with its process,
-so separate warren processes would all pick the same box without it. The log is
-append-only JSON Lines, so a write needs no lock and a torn line costs one
+run leaves its box idle again, and the in-flight ledger dies with its process.
+
+Separate warren processes would all pick the same box without that log. The log
+is append-only JSON Lines, so a write needs no lock and a torn line costs one
 decision rather than a dispatch.
 
 `WARREN_FLEET_BOX_LIMIT` and `WARREN_FLEET_PROJECT_LIMIT` add optional ceilings.
