@@ -167,6 +167,11 @@ sends the text alone and the command runs cleanly.
 A kernel that starts before the tailnet join binds loopback only. A box that
 joins later needs one `systemctl restart openrig-kernel`.
 
+Register an ssh entry by address, not by ssh-config alias. `rig host list` probes
+`target:22` over TCP, and a TCP probe cannot resolve an alias, so the entry reads
+`unreachable` while every real check passes. The key and user still come from the
+ssh config.
+
 ## Alternatives rejected
 
 | Alternative | Why not |
