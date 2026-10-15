@@ -256,6 +256,10 @@ contract methods to the box that owns the run.
 Placement is the only new decision. A healthy box comes first, then the box with
 the fewest live workspaces wins, then the box id breaks ties.
 
+The load figure is the larger of the probe and the provider's own in-flight
+count. Health arrives through a short cache, and a burst inside that window
+would otherwise stack every run on one box.
+
 `WARREN_FLEET_BOX_LIMIT` and `WARREN_FLEET_PROJECT_LIMIT` add optional ceilings.
 
 The run handle carries the box id. `providerRunId` becomes `<box>/<inner run id>`,

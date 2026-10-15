@@ -173,6 +173,12 @@ export class FleetProvider implements RuntimeProvider {
 	 * Placement input: health per box, plus how many of THIS project's runs each
 	 * box already carries. A run whose box is unknown (a handle from a box that
 	 * left the config) counts nowhere — placement must not be blocked by it.
+	 *
+	 * The load figure is `max(probe, in-flight)`. Health arrives through a short
+	 * cache, so a burst of dispatches inside that window would all read the same
+	 * number and stack on one box; the provider's own ledger is never stale. It
+	 * is `max` and not a sum because the probe already counts the burrows this
+	 * provider created, and a sum would push placement away from a free box.
 	 */
 	private candidates(
 		health: Map<string, BoxHealth>,
@@ -184,7 +190,7 @@ export class FleetProvider implements RuntimeProvider {
 			candidates.push({
 				id: box.id,
 				healthy: entry?.healthy ?? false,
-				live: entry?.live ?? 0,
+				live: Math.max(entry?.live ?? 0, this.placementLedger.get(box.id)?.size ?? 0),
 				projectLive: this.projectLive(box.id, projectId),
 			});
 		}

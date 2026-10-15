@@ -146,6 +146,31 @@ describe("FleetProvider.create", () => {
 		expect(handle.runId).toBe("run-1");
 	});
 
+	it("spreads a burst across boxes even when the probe cannot see the previous run", async () => {
+		const recorded: Recorded[] = [];
+		// The probe is the world as it was: both boxes report zero. Without
+		// in-flight accounting every dispatch in the burst would pick box-a.
+		const provider = new FleetProvider({
+			boxes: [box("box-a", recorded), box("box-b", recorded), box("box-c", recorded)],
+			materialize: async (_box, _spec) => "/box/clone",
+			probe: async () =>
+				health([
+					{ id: "box-a", live: 0 },
+					{ id: "box-b", live: 0 },
+					{ id: "box-c", live: 0 },
+				]),
+		});
+		const boxes: RunHandle[] = [];
+		for (const runId of ["run-1", "run-2", "run-3"]) {
+			boxes.push(await provider.create(spec(runId)));
+		}
+		expect(boxes.map((handle) => handle.providerRunId.split("/")[0])).toEqual([
+			"box-a",
+			"box-b",
+			"box-c",
+		]);
+	});
+
 	it("fails loudly when no box is healthy", async () => {
 		const provider = new FleetProvider({
 			boxes: [box("box-a", [])],
