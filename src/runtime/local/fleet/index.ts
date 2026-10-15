@@ -25,9 +25,10 @@
 import { BurrowClient } from "../../../burrow-client/index.ts";
 import type { EnvLike } from "../../../runs/spawn/callback-env.ts";
 import { LocalProvider } from "../provider.ts";
-import { type FleetEndpoint, loadFleetEndpoints } from "./config.ts";
+import { type FleetEndpoint, fleetPlacementLogPath, loadFleetEndpoints } from "./config.ts";
 import type { FleetBoxRuntime, FleetLogger } from "./health.ts";
 import type { PlacementOptions } from "./placement.ts";
+import { PlacementLog } from "./placement-log.ts";
 import { FleetProvider } from "./provider.ts";
 import { createRemoteReapExec, createRemoteReapFs } from "./remote-seams.ts";
 import { createSshRunner } from "./ssh-runner.ts";
@@ -64,6 +65,7 @@ export function buildFleetProvider(options: BuildFleetOptions): FleetProvider {
 	return new FleetProvider({
 		boxes,
 		env: env as Record<string, string | undefined>,
+		placementLog: new PlacementLog({ path: fleetPlacementLogPath(env) }),
 		...(options.placement !== undefined ? { placement: options.placement } : {}),
 		...(options.healthTtlMs !== undefined ? { healthTtlMs: options.healthTtlMs } : {}),
 		...(options.probeTimeoutMs !== undefined ? { probeTimeoutMs: options.probeTimeoutMs } : {}),
@@ -110,6 +112,7 @@ export {
 	type FleetBox,
 	type FleetEndpoint,
 	fleetConfigPath,
+	fleetPlacementLogPath,
 	parseBurrowUrl,
 	parseFleetConfig,
 } from "./config.ts";

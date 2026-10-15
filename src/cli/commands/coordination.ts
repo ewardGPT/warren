@@ -100,6 +100,8 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 		.requiredOption("--repo <url>", "git origin the run works on")
 		.requiredOption("--prompt <text>", "the brief handed to the agent")
 		.option("--runtime <id>", "agent runtime id (default pi)")
+		.option("--provider <name>", "agent provider override (default the runtime's own)")
+		.option("--model <name>", "agent model override (default the runtime's own)")
 		.option("--branch <name>", "branch to work on")
 		.option("--base <name>", "base branch (default main)")
 		.option("--wait", "poll until the run reaches a terminal phase")
@@ -108,6 +110,8 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 				repo: string;
 				prompt: string;
 				runtime?: string;
+				provider?: string;
+				model?: string;
 				branch?: string;
 				base?: string;
 				wait?: boolean;
@@ -118,6 +122,8 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 						repo: opts.repo,
 						prompt: opts.prompt,
 						...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}),
+						...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+						...(opts.model !== undefined ? { model: opts.model } : {}),
 						...(opts.branch !== undefined ? { branch: opts.branch } : {}),
 						...(opts.base !== undefined ? { baseBranch: opts.base } : {}),
 						wait: opts.wait === true,

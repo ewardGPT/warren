@@ -52,6 +52,7 @@ import {
 } from "./health.ts";
 import { ensureProjectClone } from "./materialize.ts";
 import { chooseBox, type PlacementOptions } from "./placement.ts";
+import type { PlacementLog } from "./placement-log.ts";
 
 export interface FleetProviderDeps {
 	readonly boxes: readonly FleetBoxRuntime[];
@@ -61,6 +62,12 @@ export interface FleetProviderDeps {
 	/** Freshness window for the health cache. */
 	readonly healthTtlMs?: number;
 	readonly placement?: PlacementOptions;
+	/**
+	 * Shared record of recent placements. Separate processes rotate boxes with
+	 * it, because a finished run leaves the box idle again and the in-flight
+	 * ledger dies with its process. Omitted in tests that do not need it.
+	 */
+	readonly placementLog?: PlacementLog;
 	/** Clock seam for the health cache. */
 	readonly now?: () => number;
 	/**
@@ -122,6 +129,7 @@ export class FleetProvider implements RuntimeProvider {
 		const hostClonePathHint = await this.materialize(box, spec);
 		const inner = await box.provider.create({ ...spec, hostClonePathHint });
 		this.track(boxId, spec.runId, spec.projectId);
+		this.deps.placementLog?.record(boxId);
 		return {
 			runId: inner.runId,
 			sandboxId: inner.sandboxId,
@@ -185,13 +193,16 @@ export class FleetProvider implements RuntimeProvider {
 		projectId: string | undefined,
 	): BoxCandidateInput[] {
 		const candidates: BoxCandidateInput[] = [];
+		const lastPlaced = this.deps.placementLog?.lastPlaced() ?? new Map<string, number>();
 		for (const box of this.boxes) {
 			const entry = health.get(box.id);
+			const at = lastPlaced.get(box.id);
 			candidates.push({
 				id: box.id,
 				healthy: entry?.healthy ?? false,
 				live: Math.max(entry?.live ?? 0, this.placementLedger.get(box.id)?.size ?? 0),
 				projectLive: this.projectLive(box.id, projectId),
+				...(at === undefined ? {} : { lastPlacedAt: at }),
 			});
 		}
 		return candidates;

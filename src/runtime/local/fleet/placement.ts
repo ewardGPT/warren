@@ -25,6 +25,12 @@ export interface BoxCandidate {
 	readonly live: number;
 	/** Live workspaces on the box for THIS project, when the caller knows it. */
 	readonly projectLive?: number;
+	/**
+	 * When this box last took a run, from the shared placement log. Least
+	 * recently used wins, so idle boxes take turns instead of stacking on the
+	 * lowest id. Absent means never used in the log's window.
+	 */
+	readonly lastPlacedAt?: number;
 }
 
 export interface PlacementOptions {
@@ -56,11 +62,14 @@ function isUsable(candidate: BoxCandidate, options: PlacementOptions): boolean {
 	return true;
 }
 
-/** Fewer total runs first, then fewer for this project, then id ascending. */
+/** Fewer total runs first, then fewer for this project, then least recently used, then id. */
 function compare(a: BoxCandidate, b: BoxCandidate): number {
 	if (a.live !== b.live) return a.live - b.live;
 	const aProject = a.projectLive ?? 0;
 	const bProject = b.projectLive ?? 0;
 	if (aProject !== bProject) return aProject - bProject;
+	const aAt = a.lastPlacedAt ?? Number.NEGATIVE_INFINITY;
+	const bAt = b.lastPlacedAt ?? Number.NEGATIVE_INFINITY;
+	if (aAt !== bAt) return aAt < bAt ? -1 : 1;
 	return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }

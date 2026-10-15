@@ -243,6 +243,49 @@ The fleet boxes run the same harness as the workstation. Per box:
    with a systemd unit holding an ssh forward from 18086 to that box's 8085.
 5. Verify with a real call: `omp -p "Reply with the single word: ok"`.
 
+## Running an agent inside a box's sandbox
+
+A dispatched run executes under `bwrap`, and three properties of that sandbox
+decide whether the agent can start at all. `scripts/agentic-box-llm-shim.sh` and
+`scripts/agentic-box-pi-runtime.sh` install the fixes on each box.
+
+burrow mounts exactly one host path per agent: the file `Bun.which("pi")`
+returns. A sibling binary stays invisible, so a wrapper that runs `~/.bun/bin/omp`
+fails with `exec: ... not found`. bwrap always mounts `/usr`, `/etc`, `/lib`,
+`/lib64`, `/bin`, `/sbin` and `/opt`, so the runtime lives there instead: bun at
+`/usr/bin/bun`, and the omp bundle installed under `/usr/local` with
+`BUN_INSTALL=/usr/local`. A plain file copy is not enough, because the bundle
+loses its platform support outside its install tree.
+
+Inside the sandbox `HOME` is the run's worktree, and omp reads its model catalog
+from `$HOME/.omp/agent/models.yml`. Without one, every run dies with `Model
+"<provider>/<id>" not found`. The installed `pi` is therefore a wrapper that
+builds a throwaway HOME holding a catalog, then runs the real binary. The catalog
+never lands in a worktree, so a run leaves the tree clean.
+
+The sandbox receives auth only through the env names its agent runtime declares,
+and burrow's pi runtime declares `ANTHROPIC_*` plus the per-provider key pair
+`OPENAI_API_KEY`/`OPENAI_BASE_URL`. The box gateway demands two custom headers,
+which no env name can carry. A loopback shim adds those headers and forwards, so
+the sandbox authenticates with a plain OpenAI pair and no secret enters a
+workspace.
+
+omp is a fork of pi with its own flags. burrow always passes `--offline`, which
+omp rejects with `unknown flag` and exit 2, so the wrapper drops it. Every other
+flag burrow passes parses on both.
+
+Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, and bwrap
+needs one for every run. Without a profile, each run fails with `bwrap: setting
+up uid map: Permission denied`. A profile for `/usr/bin/bwrap` grants the
+namespace to bwrap alone, rather than to every process on the box.
+
+A caller selects the route through the agent's frontmatter:
+
+```
+warren fleet dispatch --repo <origin> --prompt <text> \
+  --runtime pi --provider headroom-bifrost --model deepseek-v4-flash --wait
+```
+
 ## The fleet execution lane
 
 `WARREN_RUNTIME=fleet` places runs on the agentic boxes. Each box runs its own
@@ -254,11 +297,17 @@ remote host: it builds one `LocalProvider` per box and delegates all eight
 contract methods to the box that owns the run.
 
 Placement is the only new decision. A healthy box comes first, then the box with
-the fewest live workspaces wins, then the box id breaks ties.
+the fewest live workspaces wins, then the least recently used box, then the id.
 
 The load figure is the larger of the probe and the provider's own in-flight
 count. Health arrives through a short cache, and a burst inside that window
 would otherwise stack every run on one box.
+
+Recency comes from a shared placement log beside the fleet config. A finished
+run leaves its box idle again, and the in-flight ledger dies with its process,
+so separate warren processes would all pick the same box without it. The log is
+append-only JSON Lines, so a write needs no lock and a torn line costs one
+decision rather than a dispatch.
 
 `WARREN_FLEET_BOX_LIMIT` and `WARREN_FLEET_PROJECT_LIMIT` add optional ceilings.
 

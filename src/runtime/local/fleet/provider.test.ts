@@ -7,6 +7,8 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BurrowClient } from "../../../burrow-client/index.ts";
 import type {
 	FinalizeIntent,
@@ -23,6 +25,7 @@ import type {
 	WorkspaceInfo,
 } from "../../contract.ts";
 import type { BoxHealth, FleetBoxRuntime } from "./health.ts";
+import { PlacementLog } from "./placement-log.ts";
 import { FleetProvider } from "./provider.ts";
 
 interface Recorded {
@@ -169,6 +172,53 @@ describe("FleetProvider.create", () => {
 			"box-b",
 			"box-c",
 		]);
+	});
+
+	it("rotates boxes across separate processes through the shared placement log", async () => {
+		const recorded: Recorded[] = [];
+		const logPath = join(tmpdir(), `fleet-placements-${process.pid}-${Date.now()}.jsonl`);
+		// Each create below runs in its own provider, which is what separate
+		// warren processes look like. A finished run leaves the box idle again,
+		// so without the shared log every process would pick box-a.
+		const one = async (runId: string): Promise<string> => {
+			const provider = new FleetProvider({
+				boxes: [box("box-a", recorded), box("box-b", recorded), box("box-c", recorded)],
+				materialize: async (_box, _spec) => "/box/clone",
+				placementLog: new PlacementLog({ path: logPath }),
+				probe: async () =>
+					health([
+						{ id: "box-a", live: 0 },
+						{ id: "box-b", live: 0 },
+						{ id: "box-c", live: 0 },
+					]),
+			});
+			const handle = await provider.create(spec(runId));
+			return handle.providerRunId.split("/")[0] ?? "";
+		};
+		const placed = [await one("run-1"), await one("run-2"), await one("run-3"), await one("run-4")];
+		expect(placed).toEqual(["box-a", "box-b", "box-c", "box-a"]);
+	});
+
+	it("ignores a placement that fell outside the log's window", async () => {
+		const recorded: Recorded[] = [];
+		const logPath = join(tmpdir(), `fleet-window-${process.pid}-${Date.now()}.jsonl`);
+		let clock = 1_000;
+		const log = new PlacementLog({ path: logPath, windowMs: 100, now: () => clock });
+		log.record("box-a");
+		clock += 10_000;
+		const provider = new FleetProvider({
+			boxes: [box("box-a", recorded), box("box-b", recorded)],
+			materialize: async (_box, _spec) => "/box/clone",
+			placementLog: log,
+			probe: async () =>
+				health([
+					{ id: "box-a", live: 0 },
+					{ id: "box-b", live: 0 },
+				]),
+		});
+		// The stale entry must not keep box-a out of rotation forever.
+		const handle = await provider.create(spec("run-1"));
+		expect(handle.providerRunId.split("/")[0]).toBe("box-a");
 	});
 
 	it("fails loudly when no box is healthy", async () => {

@@ -104,6 +104,32 @@ fi
 command -v bwrap >/dev/null 2>&1 || fail "bwrap still missing after install"
 say "bwrap: $(bwrap --version)"
 
+step "apparmor: let bwrap create a user namespace"
+# Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, so bwrap
+# cannot build a sandbox and every run dies with `bwrap: setting up uid map:
+# Permission denied`. A profile scoped to bwrap grants the namespace to bwrap
+# alone; the alternative, relaxing the sysctl, would grant it to every process.
+if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+  sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+PROFILE
+  sudo apparmor_parser -r /etc/apparmor.d/bwrap
+  say "installed /etc/apparmor.d/bwrap"
+else
+  say "unprivileged user namespaces are not restricted here"
+fi
+# Prove the sandbox builds before anything is placed on it.
+if bwrap --unshare-all --uid 1000 --gid 1000 --dev-bind / / true 2>/tmp/bwrap-probe.err; then
+  say "sandbox probe: ok"
+else
+  fail "sandbox probe failed: $(cat /tmp/bwrap-probe.err)"
+fi
+
 step "burrow cli $BURROW_CLI_VERSION"
 BUN="$HOME/.bun/bin/bun"
 GLOBAL_NM="$HOME/.bun/install/global/node_modules"

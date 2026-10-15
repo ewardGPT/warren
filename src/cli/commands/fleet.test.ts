@@ -265,8 +265,36 @@ describe("warren fleet dispatch", () => {
 		expect(spec?.baseBranch).toBe("develop");
 		expect(spec?.runtimeId).toBe("codex");
 		expect(spec?.mode).toBe("batch");
-		expect(spec?.network).toBe("restricted");
+		// The agent needs the host network namespace to reach a model gateway.
+		// bwrap treats `restricted` without a proxy address as deny-all, so a
+		// dispatch that selected it would leave the agent with no model.
+		expect(spec?.network).toBe("open");
 		expect(spec?.runId.startsWith("fleet-")).toBe(true);
+		expect(spec?.metadata).toBeUndefined();
+	});
+
+	test("folds a provider and model override into the run's frontmatter", async () => {
+		const h = harness({ boxes: [fakeBox({ id: "box-a" })] });
+		await runFleet(
+			{
+				action: "dispatch",
+				repo: "https://example.test/x.git",
+				prompt: "go",
+				provider: "headroom-bifrost",
+				model: "deepseek-v4-flash",
+			},
+			h.context,
+			h.deps,
+		);
+		// burrow reads run metadata's frontmatter and turns it into the agent's
+		// `--provider`/`--model` flags, which is how a box's own gateway is chosen.
+		expect(h.calls.create[0]?.metadata).toEqual({
+			frontmatter: {
+				source: "builtin",
+				provider: "headroom-bifrost",
+				model: "deepseek-v4-flash",
+			},
+		});
 	});
 
 	test("defaults the branch and runtime a bare dispatch leaves out", async () => {

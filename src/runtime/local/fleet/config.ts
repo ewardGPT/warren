@@ -21,7 +21,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Transport } from "@os-eco/burrow-cli";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -30,6 +30,8 @@ import type { EnvLike } from "../../../runs/spawn/callback-env.ts";
 import { FleetConfigError } from "./errors.ts";
 
 export const FLEET_CONFIG_FILENAME = "fleet.yaml";
+/** Shared placement record, beside the config. */
+export const FLEET_PLACEMENT_LOG_FILENAME = "fleet-placements.jsonl";
 
 /** One box: where it answers, and which secret unlocks it. */
 export interface FleetBox {
@@ -124,6 +126,15 @@ export function fleetConfigPath(env: EnvLike): string {
 	const override = env.WARREN_FLEET_CONFIG;
 	if (override !== undefined && override !== "") return override;
 	return join(kernelPaths(env).home, FLEET_CONFIG_FILENAME);
+}
+
+/**
+ * `<fleet config dir>/fleet-placements.jsonl`, the shared record placement
+ * reads so separate warren processes rotate boxes. It sits beside the config so
+ * a `WARREN_FLEET_CONFIG` override moves both together.
+ */
+export function fleetPlacementLogPath(env: EnvLike): string {
+	return join(dirname(fleetConfigPath(env)), FLEET_PLACEMENT_LOG_FILENAME);
 }
 
 /** `http://host:port` → a TCP transport. Anything else is rejected with a reason. */

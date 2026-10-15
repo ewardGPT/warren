@@ -35,6 +35,10 @@ export interface FleetArgs {
 	readonly baseBranch?: string;
 	readonly prompt?: string;
 	readonly runtime?: string;
+	/** dispatch: agent provider override (pi's `--provider` vocabulary). */
+	readonly provider?: string;
+	/** dispatch: agent model override (pi's `--model` value). */
+	readonly model?: string;
 	/** dispatch: poll until the run reaches a terminal phase. */
 	readonly wait?: boolean;
 	readonly json?: boolean;
@@ -117,6 +121,37 @@ async function statusReport(
 	return { lines, exitCode: up === 0 ? 3 : 0 };
 }
 
+/**
+ * The spec a `fleet dispatch` sends. Extracted so the command stays simple, and
+ * so the two decisions it encodes are visible in one place.
+ */
+function buildDispatchSpec(args: FleetArgs, repo: string, prompt: string): RunSpec {
+	const spec: RunSpec = {
+		runId: `fleet-${Date.now().toString(36)}`,
+		originUrl: repo,
+		branch: args.branch ?? "warren/fleet-run",
+		baseBranch: args.baseBranch ?? "main",
+		runtimeId: args.runtime ?? "pi",
+		prompt,
+		mode: "batch",
+		// The agent calls a model gateway, so the sandbox must share the host
+		// network namespace. bwrap drops the namespace on `--unshare-all`, and it
+		// only adds `--share-net` for `open` or for `restricted` with a proxy
+		// address. `restricted` without one is deny-all, which leaves the agent
+		// unable to reach any model.
+		network: "open",
+		seedFiles: [],
+		env: {},
+	};
+	if (args.provider === undefined && args.model === undefined) return spec;
+	// burrow reads run metadata's frontmatter and turns it into the agent's
+	// `--provider`/`--model` flags, which is how a box's own gateway is chosen.
+	const frontmatter: Record<string, unknown> = { source: "builtin" };
+	if (args.provider !== undefined) frontmatter.provider = args.provider;
+	if (args.model !== undefined) frontmatter.model = args.model;
+	return { ...spec, metadata: { frontmatter } };
+}
+
 async function dispatchReport(
 	provider: NonNullable<FleetCliDeps["provider"]>,
 	args: FleetArgs,
@@ -125,18 +160,7 @@ async function dispatchReport(
 	if (args.repo === undefined || args.prompt === undefined) {
 		return { lines: ["fleet dispatch needs --repo and --prompt"], exitCode: 1 };
 	}
-	const spec: RunSpec = {
-		runId: `fleet-${Date.now().toString(36)}`,
-		originUrl: args.repo,
-		branch: args.branch ?? "warren/fleet-run",
-		baseBranch: args.baseBranch ?? "main",
-		runtimeId: args.runtime ?? "pi",
-		prompt: args.prompt,
-		mode: "batch",
-		network: "restricted",
-		seedFiles: [],
-		env: {},
-	};
+	const spec = buildDispatchSpec(args, args.repo, args.prompt);
 	const lines: string[] = [];
 	try {
 		const handle = await provider.create(spec);
