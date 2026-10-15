@@ -20,6 +20,7 @@ import {
 	loadPlanRunCoordinatorConfigFromEnv,
 	type PlanRunCoordinatorHandle,
 } from "../../plan-runs/index.ts";
+import { judgeContinuationFromEnv } from "../../plan-runs/jev-gate.ts";
 import type { SpawnFn } from "../../projects/clone.ts";
 import type { ProjectsConfig } from "../../projects/config.ts";
 import { parseGitHubUrl } from "../../projects/index.ts";
@@ -197,6 +198,9 @@ export function bootPlanRunCoordinatorWiring(input: PlanRunWiringInput): PlanRun
 	} = input;
 
 	const planRunCoordinatorConfig = loadPlanRunCoordinatorConfigFromEnv(env);
+	// ubuntu-cf02: an optional pre-dispatch second look. `undefined` unless
+	// WARREN_JEV_PLAN_GATE=1, so the mechanical coordinator is the default.
+	const judgeContinuation = judgeContinuationFromEnv(env);
 	const planRunCoordinator = bootPlanRunCoordinator({
 		repos,
 		showSeed: async (projectId, seedId) => {
@@ -213,6 +217,7 @@ export function bootPlanRunCoordinatorWiring(input: PlanRunWiringInput): PlanRun
 			projectSpawn,
 			logger,
 		}),
+		...(judgeContinuation === undefined ? {} : { judgeContinuation }),
 		reopenPr: createReopenPr({
 			repos,
 			warrenConfigs,

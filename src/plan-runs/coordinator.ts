@@ -39,6 +39,7 @@ import type { Repos } from "../db/repos/index.ts";
 import type { PlanRunChildRow, PlanRunChildState, PlanRunRow } from "../db/schema.ts";
 import { SeedNotFoundError, type SeedShowResult } from "../seeds-cli/index.ts";
 import { handleInFlight } from "./in-flight.ts";
+import { countChildren, type PlanContinuationJudge } from "./jev-gate.ts";
 import { type CoordinatorReopenPrFn, checkParentRunMerged } from "./merge-gate.ts";
 import type { PrMergeChecker } from "./pr-merge.ts";
 
@@ -119,6 +120,12 @@ export interface AdvancePlanRunInput {
 	readonly mergeTimeoutMs?: number;
 	/** warren-22de: PR-(re)open seam. See {@link CoordinatorReopenPrFn}. */
 	readonly reopenPr?: CoordinatorReopenPrFn;
+	/**
+	 * An optional second look before the plan moves on to its next child
+	 * (`src/plan-runs/jev-gate.ts`). Absent means no gate, which is the default;
+	 * `judgeContinuationFromEnv` supplies one from `WARREN_JEV_PLAN_GATE=1`.
+	 */
+	readonly judgeContinuation?: PlanContinuationJudge;
 	readonly now?: () => Date;
 }
 
@@ -243,6 +250,49 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 				now: nowFn(),
 			});
 			continue;
+		}
+
+		// An optional second look before the plan moves on. A stop parks the plan
+		// as failed: a plan-run has no paused state, so the honest thing is a loud
+		// terminal reason naming the band rather than a silent continuation.
+		if (input.judgeContinuation !== undefined) {
+			const counts = countChildren(children.map((child) => child.state));
+			const verdict = await input.judgeContinuation({
+				planRunId: planRun.id,
+				projectId: planRun.projectId,
+				completedChildren: counts.completed,
+				failedChildren: counts.failed,
+				remainingChildren: counts.remaining,
+				...(mergedChildSeq === undefined ? {} : { mergedChildSeq }),
+				nextChildSeq: next.seq,
+				nextSeedId: next.seedId,
+				...(planRun.startedAt === null
+					? {}
+					: { planAgeMs: Math.max(0, nowFn().getTime() - Date.parse(planRun.startedAt)) }),
+			});
+			if (verdict.kind === "stop") {
+				const reason = `plan_gate_${verdict.band}:${verdict.reason}`;
+				const endedAt = nowFn().toISOString();
+				await input.repos.planRuns.updateChild({
+					planRunId: planRun.id,
+					seq: next.seq,
+					patch: { state: "failed", failureReason: reason, endedAt },
+					now: nowFn(),
+				});
+				await input.repos.planRuns.transitionTo(planRun.id, "failed", {
+					endedAt,
+					failureReason: reason,
+				});
+				const anchor = mostRecentDispatchedRunId(children);
+				if (anchor !== null) {
+					await input.emit(anchor, "plan_run.failed", {
+						planRunId: planRun.id,
+						failedSeq: next.seq,
+						reason,
+					});
+				}
+				return { kind: "plan_failed", failedSeq: next.seq, reason };
+			}
 		}
 
 		// Dispatch the next child; legacy {seed_id}-only template render.

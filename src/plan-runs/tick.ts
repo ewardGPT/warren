@@ -36,6 +36,7 @@ import {
 	type CoordinatorSpawnFn,
 	type PlanRunEventKind,
 } from "./coordinator.ts";
+import type { PlanContinuationJudge } from "./jev-gate.ts";
 import type { PrMergeChecker } from "./pr-merge.ts";
 
 export interface PlanRunTickLogger {
@@ -65,6 +66,12 @@ export interface PlanRunTickDeps {
 	 * on a child that succeeded with no prUrl and no empty-push event.
 	 */
 	readonly reopenPr?: CoordinatorReopenPrFn;
+	/**
+	 * Optional pre-dispatch second look (ubuntu-cf02). Absent means no gate,
+	 * which is the default; `judgeContinuationFromEnv` supplies one from
+	 * `WARREN_JEV_PLAN_GATE=1`.
+	 */
+	readonly judgeContinuation?: PlanContinuationJudge;
 	/**
 	 * Optional host-side child-seed close seam (warren-3806). When provided,
 	 * the coordinator closes a plan-run child's seed on the project's default
@@ -125,6 +132,7 @@ function buildAdvanceInput(
 		emit,
 		...(deps.mergeTimeoutMs !== undefined ? { mergeTimeoutMs: deps.mergeTimeoutMs } : {}),
 		...(deps.reopenPr !== undefined ? { reopenPr: deps.reopenPr } : {}),
+		...(deps.judgeContinuation !== undefined ? { judgeContinuation: deps.judgeContinuation } : {}),
 		...(deps.closeChildSeed !== undefined ? { closeChildSeed: deps.closeChildSeed } : {}),
 		...(deps.now !== undefined ? { now: deps.now } : {}),
 	};
