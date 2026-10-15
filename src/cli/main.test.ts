@@ -24,6 +24,7 @@ describe("buildProgram", () => {
 			"db",
 			"decide",
 			"doctor",
+			"fleet",
 			"init",
 			"kernel",
 			"plan",

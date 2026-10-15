@@ -29,6 +29,7 @@ import {
 	checkWarrenDb,
 	type DiagnosticCheck,
 	type DiagnosticLogger,
+	fleetBoxChecks,
 	kernelFleetChecks,
 	type WarrenConfigCheckProject,
 } from "../../diagnostics/checks.ts";
@@ -130,6 +131,8 @@ export async function runDoctor(
 	// Peer kernels are a fleet, not a dependency: each host gets its own line
 	// here, and no host can fail warren's own readiness (checks-kernel.ts).
 	checks.push(...(await kernelFleetChecks({ env: context.env, mode: "doctor" })));
+	// Execution boxes, when this process dispatches onto them (WARREN_RUNTIME=fleet).
+	checks.push(...(await fleetBoxChecks({ env: context.env, mode: "doctor" })));
 
 	checks.push(
 		await checkWarrenConfig({

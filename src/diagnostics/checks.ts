@@ -8,6 +8,9 @@
  * the three sibling test files), which all import from `./checks.ts`,
  * keeps resolving unchanged.
  *
+ *   - checks-fleet.ts — the peer BURROW endpoints warren places runs on (only
+ *     when `WARREN_RUNTIME=fleet`): one line per box in doctor, one always-ok
+ *     aggregate line in readyz.
  *   - checks-kernel.ts — the peer kernels warren coordinates with: one line
  *     per host in `warren doctor`, one always-ok aggregate line in readyz.
  *   - checks-sandbox.ts — bwrap bring-up and the canopy clone's
@@ -56,6 +59,7 @@ export {
 	checkWarrenDb,
 	type WarrenConfigCheckProject,
 } from "./checks-config.ts";
+export { type FleetCheckDeps, fleetBoxChecks, fleetConfigured } from "./checks-fleet.ts";
 export {
 	FLEET_PROBE_TIMEOUT_MS,
 	FLEET_REGISTRY_FILENAME,

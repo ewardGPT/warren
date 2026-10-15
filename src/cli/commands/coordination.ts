@@ -13,6 +13,7 @@ import { CLOSURE_REASONS } from "../../seeds-cli/closure.ts";
 import type { CliContext } from "../output.ts";
 import { runClosure } from "./closure.ts";
 import { runDecide } from "./decide.ts";
+import { runFleet } from "./fleet.ts";
 import { type KernelAction, runKernel } from "./kernel.ts";
 
 /**
@@ -78,6 +79,55 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 				);
 			});
 	}
+
+	// `fleet` is the remote execution lane: which boxes exist, whether they
+	// answer, and a way to place one run to smoke the path end to end.
+	const fleetGroup = program
+		.command("fleet")
+		.description("remote execution boxes: their state, and dispatching a run to one");
+	fleetGroup
+		.command("status")
+		.description("probe every configured box's burrow and print its state and load")
+		.option("--json", "print the box table as JSON")
+		.action(async (opts: { json?: boolean }) => {
+			const report = await runFleet({ action: "status", json: opts.json === true }, context);
+			for (const line of report.lines) console.log(line);
+			process.exit(report.exitCode);
+		});
+	fleetGroup
+		.command("dispatch")
+		.description("place one run on a box (the smoke test for the lane)")
+		.requiredOption("--repo <url>", "git origin the run works on")
+		.requiredOption("--prompt <text>", "the brief handed to the agent")
+		.option("--runtime <id>", "agent runtime id (default pi)")
+		.option("--branch <name>", "branch to work on")
+		.option("--base <name>", "base branch (default main)")
+		.option("--wait", "poll until the run reaches a terminal phase")
+		.action(
+			async (opts: {
+				repo: string;
+				prompt: string;
+				runtime?: string;
+				branch?: string;
+				base?: string;
+				wait?: boolean;
+			}) => {
+				const report = await runFleet(
+					{
+						action: "dispatch",
+						repo: opts.repo,
+						prompt: opts.prompt,
+						...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}),
+						...(opts.branch !== undefined ? { branch: opts.branch } : {}),
+						...(opts.base !== undefined ? { baseBranch: opts.base } : {}),
+						wait: opts.wait === true,
+					},
+					context,
+				);
+				for (const line of report.lines) console.log(line);
+				process.exit(report.exitCode);
+			},
+		);
 
 	program
 		.command("closure")

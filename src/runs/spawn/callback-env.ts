@@ -46,12 +46,20 @@ export function injectWarrenCallbackEnv(
 }
 
 /**
- * Build the loopback URL a sandboxed agent dials to reach warren's HTTP
- * API. Always `localhost` (the server's bind host may be `0.0.0.0`, which
- * isn't dialable) on `WARREN_BIND_PORT` (default 8080). Returns null when
+ * Build the URL a sandboxed agent dials to reach warren's HTTP API. Always
+ * `localhost` (the server's bind host may be `0.0.0.0`, which isn't
+ * dialable) on `WARREN_BIND_PORT` (default 8080). Returns null when
  * warren is bound to a unix socket only.
+ *
+ * `WARREN_CALLBACK_URL` overrides that, and a REMOTE backend needs it: a run
+ * executing on a fleet box cannot reach warren's `localhost`, so it must be told
+ * an address it can dial (the host's tailnet address, for example). The local
+ * backend keeps the loopback answer, because there a run really does share the
+ * host. A trailing slash is trimmed so the sandbox never builds a `//` path.
  */
 export function loopbackApiUrl(serverEnv: EnvLike): string | null {
+	const override = serverEnv.WARREN_CALLBACK_URL;
+	if (override !== undefined && override !== "") return override.replace(/\/+$/, "");
 	const socket = serverEnv.WARREN_BIND_SOCKET;
 	if (socket !== undefined && socket !== "") return null;
 	const portRaw = serverEnv.WARREN_BIND_PORT;

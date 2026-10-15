@@ -31,16 +31,17 @@ import type { StreamLogger } from "./k8s/log-stream.ts";
 import type { PodCacheReader } from "./k8s/pod-watcher.ts";
 import { defaultCoreApiFactory, K8sProvider } from "./k8s/provider.ts";
 import type { K8sInboxStore } from "./k8s/send-message.ts";
+import { buildFleetProvider, fleetPlacementFromEnv } from "./local/fleet/index.ts";
 import { LocalProvider } from "./local/provider.ts";
 
 /** Runtime backends the selector understands. */
-export type RuntimeKind = "local" | "k8s";
+export type RuntimeKind = "local" | "k8s" | "fleet";
 
 /** Selector default when `WARREN_RUNTIME` is unset — the self-host backend. */
 export const DEFAULT_RUNTIME_KIND: RuntimeKind = "local";
 
 /** Every recognized `WARREN_RUNTIME` value (used for validation + error hints). */
-export const RUNTIME_KINDS: readonly RuntimeKind[] = ["local", "k8s"];
+export const RUNTIME_KINDS: readonly RuntimeKind[] = ["local", "k8s", "fleet"];
 
 /** Minimal env surface the selector reads. */
 export type RuntimeEnv = Readonly<Record<string, string | undefined>>;
@@ -170,6 +171,11 @@ export function resolveRuntimeProvider(
 			});
 		case "k8s":
 			return buildK8sProvider(deps);
+		case "fleet":
+			// The fleet backend owns its own box list, tokens and ssh seams, so it
+			// reads env directly rather than borrowing the local burrow client: its
+			// per-box clients have their own transports (src/runtime/fleet/).
+			return buildFleetProvider({ env, placement: fleetPlacementFromEnv(env) });
 	}
 }
 

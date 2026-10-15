@@ -243,6 +243,74 @@ The fleet boxes run the same harness as the workstation. Per box:
    with a systemd unit holding an ssh forward from 18086 to that box's 8085.
 5. Verify with a real call: `omp -p "Reply with the single word: ok"`.
 
+## The fleet execution lane
+
+`WARREN_RUNTIME=fleet` places runs on the agentic boxes. Each box runs its own
+`burrow serve` on the tailnet, and warren reaches it over TCP with a bearer
+token.
+
+The provider lives in `src/runtime/local/fleet/`. It is the local backend on a
+remote host: it builds one `LocalProvider` per box and delegates all eight
+contract methods to the box that owns the run.
+
+Placement is the only new decision. A healthy box comes first, then the box with
+the fewest live workspaces wins, then the box id breaks ties.
+
+`WARREN_FLEET_BOX_LIMIT` and `WARREN_FLEET_PROJECT_LIMIT` add optional ceilings.
+
+The run handle carries the box id. `providerRunId` becomes `<box>/<inner run id>`,
+so every later call routes to the same box and the routing survives a warren
+restart.
+
+Two facts about a remote burrow shape the rest of the design.
+
+First, burrow does not clone. It cuts a git worktree off a clone that already
+lives on the host, and the provider must name that clone.
+
+So the fleet provider materializes a box-side clone first (`materialize.ts`),
+keyed by the origin URL, and hands burrow the box path. A later dispatch runs a
+fetch, and a fetch failure does not fail the run when a usable clone exists.
+
+Second, the workspace belongs to the box. The reap half of a run (commit, push,
+diff, artifacts) is host filesystem and host git work.
+
+So the provider hands each box's `LocalProvider` ssh-backed `fs` and `exec` seams
+(`remote-seams.ts`). Reap itself does not change.
+
+A third fact follows. `LocalProvider` computes the callback URL as
+`http://localhost:PORT`, and a box cannot dial warren's loopback.
+
+`WARREN_CALLBACK_URL` therefore overrides that value with an address the box can
+reach, normally the warren host's tailnet address.
+
+The operator surface is `warren fleet status` for state and load per box.
+`warren fleet dispatch` places one run, and it can wait for the outcome.
+
+`warren doctor` adds one `fleet:<box>` line per box under this runtime kind.
+`/readyz` adds one aggregate line that is always ok, for the same reason the
+kernel line is.
+
+### What a box can run today
+
+The lane places runs, materializes the workspace and cleans up. Execution stops
+at the agent step, and the reason is upstream of warren.
+
+burrow resolves the agent for a daemon-dispatched run against its BUILT-IN
+registry. The create request accepts built-in ids as strings, and a declarative
+agent in a project `burrow.toml` does not register with the daemon.
+
+Two observations confirm this. `burrow agents show stub` in a project that
+declares `stub` answers `not_found`, and a dispatched run finalizes as
+`agent 'stub' is not registered`.
+
+None of the four built-in agents is installed and authenticated on the boxes.
+`omp` is installed there, it reaches the fleet's model gateway, and it offers
+`--mode rpc`, which is the protocol burrow's built-in `pi` runtime drives.
+
+So the shortest path to real agent work is to make `pi` resolvable on a box, or
+to install and authenticate `claude-code` there. That is an operator decision
+about credentials.
+
 ## Alternatives rejected
 
 | Alternative | Why not |
