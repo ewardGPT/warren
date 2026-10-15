@@ -337,29 +337,39 @@ diff, artifacts) is host filesystem and host git work.
 So the provider hands each box's `LocalProvider` ssh-backed `fs` and `exec` seams
 (`remote-seams.ts`). Reap itself does not change.
 
-**What the lane does not do yet.** The CLI fleet verbs place work and leave
-warren's lifecycle alone. `fleet dispatch` and `fleet pump` call the provider
-directly, so warren writes no run row, nothing reaps the result, and no pull
-request follows.
+**Every fleet verb now walks the lifecycle.** `fleet dispatch` and `fleet pump`
+call `spawnRun`, the same domain call `warren run` makes. Warren writes the run
+row, streams the events, and reaps the outcome.
 
-The domain verb does not have that gap. `warren run` opens the database itself
-and resolves its backend from `WARREN_RUNTIME`, so it walks the whole lifecycle
-on the fleet lane.
+A pumped run records the seed it came from, so the run list answers "which seed
+did this work" without a second lookup.
 
-Proven live. `WARREN_RUNTIME=fleet warren run pi <project> -p <prompt>` spawns the
-run, writes its row, streams the box's events, and reaches reap.
+`--wait` goes further and drives the whole lifecycle in-process, through
+`runRun`: spawn, bridge, reap. This needs no server, which makes the verb a
+smoke test.
 
-Reap then runs **on the box**. The remote seams carry it, and the failing step
+Proven live. `fleet dispatch --wait` placed `run_0fe6tc8ap4n8` on a box,
+streamed 17 events, and reaped it. Reap ran **on the box**, and its failing step
 names that box:
 
 ```
 run.reaped state=failed errors=[{step: branch_push,
-  message: git on ubuntu@100.111.105.36 failed:
+  message: git on ubuntu@100.112.188.99 failed:
   fatal: could not read Username for 'https://github.com'}]
 ```
 
+Without `--wait` the reap belongs to a server. A pump must not wait, because
+waiting on each seed would serialize a queue whose point is to fill every box at
+once. A server adopts what the CLI placed: at boot it logs `resumed run stream
+bridge` for each live run row, then the watchdog finalizes it.
+
 So the last gap is credentials, not architecture. A box can clone a public repo
 and cannot push to a private one, because it holds no GitHub credential.
+
+The `--repo` value must name a registered project, because a run row belongs to
+one. The verb refuses an unregistered URL, and names the `warren add-project`
+command that fixes it. Branch naming belongs to the domain, so the verbs no
+longer take a branch.
 
 The kernel queue stays out of this on purpose. A qitem is work addressed to a
 session, and a burrow run has no session. All three kernels report an empty queue

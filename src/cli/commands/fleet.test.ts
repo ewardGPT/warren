@@ -1,20 +1,24 @@
 /**
- * `warren fleet <status|dispatch>` through its seam.
+ * `warren fleet <status|dispatch|pump>` through its seam.
  *
- * Every test injects a provider (`FleetCliDeps.provider`), so nothing here
- * reads a real fleet config or opens a socket: the boxes are fake
- * `FleetBoxRuntime`s whose client only has to answer the two calls the real
- * `probeBoxes` makes (`probe`, then `burrows.list`).
+ * Nothing here reads a real fleet config, opens a socket, or touches a
+ * database. The boxes are fake `FleetBoxRuntime`s whose client only has to
+ * answer the two calls the real `probeBoxes` makes (`probe`, then
+ * `burrows.list`), and the placing verbs get stub `spawnRun` / `runRun` seams
+ * plus a stub project repo.
  */
 
 import { describe, expect, test } from "bun:test";
-import type { RunHandle, RunSpec } from "../../runtime/contract.ts";
+import type { Repos } from "../../db/repos/index.ts";
+import type { ProjectRow } from "../../db/schema.ts";
+import type { SpawnRunInput, SpawnRunResult } from "../../runs/spawn/types.ts";
 import type { FleetBoxRuntime } from "../../runtime/local/fleet/index.ts";
 import type { ReadySeed } from "../../seeds-cli/ready.ts";
 import type { CliContext, Stdio } from "../output.ts";
 import { type FleetCliDeps, runFleet } from "./fleet.ts";
+import type { RunArgs, RunResult } from "./run.ts";
 
-/** runFleet returns its lines; it never writes to stdio. */
+/** runFleet returns its lines; the placing verbs write through injected seams. */
 const NOOP_STDIO: Stdio = {
 	stdout: { write: (_chunk: string): void => undefined },
 	stderr: { write: (_chunk: string): void => undefined },
@@ -56,10 +60,23 @@ function fakeBox(options: {
 	return { id: options.id, client, provider: {}, ssh: {} } as unknown as FleetBoxRuntime;
 }
 
+/** The registered project the stub repo answers with. */
+const PROJECT: ProjectRow = {
+	id: "prj_test",
+	gitUrl: "https://example.test/x.git",
+	localPath: "/tmp/x",
+	defaultBranch: "main",
+	addedAt: "2026-01-01T00:00:00.000Z",
+	lastFetchedAt: null,
+	lastHeadSha: null,
+	hasSeeds: false,
+};
+
 interface FleetCalls {
-	readonly create: RunSpec[];
-	readonly terminated: RunHandle[];
-	statusCount: number;
+	/** Every domain spawn the placing verbs made, in order. */
+	readonly spawns: SpawnRunInput[];
+	/** Every lifecycle delegation `dispatch --wait` made. */
+	readonly runs: RunArgs[];
 }
 
 /** The single line `status --json` prints. */
@@ -81,49 +98,59 @@ interface FleetHarness {
 }
 
 /**
- * A provider whose `status` walks `phases` in order (the last phase repeats), so
- * a `--wait` test reaches a terminal answer within `maxPolls` without sleeping.
+ * A harness whose placing verbs go through stub domain seams. `exactUrl` is what
+ * `findByGitUrl` answers to; `listedUrl` is what the fallback scan sees, which
+ * lets a test drive the normalization path on its own.
  */
 function harness(options: {
 	boxes: readonly FleetBoxRuntime[];
-	phases?: readonly string[];
-	createError?: string;
-	maxPolls?: number;
 	seeds?: FleetCliDeps["seeds"];
 	projectPath?: string;
+	repos?: Repos;
+	exactUrl?: string | null;
+	listedUrl?: string | null;
+	spawnError?: string;
+	runExit?: number;
+	env?: Record<string, string | undefined>;
 }): FleetHarness {
-	const calls: FleetCalls = { create: [], terminated: [], statusCount: 0 };
-	const phases = options.phases ?? ["succeeded"];
-	let index = 0;
-	const provider: NonNullable<FleetCliDeps["provider"]> = {
-		boxes: options.boxes,
-		create: async (spec: RunSpec): Promise<RunHandle> => {
-			calls.create.push(spec);
-			if (options.createError !== undefined) throw new Error(options.createError);
-			const box = options.boxes[0]?.id ?? "box";
-			return { runId: spec.runId, sandboxId: "sandbox-07", providerRunId: `${box}/inner-run` };
-		},
-		status: async (_handle: RunHandle) => {
-			calls.statusCount += 1;
-			const phase = phases[Math.min(index, phases.length - 1)] ?? "running";
-			index += 1;
-			return { phase, exitCode: phase === "succeeded" ? 0 : 1, exists: true };
-		},
-		terminate: async (handle: RunHandle): Promise<unknown> => {
-			calls.terminated.push(handle);
-			return {};
-		},
-	};
+	const calls: FleetCalls = { spawns: [], runs: [] };
+	const provider = { boxes: options.boxes } as NonNullable<FleetCliDeps["provider"]>;
+	const repos =
+		options.repos ??
+		({
+			projects: {
+				findByGitUrl: async (gitUrl: string): Promise<ProjectRow | null> =>
+					options.exactUrl === gitUrl ? PROJECT : null,
+				listAll: async (): Promise<ProjectRow[]> =>
+					options.listedUrl === null || options.listedUrl === undefined
+						? []
+						: [{ ...PROJECT, id: "prj_listed", gitUrl: options.listedUrl }],
+			},
+		} as unknown as Repos);
 	const context: CliContext = {
-		env: {},
+		env: options.env ?? {},
 		stdio: NOOP_STDIO,
 		spawn: () => Promise.reject(new Error("fleet must not spawn")),
 	};
 	const deps: FleetCliDeps = {
 		provider,
-		env: {},
-		pollMs: 1,
-		maxPolls: options.maxPolls ?? 3,
+		env: options.env ?? {},
+		repos,
+		spawn: async (input: SpawnRunInput): Promise<SpawnRunResult> => {
+			calls.spawns.push(input);
+			if (options.spawnError !== undefined) throw new Error(options.spawnError);
+			const box = options.boxes[0]?.id ?? "box-a";
+			return {
+				run: { id: `run_${calls.spawns.length}`, agentName: input.agentName } as never,
+				burrow: { id: "sandbox-07", workspacePath: "" },
+				burrowRun: { id: `${box}/run_inner` },
+				agent: {} as never,
+			};
+		},
+		run: async (_context, _deps, args: RunArgs): Promise<RunResult> => {
+			calls.runs.push(args);
+			return { exitCode: options.runExit ?? 0, runId: "run_wait", state: "succeeded" };
+		},
 		...(options.seeds === undefined ? {} : { seeds: options.seeds }),
 		...(options.projectPath === undefined ? {} : { projectPath: options.projectPath }),
 	};
@@ -169,7 +196,7 @@ describe("warren fleet status", () => {
 		expect(row).toContain("ok");
 		expect(row).toContain("2 live");
 		expect(row).toContain("http://100.64.0.1:7455");
-		expect(h.calls.create).toHaveLength(0);
+		expect(h.calls.spawns).toHaveLength(0);
 	});
 
 	test("every box down is exit 3, and each row says why", async () => {
@@ -258,141 +285,158 @@ describe("warren fleet dispatch", () => {
 			h.deps,
 		);
 		expect(noPrompt.exitCode).toBe(1);
-		expect(h.calls.create).toHaveLength(0);
+		expect(h.calls.spawns).toHaveLength(0);
 	});
 
-	test("places the run on a box and returns without waiting or terminating", async () => {
+	test("an unregistered repo stops with the command that fixes it", async () => {
 		const h = harness({ boxes: [fakeBox({ id: "box-a" })] });
 		const report = await runFleet(
-			{ action: "dispatch", repo: "https://example.test/x.git", prompt: "go" },
+			{ action: "dispatch", repo: "https://example.test/other.git", prompt: "go" },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(1);
+		expect(report.lines[0]).toBe(
+			"fleet: https://example.test/other.git is not a registered project",
+		);
+		expect(report.lines[1]).toContain("warren add-project https://example.test/other.git");
+		expect(h.calls.spawns).toHaveLength(0);
+	});
+
+	test("dispatches through the domain, so the run gets a row and a seed-free trigger", async () => {
+		const h = harness({ boxes: [fakeBox({ id: "box-a" })], exactUrl: PROJECT.gitUrl });
+		const report = await runFleet(
+			{ action: "dispatch", repo: PROJECT.gitUrl, prompt: "go" },
 			h.context,
 			h.deps,
 		);
 		expect(report.exitCode).toBe(0);
-		expect(report.lines[0]).toBe(`dispatched ${h.calls.create[0]?.runId} on box-a`);
+		expect(report.lines[0]).toBe("dispatched run_1 on box-a");
 		expect(report.lines[1]).toContain("sandbox sandbox-07");
-		expect(h.calls.create).toHaveLength(1);
-		expect(h.calls.statusCount).toBe(0);
-		expect(h.calls.terminated).toHaveLength(0);
+		const input = h.calls.spawns[0];
+		expect(input?.projectId).toBe("prj_test");
+		expect(input?.agentName).toBe("pi");
+		expect(input?.prompt).toBe("go");
+		expect(input?.trigger).toBe("cli");
+		expect(input?.seedId).toBeUndefined();
+		// The run's own branch composition owns the branch, so no branch rides in.
+		expect(h.calls.runs).toHaveLength(0);
 	});
 
-	test("passes repo, prompt, branch, base branch and runtime through to create", async () => {
-		const h = harness({ boxes: [fakeBox({ id: "box-a" })] });
-		const report = await runFleet(
-			{
-				action: "dispatch",
-				repo: "https://example.test/x.git",
-				prompt: "do the thing",
-				branch: "warren/ticket",
-				baseBranch: "develop",
-				runtime: "codex",
-			},
-			h.context,
-			h.deps,
-		);
-		expect(report.exitCode).toBe(0);
-		const spec = h.calls.create[0];
-		expect(spec?.originUrl).toBe("https://example.test/x.git");
-		expect(spec?.prompt).toBe("do the thing");
-		expect(spec?.branch).toBe("warren/ticket");
-		expect(spec?.baseBranch).toBe("develop");
-		expect(spec?.runtimeId).toBe("codex");
-		expect(spec?.mode).toBe("batch");
-		// The agent needs the host network namespace to reach a model gateway.
-		// bwrap treats `restricted` without a proxy address as deny-all, so a
-		// dispatch that selected it would leave the agent with no model.
-		expect(spec?.network).toBe("open");
-		expect(spec?.runId.startsWith("fleet-")).toBe(true);
-		expect(spec?.metadata).toBeUndefined();
-	});
-
-	test("folds a provider and model override into the run's frontmatter", async () => {
-		const h = harness({ boxes: [fakeBox({ id: "box-a" })] });
-		await runFleet(
-			{
-				action: "dispatch",
-				repo: "https://example.test/x.git",
-				prompt: "go",
-				provider: "headroom-bifrost",
-				model: "deepseek-v4-flash",
-			},
-			h.context,
-			h.deps,
-		);
-		// burrow reads run metadata's frontmatter and turns it into the agent's
-		// `--provider`/`--model` flags, which is how a box's own gateway is chosen.
-		expect(h.calls.create[0]?.metadata).toEqual({
-			frontmatter: {
-				source: "builtin",
-				provider: "headroom-bifrost",
-				model: "deepseek-v4-flash",
-			},
-		});
-	});
-
-	test("defaults the branch and runtime a bare dispatch leaves out", async () => {
-		const h = harness({ boxes: [fakeBox({ id: "box-a" })] });
-		await runFleet(
-			{ action: "dispatch", repo: "https://example.test/x.git", prompt: "go" },
-			h.context,
-			h.deps,
-		);
-		expect(h.calls.create[0]?.branch).toBe("warren/fleet-run");
-		expect(h.calls.create[0]?.baseBranch).toBe("main");
-		expect(h.calls.create[0]?.runtimeId).toBe("pi");
-	});
-
-	test("--wait polls to success, terminates the box and exits 0", async () => {
-		const h = harness({ boxes: [fakeBox({ id: "box-a" })], phases: ["running", "succeeded"] });
-		const report = await runFleet(
-			{ action: "dispatch", repo: "https://example.test/x.git", prompt: "go", wait: true },
-			h.context,
-			h.deps,
-		);
-		expect(report.exitCode).toBe(0);
-		expect(h.calls.statusCount).toBe(2);
-		expect(h.calls.terminated).toHaveLength(1);
-		expect(report.lines.at(-1)).toContain("succeeded (exit 0)");
-	});
-
-	test("--wait on a failed run terminates and exits 1", async () => {
-		const h = harness({ boxes: [fakeBox({ id: "box-a" })], phases: ["failed"] });
-		const report = await runFleet(
-			{ action: "dispatch", repo: "https://example.test/x.git", prompt: "go", wait: true },
-			h.context,
-			h.deps,
-		);
-		expect(report.exitCode).toBe(1);
-		expect(h.calls.terminated).toHaveLength(1);
-		expect(report.lines.at(-1)).toContain("failed (exit 1)");
-	});
-
-	test("--wait gives up after maxPolls rather than hanging", async () => {
-		const h = harness({ boxes: [fakeBox({ id: "box-a" })], phases: ["running"], maxPolls: 2 });
-		const report = await runFleet(
-			{ action: "dispatch", repo: "https://example.test/x.git", prompt: "go", wait: true },
-			h.context,
-			h.deps,
-		);
-		expect(report.exitCode).toBe(1);
-		expect(h.calls.statusCount).toBe(3);
-		expect(h.calls.terminated).toHaveLength(1);
-		expect(report.lines.at(-1)).toContain("running");
-	});
-
-	test("a create failure is reported with its message and exits 1", async () => {
+	test("a repo typed with .git, a trailing slash or other case still resolves", async () => {
 		const h = harness({
 			boxes: [fakeBox({ id: "box-a" })],
-			createError: "burrow refused: no capacity",
+			exactUrl: null,
+			listedUrl: "https://example.test/X.git/",
 		});
 		const report = await runFleet(
-			{ action: "dispatch", repo: "https://example.test/x.git", prompt: "go" },
+			{ action: "dispatch", repo: "https://example.test/x", prompt: "go" },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(0);
+		expect(h.calls.spawns[0]?.projectId).toBe("prj_listed");
+	});
+
+	test("passes the agent and the provider and model overrides through", async () => {
+		const h = harness({ boxes: [fakeBox({ id: "box-a" })], exactUrl: PROJECT.gitUrl });
+		await runFleet(
+			{
+				action: "dispatch",
+				repo: PROJECT.gitUrl,
+				prompt: "go",
+				runtime: "codex",
+				provider: "headroom-bifrost",
+				model: "deepseek-v4-flash",
+			},
+			h.context,
+			h.deps,
+		);
+		const input = h.calls.spawns[0];
+		expect(input?.agentName).toBe("codex");
+		expect(input?.providerOverride).toBe("headroom-bifrost");
+		expect(input?.modelOverride).toBe("deepseek-v4-flash");
+	});
+
+	test("warns that reap needs a fleet server when the shell does not pick that runtime", async () => {
+		const h = harness({ boxes: [fakeBox({ id: "box-a" })], exactUrl: PROJECT.gitUrl });
+		const local = await runFleet(
+			{ action: "dispatch", repo: PROJECT.gitUrl, prompt: "go" },
+			h.context,
+			h.deps,
+		);
+		expect(local.lines.at(-1)).toContain("WARREN_RUNTIME=fleet");
+
+		const fleet = harness({
+			boxes: [fakeBox({ id: "box-a" })],
+			exactUrl: PROJECT.gitUrl,
+			env: { WARREN_RUNTIME: "fleet" },
+		});
+		const report = await runFleet(
+			{ action: "dispatch", repo: PROJECT.gitUrl, prompt: "go" },
+			fleet.context,
+			fleet.deps,
+		);
+		expect(report.lines.at(-1)).toContain("next watchdog tick");
+	});
+
+	test("--wait runs the whole lifecycle instead of leaving reap to a server", async () => {
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" })],
+			exactUrl: PROJECT.gitUrl,
+			runExit: 0,
+		});
+		const report = await runFleet(
+			{ action: "dispatch", repo: PROJECT.gitUrl, prompt: "go", wait: true },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(0);
+		expect(report.lines[0]).toContain("run_wait succeeded");
+		// The lifecycle is the domain's, so nothing here spawns directly.
+		expect(h.calls.spawns).toHaveLength(0);
+		expect(h.calls.runs[0]?.project).toBe("prj_test");
+		expect(h.calls.runs[0]?.prompt).toBe("go");
+	});
+
+	test("--wait passes a failing lifecycle's exit code through", async () => {
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" })],
+			exactUrl: PROJECT.gitUrl,
+			runExit: 1,
+		});
+		const report = await runFleet(
+			{ action: "dispatch", repo: PROJECT.gitUrl, prompt: "go", wait: true },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(1);
+	});
+
+	test("a spawn failure is reported with its message and exits 1", async () => {
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" })],
+			exactUrl: PROJECT.gitUrl,
+			spawnError: "burrow refused: no capacity",
+		});
+		const report = await runFleet(
+			{ action: "dispatch", repo: PROJECT.gitUrl, prompt: "go" },
 			h.context,
 			h.deps,
 		);
 		expect(report.exitCode).toBe(1);
 		expect(report.lines).toEqual(["fleet dispatch failed: burrow refused: no capacity"]);
-		expect(h.calls.terminated).toHaveLength(0);
+	});
+
+	test("refuses to place without a database, rather than writing no evidence", async () => {
+		const h = harness({ boxes: [fakeBox({ id: "box-a" })] });
+		const report = await runFleet(
+			{ action: "dispatch", repo: PROJECT.gitUrl, prompt: "go" },
+			h.context,
+			{ ...h.deps, repos: undefined },
+		);
+		expect(report.exitCode).toBe(1);
+		expect(report.lines[0]).toContain("no warren database in reach");
 	});
 });
 
@@ -406,9 +450,10 @@ describe("warren fleet pump", () => {
 			boxes: [fakeBox({ id: "box-a" }), fakeBox({ id: "box-b" })],
 			seeds: seeds.seam,
 			projectPath: "/proj",
+			exactUrl: PROJECT.gitUrl,
 		});
 		const report = await runFleet(
-			{ action: "pump", repo: "https://example.test/x.git", dryRun: true },
+			{ action: "pump", repo: PROJECT.gitUrl, dryRun: true },
 			h.context,
 			h.deps,
 		);
@@ -417,10 +462,10 @@ describe("warren fleet pump", () => {
 		expect(report.lines[1]).toContain("ubuntu-aaaa");
 		// The point of the flag: no lease is taken and no run is created.
 		expect(seeds.calls.claimed).toBe(0);
-		expect(h.calls.create).toHaveLength(0);
+		expect(h.calls.spawns).toHaveLength(0);
 	});
 
-	test("claims one seed per box and places a run for each", async () => {
+	test("claims one seed per box and records each seed on its run", async () => {
 		const seeds = pumpSeeds([
 			{ id: "ubuntu-aaaa", title: "first" },
 			{ id: "ubuntu-bbbb", title: "second" },
@@ -429,24 +474,23 @@ describe("warren fleet pump", () => {
 			boxes: [fakeBox({ id: "box-a" }), fakeBox({ id: "box-b" })],
 			seeds: seeds.seam,
 			projectPath: "/proj",
+			exactUrl: PROJECT.gitUrl,
 		});
-		const report = await runFleet(
-			{ action: "pump", repo: "https://example.test/x.git" },
-			h.context,
-			h.deps,
-		);
+		const report = await runFleet({ action: "pump", repo: PROJECT.gitUrl }, h.context, h.deps);
 		expect(report.exitCode).toBe(0);
 		// One per box, because the default limit is the box count.
-		expect(h.calls.create).toHaveLength(2);
+		expect(h.calls.spawns).toHaveLength(2);
 		expect(seeds.calls.claimed).toBe(2);
-		expect(h.calls.create[0]?.prompt).toContain("ubuntu-aaaa");
-		expect(h.calls.create[0]?.prompt).toContain("sd show ubuntu-aaaa");
-		expect(report.lines[0]).toContain("ubuntu-aaaa -> box-a");
+		expect(h.calls.spawns[0]?.seedId).toBe("ubuntu-aaaa");
+		expect(h.calls.spawns[1]?.seedId).toBe("ubuntu-bbbb");
+		expect(h.calls.spawns[0]?.prompt).toContain("ubuntu-aaaa");
+		expect(h.calls.spawns[0]?.prompt).toContain("sd show ubuntu-aaaa");
+		expect(h.calls.spawns[0]?.projectId).toBe("prj_test");
+		expect(report.lines[0]).toBe("ubuntu-aaaa -> box-a (run_1)");
 		// Claiming an epic would hand an agent a plan, so the pump asks for tasks.
 		expect(seeds.calls.types).toEqual(["task", "task"]);
-		// The seeds ledger stays the source of truth: no wait, no terminate.
-		expect(h.calls.statusCount).toBe(0);
-		expect(h.calls.terminated).toHaveLength(0);
+		// The pump places and returns: waiting on each seed would serialize the queue.
+		expect(h.calls.runs).toHaveLength(0);
 	});
 
 	test("reports an empty queue and places nothing", async () => {
@@ -455,44 +499,38 @@ describe("warren fleet pump", () => {
 			boxes: [fakeBox({ id: "box-a" })],
 			seeds: seeds.seam,
 			projectPath: "/proj",
+			exactUrl: PROJECT.gitUrl,
 		});
-		const report = await runFleet(
-			{ action: "pump", repo: "https://example.test/x.git" },
-			h.context,
-			h.deps,
-		);
+		const report = await runFleet({ action: "pump", repo: PROJECT.gitUrl }, h.context, h.deps);
 		expect(report.exitCode).toBe(1);
 		expect(report.lines[0]).toBe("pump: nothing else is ready, 0 placed");
-		expect(h.calls.create).toHaveLength(0);
+		expect(h.calls.spawns).toHaveLength(0);
 	});
 
-	test("keeps a claim whose dispatch failed, and still places the next seed", async () => {
+	test("keeps a claim whose placement failed, and still places the next seed", async () => {
 		const seeds = pumpSeeds([
 			{ id: "ubuntu-cccc", title: "doomed" },
 			{ id: "ubuntu-dddd", title: "fine" },
 		]);
-		// The first create throws, the second succeeds.
-		let calls = 0;
 		const h = harness({
 			boxes: [fakeBox({ id: "box-a" })],
 			seeds: seeds.seam,
 			projectPath: "/proj",
+			exactUrl: PROJECT.gitUrl,
 		});
-		const provider = h.deps.provider as NonNullable<FleetCliDeps["provider"]>;
-		const realCreate = provider.create.bind(provider);
+		// The first placement throws, the second succeeds.
+		let calls = 0;
+		const realSpawn = h.deps.spawn as NonNullable<FleetCliDeps["spawn"]>;
 		const failing: FleetCliDeps = {
 			...h.deps,
-			provider: {
-				...provider,
-				create: async (spec: RunSpec) => {
-					calls += 1;
-					if (calls === 1) throw new Error("burrow refused: no capacity");
-					return await realCreate(spec);
-				},
+			spawn: async (input) => {
+				calls += 1;
+				if (calls === 1) throw new Error("burrow refused: no capacity");
+				return await realSpawn(input);
 			},
 		};
 		const report = await runFleet(
-			{ action: "pump", repo: "https://example.test/x.git", limit: 2 },
+			{ action: "pump", repo: PROJECT.gitUrl, limit: 2 },
 			h.context,
 			failing,
 		);
@@ -501,11 +539,28 @@ describe("warren fleet pump", () => {
 		expect(report.exitCode).toBe(0);
 	});
 
-	test("needs a repo, because a run works on a clone", async () => {
+	test("needs a repo, because a run works on a registered project", async () => {
 		const seeds = pumpSeeds([{ id: "ubuntu-eeee", title: "x" }]);
 		const h = harness({ boxes: [fakeBox({ id: "box-a" })], seeds: seeds.seam });
 		const report = await runFleet({ action: "pump" }, h.context, h.deps);
 		expect(report.exitCode).toBe(1);
 		expect(report.lines).toEqual(["fleet pump needs --repo"]);
+	});
+
+	test("an unregistered repo stops before it claims a lease", async () => {
+		const seeds = pumpSeeds([{ id: "ubuntu-ffff", title: "x" }]);
+		const h = harness({
+			boxes: [fakeBox({ id: "box-a" })],
+			seeds: seeds.seam,
+			projectPath: "/proj",
+		});
+		const report = await runFleet(
+			{ action: "pump", repo: "https://example.test/other.git" },
+			h.context,
+			h.deps,
+		);
+		expect(report.exitCode).toBe(1);
+		expect(report.lines[0]).toContain("is not a registered project");
+		expect(seeds.calls.claimed).toBe(0);
 	});
 });

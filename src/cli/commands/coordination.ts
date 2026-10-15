@@ -9,7 +9,9 @@
  */
 
 import type { Command } from "commander";
+import { seedBuiltinAgents } from "../../registry/builtins/index.ts";
 import { CLOSURE_REASONS } from "../../seeds-cli/closure.ts";
+import { withCliDb } from "../context.ts";
 import type { CliContext } from "../output.ts";
 import { runClosure } from "./closure.ts";
 import { runDecide } from "./decide.ts";
@@ -96,15 +98,13 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 		});
 	fleetGroup
 		.command("dispatch")
-		.description("place one run on a box, unreaped (the lane's smoke test)")
-		.requiredOption("--repo <url>", "git origin the run works on")
+		.description("place one run on a box through warren's lifecycle (row, and reap)")
+		.requiredOption("--repo <url>", "git origin to work on (a registered project)")
 		.requiredOption("--prompt <text>", "the brief handed to the agent")
 		.option("--runtime <id>", "agent runtime id (default pi)")
 		.option("--provider <name>", "agent provider override (default the runtime's own)")
 		.option("--model <name>", "agent model override (default the runtime's own)")
-		.option("--branch <name>", "branch to work on")
-		.option("--base <name>", "base branch (default main)")
-		.option("--wait", "poll until the run reaches a terminal phase")
+		.option("--wait", "spawn, stream and reap here, so no server is needed")
 		.action(
 			async (opts: {
 				repo: string;
@@ -112,33 +112,34 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 				runtime?: string;
 				provider?: string;
 				model?: string;
-				branch?: string;
-				base?: string;
 				wait?: boolean;
 			}) => {
-				const report = await runFleet(
-					{
-						action: "dispatch",
-						repo: opts.repo,
-						prompt: opts.prompt,
-						...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}),
-						...(opts.provider !== undefined ? { provider: opts.provider } : {}),
-						...(opts.model !== undefined ? { model: opts.model } : {}),
-						...(opts.branch !== undefined ? { branch: opts.branch } : {}),
-						...(opts.base !== undefined ? { baseBranch: opts.base } : {}),
-						wait: opts.wait === true,
-					},
-					context,
-				);
-				for (const line of report.lines) console.log(line);
-				process.exit(report.exitCode);
+				const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
+					await seedBuiltinAgents(repos.agents, undefined, context.now);
+					const report = await runFleet(
+						{
+							action: "dispatch",
+							repo: opts.repo,
+							prompt: opts.prompt,
+							...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}),
+							...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+							...(opts.model !== undefined ? { model: opts.model } : {}),
+							wait: opts.wait === true,
+						},
+						context,
+						{ repos },
+					);
+					for (const line of report.lines) console.log(line);
+					return report.exitCode;
+				});
+				process.exit(exitCode);
 			},
 		);
 
 	fleetGroup
 		.command("pump")
-		.description("claim ready seeds and place a run for each, unreaped (run it by hand)")
-		.requiredOption("--repo <url>", "git origin the runs work on")
+		.description("claim ready seeds and place a run for each through the lifecycle")
+		.requiredOption("--repo <url>", "git origin the runs work on (a registered project)")
 		.option("--limit <n>", "how many seeds to take (default one per box)")
 		.option("--lease <minutes>", "claim lease, so a stalled run's seed returns to the queue")
 		.option("--project <path>", "project holding the seeds ledger (default cwd)")
@@ -147,8 +148,6 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 		.option("--runtime <id>", "agent runtime id (default pi)")
 		.option("--provider <name>", "agent provider override (default the runtime's own)")
 		.option("--model <name>", "agent model override (default the runtime's own)")
-		.option("--branch <name>", "branch to work on")
-		.option("--base <name>", "base branch (default main)")
 		.action(
 			async (opts: {
 				repo: string;
@@ -160,12 +159,14 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 				runtime?: string;
 				provider?: string;
 				model?: string;
-				branch?: string;
-				base?: string;
 			}) => {
-				const report = await runFleet(toPumpArgs(opts), context);
-				for (const line of report.lines) console.log(line);
-				process.exit(report.exitCode);
+				const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
+					await seedBuiltinAgents(repos.agents, undefined, context.now);
+					const report = await runFleet(toPumpArgs(opts), context, { repos });
+					for (const line of report.lines) console.log(line);
+					return report.exitCode;
+				});
+				process.exit(exitCode);
 			},
 		);
 
@@ -180,8 +181,6 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 		runtime?: string;
 		provider?: string;
 		model?: string;
-		branch?: string;
-		base?: string;
 	}): FleetArgs {
 		// A draft keyed by FleetArgs field names, so the two tables below stay the
 		// only place a new option has to be added.
@@ -199,8 +198,6 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 			runtime: opts.runtime,
 			provider: opts.provider,
 			model: opts.model,
-			branch: opts.branch,
-			baseBranch: opts.base,
 		};
 		for (const [key, value] of Object.entries(named)) {
 			if (value !== undefined) draft[key] = value;
