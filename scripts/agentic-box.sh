@@ -35,6 +35,8 @@ KERNEL_USER="${KERNEL_USER:-openrig}"
 KERNEL_PORT="${KERNEL_PORT:-7433}"
 AUTHORIZED_FROM="${AUTHORIZED_FROM:-}"   # path to a public key to install for the kernel user
 BIND="${BIND:-}"                         # empty = the daemon default: loopback + the tailnet, never public
+ALLOW_PORTS="${ALLOW_PORTS:-}"           # extra public ports ufw must keep open (live services)
+SETUP_TAILSCALE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,6 +47,8 @@ while [ $# -gt 0 ]; do
     --port) KERNEL_PORT="$2"; shift 2 ;;
     --authorized-key) AUTHORIZED_FROM="$2"; shift 2 ;;
     --bind) BIND="$2"; shift 2 ;;
+    --allow) ALLOW_PORTS="$2"; shift 2 ;;
+    --tailscale) SETUP_TAILSCALE=1; shift ;;
     -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) printf 'agentic-box: unknown argument: %s\n' "$1" >&2; exit 1 ;;
   esac
@@ -115,6 +119,10 @@ fi
 
 # ------------------------------------------------------------------ tailscale
 step "tailscale (tailnet ingress is how the fleet reaches this box)"
+if [ "$SETUP_TAILSCALE" = 1 ] && ! have tailscale; then
+  say "installing tailscale"
+  sh_run "curl -fsSL https://tailscale.com/install.sh | $SUDO sh"
+fi
 TAILNET_IP=""
 if have tailscale; then
   TAILNET_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
@@ -124,6 +132,19 @@ else
 fi
 if have tailscale; then
   sh_run "tailscale set --ssh=false >/dev/null 2>&1 || true"
+  if [ "$SETUP_TAILSCALE" = 1 ] && [ -z "$TAILNET_IP" ]; then
+    # No auth key here on purpose: a key is a credential only the operator can
+    # mint. Start the interactive login in the background instead and print the
+    # URL the operator approves. The pending login survives this script.
+    LOGIN_LOG=/tmp/tailscale-login.log
+    sh_run "nohup $SUDO tailscale up --hostname=$(hostname -s) --accept-dns=false >$LOGIN_LOG 2>&1 & sleep 8"
+    LOGIN_URL="$(printf '%s' "$(tail -c 4000 "$LOGIN_LOG" 2>/dev/null)" | grep -oE 'https://login\.tailscale\.com/[a-z]/[A-Za-z0-9]+' | head -1 || true)"
+    if [ -n "$LOGIN_URL" ]; then
+      printf '\n  APPROVE THIS LOGIN: %s\n' "$LOGIN_URL"
+    else
+      printf '\n  tailscale login did not print a URL; check %s on the box\n' "$LOGIN_LOG"
+    fi
+  fi
 fi
 
 # ------------------------------------------------------------------ ufw
@@ -134,6 +155,13 @@ if [ "$DO_UFW" = 1 ]; then
   fi
   # Allow ssh BEFORE the default-deny flip: this session is an ssh session.
   run $SUDO ufw allow 22/tcp
+  # Ports a live service already serves. Allowing them keeps reachability
+  # exactly as it is today; the change is only that everything else is denied.
+  for port in ${ALLOW_PORTS//,/ }; do
+    [ -n "$port" ] || continue
+    say "keeping $port reachable (a live service listens there)"
+    run $SUDO ufw allow "$port/tcp"
+  done
   if have tailscale; then run $SUDO ufw allow in on tailscale0; fi
   run $SUDO ufw default deny incoming
   run $SUDO ufw default allow outgoing
@@ -236,7 +264,7 @@ cat <<NEXT
 
 Next, from the box you operate from (the fleet's own kernel or CLI):
 
-  rig host add --id $(hostname) --transport http --url http://${TAILNET_IP:-<this host's tailnet ip>}:$KERNEL_PORT --bearer-file <copy of $TOKEN_FILE>
+  rig host add --id $(hostname) --transport http --url http://<this host's tailnet ip>:$KERNEL_PORT --bearer-file <copy of $TOKEN_FILE>
   rig host doctor $(hostname)
 
 The token lives at $TOKEN_FILE on this box (mode 600). Treat it as the fleet's
