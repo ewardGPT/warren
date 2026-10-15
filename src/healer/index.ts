@@ -34,6 +34,18 @@ export {
 	type HealSkipReason,
 } from "./dispatch.ts";
 export {
+	buildHealTriageEvidence,
+	HEAL_GATE_ENV,
+	HEAL_GATE_FEATURE,
+	type HealTriageEvidence,
+	type HealTriageJudge,
+	type HealTriageVerdict,
+	healGateEnabled,
+	judgeHealFromEnv,
+	judgeHealTriage,
+	triageVerdict,
+} from "./jev-gate.ts";
+export {
 	type HealProjectCandidate,
 	type HealResolveResult,
 	healMappingKeyMatches,

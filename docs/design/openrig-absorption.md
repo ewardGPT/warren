@@ -280,6 +280,42 @@ The key lives outside the repository: `~/.warren/jev.key` (0600), exported as
 `JEV_API_KEY` or `TYPESAFE_API_KEY`. Without it the engine degrades to
 `unavailable` and changes nothing.
 
+### Where Jev decides in the kernel
+
+Two seams call Jev today. Both stay off until an operator sets a flag. Both log
+every call to the decision log. When the flag is unset, the mechanical default
+stays in place.
+
+| Seam | Flag | Shape | On a stop |
+| --- | --- | --- | --- |
+| `plan-continuation` (`src/plan-runs/jev-gate.ts`) | `WARREN_JEV_PLAN_GATE=1` | **Proceed gate:** the plan needs a yes, because a plan that keeps walking drags hours of work behind it | The plan parks `failed` and the reason names the band |
+| `heal-triage` (`src/healer/jev-gate.ts`) | `WARREN_JEV_HEAL_GATE=1` | **Veto gate:** the rails (`enabled`, `cooldown`, `max_retries`) already agreed to a run, so only a confident `hold` overrides them | The intake answers `{status:"skipped", reason:"jevs_hold: …"}` and writes no run row |
+
+The shapes differ on purpose.
+`act` and `ask` continue in the veto gate, and neither continues in the proceed gate.
+A gate that guards a long autonomous process needs a yes.
+A gate that guards one bounded and reversible run, which the rails already approved, needs a no.
+
+**Calibration is the open question, not the wiring.** The first live
+`plan-continuation` call saw a healthy plan (6 children merged, 2 left, 3 hours
+old) and answered `noul 0.73`. That value is `ask`, so with the flag on today
+the plan would park at the first tick.
+
+The band edges (`act >= 0.9`, `hold <= 0.1`) are the engine defaults, not this
+question's distribution. `actAt` and `denyAt` on the request set them per
+feature. Choose them from 30 or more recorded outcomes.
+
+The veto gate needs no such work. The alerts it must stop answer near 0.1, far
+below the default edge.
+
+Other seams stay mechanical for now. A wrong answer costs the most at the trust
+verdict in reap (did the run do the work, is a PR a fair offer), then at seed
+routing in dispatch (which agent, which model tier), then at the scheduled-seed
+drain (is this seed worth a run now).
+
+Each seam already has deterministic signals. Each seam should reach Jev only
+for the gray zone.
+
 ## Evidence
 
 - Kernel build from the vendored tree: `npm ci && npm run build` in
@@ -301,6 +337,14 @@ The key lives outside the repository: `~/.warren/jev.key` (0600), exported as
   closed.
 - Decision engine live: `warren decide --feature merge-gate` returned `ask` from
   `typesafe/jev-1.13.0` in 134 ms and wrote a 0600 record to the decision log.
+- Healer gate live: `judgeHealTriage` ran two real alerts. An actionable one
+  (a TypeError in our own source, 412 events) answered `noul 0.70` in 113 ms,
+  so the dispatch went ahead. A quota alert answered `noul 0.10` in 64 ms, so
+  the intake returned `jevs_hold` and wrote no run row.
+- Healer gate tests: 25 green across `src/healer/jev-gate.test.ts` and
+  `src/server/handlers/alerts.test.ts` (band mapping, body clipping, the
+  offline provider both ways, and the 200/202 arms of the intake). `bun run
+  lint` and `tsc --noEmit` green.
 - Gates: `bun run lint`, `check:size`, `check:dups` and `check:deps` pass. The
   test runner, knip and the duplicate scan all skip the vendored tree, because
   its own suites and its own internals are not ours to judge.

@@ -24,6 +24,7 @@ import { ValidationError } from "../../core/errors.ts";
 import type { EventsRepo } from "../../db/repos/events.ts";
 import {
 	buildHealPrompt,
+	buildHealTriageEvidence,
 	checkHealerRole,
 	decideHealDispatch,
 	HEAL_DISPATCHED_EVENT,
@@ -33,6 +34,7 @@ import {
 	type HealerSettings,
 	type HealProjectCandidate,
 	isHealAlertSource,
+	judgeHealFromEnv,
 	normalizeAlert,
 	resolveHealProject,
 } from "../../healer/index.ts";
@@ -78,6 +80,19 @@ export function healAlertHandler(deps: ServerDeps): RouteHandler {
 		});
 		if (decision.kind === "skip") return skipped(decision.reason, alert);
 
+		// The mechanical rails passed. When an operator has asked for a second
+		// look (WARREN_JEV_HEAL_GATE), Jev decides whether this alert may spend
+		// a sandboxed run; only `act` dispatches, and a skip names its band in
+		// the response the webhook sender already handles. Extracted so the
+		// handler stays under the cognitive-complexity gate.
+		const gate = await triageHealDispatch({
+			candidate: resolved.candidate,
+			alert,
+			history,
+			settings,
+		});
+		if (gate !== null) return gate;
+
 		const runId = await dispatchHealer(deps, resolved.candidate, alert);
 		return jsonResponse(202, {
 			status: "dispatched",
@@ -96,6 +111,37 @@ function skipped(reason: string, alert: HealAlert): Response {
 		fingerprint: alert.fingerprint,
 		source: alert.source,
 	});
+}
+
+/**
+ * The optional second look before a healer run is spent. `null` means the run
+ * may go ahead — either because no gate was asked for, or because Jev said
+ * `act`. A `Response` means skip, with the band named in the reason.
+ */
+async function triageHealDispatch(input: {
+	readonly candidate: HealProjectCandidate;
+	readonly alert: HealAlert;
+	readonly history: HealAttemptHistory;
+	readonly settings: HealerSettings;
+}): Promise<Response | null> {
+	const judge = judgeHealFromEnv(process.env);
+	if (judge === undefined) return null;
+	const verdict = await judge(
+		buildHealTriageEvidence({
+			projectId: input.candidate.projectId,
+			fingerprint: input.alert.fingerprint,
+			source: input.alert.source,
+			title: input.alert.title,
+			culprit: input.alert.culprit,
+			detail: input.alert.detail,
+			linkCount: input.alert.links.length,
+			attempts: input.history.attempts,
+			maxRetries: input.settings.maxRetries,
+			cooldownMinutes: input.settings.cooldownMinutes,
+			role: input.candidate.role,
+		}),
+	);
+	return verdict.kind === "skip" ? skipped(verdict.reason, input.alert) : null;
 }
 
 /**

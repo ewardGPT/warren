@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
@@ -256,5 +256,90 @@ describe("POST /alerts/heal", () => {
 		expect(res.status).toBe(400);
 		const body = (await res.json()) as { error: { code: string } };
 		expect(body.error.code).toBe("validation_error");
+	});
+
+	// The healer is Warren's reflex; the Jev gate gives it a judgement layer
+	// between the mechanical rails and the run. Off unless asked, and a skip
+	// names its band in the response the webhook sender already handles.
+	describe("with the Jev gate on (WARREN_JEV_HEAL_GATE)", () => {
+		const dirs: string[] = [];
+		const saved = new Map<string, string | undefined>();
+
+		async function stubEnv(noul: number): Promise<void> {
+			const dir = await mkdtemp(join(tmpdir(), "jev-heal-http-"));
+			dirs.push(dir);
+			const fixture = join(dir, "fixture.json");
+			await writeFile(
+				fixture,
+				JSON.stringify({ model: "fake", defaults: { noul: { noul } }, usage: {} }),
+			);
+			const wanted: Record<string, string> = {
+				WARREN_JEV_HEAL_GATE: "1",
+				WARREN_JEV_STUB: "1",
+				WARREN_JEV_STUB_FIXTURE: fixture,
+				WARREN_DECISION_LOG: join(dir, "decisions.jsonl"),
+			};
+			for (const [name, value] of Object.entries(wanted)) {
+				if (!saved.has(name)) saved.set(name, process.env[name]);
+				process.env[name] = value;
+			}
+		}
+
+		afterEach(async () => {
+			for (const [name, value] of saved) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			saved.clear();
+			await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+		});
+
+		test("holds the dispatch when Jev says no (200 skipped, jevs_hold)", async () => {
+			await writeHealerConfig(
+				projectLocalPath,
+				"healer:\n  enabled: true\n  projectMapping:\n    - issue-99\n",
+			);
+			await stubEnv(0.02);
+			await serve();
+
+			const res = await post(SENTRY_PAYLOAD);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { status: string; reason: string };
+			expect(body.status).toBe("skipped");
+			expect(body.reason).toContain("jevs_hold");
+			// No run, and no durable heal.dispatched event either.
+			expect((await repos.runs.listAll()).length).toBe(0);
+			expect((await repos.events.listByKind("heal.dispatched")).length).toBe(0);
+		});
+
+		test("an ask band leaves the dispatch standing (202)", async () => {
+			await writeHealerConfig(
+				projectLocalPath,
+				"healer:\n  enabled: true\n  projectMapping:\n    - issue-99\n",
+			);
+			await stubEnv(0.81);
+			await serve();
+
+			const res = await post(SENTRY_PAYLOAD);
+			expect(res.status).toBe(202);
+			const body = (await res.json()) as { status: string };
+			expect(body.status).toBe("dispatched");
+			expect((await repos.runs.listAll()).length).toBe(1);
+		});
+
+		test("dispatches when Jev says yes (202)", async () => {
+			await writeHealerConfig(
+				projectLocalPath,
+				"healer:\n  enabled: true\n  projectMapping:\n    - issue-99\n",
+			);
+			await stubEnv(0.97);
+			await serve();
+
+			const res = await post(SENTRY_PAYLOAD);
+			expect(res.status).toBe(202);
+			const body = (await res.json()) as { status: string; runId: string };
+			expect(body.status).toBe("dispatched");
+			expect((await repos.runs.listAll()).length).toBe(1);
+		});
 	});
 });
