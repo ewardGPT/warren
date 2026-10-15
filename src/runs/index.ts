@@ -109,6 +109,7 @@ export {
 	openPullRequest,
 } from "./pr.ts";
 export {
+	assembleScorecard,
 	mergeMulchFile,
 	type ReapExec,
 	type ReapFs,
@@ -116,7 +117,14 @@ export {
 	type ReapRunResult,
 	type ReapStep,
 	type ReapStepError,
+	type RunScorecard,
 	reapRun,
+	type ScorecardBranch,
+	type ScorecardDiff,
+	type ScorecardGate,
+	type ScorecardPr,
+	type ScorecardUsage,
+	summarizeRunStream,
 } from "./reap/index.ts";
 export {
 	type BuildSeedFilesResult,

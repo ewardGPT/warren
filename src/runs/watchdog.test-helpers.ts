@@ -44,6 +44,7 @@ export function fakeReapResult(state: ReapRunResult["state"]): ReapRunResult {
 		salvagePath: null,
 		errors: [],
 		alreadyTerminal: false,
+		scorecard: null,
 	};
 }
 

@@ -40,6 +40,7 @@ import type {
 	StreamOpts,
 	TeardownResult,
 	WorkspaceInfo,
+	WorkspaceSeams,
 } from "../../contract.ts";
 import { LOCAL_PROVIDER_CAPABILITIES } from "../provider.ts";
 import { FleetUnavailableError, FleetUnknownBoxError } from "./errors.ts";
@@ -163,6 +164,16 @@ export class FleetProvider implements RuntimeProvider {
 		// The box's path, which is exactly what its ssh-backed reap seams need.
 		const route = this.route(handle);
 		return await route.box.provider.workspaceInfo(route.handle);
+	}
+
+	/**
+	 * The owning box's ssh-backed workspace seams (ubuntu-c929). Reap's salvage
+	 * and the scorecard's diff run domain-side, so they need the seams of the
+	 * machine that actually holds the workspace — the host's own would fail.
+	 */
+	workspaceSeams(handle: RunHandle): WorkspaceSeams | undefined {
+		const route = this.route(handle);
+		return route.box.provider.workspaceSeams?.(route.handle);
 	}
 
 	async finalize(handle: RunHandle, intent: FinalizeIntent): Promise<FinalizeResult> {

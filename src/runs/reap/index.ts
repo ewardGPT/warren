@@ -17,6 +17,7 @@
  *   - `pr-open.ts`      — auto-open PR (warren-f6af)
  *   - `preview.ts`      — preview launch + PR annotation (warren-f156)
  *   - `state.ts`        — failure-reason inference + terminal transition
+ *   - `scorecard.ts`    — the deterministic run scorecard (ubuntu-c929)
  *   - `run.ts`          — top-level orchestrator
  *
  * Reap errors never fail the run — each sub-step is wrapped, and any
@@ -34,6 +35,25 @@
 
 export { mergeMulchFile } from "./mulch.ts";
 export { reapRun } from "./run.ts";
+export type {
+	RunScorecard,
+	ScorecardBranch,
+	ScorecardDiff,
+	ScorecardGate,
+	ScorecardPr,
+	ScorecardUsage,
+	StreamSummary,
+} from "./scorecard.ts";
+export {
+	assembleScorecard,
+	boxOf,
+	buildScorecard,
+	computeDiffStat,
+	isGateCommand,
+	parseNumstat,
+	readPrUpstream,
+	summarizeRunStream,
+} from "./scorecard.ts";
 export type {
 	ReapExec,
 	ReapFs,

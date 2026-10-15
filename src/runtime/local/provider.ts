@@ -111,6 +111,23 @@ export class LocalProvider implements RuntimeProvider {
 	constructor(private readonly deps: LocalProviderDeps) {}
 
 	/**
+	 * The workspace seams this provider holds (ubuntu-c929).
+	 *
+	 * The provider owns the workspace, so it owns the filesystem and exec seams
+	 * for it. The fleet backend already injects ssh-backed seams here for its
+	 * in-box `finalize`; exposing them lets a domain step whose workspace work is
+	 * NOT inside `finalize` — reap's salvage and the scorecard's diff — read the
+	 * same workspace rather than the warren host's.
+	 *
+	 * Absent ⇒ the caller's own seams hold (the host is the workspace owner).
+	 */
+	workspaceSeams(): { readonly fs?: ReapFs; readonly exec?: ReapExec } | undefined {
+		const { fs, exec } = this.deps;
+		if (fs === undefined && exec === undefined) return undefined;
+		return { ...(fs === undefined ? {} : { fs }), ...(exec === undefined ? {} : { exec }) };
+	}
+
+	/**
 	 * Provision a burrow and dispatch a run onto it — burrow's two calls behind
 	 * the one seam method (§6.1). Faithful to `spawnRun`'s burrow-touching half
 	 * (`provisionBurrow` → `dispatchRun` in `src/runs/spawn/dispatch.ts`):

@@ -178,6 +178,65 @@ The agent's worklist (seeds) belongs to the project, not the agent. The
 same project worked on by `refactor-bot` today and `sre-bot` tomorrow
 uses the same seeds queue.
 
+## The run scorecard (2026-10-15)
+
+Reap's terminal verdict comes from the runtime's own envelope, and the
+deployed build's stop-check is a model's opinion over a text sample. Neither
+is execution evidence. Every run now also gets a scorecard: the facts it left
+behind, computed at reap (ubuntu-c929).
+
+It lands in two places. `run.scorecard` is an event on the run, beside
+`reap.completed`, and `reapRun` returns the same object as `scorecard`. A
+skipped reap returns null, because a reap that observed nothing must not
+report an empty run.
+
+**The scorecard judges nothing.** Each field is a count, a flag, an exit code
+or an id. A field reap could not read is `null`, and `null` means "not
+observed" — it never means "not done".
+
+So a run with no gate in its stream scores a null gate and zero gate commands,
+which is a different claim from a gate that failed.
+
+The fields group by source. The pipeline supplies the branch facts
+(`pushed`, `commitsAhead`, `droppedCommit`, `noChanges`) and the PR url. The
+run row supplies cost and tokens.
+
+The workspace supplies the diff. GitHub supplies the merge state and the CI
+verdict. The event stream supplies the turn count, the tool count and the
+gate.
+
+Three of those reads carry a caveat worth knowing.
+
+The stream half is a **sample**. The bridge persists a bounded slice of a
+chatty run, so the counts cover what reached the event table rather than the
+whole run.
+
+The gate field reports the **last** gate-shaped command and the runtime's own
+`isError` flag. A command that pipes its gate into another command hides the
+gate's exit status, so `ok` can be true while the gate failed. An `EXIT=<n>`
+marker in the output, when the agent prints one, lands in `exitCode`.
+
+The upstream reads are **later facts than the run**. At reap a fresh PR is
+usually open with checks pending, and the scorecard records that rather than
+waiting for an answer it may never see.
+
+With no GitHub token both fields stay null and the scorecard makes no call.
+
+Consumers today are the event stream and the returned result. The eval
+harness and Langfuse sinks named in the seed do not exist in this repo, so
+nothing feeds them yet.
+
+### The workspace belongs to the provider
+
+The scorecard's diff and reap's salvage both read the workspace outside
+`finalize`. Both used to run through the host's own filesystem, which is the
+wrong machine once the workspace is on a fleet box.
+
+`RuntimeProvider.workspaceSeams(handle)` answers that now. `LocalProvider`
+returns the seams it holds — ssh-backed on a fleet box — and reap prefers
+them over the host's own. The fix is visible in the failure text: a rescue
+push that fails now names the box's git rather than a host path.
+
 ## Pi runtime support (2026-05-12)
 
 The `pi` (`@earendil-works/pi-coding-agent`) runtime is the third

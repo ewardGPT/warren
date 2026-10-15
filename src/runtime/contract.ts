@@ -18,8 +18,22 @@ import type {
 	InboxState,
 	RunState,
 } from "../core/wire.ts";
+import type { ReapExec, ReapFs } from "../runs/reap/types.ts";
 import type { ArtifactDelta } from "./finalize-deltas.ts";
 import type { FinalizeStage } from "./finalize-stages.ts";
+
+/**
+ * Filesystem + exec seams for a provider-owned workspace (ubuntu-c929).
+ *
+ * The same shape `finalize` runs against, exposed so a domain step outside
+ * `finalize` can read the workspace the provider owns. `LocalProvider` answers
+ * with the seams it was built with — the host's own under the local backend,
+ * ssh-backed under the fleet backend.
+ */
+export interface WorkspaceSeams {
+	readonly fs?: ReapFs;
+	readonly exec?: ReapExec;
+}
 
 /**
  * Opaque handle — the only run reference that crosses the seam. Providers map
@@ -447,6 +461,20 @@ export interface FinalizeStageOutcome {
  */
 export interface RuntimeProvider {
 	readonly capabilities: RuntimeCapabilities;
+
+	/**
+	 * Filesystem + exec seams for the workspace this provider owns
+	 * (ubuntu-c929). Optional: a provider answers only when its workspace is
+	 * reachable through it rather than through the warren host.
+	 *
+	 * The domain needs these for workspace work that lives OUTSIDE `finalize` —
+	 * reap's salvage capture and the scorecard's diff read. Without them, a
+	 * remote workspace (a fleet box) gets read through the host's own
+	 * filesystem, which is the wrong machine.
+	 *
+	 * Absent ⇒ the caller's own seams hold.
+	 */
+	workspaceSeams?(handle: RunHandle): WorkspaceSeams | undefined;
 
 	/**
 	 * Create a run. Collapses burrow's two-call (`burrows.up` + `runs.create`)
