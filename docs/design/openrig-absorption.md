@@ -146,11 +146,26 @@ Three choices in that script are deliberate.
 The registry holds two entries per box, `--transport http` for work and
 `--transport ssh` for posture, because the posture profile needs a shell.
 
-Verified on the EC2 box `headroom-aws` (t3.xlarge, us-east-1a): the kernel
-answers on its tailnet address, `rig host doctor --posture product-factory-vps`
-reports the daemon healthy and bound to loopback and the tailnet, and a terminal
-seat launched there is visible and drivable from the workstation: a `rig send`
-ran a command whose output came back through `rig capture`.
+The fleet, as of 2026-10-15:
+
+| Box | Instance | Tailnet | Registry | Posture |
+| --- | --- | --- | --- | --- |
+| headroom-aws | t3.xlarge | 100.112.188.99 | http + ssh | 8 pass, ufw off (a live proxy holds two public ports) |
+| nexus-gate | t3.medium | 100.94.199.106 | http + ssh | 10 pass |
+| mt5-wine | t3.large | 100.111.105.36 | http + ssh | 10 pass |
+
+Verified on each box: the kernel answers on its tailnet address, the posture
+doctor reports the daemon healthy and bound to loopback and the tailnet, and a
+terminal seat launched there is visible and drivable from the workstation.
+
+Two details the bare-shell seats taught us.
+
+A seat with the `terminal` runtime receives the delivery header as typed text,
+so a plain `rig send` lands as a few stray commands. Use `rig send --raw`: it
+sends the text alone and the command runs cleanly.
+
+A kernel that starts before the tailnet join binds loopback only. A box that
+joins later needs one `systemctl restart openrig-kernel`.
 
 ## Alternatives rejected
 
