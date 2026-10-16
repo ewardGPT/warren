@@ -10,6 +10,11 @@ import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { SqliteDrizzleDb } from "../client.ts";
 import type { EventRow, EventStream } from "../schema.ts";
 import type { DrizzleAdapter } from "./drizzle-adapter.ts";
+import {
+	deleteEventsBatch,
+	estimateEventsForWindow,
+	listExpiredTerminalRunIds,
+} from "./events-retention.ts";
 
 /**
  * Default row cap for {@link EventsRepo.listToolEventsForRuns}. Bounds the
@@ -281,5 +286,26 @@ export class EventsRepo {
 				.where(inArray(this.events.runId, runIds as string[])),
 		);
 		return Number(row?.n ?? 0);
+	}
+
+	/** Retention's selection half — see {@link listExpiredTerminalRunIds}. */
+	listExpiredTerminalRunIds(opts: { cutoff: string; limit: number }): Promise<string[]> {
+		return listExpiredTerminalRunIds(this.adapter, opts);
+	}
+
+	/** Retention's dry-run sizing scan — see {@link estimateEventsForWindow}. */
+	estimateEventsForWindow(opts: { cutoff: string }): Promise<{
+		runs: number;
+		events: number;
+		bytes: number;
+	}> {
+		return estimateEventsForWindow(this.adapter, opts);
+	}
+
+	/** Retention's delete half — see {@link deleteEventsBatch}. */
+	deleteEventsBatch(
+		ids: readonly string[],
+	): Promise<{ runs: number; events: number; bytes: number }> {
+		return deleteEventsBatch(this.adapter, ids);
 	}
 }

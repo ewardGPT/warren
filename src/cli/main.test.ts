@@ -57,12 +57,12 @@ describe("buildProgram", () => {
 		expect(runCmd?.options.find((o) => o.long === "--no-follow")).toBeDefined();
 	});
 
-	test("`db migrate-to-postgres` and `db prune` are registered under the db group", () => {
+	test("`db migrate-to-postgres`, `db prune` and `db prune-events` are registered under the db group", () => {
 		const program = buildProgram(silentContext());
 		const dbCmd = program.commands.find((c) => c.name() === "db");
 		expect(dbCmd).toBeDefined();
 		const subNames = dbCmd?.commands.map((c) => c.name()).sort() ?? [];
-		expect(subNames).toEqual(["migrate-to-postgres", "prune"]);
+		expect(subNames).toEqual(["migrate-to-postgres", "prune", "prune-events"]);
 		const migrateCmd = dbCmd?.commands.find((c) => c.name() === "migrate-to-postgres");
 		const fromOpt = migrateCmd?.options.find((o) => o.long === "--from");
 		const toOpt = migrateCmd?.options.find((o) => o.long === "--to");
@@ -74,6 +74,17 @@ describe("buildProgram", () => {
 		expect(pruneCmd?.options.find((o) => o.long === "--older-than")?.defaultValue).toBe("14d");
 		expect(pruneCmd?.options.find((o) => o.long === "--batch")?.defaultValue).toBe("500");
 		expect(pruneCmd?.options.find((o) => o.long === "--max-batches")?.defaultValue).toBe("0");
+		// `prune-events` (ubuntu-057f) defaults to a 30d window and deletes only
+		// when `--apply` is given; `--dry-run` is the explicit spelling of the
+		// default so a script can be self-documenting.
+		const pruneEventsCmd = dbCmd?.commands.find((c) => c.name() === "prune-events");
+		expect(pruneEventsCmd?.options.find((o) => o.long === "--older-than")?.defaultValue).toBe(
+			"30d",
+		);
+		expect(pruneEventsCmd?.options.find((o) => o.long === "--batch")?.defaultValue).toBe("200");
+		expect(pruneEventsCmd?.options.find((o) => o.long === "--max-batches")?.defaultValue).toBe("0");
+		expect(pruneEventsCmd?.options.find((o) => o.long === "--dry-run")).toBeDefined();
+		expect(pruneEventsCmd?.options.find((o) => o.long === "--apply")).toBeDefined();
 	});
 
 	test("`config migrate` is registered under the config group (warren-5840)", () => {

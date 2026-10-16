@@ -18,9 +18,11 @@ import { Client } from "pg";
 import { openDatabase, type PostgresWarrenDb, type SqliteWarrenDb } from "../../db/client.ts";
 import { createRepos } from "../../db/repos/index.ts";
 import { WARREN_TEST_PG_URL_ENV } from "../../db/testing.ts";
+import { type EventsRetentionRepo, MIN_EVENTS_RETENTION_MS } from "../../runs/events-retention.ts";
 import type { RetentionRunsRepo } from "../../runs/retention.ts";
 import type { CliContext } from "../output.ts";
-import { runMigrateToPostgres, runPruneRuns } from "./db.ts";
+import { runMigrateToPostgres } from "./db.ts";
+import { parseRetentionCliOptions, runPruneEvents, runPruneRuns } from "./db-retention.ts";
 
 function captureContext(): { context: CliContext; out: string[]; err: string[] } {
 	const out: string[] = [];
@@ -319,5 +321,100 @@ describe("runPruneRuns", () => {
 			events: 2,
 			exhausted: false,
 		});
+	});
+});
+
+/**
+ * `runPruneEvents` is the operator surface over `pruneRunEvents`
+ * (ubuntu-057f): the sweep's predicates, batching and guard are covered
+ * against a real temp sqlite in `src/runs/events-retention.test.ts`; what this
+ * exercises is the plumbing a caller sees — the dry-run default, the reported
+ * counts and the single JSON line on stdout.
+ */
+describe("runPruneEvents", () => {
+	const DAY_MS = 24 * 60 * 60 * 1000;
+	const NOW = new Date("2026-06-01T00:00:00.000Z");
+
+	const stubEvents: EventsRetentionRepo = {
+		estimateEventsForWindow: async () => ({ runs: 306, events: 1_396_293, bytes: 987_654_321 }),
+		listExpiredTerminalRunIds: async () => [],
+		deleteEventsBatch: async () => ({ runs: 0, events: 0, bytes: 0 }),
+	};
+
+	test("dry-run by default: reports the window without deleting", async () => {
+		const { context, out } = captureContext();
+
+		const result = await runPruneEvents(context, {
+			events: stubEvents,
+			olderThanMs: 30 * DAY_MS,
+			now: () => NOW,
+		});
+
+		expect(result).toMatchObject({
+			exitCode: 0,
+			dryRun: true,
+			batches: 0,
+			runs: 306,
+			events: 1_396_293,
+			bytes: 987_654_321,
+			exhausted: true,
+			cutoff: "2026-05-02T00:00:00.000Z",
+		});
+		expect(out).toHaveLength(1);
+		expect(JSON.parse(out[0] ?? "")).toEqual({
+			ok: true,
+			cutoff: "2026-05-02T00:00:00.000Z",
+			dryRun: true,
+			batches: 0,
+			runs: 306,
+			events: 1_396_293,
+			bytes: 987_654_321,
+			exhausted: true,
+		});
+	});
+
+	test("refuses a window below the 7-day floor before touching the database", async () => {
+		const { context } = captureContext();
+
+		await expect(
+			runPruneEvents(context, { events: stubEvents, olderThanMs: DAY_MS, now: () => NOW }),
+		).rejects.toThrow(/7 days/);
+	});
+});
+
+/**
+ * The shared retention flags parser (ubuntu-4f98 / ubuntu-057f). `usage` is
+ * the command's exit-2 reporter; the tests pass one that throws so the
+ * refusal is observable without exiting the process.
+ */
+describe("parseRetentionCliOptions", () => {
+	const blowUp = (detail: string): never => {
+		throw new Error(detail);
+	};
+
+	test("refuses --older-than below the command's floor", () => {
+		expect(() =>
+			parseRetentionCliOptions(
+				{ olderThan: "1d", batch: "200", maxBatches: "0" },
+				MIN_EVENTS_RETENTION_MS,
+				blowUp,
+			),
+		).toThrow(/at least 7d/);
+	});
+
+	test("accepts a window at the floor and parses the batch knobs", () => {
+		expect(
+			parseRetentionCliOptions(
+				{ olderThan: "7d", batch: "50", maxBatches: "3" },
+				MIN_EVENTS_RETENTION_MS,
+				blowUp,
+			),
+		).toEqual({ olderThanMs: 7 * 24 * 60 * 60 * 1000, batchSize: 50, maxBatches: 3 });
+	});
+
+	test("rejects a non-integer --batch", () => {
+		expect(() =>
+			parseRetentionCliOptions({ olderThan: "30d", batch: "2.5", maxBatches: "0" }, 0, blowUp),
+		).toThrow(/--batch must be a positive integer/);
 	});
 });

@@ -19,6 +19,23 @@ Releases **0.9.10 and earlier** live in
   `--older-than` sets the cutoff in `ms`, `s`, `m`, `h` or `d` units.
   `--batch` sets the page size and `--max-batches` caps one sweep. The
   command prints the counts as one JSON line.
+- **`warren db prune-events` expires the `events` transcript of old
+  terminal runs** (ubuntu-057f). `/data/warren.db` was 14.7 GB and the
+  growth was the `events` table — ~1.4M rows, the largest run owning
+  ~98k — with nothing expiring them. The new command deletes the events
+  of runs that reached a terminal state (`succeeded` / `failed` /
+  `cancelled`) and ended before `--older-than` (default 30d, floored at
+  7d). **Dry-run is the default** and deletes nothing; deletion requires
+  `--apply`. `--batch` sets the runs per delete transaction and
+  `--max-batches` caps one sweep; the sweep is resumable and re-running
+  it continues from the oldest un-pruned run. Run rows are never
+  deleted, `never_started` rows are left to `db prune`, and the command
+  never VACUUMs: deleting rows frees pages for reuse but does **not**
+  shrink the file, so reclaiming disk still needs an operator-run
+  offline `VACUUM`. The dry-run reports the window's row count and an
+  estimated stored-byte figure (row-content lengths plus a fixed
+  per-row overhead — the on-disk cost is higher because of index
+  entries and page slack) as one JSON line.
 
 ### Security
 
