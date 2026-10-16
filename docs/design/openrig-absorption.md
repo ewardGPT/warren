@@ -428,11 +428,11 @@ The kernel decides mechanically. Some questions are still judgement calls, and
 those go to TypeSafe Jev, a decision model that answers typed questions about a
 state snapshot in about one second for a tiny cost.
 
-`src/decide/` is the client: providers (`typesafe`, `openrouter`, `vercel`), a
-three-way band (`act` / `ask` / `hold`), a timeout, an optional daily cap, an
-offline stub provider, and an append-only JSONL log. `warren decide` exposes it
-to a shell gate and maps the band onto an exit code, so a script can branch
-without parsing prose.
+`src/decide/` is the client: providers (`typesafe`, `openrouter`, `vercel`,
+`laya`), a three-way band (`act` / `ask` / `hold`), a timeout, an optional daily
+cap, an offline stub provider, and an append-only JSONL log. `warren decide`
+exposes it to a shell gate and maps the band onto an exit code, so a script can
+branch without parsing prose.
 
 | Band | Exit | Meaning |
 | --- | --- | --- |
@@ -449,6 +449,32 @@ questions and its band, at mode 0600, under `$HOME/.warren/decisions.jsonl`.
 The key lives outside the repository: `~/.warren/jev.key` (0600), exported as
 `JEV_API_KEY` or `TYPESAFE_API_KEY`. Without it the engine degrades to
 `unavailable` and changes nothing.
+
+### The Laya and Jev pair
+
+A second opinion is available. Laya is a self-hosted System-1 model that answers
+the same typed questions in one forward pass.
+
+Laya generates no text and costs nothing per call. It runs beside Jev and never
+replaces it, so `TYPESAFE_BASE_URL` keeps its meaning and an ordinary call still
+goes to Jev.
+
+`WARREN_JEV_CASCADE=1` enables the pair. Laya answers first. A `hold` from Laya
+is final, and Jev never gets the chance to lift it.
+
+A verdict at or above the confidence bar stands alone.
+
+Below that bar Jev answers too, and the two bands fold worst-first. A second
+look can therefore add a block and can never remove one.
+
+An unreachable Laya leaves a plain Jev call, and an unreachable Jev leaves the
+first opinion in place.
+
+The endpoint is `LAYA_URL`, and the bar is `WARREN_JEV_CASCADE_CONFIDENCE`.
+
+A fresh connection to a self-hosted lane costs far more than one decision. A
+client that opens a connection per call therefore raises
+`WARREN_JEV_TIMEOUT_MS`.
 
 ### Where Jev decides in the kernel
 

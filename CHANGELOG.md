@@ -36,6 +36,19 @@ Releases **0.9.10 and earlier** live in
   estimated stored-byte figure (row-content lengths plus a fixed
   per-row overhead — the on-disk cost is higher because of index
   entries and page slack) as one JSON line.
+- **The decision engine can use a self-hosted System-1 model beside Jev**
+  (ubuntu-829c). Laya answers the same typed questions in one forward pass,
+  never generates text, and costs nothing per call. It runs beside Jev and
+  never replaces it, so `TYPESAFE_BASE_URL` keeps its meaning and an
+  ordinary call still goes to Jev. `WARREN_JEV_CASCADE=1` enables the pair.
+  Laya answers first, a `hold` from Laya is final, and a verdict at or above
+  the confidence bar stands alone. Below that bar Jev answers too and the
+  two bands fold worst-first, so a second look can add a block and can never
+  remove one. An unreachable Laya leaves a plain Jev call, and an
+  unreachable Jev leaves the first opinion in place. The endpoint is
+  `LAYA_URL` and the bar is `WARREN_JEV_CASCADE_CONFIDENCE`. A fresh
+  connection to a self-hosted lane costs far more than one decision, so a
+  client that opens a connection per call raises `WARREN_JEV_TIMEOUT_MS`.
 
 ### Security
 
