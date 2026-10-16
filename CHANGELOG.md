@@ -58,6 +58,21 @@ Releases **0.9.10 and earlier** live in
 
 ### Fixed
 
+- **An explicitly named agent keeps its own provider over a project
+  default** (ubuntu-9663). The spawn precedence was operator override >
+  project default > agent frontmatter, so a project that pinned
+  `defaultProvider` / `defaultModel` in `.warren/config.yaml` silently
+  replaced the provider of an agent the caller named in `POST /runs` —
+  a DeepSeek key posted to `api.openai.com` and died with a 401
+  (`failure_reason=provider_error`) two seconds in. When the caller names
+  the agent (an `agent` field) and passes no `providerOverride` /
+  `modelOverride`, the agent's own frontmatter now wins; a
+  `defaultRole`-style dispatch (scheduled seeds, the CI-fixer, plan-runs)
+  still takes the project default, which is what those lanes configure.
+  An explicit per-run override still wins over everything. The chosen
+  layer is now named on the `spawn.dispatched` log line
+  (`provider_source` / `model_source`: `override` | `agent` |
+  `project-default`) so the winner is never silent again.
 - **A run that produced no commits no longer pushes a branch or opens a
   PR** (ubuntu-571a). Reap counted commits ahead of the base only *after*
   pushing, so a run that failed before the agent emitted anything still

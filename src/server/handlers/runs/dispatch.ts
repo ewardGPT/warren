@@ -63,6 +63,13 @@ interface ResolvedDispatchFields {
 	readonly prompt: string;
 	readonly providerOverride?: string;
 	readonly modelOverride?: string;
+	/**
+	 * warren-9663: the caller named the agent with an explicit `agent` field
+	 * (as opposed to inheriting it from `cloneFromRunId`). Threaded onto the
+	 * spawn so an explicitly named agent keeps its own provider/model over the
+	 * project's `defaultProvider` / `defaultModel`.
+	 */
+	readonly explicitAgent: boolean;
 	readonly parentRunId?: string;
 	readonly cloneKind?: "replicate";
 }
@@ -84,14 +91,19 @@ async function resolveDispatchFields(
 		continueFromRunId === undefined && cloneFromRunId !== undefined
 			? await resolveCloneDefaults(deps, cloneFromRunId)
 			: undefined;
+	const explicitAgentName = optionalString(body, "agent");
 
 	return {
-		agentName: optionalString(body, "agent") ?? clone?.agentName ?? requireString(body, "agent"),
+		agentName: explicitAgentName ?? clone?.agentName ?? requireString(body, "agent"),
 		projectId:
 			optionalString(body, "project") ?? clone?.projectId ?? requireString(body, "project"),
 		prompt: optionalString(body, "prompt") ?? clone?.prompt ?? requireString(body, "prompt"),
 		providerOverride: optionalString(body, "providerOverride") ?? clone?.providerOverride,
 		modelOverride: optionalString(body, "modelOverride") ?? clone?.modelOverride,
+		// warren-9663: only an explicit `agent` field counts as naming the agent.
+		// A clone inherits its agent from the parent and its provider/model are
+		// pinned by the clone defaults above, so it is not "explicit".
+		explicitAgent: explicitAgentName !== undefined,
 		// A replicate records the same `parent_run_id` column as a continuation;
 		// the `clone_kind` discriminator keeps them apart.
 		...(continueFromRunId !== undefined ? { parentRunId: continueFromRunId } : {}),
@@ -118,6 +130,7 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 			prompt,
 			providerOverride,
 			modelOverride,
+			explicitAgent,
 			parentRunId,
 			cloneKind,
 		} = await resolveDispatchFields(deps, body);
@@ -143,6 +156,7 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 			ref,
 			providerOverride,
 			modelOverride,
+			explicitAgent,
 			seedId,
 			...(targetBranch !== undefined ? { targetBranch } : {}),
 			...(parentRunId !== undefined ? { parentRunId } : {}),

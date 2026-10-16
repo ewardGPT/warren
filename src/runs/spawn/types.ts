@@ -75,6 +75,20 @@ export interface SpawnRunInput {
 	/** Optional per-run override of the agent's `frontmatter.model`. */
 	readonly modelOverride?: string;
 	/**
+	 * True when the caller named this agent explicitly — an `agent` field on
+	 * `POST /runs` (warren-9663). An explicitly named agent keeps its own
+	 * frontmatter provider/model: the project's `defaultProvider` /
+	 * `defaultModel` must NOT silently replace them (a project-wide provider
+	 * pinned for the sapling lane was being stamped onto every hand-picked
+	 * agent, and `api.openai.com` then 401'd a DeepSeek key). Role-based
+	 * dispatches (a `defaultRole` scheduled seed, the CI-fixer, plan-runs)
+	 * leave this unset, so the project default still wins for them — that is
+	 * exactly what those lanes are configured for.
+	 *
+	 * An explicit `providerOverride` / `modelOverride` still outranks this.
+	 */
+	readonly explicitAgent?: boolean;
+	/**
 	 * Per-trigger spend cap (warren-a63d). When set, the spawn composer
 	 * folds it onto `frontmatter.maxCostUsd` (overriding the agent's own
 	 * value) before freezing `runs.rendered_agent_json`, so the bridge

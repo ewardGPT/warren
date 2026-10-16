@@ -68,12 +68,20 @@ export function logProvisioned(
 	);
 }
 
-/** warren-c686: run dispatched onto the burrow, with dispatch latency. */
+/**
+ * warren-c686: run dispatched onto the burrow, with dispatch latency.
+ *
+ * warren-9663: `sources` names the layer that supplied the effective
+ * provider/model (`override` | `agent` | `project-default`). A silent project
+ * default replacing an explicitly named agent's provider used to be invisible
+ * until the run died with a provider 401; this line makes the winner visible.
+ */
 export function logDispatched(
 	log: SpawnLogger,
 	burrowId: string,
 	burrowRunId: string,
 	startedAt: number,
+	sources?: { readonly provider: string; readonly model: string },
 ): void {
 	log.info(
 		{
@@ -81,6 +89,9 @@ export function logDispatched(
 			burrow_id: burrowId,
 			burrow_run_id: burrowRunId,
 			duration_ms: Date.now() - startedAt,
+			...(sources !== undefined
+				? { provider_source: sources.provider, model_source: sources.model }
+				: {}),
 		},
 		"spawn: run dispatched onto burrow",
 	);

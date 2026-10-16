@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { readCachedAgent } from "../../runs/spawn/agent-cache.ts";
+import type { WarrenConfigCache } from "../../warren-config/index.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { BridgeRegistry, ServeHandle } from "../types.ts";
@@ -357,5 +362,67 @@ describe("POST /runs — spawn flow", () => {
 
 		const res = await fetch(`${tcpUrl(handle)}/runs`, { method: "POST" });
 		expect(res.status).toBe(400);
+	});
+
+	// warren-9663: the handler must mark an explicitly named agent so spawnRun
+	// lets its own frontmatter provider/model win over the project default.
+	test("an explicitly named agent keeps its own provider over the project default (warren-9663)", async () => {
+		const project = (await repos.projects.listAll())[0];
+		if (!project) throw new Error("project missing");
+
+		await repos.agents.upsert({
+			name: "pi-bridge",
+			renderedJson: {
+				name: "pi-bridge",
+				version: 1,
+				sections: { system: "you are pi-bridge" },
+				resolvedFrom: [],
+				frontmatter: { provider: "bridge", model: "deepseek-v4-flash" },
+			},
+		});
+
+		const tmpWs = await mkdtemp(join(tmpdir(), "warren-handlers-provider-"));
+
+		const calls: { method: string; path: string; body: unknown }[] = [];
+		const burrowClient = makeBurrowClient(
+			{ burrowId: "bur_provider0000", burrowRunId: "run_provider0000", workspacePath: tmpWs },
+			calls,
+		);
+		const baseDeps = await depsFor(repos, burrowClient);
+		const warrenConfigs: WarrenConfigCache = {
+			get: async () => ({
+				triggers: null,
+				defaults: { defaultProvider: "openai", defaultModel: "deepseek-chat" },
+				prTemplate: null,
+				sourceFile: null,
+				errors: [],
+				warnings: [],
+			}),
+			invalidate: () => undefined,
+			clear: () => undefined,
+			size: () => 0,
+		};
+		handle = startServer(
+			{ ...baseDeps, warrenConfigs },
+			{
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: NO_AUTH,
+				logger: silentLogger,
+			},
+		);
+
+		const res = await fetch(`${tcpUrl(handle)}/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ agent: "pi-bridge", project: project.id, prompt: "hello" }),
+		});
+		expect(res.status).toBe(201);
+
+		const runs = await repos.runs.listAll();
+		const run = runs.find((r) => r.agentName === "pi-bridge");
+		if (!run) throw new Error("run missing");
+		const agent = readCachedAgent(run.renderedAgentJson, "pi-bridge");
+		expect(agent.frontmatter.provider).toBe("bridge");
+		expect(agent.frontmatter.model).toBe("deepseek-v4-flash");
 	});
 });

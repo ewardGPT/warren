@@ -38,6 +38,7 @@
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
 import { refreshProject } from "../../projects/manage.ts";
 import {
+	readProviderFrontmatter,
 	readRuntimeId,
 	withMaxCostUsdOverride,
 	withProviderOverrides,
@@ -49,7 +50,7 @@ import { parseBurrowConfig } from "../burrow-config.ts";
 import { lifecycleBus } from "../lifecycle-bus.ts";
 import { buildSeedFiles } from "../seed.ts";
 import { validateTargetBranch } from "../target-branch.ts";
-import { readCachedAgent, readProjectDefaults, resolveOverride } from "./agent-cache.ts";
+import { readCachedAgent, readProjectDefaults, resolveProviderAxis } from "./agent-cache.ts";
 import { type EnvLike, injectWarrenCallbackEnv } from "./callback-env.ts";
 import {
 	bindRunLogger,
@@ -122,25 +123,38 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			: null;
 	const projectAfterRefresh = refreshed?.project ?? project;
 
-	// warren-618b: fold per-project provider/model defaults onto the agent
-	// frontmatter, operator per-run override winning. Order: operator
-	// override > .warren/defaults.json > agent frontmatter, all riding the
-	// same `withProviderOverrides` path onto frozen `rendered_agent_json`.
+	// warren-9663: fold per-project provider/model defaults onto the agent
+	// frontmatter. Order: operator per-run override > agent frontmatter (only
+	// when the caller named the agent explicitly) > .warren project defaults >
+	// agent frontmatter, all riding the same `withProviderOverrides` path onto
+	// frozen `rendered_agent_json`. An explicitly named agent keeps its own
+	// provider/model even when the project pins `defaultProvider` /
+	// `defaultModel`; a `defaultRole`-style dispatch (no `agent` field) still
+	// takes the project default. `resolveProviderAxis` reports which layer won.
 	const projectDefaults = await readProjectDefaults(
 		input.warrenConfigs,
 		projectAfterRefresh.id,
 		projectAfterRefresh.localPath,
 	);
-	const effectiveProvider = resolveOverride(
+	const agentProvider = readProviderFrontmatter(baseAgent.frontmatter);
+	const explicitAgent = input.explicitAgent === true;
+	const providerAxis = resolveProviderAxis(
 		input.providerOverride,
 		projectDefaults?.defaultProvider,
+		agentProvider.provider,
+		explicitAgent,
 	);
-	const effectiveModel = resolveOverride(input.modelOverride, projectDefaults?.defaultModel);
+	const modelAxis = resolveProviderAxis(
+		input.modelOverride,
+		projectDefaults?.defaultModel,
+		agentProvider.model,
+		explicitAgent,
+	);
 	// warren-a63d: fold the per-trigger spend cap on top (trigger > agent).
 	const agent = withMaxCostUsdOverride(
 		withProviderOverrides(baseAgent, {
-			...(effectiveProvider !== undefined ? { providerOverride: effectiveProvider } : {}),
-			...(effectiveModel !== undefined ? { modelOverride: effectiveModel } : {}),
+			...(providerAxis.value !== undefined ? { providerOverride: providerAxis.value } : {}),
+			...(modelAxis.value !== undefined ? { modelOverride: modelAxis.value } : {}),
 		}),
 		input.maxCostUsdOverride,
 	);
@@ -256,7 +270,10 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		const updated = await input.repos.runs.attachBurrow(run.id, {
 			burrowRunId: handle.providerRunId,
 		});
-		logDispatched(log, handle.sandboxId, handle.providerRunId, dispatchStart);
+		logDispatched(log, handle.sandboxId, handle.providerRunId, dispatchStart, {
+			provider: providerAxis.source,
+			model: modelAxis.source,
+		});
 		// warren-4e74: fire the observe-only `run_dispatched` lifecycle hook.
 		// A no-op when no bus is installed (unit tests) or no extension
 		// subscribes; a subscriber can neither mutate this payload nor stall

@@ -66,21 +66,54 @@ export function readCachedAgent(raw: unknown, name: string): AgentDefinition {
 }
 
 /**
- * Pick the effective frontmatter override given a per-run operator value and
- * a project default. Empty / whitespace-only strings are treated the same as
- * "not provided" (matches `withProviderOverrides`'s shape). Returns the
- * operator value when present, otherwise the project default, otherwise
- * `undefined` so the agent's own frontmatter remains in force.
+ * Which layer supplied an effective provider/model (warren-9663). Surfaced on
+ * the `spawn.dispatched` log line so a silently-stamped project default is
+ * visible at a glance instead of only showing up as a provider 401 two
+ * seconds later.
  */
-export function resolveOverride(
+export type ProviderSource = "override" | "agent" | "project-default";
+
+export interface AxisResolution {
+	/**
+	 * The value to stamp onto the rendered agent frontmatter. `undefined`
+	 * means "stamp nothing" — the agent's own frontmatter stays in force.
+	 */
+	readonly value: string | undefined;
+	readonly source: ProviderSource;
+}
+
+/**
+ * Resolve one provider/model axis for a spawn (warren-9663).
+ *
+ * Precedence:
+ *   1. an explicit per-run `providerOverride` / `modelOverride` — always wins;
+ *   2. the agent's own frontmatter value — BUT only when the caller named the
+ *      agent explicitly (an `agent` field on `POST /runs`). Naming an agent
+ *      means "run this agent", so its own provider/model must not be replaced
+ *      by the project's `defaultProvider` / `defaultModel`;
+ *   3. the project default (`defaultProvider` / `defaultModel`), which stays
+ *      in force for role-based dispatches (a `defaultRole` scheduled seed, the
+ *      CI-fixer, plan-runs) — those never name the agent, so a project-wide
+ *      provider the operator pinned is exactly what they asked for.
+ *
+ * Empty / whitespace-only strings are treated the same as "not provided"
+ * (matches `withProviderOverrides`'s shape). When no layer supplies a value
+ * the axis resolves to `{ source: "agent" }` with no stamp, leaving the
+ * agent's frontmatter (or the runtime default) untouched.
+ */
+export function resolveProviderAxis(
 	operator: string | undefined,
 	projectDefault: string | undefined,
-): string | undefined {
+	agentValue: string | undefined,
+	explicitAgent: boolean,
+): AxisResolution {
 	const op = operator?.trim();
-	if (op !== undefined && op !== "") return op;
+	if (op !== undefined && op !== "") return { value: op, source: "override" };
+	const av = agentValue?.trim();
+	if (explicitAgent && av !== undefined && av !== "") return { value: undefined, source: "agent" };
 	const pd = projectDefault?.trim();
-	if (pd !== undefined && pd !== "") return pd;
-	return undefined;
+	if (pd !== undefined && pd !== "") return { value: pd, source: "project-default" };
+	return { value: undefined, source: "agent" };
 }
 
 /**
