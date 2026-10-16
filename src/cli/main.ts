@@ -11,8 +11,6 @@
  */
 
 import { Command } from "commander";
-import { WarrenClient } from "../client/index.ts";
-import { PLAN_RUN_STATES, type PlanRunState } from "../core/wire.ts";
 import { openDatabase } from "../db/client.ts";
 import { parseDatabaseUrl } from "../db/url.ts";
 import { VERSION } from "../index.ts";
@@ -20,19 +18,83 @@ import { loadProjectsConfigFromEnv } from "../projects/config.ts";
 import { resolvePublicAllowlist } from "../projects/public-allowlist.ts";
 import { seedBuiltinAgents } from "../registry/builtins/index.ts";
 import { resolveLocalRunBackend } from "../runtime/local/diagnostics/burrow.ts";
+import { loadTriggerSchedulerConfigFromEnv } from "../triggers/config.ts";
 import { runAddProject } from "./commands/add-project.ts";
 import { runBestOf } from "./commands/best-of.ts";
 import { runConfigMigrate } from "./commands/config-migrate.ts";
 import { runMigrateToPostgres } from "./commands/db.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInit } from "./commands/init.ts";
-import { runPlanCancel, runPlanRun } from "./commands/plan-run.ts";
-import { runPlanList, runPlanStatus } from "./commands/plan-status.ts";
+import { registerPlanCommands } from "./commands/plan-group.ts";
 import { runRun } from "./commands/run.ts";
+import { runSeedDrain } from "./commands/seed-drain.ts";
 import { runServe } from "./commands/serve.ts";
 import { withCliDb } from "./context.ts";
 import { type CliContext, defaultSpawn, formatError, PROCESS_STDIO } from "./output.ts";
-import type { PlanRunOutput } from "./plan-run-renderer.ts";
+
+/** Parse an optional integer millisecond option; undefined or blank → undefined. */
+function parseMs(value: string | undefined): number | undefined {
+	if (value === undefined || value.trim() === "") return undefined;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+interface SeedDrainCliOptions {
+	agent: string;
+	project?: string;
+	prompt?: string;
+	provider?: string;
+	model?: string;
+	timeoutMs?: string;
+	pollMs?: string;
+}
+
+/**
+ * `warren seed-drain` body: boot the DB + run backend, run the lane, and
+ * return its exit code. A module-level helper keeps the commander action's
+ * cognitive complexity inside the project ceiling.
+ */
+async function runSeedDrainCommand(
+	context: CliContext,
+	seedId: string,
+	opts: SeedDrainCliOptions,
+): Promise<number> {
+	return await withCliDb({ env: context.env }, async ({ repos }) => {
+		await seedBuiltinAgents(repos.agents, undefined, context.now);
+		const backend = resolveLocalRunBackend(context.env);
+		const timeoutMs = parseMs(opts.timeoutMs);
+		const pollMs = parseMs(opts.pollMs);
+		try {
+			const result = await runSeedDrain(
+				context,
+				{
+					repos,
+					runtimeProvider: backend.runtimeProvider,
+					seedsCli: {
+						sdBinary: loadTriggerSchedulerConfigFromEnv(context.env).sdBinary,
+						spawn: defaultSpawn,
+					},
+					...(context.env.GITHUB_TOKEN !== undefined
+						? { githubToken: context.env.GITHUB_TOKEN }
+						: {}),
+				},
+				{
+					seedId,
+					agent: opts.agent,
+					...(opts.project !== undefined ? { project: opts.project } : {}),
+					...(opts.prompt !== undefined ? { prompt: opts.prompt } : {}),
+					...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+					...(opts.model !== undefined ? { model: opts.model } : {}),
+					...(timeoutMs !== undefined ? { timeoutMs } : {}),
+					...(pollMs !== undefined ? { pollMs } : {}),
+				},
+			);
+			return result.exitCode;
+		} finally {
+			await backend.close();
+		}
+	});
+}
 
 export function buildProgram(context: CliContext): Command {
 	const program = new Command();
@@ -198,6 +260,21 @@ export function buildProgram(context: CliContext): Command {
 		);
 
 	program
+		.command("seed-drain")
+		.description("dispatch a run for one seed, wait for its PR, and close the seed on merge")
+		.argument("<seed-id>", "seed id to drain (resolved to its home project)")
+		.requiredOption("--agent <name>", "registered agent name to dispatch")
+		.option("--project <id>", "home project id (default: resolve the seed across projects)")
+		.option("-p, --prompt <text>", "prompt template; {seed_id} and {seed_body} are substituted")
+		.option("--provider <name>", "per-run override of agent frontmatter.provider")
+		.option("--model <name>", "per-run override of agent frontmatter.model")
+		.option("--timeout-ms <n>", "wait budget in milliseconds; 0 disables the bound")
+		.option("--poll-ms <n>", "poll cadence in milliseconds")
+		.action(async (seedId: string, opts: SeedDrainCliOptions) => {
+			process.exit(await runSeedDrainCommand(context, seedId, opts));
+		});
+
+	program
 		.command("init")
 		.description("scaffold a .warren/ directory (triggers.yaml + config.yaml) in a project repo")
 		.option("--project <id>", "target a registered project by id (writes into its warren clone)")
@@ -349,104 +426,7 @@ export function buildProgram(context: CliContext): Command {
 	// `plan` is a thin HTTP-client subcommand group (warren-ec6a, pl-55df) —
 	// the first command family that talks to a remote warren via
 	// WarrenClient.fromEnv rather than opening a local DB with withCliDb.
-	const planGroup = program.command("plan").description("dispatch and steer cloud plan-runs");
-	planGroup
-		.command("run")
-		.description("dispatch a serial plan-run against a remote warren and tail events as NDJSON")
-		.argument("<plan-id>", "seeds plan id (pl_xxx)")
-		.requiredOption("--project <id>", "project id (prj_xxx)")
-		.requiredOption("--agent <name>", "registered agent name")
-		.option("--prompt-template <text>", "per-child prompt template override")
-		.option("--ref <git-ref>", "git ref to clone child workspaces from")
-		.option("--provider <name>", "per-run override of agent frontmatter.provider")
-		.option("--model <name>", "per-run override of agent frontmatter.model")
-		.option("--no-follow", "dispatch and exit without tailing events")
-		.option("--output <mode>", "output mode: ndjson (default) or pretty", "ndjson")
-		.action(
-			async (
-				planId: string,
-				opts: {
-					project: string;
-					agent: string;
-					promptTemplate?: string;
-					ref?: string;
-					provider?: string;
-					model?: string;
-					follow: boolean;
-					output?: string;
-				},
-			) => {
-				const client = WarrenClient.fromEnv(context.env);
-				const result = await runPlanRun(
-					context,
-					{ client },
-					{
-						planId,
-						project: opts.project,
-						agent: opts.agent,
-						follow: opts.follow,
-						output: parsePlanRunOutput(opts.output),
-						...(opts.promptTemplate !== undefined ? { promptTemplate: opts.promptTemplate } : {}),
-						...(opts.ref !== undefined ? { ref: opts.ref } : {}),
-						...(opts.provider !== undefined ? { provider: opts.provider } : {}),
-						...(opts.model !== undefined ? { model: opts.model } : {}),
-					},
-				);
-				process.exit(result.exitCode);
-			},
-		);
-	planGroup
-		.command("cancel")
-		.description("cancel a remote plan-run and its in-flight child run")
-		.argument("<plan-run-id>", "plan-run id")
-		.option("--output <mode>", "output mode: ndjson (default) or pretty", "ndjson")
-		.action(async (planRunId: string, opts: { output?: string }) => {
-			const client = WarrenClient.fromEnv(context.env);
-			const result = await runPlanCancel(
-				context,
-				{ client },
-				{ planRunId, output: parsePlanRunOutput(opts.output) },
-			);
-			process.exit(result.exitCode);
-		});
-	planGroup
-		.command("status")
-		.description("render a plan-run's child-state table with per-child cost + duration")
-		.argument("<plan-run-id>", "plan-run id")
-		.option("--output <mode>", "output mode: ndjson (default) or pretty", "ndjson")
-		.action(async (planRunId: string, opts: { output?: string }) => {
-			const client = WarrenClient.fromEnv(context.env);
-			const result = await runPlanStatus(
-				context,
-				{ client },
-				{ planRunId, output: parsePlanRunOutput(opts.output) },
-			);
-			process.exit(result.exitCode);
-		});
-	planGroup
-		.command("list")
-		.description("list plan-runs, optionally filtered by project / state")
-		.option("--project <id>", "only plan-runs for this project (prj_xxx)")
-		.option(
-			"--state <state>",
-			"only plan-runs in this state (queued|running|succeeded|failed|cancelled)",
-		)
-		.option("--output <mode>", "output mode: ndjson (default) or pretty", "ndjson")
-		.action(async (opts: { project?: string; state?: string; output?: string }) => {
-			const client = WarrenClient.fromEnv(context.env);
-			const result = await runPlanList(
-				context,
-				{ client },
-				{
-					output: parsePlanRunOutput(opts.output),
-					...(opts.project !== undefined ? { project: opts.project } : {}),
-					...(parsePlanRunState(opts.state) !== undefined
-						? { state: parsePlanRunState(opts.state) }
-						: {}),
-				},
-			);
-			process.exit(result.exitCode);
-		});
+	registerPlanCommands(program, context);
 
 	program
 		.command("serve")
@@ -458,22 +438,6 @@ export function buildProgram(context: CliContext): Command {
 		});
 
 	return program;
-}
-
-/** Coerce a `--output` flag value to a {@link PlanRunOutput}, defaulting `ndjson`. */
-export function parsePlanRunOutput(value: string | undefined): PlanRunOutput {
-	return value === "pretty" ? "pretty" : "ndjson";
-}
-
-/**
- * Coerce a `--state` flag value to a {@link PlanRunState}, or undefined when
- * unset/invalid. Membership is tested against the canonical tuple rather than
- * a locally rebuilt `Set` — that copy was drift waiting to happen (warren-d371).
- */
-export function parsePlanRunState(value: string | undefined): PlanRunState | undefined {
-	return value !== undefined && (PLAN_RUN_STATES as readonly string[]).includes(value)
-		? (value as PlanRunState)
-		: undefined;
 }
 
 if (import.meta.main) {
