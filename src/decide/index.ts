@@ -22,6 +22,15 @@ export {
 	foldBands,
 	SCORE_CRITERIA_MEDIAN,
 } from "./band.ts";
+export type { BatchEntry, DecideManyRequest, Screened } from "./batch.ts";
+export {
+	buildBatchBody,
+	decideMany,
+	MAX_BATCH_STATES,
+	parseBatchResponse,
+	readBatchResult,
+	screen,
+} from "./batch.ts";
 export {
 	checkDailyCap,
 	countLiveCalls,

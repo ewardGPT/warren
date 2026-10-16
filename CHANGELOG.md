@@ -49,6 +49,17 @@ Releases **0.9.10 and earlier** live in
   `LAYA_URL` and the bar is `WARREN_JEV_CASCADE_CONFIDENCE`. A fresh
   connection to a self-hosted lane costs far more than one decision, so a
   client that opens a connection per call raises `WARREN_JEV_TIMEOUT_MS`.
+- **The decision engine can judge many states in one forward pass**
+  (ubuntu-829c). `LAYA_URL` also serves `<url>/batch`, which answers up to
+  64 states in one call, and `decideMany` splits a larger set into requests
+  of that size. The count is the limit and not the body size. The engine
+  writes each state to the decision log as its own record, and every
+  decision lines up with the state it judges, so a short answer fails its
+  chunk rather than shifting the decisions after it. A state the lane
+  truncated becomes `unavailable` with the lane's own reason, because a
+  verdict from a truncated state answers a question the caller did not ask.
+  The served checkpoint takes 512 tokens, so a caller that screens whole
+  files meets refusals and wants shorter passages instead.
 
 ### Security
 

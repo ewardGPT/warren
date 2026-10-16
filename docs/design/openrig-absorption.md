@@ -476,6 +476,26 @@ A fresh connection to a self-hosted lane costs far more than one decision. A
 client that opens a connection per call therefore raises
 `WARREN_JEV_TIMEOUT_MS`.
 
+### The batch route
+
+One call answers one state. The endpoint also serves `<url>/batch`.
+
+A batch answers up to 64 states in one forward pass. `decideMany` splits a
+larger set into requests of that size.
+
+The count is the limit and not the body size. A batch of 64 states carrying
+4 kB documents passes a 128 kB body, while the lane refuses 72 short states.
+
+The window is the limit a caller meets first. The served checkpoint takes 512
+tokens.
+
+The lane truncates an oversized state instead of refusing it. `decideMany`
+refuses a truncated state, because its verdict answers a question the caller
+did not ask.
+
+A caller that screens whole files therefore meets refusals. The fix is shorter
+passages rather than a larger batch.
+
 ### Where Jev decides in the kernel
 
 Two seams call Jev today. Both stay off until an operator sets a flag. Both log

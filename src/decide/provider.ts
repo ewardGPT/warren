@@ -51,6 +51,12 @@ export interface ProviderSpec {
 	 * so demanding a key env would report a missing key for a working route.
 	 */
 	readonly keyOptional?: boolean;
+	/**
+	 * `true` when the route also serves `<url>/batch`, which answers many
+	 * states in one forward pass. The batch address is derived from the
+	 * resolved endpoint, so an override moves both routes together.
+	 */
+	readonly batches?: boolean;
 }
 
 export const PROVIDERS = {
@@ -84,6 +90,7 @@ export const PROVIDERS = {
 		keyEnvs: ["LAYA_API_KEY"],
 		urlEnv: "LAYA_URL",
 		keyOptional: true,
+		batches: true,
 	},
 	stub: { name: "stub", url: "", model: "jev-stub", keyEnvs: [] },
 } as const satisfies Record<string, ProviderSpec>;
@@ -110,6 +117,8 @@ export interface ProviderChoice {
 	model: string;
 	/** Empty for `stub`, which never authenticates. */
 	key: string;
+	/** The batch endpoint, present only when the route serves one. */
+	batchUrl?: string;
 }
 
 export type ProviderResult = { ok: true; provider: ProviderChoice } | { ok: false; reason: string };
@@ -202,7 +211,8 @@ export function resolveProvider(env: Env): ProviderResult {
 		};
 	}
 	const model = envString(env, MODEL_ENV) ?? spec.model;
-	return { ok: true, provider: { name: spec.name, url, model, key: key ?? "" } };
+	const batch = spec.batches === true ? { batchUrl: `${url}/batch` } : {};
+	return { ok: true, provider: { name: spec.name, url, model, key: key ?? "", ...batch } };
 }
 
 /** The provider's endpoint: `urlEnv` when it is set, else the table's constant. */
