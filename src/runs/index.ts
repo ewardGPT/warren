@@ -62,7 +62,12 @@ export {
 	type Dimension as CostDimension,
 	NONE_KEY as COST_ANALYTICS_NONE_KEY,
 } from "./cost-analytics.ts";
-export { RunSpawnError } from "./errors.ts";
+export {
+	RunSpawnError,
+	SEED_DRAIN_REFUSAL_REASONS,
+	type SeedDrainRefusalReason,
+	SeedDrainRefusedError,
+} from "./errors.ts";
 export {
 	DEFAULT_SUBSCRIPTION_BUFFER,
 	RunEventBroker,
@@ -123,6 +128,31 @@ export {
 	buildSeedFiles,
 	type SeedFile,
 } from "./seed.ts";
+export {
+	awaitSeedDrain,
+	closeSeedAfterDrain,
+	DEFAULT_SEED_DRAIN_POLL_MS,
+	DEFAULT_SEED_DRAIN_PROMPT,
+	DEFAULT_SEED_DRAIN_WAIT_MS,
+	type DrainSeedInput,
+	type DrainSeedResult,
+	dispatchSeedDrain,
+	drainSeed,
+	type ResolveSeedDrainRefInput,
+	readRunSnapshot,
+	resolveSeedDrainRef,
+	SEED_DRAIN_TRIGGER,
+	type SeedDrainCloseInput,
+	type SeedDrainCloseResult,
+	type SeedDrainDispatchInput,
+	type SeedDrainDispatchResult,
+	type SeedDrainMergeState,
+	type SeedDrainOutcome,
+	type SeedDrainOutcomeKind,
+	type SeedDrainRunSnapshot,
+	type SeedDrainSeedRef,
+	type SeedDrainWaitDeps,
+} from "./seed-drain.ts";
 export { type SpawnRunInput, type SpawnRunResult, spawnRun } from "./spawn/index.ts";
 export { type SteerRunInput, type SteerRunResult, steerRun } from "./steer.ts";
 export {

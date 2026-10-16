@@ -26,6 +26,7 @@ describe("buildProgram", () => {
 			"init",
 			"plan",
 			"run",
+			"seed-drain",
 			"serve",
 		]);
 	});
@@ -81,5 +82,16 @@ describe("buildProgram", () => {
 		expect(runCmd).toBeDefined();
 		const promptOpt = runCmd?.options.find((o) => o.long === "--prompt");
 		expect(promptOpt?.mandatory).toBe(true);
+	});
+
+	test("`seed-drain` takes a seed id and requires --agent (ubuntu-6ab8)", () => {
+		const program = buildProgram(silentContext());
+		const cmd = program.commands.find((c) => c.name() === "seed-drain");
+		expect(cmd).toBeDefined();
+		expect(cmd?.registeredArguments.map((a) => a.name())).toEqual(["seed-id"]);
+		expect(cmd?.options.find((o) => o.long === "--agent")?.mandatory).toBe(true);
+		// The home project is optional: the lane resolves it from the seed.
+		expect(cmd?.options.find((o) => o.long === "--project")?.mandatory).toBe(false);
+		expect(cmd?.options.find((o) => o.long === "--timeout-ms")).toBeDefined();
 	});
 });
