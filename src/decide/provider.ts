@@ -9,6 +9,7 @@
  *   | `typesafe`   | https://api.typesafe.ai/v1/systemone           | jev-1.13.0       | TYPESAFE_API_KEY, JEV_API_KEY          |
  *   | `openrouter` | https://openrouter.ai/api/alpha/decisions      | typesafe/jev-1.13| OPENROUTER_API_KEY                     |
  *   | `vercel`     | https://ai-gateway.vercel.sh/typesafe/v1/systemone | typesafe-ai/jev | AI_GATEWAY_API_KEY                  |
+ *   | `laya`       | http://127.0.0.1:18091/v1/systemone (LAYA_URL) | laya             | LAYA_API_KEY (optional)                |
  *
  * plus the offline `stub` provider (`WARREN_JEV_STUB=1` or
  * `JEV_PROVIDER=stub`), which answers from a fixture instead of the
@@ -16,7 +17,9 @@
  * reported, never silently ignored), else the first of `typesafe` /
  * `openrouter` whose key is present, else `typesafe` so the caller gets a
  * "key is not set" reason naming the env vars it needs. `JEV_MODEL`
- * overrides the model for any hosted route.
+ * overrides the model for any hosted route. `laya` is deliberately absent
+ * from that order, so no call reaches it by accident: only an explicit
+ * `JEV_PROVIDER=laya`, or the cascade in `cascade.ts`, selects it.
  *
  * Request: `Authorization: Bearer <key>`, `Content-Type: application/json`,
  * `X-Title: <title>`; body `{ "model", "state", "questions" }`.
@@ -36,6 +39,18 @@ export interface ProviderSpec {
 	readonly url: string;
 	readonly model: string;
 	readonly keyEnvs: readonly string[];
+	/**
+	 * Env var holding the full endpoint, overriding `url`. A self-hosted
+	 * route lives at an address only its operator knows, so its URL cannot
+	 * be a constant in this table.
+	 */
+	readonly urlEnv?: string;
+	/**
+	 * `true` when the route authenticates on its own side and a client key
+	 * is therefore not required. The `laya` relay injects the key it holds,
+	 * so demanding a key env would report a missing key for a working route.
+	 */
+	readonly keyOptional?: boolean;
 }
 
 export const PROVIDERS = {
@@ -56,6 +71,19 @@ export const PROVIDERS = {
 		url: "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
 		model: "typesafe-ai/jev",
 		keyEnvs: ["AI_GATEWAY_API_KEY"],
+	},
+	/**
+	 * The self-hosted System-1 lane. This is a *second* opinion beside
+	 * Jev, never a substitute for it, so it stays out of
+	 * `DEFAULT_PROVIDER_ORDER` and is reached only on purpose.
+	 */
+	laya: {
+		name: "laya",
+		url: "http://127.0.0.1:18091/v1/systemone",
+		model: "laya",
+		keyEnvs: ["LAYA_API_KEY"],
+		urlEnv: "LAYA_URL",
+		keyOptional: true,
 	},
 	stub: { name: "stub", url: "", model: "jev-stub", keyEnvs: [] },
 } as const satisfies Record<string, ProviderSpec>;
@@ -162,18 +190,25 @@ export function resolveProvider(env: Env): ProviderResult {
 	const picked = readProviderName(env);
 	if ("error" in picked) return { ok: false, reason: picked.error };
 	const spec: ProviderSpec = PROVIDERS[picked.name];
+	const url = endpointFor(spec, env);
 	if (spec.name === "stub") {
-		return { ok: true, provider: { name: spec.name, url: spec.url, model: spec.model, key: "" } };
+		return { ok: true, provider: { name: spec.name, url, model: spec.model, key: "" } };
 	}
 	const key = resolveKey(spec, env);
-	if (key === undefined) {
+	if (key === undefined && spec.keyOptional !== true) {
 		return {
 			ok: false,
 			reason: `${spec.name} provider has no API key (set ${spec.keyEnvs.join(" or ")})`,
 		};
 	}
 	const model = envString(env, MODEL_ENV) ?? spec.model;
-	return { ok: true, provider: { name: spec.name, url: spec.url, model, key } };
+	return { ok: true, provider: { name: spec.name, url, model, key: key ?? "" } };
+}
+
+/** The provider's endpoint: `urlEnv` when it is set, else the table's constant. */
+function endpointFor(spec: ProviderSpec, env: Env): string {
+	if (spec.urlEnv === undefined) return spec.url;
+	return envString(env, spec.urlEnv) ?? spec.url;
 }
 
 /** Headers for a Jev POST. `X-Title` is openrouter's app-attribution header. */

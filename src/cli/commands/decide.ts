@@ -15,6 +15,10 @@
  * Nothing here is allowed to block on the network: the engine's own timeout and
  * daily cap apply, and a failure is `unavailable` rather than an exception.
  *
+ * With `WARREN_JEV_CASCADE=1` the Laya → Jev tandem answers instead of a single
+ * route: Laya judges first and Jev is asked only when Laya is unsure or when the
+ * verdict must block. `cascade.ts` holds the rules.
+ *
  * Usage:
  *   warren decide --feature merge-gate --state state.json --questions q.json
  *   warren decide --feature triage --state '{"attempts":3}' --subject run-42 --json
@@ -23,7 +27,14 @@
 
 import { readFileSync } from "node:fs";
 import type { Answer, Band, Decided, Question } from "../../decide/index.ts";
-import { bandFor, decide, foldBands, STUB_ENV } from "../../decide/index.ts";
+import {
+	bandFor,
+	cascadeEnabled,
+	decide,
+	decideWithCascade,
+	foldBands,
+	STUB_ENV,
+} from "../../decide/index.ts";
 import type { CliContext } from "../output.ts";
 
 export interface DecideArgs {
@@ -73,18 +84,19 @@ export async function runDecide(context: CliContext, args: DecideArgs): Promise<
 	const inputs = readInputs(args);
 	if ("error" in inputs) return fail(inputs.error);
 
-	const decision = await decide(
-		{
-			feature: args.feature,
-			subject: args.subject,
-			state: inputs.state,
-			questions: inputs.questions,
-		},
-		// The caller's environment decides the provider, the log path and the daily
-		// cap. `--stub` only flips the offline provider on top of it, so a test can
-		// point the fixture somewhere private.
-		{ env: args.stub === true ? { ...context.env, [STUB_ENV]: "1" } : context.env },
-	);
+	// The caller's environment decides the provider, the log path and the daily
+	// cap. `--stub` only flips the offline provider on top of it, so a test can
+	// point the fixture somewhere private.
+	const deps = { env: args.stub === true ? { ...context.env, [STUB_ENV]: "1" } : context.env };
+	const request = {
+		feature: args.feature,
+		subject: args.subject,
+		state: inputs.state,
+		questions: inputs.questions,
+	};
+	const decision = cascadeEnabled(deps.env)
+		? await decideWithCascade(request, deps)
+		: await decide(request, deps);
 
 	if (decision.outcome !== "decided") {
 		context.stdio.stderr.write(`decide: ${decision.outcome} — ${decision.reason}\n`);

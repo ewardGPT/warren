@@ -38,6 +38,17 @@ export {
 export type { CacheEntry } from "./cache.ts";
 
 export { CACHE_MAX_ENTRIES, CACHE_TTL_ENV } from "./cache.ts";
+export {
+	CASCADE_ENV,
+	CONFIDENCE_ENV,
+	cascadeEnabled,
+	decideWithCascade,
+	foldCascade,
+	LAYA_CONFIDENT_AT,
+	LAYA_PROVIDER,
+	needsEscalation,
+	weakestConfidence,
+} from "./cascade.ts";
 export type { DecideDeps, DecideRequest, FetchLike } from "./client.ts";
 export {
 	DEFAULT_RETRY_DELAY_MS,
