@@ -258,16 +258,22 @@ function applyFinalizeToState(state: ReapPipelineState, r: FinalizeResult): void
 }
 
 /**
- * warren-72b9 / warren-89b0: classify a zero-commit push via `classifyEmptyPush`
- * — clean/bookkeeping-only ⇒ `noChanges` (succeeded), else `droppedCommit`
- * (failed). Domain-owned: needs the run outcome; workspace is gone post-terminate.
+ * warren-72b9 / warren-89b0: classify a zero-commit outcome via
+ * `classifyEmptyPush` — clean/bookkeeping-only ⇒ `noChanges` (succeeded), else
+ * `droppedCommit` (failed). Domain-owned: needs the run outcome; workspace is
+ * gone post-terminate.
+ *
+ * ubuntu-571a: finalize now SKIPS the push entirely for a zero-commit run
+ * (`pushed: false`), so the trigger keys on `commitsAhead === 0` — set only when
+ * the base was resolvable and the count ran — rather than on a push having
+ * happened. The classification is unchanged.
  */
 async function emitEmptyPushIfNeeded(
 	ctx: ReapPipelineContext,
 	state: ReapPipelineState,
 	r: FinalizeResult,
 ): Promise<void> {
-	if (!(r.pushed && r.commitsAhead === 0)) return;
+	if (r.commitsAhead !== 0) return;
 	const c = classifyEmptyPush(ctx.input.outcome === "succeeded", r.dirty, r.dirtyPaths ?? []);
 	state.noChanges = c.noChanges;
 	state.droppedCommit = c.droppedCommit;

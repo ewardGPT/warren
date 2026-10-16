@@ -8,6 +8,7 @@ import {
 	fakeBurrowClient,
 	fakeExec,
 	fakeFs,
+	fakeOpenPr,
 	makeBurrow,
 	openDatabase,
 	reapDeps,
@@ -56,19 +57,20 @@ describe("reapRun", () => {
 		expect(f.files.get("/data/projects/x/y/.mulch/expertise/build.jsonl")).toContain(
 			'"content":"new"',
 		);
-		// Reap runs `git push` then `git rev-list --count <base>..HEAD`
-		// (warren-f3bb).
+		// Reap counts commits ahead of the base, THEN pushes (ubuntu-571a moved
+		// the count before the push so a zero-commit run never pushes).
 		expect(e.calls).toHaveLength(2);
 		expect(e.calls[0]?.cmd).toBe("git");
-		expect(e.calls[0]?.args).toEqual(["push", "origin", "HEAD:agent/refactor-bot/run-1"]);
+		expect(e.calls[0]?.args).toEqual(["rev-list", "--count", "main..HEAD"]);
 		expect(e.calls[0]?.cwd).toBe("/data/burrow/ws");
 		expect(e.calls[1]?.cmd).toBe("git");
-		expect(e.calls[1]?.args).toEqual(["rev-list", "--count", "main..HEAD"]);
+		expect(e.calls[1]?.args).toEqual(["push", "origin", "HEAD:agent/refactor-bot/run-1"]);
 	});
 
-	test("emits reap.empty_push when push lands zero commits (warren-f3bb)", async () => {
+	test("skips the push entirely and emits reap.empty_push when zero commits (warren-f3bb, ubuntu-571a)", async () => {
 		const f = fakeFs();
 		const e = fakeExec({ revListCount: "0" });
+		const pr = fakeOpenPr([]);
 
 		const result = await reapRun({
 			runId: ctx.runId,
@@ -78,15 +80,30 @@ describe("reapRun", () => {
 			broker: ctx.broker,
 			fs: f.fs,
 			exec: e.exec,
+			// PR auto-open is enabled, so the only reason it stays shut is the
+			// zero-commit guard (ubuntu-571a).
+			autoOpenPr: { enabled: true, token: "ghp_xyz", warrenBaseUrl: null },
+			openPr: pr.openPr,
 		});
 
-		expect(result.branchPushed).toBe(true);
+		// ubuntu-571a: no commits ahead → the push is skipped, so no remote ref.
+		expect(e.calls.some((c) => c.args[0] === "push")).toBe(false);
+		expect(result.branchPushed).toBe(false);
 		expect(result.commitsAhead).toBe(0);
 		// Clean tree (default fakeExec gitStatus="") => deliberate no-op, the
 		// run still succeeds (warren-72b9).
 		expect(result.state).toBe("succeeded");
 		expect(result.failureReason).toBeNull();
 		const events = await ctx.repos.events.listByRun(ctx.runId);
+		const skipped = events.find((ev) => ev.kind === "reap.branch_push_skipped");
+		expect(skipped?.payloadJson).toMatchObject({
+			branch: "agent/refactor-bot/run-1",
+			reason: "no_commits",
+		});
+		// No push ⇒ no PR.
+		expect(pr.calls).toHaveLength(0);
+		expect(events.find((ev) => ev.kind === "reap.pr_opened")).toBeUndefined();
+		expect(result.prUrl).toBeNull();
 		const empty = events.find((ev) => ev.kind === "reap.empty_push");
 		expect(empty).toBeDefined();
 		expect(empty?.payloadJson).toMatchObject({
@@ -96,7 +113,7 @@ describe("reapRun", () => {
 			droppedCommit: false,
 		});
 		const completed = events.find((ev) => ev.kind === "reap.completed");
-		expect(completed?.payloadJson).toMatchObject({ branchPushed: true, commitsAhead: 0 });
+		expect(completed?.payloadJson).toMatchObject({ branchPushed: false, commitsAhead: 0 });
 	});
 
 	test("flags a dropped commit (zero commits + dirty tree) and fails the run (warren-72b9)", async () => {
@@ -362,8 +379,8 @@ describe("reapRun", () => {
 
 		expect(result.state).toBe("succeeded");
 		expect(result.branchPushed).toBe(true);
-		// The provider's exec did the workspace git: the push, then rev-list.
-		expect(e.calls.map((call) => call.args[0])).toEqual(["push", "rev-list"]);
+		// The provider's exec did the workspace git: rev-list, then the push.
+		expect(e.calls.map((call) => call.args[0])).toEqual(["rev-list", "push"]);
 	});
 
 	test("never-started (queued) run skips workspace pipeline and emits reap.never_started_skip (warren-5e53)", async () => {

@@ -58,6 +58,14 @@ Releases **0.9.10 and earlier** live in
 
 ### Fixed
 
+- **A run that produced no commits no longer pushes a branch or opens a
+  PR** (ubuntu-571a). Reap counted commits ahead of the base only *after*
+  pushing, so a run that failed before the agent emitted anything still
+  created a `warren/<run>` ref pointing straight at base — operator noise
+  and a wasted GitHub API call per failed run. Finalize now counts first
+  and, when the branch is level with its base, skips both the push and the
+  PR and logs `reap.branch_push_skipped {reason:"no_commits"}`. Runs that
+  do carry commits are unchanged.
 - **The analytics window no longer table-scans `runs`, and
   `events_kind_ts_idx` finally lands on a database that skipped it**
   (ubuntu-b968). `listForAnalytics`'s bare `started_at` range had no

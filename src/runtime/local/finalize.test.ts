@@ -225,14 +225,24 @@ describe("finalize — stage trail + push reporting", () => {
 		expect(result.prBranch).toBe("warren/run-1");
 	});
 
-	test("empty push: zero commits ahead → emptyPush true, prBranch null", async () => {
+	test("zero commits ahead: push skipped, no remote ref, emptyPush true, prBranch null", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec({ revListCount: "0" }) });
+		const exec = fakeExec({ revListCount: "0" });
+		const p = await provider({ fs, exec });
 		const result = await p.finalize(HANDLE, intent());
-		expect(result.pushed).toBe(true);
+		// ubuntu-571a: a run that produced no commits must not create a remote ref.
+		expect(result.pushed).toBe(false);
 		expect(result.commitsAhead).toBe(0);
 		expect(result.emptyPush).toBe(true);
 		expect(result.prBranch).toBe(null);
+		expect(exec.calls.some((c) => c.args[0] === "push")).toBe(false);
+		expect(result.stages.slice(-2)).toEqual([
+			{ stage: "branch_push", status: "skipped" },
+			{ stage: "commits_ahead", status: "ok" },
+		]);
+		expect(result.events.find((e) => e.kind === "reap.branch_push_skipped")?.payload).toMatchObject(
+			{ branch: "warren/run-1", reason: "no_commits" },
+		);
 	});
 
 	test("push disabled: branch_push + commits_ahead skipped, commitsAhead null", async () => {

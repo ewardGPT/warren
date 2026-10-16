@@ -378,11 +378,13 @@ interface PushOutcome {
 }
 
 /**
- * `git push origin HEAD:<branch>` then the commits-ahead / empty-push count —
- * faithful to reap's `pushStep` + `commitsAheadStep`. `push === false` skips
- * both; a missing `baseBranch`/`rev-list` failure yields `commitsAhead: null`. A
- * zero-commit push probes `git status --porcelain` for `dirty` + dirtyPaths (the
- * domain's dropped-commit signal); an empty branch pushes `HEAD`.
+ * Count commits ahead of the base, then `git push origin HEAD:<branch>` only
+ * when there is work — faithful to reap's `pushStep` + `commitsAheadStep`.
+ * `push === false` skips both; a missing `baseBranch`/`rev-list` failure yields
+ * `commitsAhead: null` and still pushes (the zero-commit guard cannot prove the
+ * branch is empty). A zero-commit run (ubuntu-571a) pushes nothing, probes
+ * `git status --porcelain` for `dirty` + dirtyPaths (the domain's dropped-commit
+ * signal) and logs `reap.branch_push_skipped`; an empty branch pushes `HEAD`.
  */
 async function finalizePush(
 	intent: FinalizeIntent,
@@ -395,6 +397,30 @@ async function finalizePush(
 		trail.skipped("branch_push");
 		trail.skipped("commits_ahead");
 		return { pushed: false, commitsAhead: null, emptyPush: false, dirty: false, dirtyPaths: [] };
+	}
+	// ubuntu-571a: count commits ahead of the base BEFORE pushing. A run whose
+	// HEAD is the base (no agent output at all) must not create a remote ref —
+	// that ref is operator noise and costs a GitHub API call per failed run.
+	// The probe is quiet (no stage-trail write); the stage is recorded below.
+	const probe = await probeCommitsAhead(intent, workspacePath, exec);
+	if (probe.count === 0) {
+		trail.skipped("branch_push");
+		trail.ok("commits_ahead");
+		// warren-72b9/89b0: still capture dirty PATHS so the domain classifies a
+		// bookkeeping-only no-op vs a dropped commit without the push.
+		const dirtyPaths = await workspaceDirtyPaths(exec, workspacePath);
+		await collector.emit("reap.branch_push_skipped", {
+			branch: intent.branch,
+			baseBranch: intent.baseBranch ?? "",
+			reason: "no_commits",
+		});
+		return {
+			pushed: false,
+			commitsAhead: 0,
+			emptyPush: true,
+			dirty: dirtyPaths.length > 0,
+			dirtyPaths,
+		};
 	}
 	const refspec = intent.branch === "" ? "HEAD" : `HEAD:${intent.branch}`;
 	try {
@@ -409,22 +435,30 @@ async function finalizePush(
 		trail.skipped("commits_ahead");
 		return { pushed: false, commitsAhead: null, emptyPush: false, dirty: false, dirtyPaths: [] };
 	}
-	const commitsAhead = await countCommitsAhead(intent, workspacePath, exec, trail);
-	// warren-72b9/89b0: capture dirty PATHS on a zero-commit push (dropped commit vs no-op).
-	const dirtyPaths = commitsAhead === 0 ? await workspaceDirtyPaths(exec, workspacePath) : [];
-	const dirty = dirtyPaths.length > 0;
-	return { pushed: true, commitsAhead, emptyPush: commitsAhead === 0, dirty, dirtyPaths };
+	// A zero-commit run never reaches here, so the pushed branch always carries
+	// work: no empty-push probe and no dirty scan needed.
+	const commitsAhead = recordCommitsAhead(trail, probe);
+	return { pushed: true, commitsAhead, emptyPush: false, dirty: false, dirtyPaths: [] };
 }
 
-async function countCommitsAhead(
+/** Outcome of the pre-push `git rev-list --count <base>..HEAD` probe. */
+interface AheadProbe {
+	/** Parsed commits ahead; `null` when the base is unset or the output was unparsable. */
+	count: number | null;
+	/** True when there is no `baseBranch` to count against — the stage is skipped. */
+	unavailable: boolean;
+	/** `git rev-list` failure message; `null` on success. */
+	error: string | null;
+}
+
+/** Quiet commits-ahead probe: never writes the stage trail (see {@link recordCommitsAhead}). */
+async function probeCommitsAhead(
 	intent: FinalizeIntent,
 	workspacePath: string,
 	exec: ReapExec,
-	trail: StageTrail,
-): Promise<number | null> {
+): Promise<AheadProbe> {
 	if (intent.baseBranch === undefined || intent.baseBranch === "") {
-		trail.skipped("commits_ahead");
-		return null;
+		return { count: null, unavailable: true, error: null };
 	}
 	try {
 		const out = await exec.run("git", ["rev-list", "--count", `${intent.baseBranch}..HEAD`], {
@@ -432,11 +466,27 @@ async function countCommitsAhead(
 			timeoutMs: 10_000,
 		});
 		const parsed = Number.parseInt(out.stdout.trim(), 10);
-		trail.ok("commits_ahead");
-		return Number.isFinite(parsed) ? parsed : null;
+		return { count: Number.isFinite(parsed) ? parsed : null, unavailable: false, error: null };
 	} catch (err) {
 		// reap logs the rev-list failure but emits NO `reap_failed` — count → null.
-		trail.failed("commits_ahead", err);
+		return {
+			count: null,
+			unavailable: false,
+			error: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
+
+/** Record the `commits_ahead` stage for a probe — skipped / failed / ok. */
+function recordCommitsAhead(trail: StageTrail, probe: AheadProbe): number | null {
+	if (probe.unavailable) {
+		trail.skipped("commits_ahead");
 		return null;
 	}
+	if (probe.error !== null) {
+		trail.failed("commits_ahead", probe.error);
+		return null;
+	}
+	trail.ok("commits_ahead");
+	return probe.count;
 }

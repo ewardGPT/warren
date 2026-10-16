@@ -68,6 +68,9 @@ class StageTrail {
 
 class EventCollector {
 	readonly events: FinalizeEvent[] = [];
+	emit(kind: string, payload: unknown): void {
+		this.events.push({ kind, payload });
+	}
 	fail(step: string, err: unknown, path?: string): void {
 		const message = err instanceof Error ? err.message : String(err);
 		this.events.push({
@@ -209,6 +212,27 @@ async function runPush(
 		trail.skipped("commits_ahead");
 		return NO_PUSH;
 	}
+	// ubuntu-571a: count ahead of the base BEFORE pushing so a run with no
+	// commits (no agent output) never creates a remote ref. Parity with
+	// ../local/finalize.ts finalizePush.
+	const probe = await probeCommitsAhead(intent, workspacePath, git);
+	if (probe.count === 0) {
+		trail.skipped("branch_push");
+		trail.ok("commits_ahead");
+		const dirtyPaths = await workspaceDirtyPaths(workspacePath, git);
+		collector.emit("reap.branch_push_skipped", {
+			branch: intent.branch,
+			baseBranch: intent.baseBranch ?? "",
+			reason: "no_commits",
+		});
+		return {
+			pushed: false,
+			commitsAhead: 0,
+			emptyPush: true,
+			dirty: dirtyPaths.length > 0,
+			dirtyPaths,
+		};
+	}
 	const refspec = intent.branch === "" ? "HEAD" : `HEAD:${intent.branch}`;
 	const restore = await authenticateOrigin(intent.gitToken, workspacePath, git);
 	try {
@@ -221,17 +245,14 @@ async function runPush(
 			return NO_PUSH;
 		}
 		trail.ok("branch_push");
-		const commitsAhead = await countCommitsAhead(intent, workspacePath, git, trail);
-		// warren-89b0: capture dirty PATHS on a zero-commit push so warren can
-		// classify a bookkeeping-only no-op vs a dropped commit (parity with
-		// ../local/finalize.ts).
-		const dirtyPaths = commitsAhead === 0 ? await workspaceDirtyPaths(workspacePath, git) : [];
+		// A zero-commit run returned above, so the pushed branch carries work.
+		const commitsAhead = recordCommitsAhead(trail, probe);
 		return {
 			pushed: true,
 			commitsAhead,
-			emptyPush: commitsAhead === 0,
-			dirty: dirtyPaths.length > 0,
-			dirtyPaths,
+			emptyPush: false,
+			dirty: false,
+			dirtyPaths: [],
 		};
 	} finally {
 		await restore();
@@ -265,27 +286,48 @@ export async function authenticateOrigin(
 	};
 }
 
-async function countCommitsAhead(
+/** Outcome of the pre-push `git rev-list --count <base>..HEAD` probe. */
+interface AheadProbe {
+	/** Parsed commits ahead; `null` when the base is unset or the output was unparsable. */
+	count: number | null;
+	/** True when there is no `baseBranch` to count against — the stage is skipped. */
+	unavailable: boolean;
+	/** `git rev-list` failure message; `null` on success. */
+	error: string | null;
+}
+
+/** Quiet commits-ahead probe: never writes the stage trail (see {@link recordCommitsAhead}). */
+async function probeCommitsAhead(
 	intent: InPodFinalizeIntent,
 	workspacePath: string,
 	git: FinalizeGitRunner,
-	trail: StageTrail,
-): Promise<number | null> {
+): Promise<AheadProbe> {
 	if (intent.baseBranch === undefined || intent.baseBranch === "") {
-		trail.skipped("commits_ahead");
-		return null;
+		return { count: null, unavailable: true, error: null };
 	}
 	const res = await git(["rev-list", "--count", `${intent.baseBranch}..HEAD`], {
 		cwd: workspacePath,
 		timeoutMs: 10_000,
 	});
 	if (res.exitCode !== 0) {
-		trail.failed("commits_ahead", new Error(res.stderr.trim() || "git rev-list failed"));
-		return null;
+		return { count: null, unavailable: false, error: res.stderr.trim() || "git rev-list failed" };
 	}
 	const parsed = Number.parseInt(res.stdout.trim(), 10);
+	return { count: Number.isFinite(parsed) ? parsed : null, unavailable: false, error: null };
+}
+
+/** Record the `commits_ahead` stage for a probe — skipped / failed / ok. */
+function recordCommitsAhead(trail: StageTrail, probe: AheadProbe): number | null {
+	if (probe.unavailable) {
+		trail.skipped("commits_ahead");
+		return null;
+	}
+	if (probe.error !== null) {
+		trail.failed("commits_ahead", probe.error);
+		return null;
+	}
 	trail.ok("commits_ahead");
-	return Number.isFinite(parsed) ? parsed : null;
+	return probe.count;
 }
 
 async function workspaceDirtyPaths(
