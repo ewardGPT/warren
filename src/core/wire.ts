@@ -238,6 +238,7 @@ export const RUN_FAILURE_REASONS = [
 	"oom_killed",
 	"evicted",
 	"push_rejected_policy",
+	"stalled",
 ] as const;
 export type RunFailureReason = (typeof RUN_FAILURE_REASONS)[number];
 
