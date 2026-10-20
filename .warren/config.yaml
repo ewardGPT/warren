@@ -1,10 +1,16 @@
 # .warren/config.yaml — per-project warren defaults.
-defaultRole: sapling
+defaultRole: pi-bridge
 defaultBranch: main
-# Sapling runs through Burrow's OpenAI-compatible backend. Keep the project
-# default aligned with the backend names Burrow accepts; Pi/OpenRouter is not
-# an implementation path for Warren Seeds.
-defaultProvider: openai
-defaultModel: deepseek-chat
+# Route this project's runs through OpenRouter. The previous openai /
+# deepseek-chat pair pointed at api.openai.com and 401'd on every dispatch,
+# because warren does not read OPENAI_BASE_URL. defaultRole was sapling, which
+# is not a runnable runtime on this deployment (known runtimes: claude-code, pi).
+#
+# nvidia/nemotron-3.5-lightning is a free 1M-context model, so this costs
+# nothing and can hold long-context work. It is opportunistic: it has hit
+# "Upstream idle timeout exceeded" under heavier agent load, so heavier runs
+# should pass an explicit providerOverride / modelOverride.
+defaultProvider: openrouter
+defaultModel: nvidia/nemotron-3.5-lightning:free
 runBranchPrefix: warren
 qualityGate: bun run check:all
