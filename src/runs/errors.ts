@@ -15,3 +15,29 @@ import { WarrenError } from "../core/errors.ts";
 export class RunSpawnError extends WarrenError {
 	readonly code = "run_spawn_error";
 }
+
+/** Why the seed-drain lane refused to dispatch a seed (ubuntu-6ab8). */
+export const SEED_DRAIN_REFUSAL_REASONS = [
+	"seed_not_found",
+	"seed_closed",
+	"seed_blocked",
+	"project_lacks_seeds",
+] as const;
+export type SeedDrainRefusalReason = (typeof SEED_DRAIN_REFUSAL_REASONS)[number];
+
+/**
+ * A seed the drain lane will not dispatch (ubuntu-6ab8): the id resolves to no
+ * project, the seed is already closed, one of its blockers is still open, or
+ * the project carries no `.seeds/` directory. The reason rides on the code, so
+ * a caller routes on it without parsing the message.
+ */
+export class SeedDrainRefusedError extends WarrenError {
+	readonly code: SeedDrainRefusalReason;
+	readonly reason: SeedDrainRefusalReason;
+
+	constructor(reason: SeedDrainRefusalReason, message: string) {
+		super(message);
+		this.code = reason;
+		this.reason = reason;
+	}
+}

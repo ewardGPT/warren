@@ -13,24 +13,29 @@ Usage: warren [options] [command]
 Control plane and UI for cloud-based custom agents
 
 Options:
-  -V, --version                    output the version number
-  -h, --help                       display help for command
+  -V, --version                        output the version number
+  -h, --help                           display help for command
 
 Commands:
-  add-project [options] <git-url>  clone a GitHub repo into the projects root
-                                   and persist it
-  run [options] <agent> <project>  spawn a one-shot run, tail events as NDJSON,
-                                   and exit
-  init [options]                   scaffold a .warren/ directory (triggers.yaml
-                                   + config.yaml) in a project repo
-  config                           .warren/ admin tools
-  doctor [options]                 check warren's environment: env vars, burrow
-                                   socket
-  db                               database admin tools
-  plan                             dispatch and steer cloud plan-runs
-  serve [options]                  start the HTTP server (default in docker
-                                   entrypoint)
-  help [command]                   display help for command
+  add-project [options] <git-url>      clone a GitHub repo into the projects
+                                       root and persist it
+  run [options] <agent> <project>      spawn a one-shot run, tail events as
+                                       NDJSON, and exit
+  best-of [options] <agent> <project>  contest N competing replicates of one
+                                       prompt, ranked by verified scorecards
+  seed-drain [options] <seed-id>       dispatch a run for one seed, wait for its
+                                       PR, and close the seed on merge
+  init [options]                       scaffold a .warren/ directory
+                                       (triggers.yaml + config.yaml) in a
+                                       project repo
+  config                               .warren/ admin tools
+  doctor [options]                     check warren's environment: env vars,
+                                       burrow socket
+  db                                   database admin tools
+  plan                                 dispatch and steer cloud plan-runs
+  serve [options]                      start the HTTP server (default in docker
+                                       entrypoint)
+  help [command]                       display help for command
 ```
 
 ## warren add-project
@@ -64,6 +69,48 @@ Options:
   --trigger <label>    run trigger label (default: "cli")
   --provider <name>    per-run override of agent frontmatter.provider
   --model <name>       per-run override of agent frontmatter.model
+  -h, --help           display help for command
+```
+
+## warren best-of
+
+```text
+Usage: warren best-of [options] <agent> <project>
+
+contest N competing replicates of one prompt, ranked by verified scorecards
+
+Arguments:
+  agent                 registered agent name
+  project               project id (prj_xxx)
+
+Options:
+  -p, --prompt <text>   prompt text every replicate receives
+  -r, --replicates <n>  number of competing replicates (2..5) (default: "2")
+  --seed <id>           seed id attached to every replicate
+  --tiers <list>        comma-separated model overrides, cycled per replicate
+  -h, --help            display help for command
+```
+
+## warren seed-drain
+
+```text
+Usage: warren seed-drain [options] <seed-id>
+
+dispatch a run for one seed, wait for its PR, and close the seed on merge
+
+Arguments:
+  seed-id              seed id to drain (resolved to its home project)
+
+Options:
+  --agent <name>       registered agent name to dispatch
+  --project <id>       home project id (default: resolve the seed across
+                       projects)
+  -p, --prompt <text>  prompt template; {seed_id} and {seed_body} are
+                       substituted
+  --provider <name>    per-run override of agent frontmatter.provider
+  --model <name>       per-run override of agent frontmatter.model
+  --timeout-ms <n>     wait budget in milliseconds; 0 disables the bound
+  --poll-ms <n>        poll cadence in milliseconds
   -h, --help           display help for command
 ```
 
