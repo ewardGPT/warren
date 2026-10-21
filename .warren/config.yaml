@@ -1,10 +1,13 @@
 # .warren/config.yaml — per-project warren defaults.
 defaultRole: sapling
 defaultBranch: main
-# Sapling runs through Burrow's OpenAI-compatible backend. Keep the project
-# default aligned with the backend names Burrow accepts; Pi/OpenRouter is not
-# an implementation path for Warren Seeds.
-defaultProvider: openai
-defaultModel: deepseek-chat
+# Measured 2026-10-21: the previous default (openai/deepseek-chat) made every
+# run fail with provider_error. pi sent the Bifrost virtual key to
+# api.openai.com (no OPENAI_BASE_URL in the sandbox), and Bifrost answers
+# HTTP 400 "could not auto resolve a provider" for the bare model id
+# deepseek-chat. Verified from inside the warren sandbox: openrouter with
+# nvidia/nemotron-3.5-lightning:free answers in ~2s at $0.00.
+defaultProvider: openrouter
+defaultModel: nvidia/nemotron-3.5-lightning:free
 runBranchPrefix: warren
 qualityGate: bun run check:all
