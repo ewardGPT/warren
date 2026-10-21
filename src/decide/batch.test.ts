@@ -12,7 +12,7 @@ import { resolveProvider } from "./provider.ts";
 import { jsonResponse, makeHarness } from "./test-helpers.ts";
 import type { Decision, Question } from "./types.ts";
 
-const LAYA_BATCH_URL = "http://127.0.0.1:18091/v1/systemone/batch";
+const LAYA_BATCH_URL = "http://172.17.0.1:18091/v1/systemone/batch";
 
 const QUESTIONS: Record<string, Question> = {
 	ok: {
@@ -246,7 +246,7 @@ describe("the batch route is derived, not a second knob", () => {
 		const resolved = resolveProvider({ JEV_PROVIDER: "laya" });
 		expect(resolved.ok).toBe(true);
 		if (resolved.ok) {
-			expect(resolved.provider.url).toBe("http://127.0.0.1:18091/v1/systemone");
+			expect(resolved.provider.url).toBe("http://172.17.0.1:18091/v1/systemone");
 			expect(resolved.provider.batchUrl).toBe(LAYA_BATCH_URL);
 		}
 	});
@@ -255,5 +255,28 @@ describe("the batch route is derived, not a second knob", () => {
 		const resolved = resolveProvider({ TYPESAFE_API_KEY: "k" });
 		expect(resolved.ok).toBe(true);
 		if (resolved.ok) expect(resolved.provider.batchUrl).toBeUndefined();
+	});
+});
+
+describe("the batch request names its checkpoint", () => {
+	// An unnamed request is auto-routed by the lane, per request, so it does not
+	// reliably reach the checkpoint the run was configured for. Omitting `model`
+	// here is therefore a wrong decision, not a neutral one.
+	test("sends the checkpoint the provider resolved", async () => {
+		const h = makeHarness({ env: ON_LAYA, responses: [batchAnswer(2)] });
+		await decideMany(request(2), h.deps);
+		const [call] = h.calls;
+		const body = JSON.parse(call?.body ?? "{}") as { model?: string };
+		expect(body.model).toBe("typed-decisions");
+	});
+
+	test("sends an override, so a measurement says what it measured", async () => {
+		const h = makeHarness({
+			env: { ...ON_LAYA, JEV_MODEL: "multilingual" },
+			responses: [batchAnswer(1)],
+		});
+		await decideMany(request(1), h.deps);
+		const [call] = h.calls;
+		expect((JSON.parse(call?.body ?? "{}") as { model?: string }).model).toBe("multilingual");
 	});
 });

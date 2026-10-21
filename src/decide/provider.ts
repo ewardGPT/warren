@@ -9,7 +9,7 @@
  *   | `typesafe`   | https://api.typesafe.ai/v1/systemone           | jev-1.13.0       | TYPESAFE_API_KEY, JEV_API_KEY          |
  *   | `openrouter` | https://openrouter.ai/api/alpha/decisions      | typesafe/jev-1.13| OPENROUTER_API_KEY                     |
  *   | `vercel`     | https://ai-gateway.vercel.sh/typesafe/v1/systemone | typesafe-ai/jev | AI_GATEWAY_API_KEY                  |
- *   | `laya`       | http://127.0.0.1:18091/v1/systemone (LAYA_URL) | laya             | LAYA_API_KEY (optional)                |
+ *   | `laya`       | http://172.17.0.1:18091/v1/systemone (LAYA_URL) | typed-decisions | LAYA_API_KEY (optional)                |
  *
  * plus the offline `stub` provider (`WARREN_JEV_STUB=1` or
  * `JEV_PROVIDER=stub`), which answers from a fixture instead of the
@@ -85,8 +85,12 @@ export const PROVIDERS = {
 	 */
 	laya: {
 		name: "laya",
-		url: "http://127.0.0.1:18091/v1/systemone",
-		model: "laya",
+		url: "http://172.17.0.1:18091/v1/systemone",
+		// The checkpoint the lane must serve, named explicitly. This was "laya",
+		// which is not a checkpoint -- the lane maps it elsewhere (measured: it
+		// answers byte-identically to `english`), so every production decision was
+		// read from the wrong model. `typed-decisions` is the fine-tune.
+		model: "typed-decisions",
 		keyEnvs: ["LAYA_API_KEY"],
 		urlEnv: "LAYA_URL",
 		keyOptional: true,

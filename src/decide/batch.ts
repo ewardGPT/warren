@@ -101,12 +101,22 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
 	return out;
 }
 
-/** The body of a batch request. The lane ignores a `model` field, so none is sent. */
+/**
+ * The body of a batch request.
+ *
+ * The `model` field is NOT ignorable. `laya-serve` auto-routes any request that
+ * names no checkpoint, and it routes *per request*: measured on the live lane,
+ * an unnamed call matched neither the fine-tuned checkpoint nor `multilingual`
+ * when each was named, and answered a 5-option probe differently from a
+ * 2-option one. So a batch names its checkpoint exactly as
+ * `buildRequestBody` names it on a single request.
+ */
 export function buildBatchBody(
+	model: string,
 	states: readonly Record<string, unknown>[],
 	questions: Record<string, Question>,
 ): string {
-	return JSON.stringify({ states, questions });
+	return JSON.stringify({ model, states, questions });
 }
 
 /**
@@ -246,7 +256,7 @@ export async function decideMany(
 			provider.batchUrl,
 			provider.key,
 			title,
-			buildBatchBody(states, req.questions),
+			buildBatchBody(provider.model, states, req.questions),
 			states,
 			req.questions,
 			deps,

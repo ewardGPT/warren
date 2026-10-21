@@ -29,7 +29,7 @@ const QUESTIONS: Record<string, Question> = {
 
 const REQUEST = { feature: "cascade-test", state: { attempts: 1 }, questions: QUESTIONS };
 
-const LAYA_URL = "http://127.0.0.1:18091/v1/systemone";
+const LAYA_URL = "http://172.17.0.1:18091/v1/systemone";
 const TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone";
 
 /** A 200 whose single `noul` answer carries this probability and confidence. */

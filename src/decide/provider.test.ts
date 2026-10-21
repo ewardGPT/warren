@@ -4,6 +4,7 @@ import {
 	buildRequestBody,
 	envString,
 	extractErrorMessage,
+	PROVIDERS,
 	parseJevResponse,
 	parseRetryAfterMs,
 	readAnswer,
@@ -226,5 +227,20 @@ describe("extractErrorMessage", () => {
 	test("clips a verbose body", () => {
 		const message = extractErrorMessage({ error: { message: "x".repeat(500) } });
 		expect(message?.length).toBe(200);
+	});
+});
+
+describe("the laya provider names its checkpoint", () => {
+	// The lane auto-routes a request whose `model` is not a checkpoint it knows,
+	// so a name such as "laya" is not a harmless label -- it silently selects a
+	// different model, and every decision read through it is the wrong model's.
+	test("names the checkpoint, not a label the lane resolves elsewhere", () => {
+		expect(PROVIDERS.laya.model).toBe("typed-decisions");
+	});
+
+	test("carries that name onto the resolved choice", () => {
+		const resolved = resolveProvider({ JEV_PROVIDER: "laya" });
+		expect(resolved.ok).toBe(true);
+		if (resolved.ok) expect(resolved.provider.model).toBe("typed-decisions");
 	});
 });
