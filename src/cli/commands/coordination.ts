@@ -18,6 +18,37 @@ import { runDecide } from "./decide.ts";
 import { type FleetArgs, runFleet } from "./fleet.ts";
 import { type KernelAction, runKernel } from "./kernel.ts";
 
+/** `fleet pump` option shape — shared by the action and its arg mapper. */
+interface FleetPumpOptions {
+	repo: string;
+	limit?: string;
+	lease?: string;
+	project?: string;
+	type?: string;
+	dryRun?: boolean;
+	runtime?: string;
+	provider?: string;
+	model?: string;
+}
+
+/**
+ * Run one `fleet` action through the CLI's db handle and echo its report.
+ *
+ * `dispatch` and `pump` differ only in the {@link FleetArgs} they build: both
+ * open the CLI db, seed the builtin agents, run the action against the live
+ * repos and print the report. That wiring lives here once so neither command
+ * re-implements it — the same split as `src/projects/clone.ts`, which owns
+ * `defaultSpawn` for its callers.
+ */
+async function runFleetInCliDb(context: CliContext, args: FleetArgs): Promise<number> {
+	return withCliDb({ env: context.env }, async ({ repos }) => {
+		await seedBuiltinAgents(repos.agents, undefined, context.now);
+		const report = await runFleet(args, context, { repos });
+		for (const line of report.lines) console.log(line);
+		return report.exitCode;
+	});
+}
+
 /**
  * Register `decide`, the `kernel` group and `closure`.
  *
@@ -114,25 +145,17 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 				model?: string;
 				wait?: boolean;
 			}) => {
-				const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
-					await seedBuiltinAgents(repos.agents, undefined, context.now);
-					const report = await runFleet(
-						{
-							action: "dispatch",
-							repo: opts.repo,
-							prompt: opts.prompt,
-							...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}),
-							...(opts.provider !== undefined ? { provider: opts.provider } : {}),
-							...(opts.model !== undefined ? { model: opts.model } : {}),
-							wait: opts.wait === true,
-						},
-						context,
-						{ repos },
-					);
-					for (const line of report.lines) console.log(line);
-					return report.exitCode;
-				});
-				process.exit(exitCode);
+				process.exit(
+					await runFleetInCliDb(context, {
+						action: "dispatch",
+						repo: opts.repo,
+						prompt: opts.prompt,
+						...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}),
+						...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+						...(opts.model !== undefined ? { model: opts.model } : {}),
+						wait: opts.wait === true,
+					}),
+				);
 			},
 		);
 
@@ -148,40 +171,12 @@ export function registerCoordinationCommands(program: Command, context: CliConte
 		.option("--runtime <id>", "agent runtime id (default pi)")
 		.option("--provider <name>", "agent provider override (default the runtime's own)")
 		.option("--model <name>", "agent model override (default the runtime's own)")
-		.action(
-			async (opts: {
-				repo: string;
-				limit?: string;
-				lease?: string;
-				project?: string;
-				type?: string;
-				dryRun?: boolean;
-				runtime?: string;
-				provider?: string;
-				model?: string;
-			}) => {
-				const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
-					await seedBuiltinAgents(repos.agents, undefined, context.now);
-					const report = await runFleet(toPumpArgs(opts), context, { repos });
-					for (const line of report.lines) console.log(line);
-					return report.exitCode;
-				});
-				process.exit(exitCode);
-			},
-		);
+		.action(async (opts: FleetPumpOptions) => {
+			process.exit(await runFleetInCliDb(context, toPumpArgs(opts)));
+		});
 
 	/** `fleet pump` options → the args `runFleet` takes. Extracted to keep the action simple. */
-	function toPumpArgs(opts: {
-		repo: string;
-		limit?: string;
-		lease?: string;
-		project?: string;
-		type?: string;
-		dryRun?: boolean;
-		runtime?: string;
-		provider?: string;
-		model?: string;
-	}): FleetArgs {
+	function toPumpArgs(opts: FleetPumpOptions): FleetArgs {
 		// A draft keyed by FleetArgs field names, so the two tables below stay the
 		// only place a new option has to be added.
 		const draft: Record<string, string | number | boolean> = { action: "pump", repo: opts.repo };
