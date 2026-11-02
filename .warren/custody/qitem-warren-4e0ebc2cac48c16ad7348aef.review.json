@@ -1,0 +1,38 @@
+{
+  "workId": "qitem-warren-4e0ebc2cac48c16ad7348aef",
+  "seedId": "warren-e786",
+  "implementationRunId": "run_custody_b53f7277c4ee087a4ac5e7f8",
+  "implementationCommit": "4dc0cba15ac2f6539aa9ae7a4793b12a3606fd25",
+  "verdict": "approved",
+  "rationale": "The maker's change to CONTRIBUTING.md correctly fixes every issue from the seed brief. Verified: (1) All 12 named package scripts in the bullet list exist in package.json. (2) All 12 canonical gates from scripts/check-all.ts that are defined in package.json are listed accurately in CONTRIBUTING.md bullets. (3) No nonexistent scripts (check:lint, check:type, check:seeds, check:file-sizes, check:wire-types, check:layers, check:prose, check:version-sync) remain in the Build & Test Commands section. (4) check:all is clearly stated as not regenerating docs, and gen:docs:check/gen:openapi:check are labeled as read-only verification. (5) git diff --check passes with no whitespace errors. (6) Only CONTRIBUTING.md was changed, no unrelated doc rewrites or implementation changes. The `check:client-contract` gate from the canonical list is correctly omitted as it does not exist in package.json (it is conditional).",
+  "checks": [
+    {
+      "command": "git show 4dc0cba15ac2f6539aa9ae7a4793b12a3606fd25 --stat",
+      "outcome": "passed"
+    },
+    {
+      "command": "git diff 99cbe9f8..4dc0cba1 --stat",
+      "outcome": "passed"
+    },
+    {
+      "command": "git diff 99cbe9f8 4dc0cba1 --check --no-color",
+      "outcome": "passed"
+    },
+    {
+      "command": "node -e \"const p=require('./package.json'); ['lint','check:agents','check:dups','check:deps','check:size','check:debt','check:bundle-size','typecheck','check:coverage','gen:docs:check','gen:openapi:check','check:ci-parity'].forEach(s => console.log(s + ': ' + (p.scripts[s] ? 'EXISTS' : 'MISSING')));\"",
+      "outcome": "passed"
+    },
+    {
+      "command": "grep -oP 'name: \"\\K[^\"]+' scripts/check-all.ts",
+      "outcome": "passed"
+    },
+    {
+      "command": "grep -c 'check:lint\\|check:type\\|check:seeds\\|check:file-sizes' CONTRIBUTING.md",
+      "outcome": "passed"
+    },
+    {
+      "command": "node -e \"const md=require('fs').readFileSync('./CONTRIBUTING.md','utf8'); const b=md.split('## Build & Test Commands')[1].split('## ')[0]; console.log('read-only:', b.includes('read-only')); console.log('no regen:', b.includes('does not regenerate'));\"",
+      "outcome": "passed"
+    }
+  ]
+}
