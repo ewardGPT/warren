@@ -67,17 +67,15 @@ bun test src/foo.test.ts                   # Run a single test file
 bun run check:all                          # All quality gates CI enforces
 ```
 
-`bun run check:all` is the full gate manifest CI runs on every PR. It
-runs lint (with the per-layer rules), typecheck, the full test suite,
-and the wire / version-sync / prose / seed / file-size / bundle-size /
-coverage guards, then regenerates docs and fails if they appear dirty.
+`bun run check:all` is the full gate manifest CI enforces on every PR. It runs lint (with layer and version-sync guards), typecheck, a suite of static checks (agents, dups, deps, size, debt, bundle-size), the test suite with coverage ratchet, the read-only doc and OpenAPI sanity checks, and the CI-parity cross-check. It does not regenerate docs — `gen:docs:check` and `gen:openapi:check` verify that generated docs match the code and fail if they appear stale; run `gen:docs` / `gen:openapi` to regenerate them.
 
 `biome check .` alone is not the gate. `scripts/check-all.ts` is
 canonical, and each stage can run on its own to iterate faster:
 
-- `check:lint`, `check:type`, `check:wire-types`, `check:layers`
-- `check:seeds`, `check:prose`, `check:version-sync`, `check:ci-parity`
-- `check:file-sizes`, `check:bundle-size`, `check:coverage`
+- `lint`, `check:agents`, `check:dups`, `check:deps`, `check:size`, `check:debt`
+- `check:bundle-size`, `typecheck`, `check:coverage`
+- `gen:docs:check`, `gen:openapi:check` (read-only verification)
+- `check:ci-parity`
 
 Always run the full `bun run check:all` before submitting a PR.
 
