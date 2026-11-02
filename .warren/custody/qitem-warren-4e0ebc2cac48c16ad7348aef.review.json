@@ -1,0 +1,26 @@
+{
+  "workId": "qitem-warren-4e0ebc2cac48c16ad7348aef",
+  "seedId": "warren-e786",
+  "implementationRunId": "run_custody_b53f7277c4ee087a4ac5e7f8",
+  "implementationCommit": "4dc0cba15ac2f6539aa9ae7a4793b12a3606fd25",
+  "verdict": "approved",
+  "rationale": "The maker's commit correctly fixes CONTRIBUTING.md Build & Test Commands section against the check-all manifest. Verification results:\n\n1. Every named package script exists in package.json: lint, typecheck, check:agents, check:dups, check:deps, check:size, check:debt, check:bundle-size, gen:docs:check, gen:openapi:check, check:coverage, check:ci-parity, and check:all all verified present.\n\n2. The canonical full command remains bun run check:all — unchanged as required.\n\n3. The gate list exactly matches the resolved CANONICAL_GATES array from scripts/check-all.ts (12 gates: lint, typecheck, check:agents, check:dups, check:deps, check:size, check:debt, check:bundle-size, gen:docs:check, gen:openapi:check, check:coverage, check:ci-parity).\n\n4. gen:docs:check and gen:openapi:check are correctly labeled as read-only verification, with gen:docs/gen:openapi noted as the regeneration commands.\n\n5. Old broken references (check:type, check:lint, check:seeds, check:file-sizes) are removed — all four confirmed nonexistent in package.json.\n\n6. Only CONTRIBUTING.md is changed — no unrelated doc or implementation modifications.\n\n7. git diff --check passes with zero whitespace errors.",
+  "checks": [
+    {
+      "command": "git diff --check origin/warren/run_custody_b53f7277c4ee087a4ac5e7f8~1..origin/warren/run_custody_b53f7277c4ee087a4ac5e7f8 -- CONTRIBUTING.md",
+      "outcome": "passed"
+    },
+    {
+      "command": "grep -c '\"lint\"' package.json && grep -c '\"typecheck\"' package.json && grep -c '\"check:agents\"' package.json && grep -c '\"check:dups\"' package.json && grep -c '\"check:deps\"' package.json && grep -c '\"check:size\"' package.json && grep -c '\"check:debt\"' package.json && grep -c '\"check:bundle-size\"' package.json && grep -c '\"gen:docs:check\"' package.json && grep -c '\"gen:openapi:check\"' package.json && grep -c '\"check:coverage\"' package.json && grep -c '\"check:ci-parity\"' package.json && grep -c '\"check:all\"' package.json",
+      "outcome": "passed"
+    },
+    {
+      "command": "bun -e \"const {GATES} = require('./scripts/check-all.ts'); console.log(JSON.stringify(GATES, null, 2));\"",
+      "outcome": "passed"
+    },
+    {
+      "command": "git diff --stat origin/warren/run_custody_b53f7277c4ee087a4ac5e7f8~1..origin/warren/run_custody_b53f7277c4ee087a4ac5e7f8",
+      "outcome": "passed"
+    }
+  ]
+}
