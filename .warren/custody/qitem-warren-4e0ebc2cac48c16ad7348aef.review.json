@@ -1,0 +1,14 @@
+{
+  "workId": "qitem-warren-4e0ebc2cac48c16ad7348aef",
+  "seedId": "warren-e786",
+  "implementationRunId": "run_custody_b53f7277c4ee087a4ac5e7f8",
+  "implementationCommit": "4dc0cba15ac2f6539aa9ae7a4793b12a3606fd25",
+  "verdict": "approved",
+  "rationale": "The maker's diff correctly fixes the Build & Test Commands section in CONTRIBUTING.md. Specific changes verified against seed acceptance criteria: (1) Replaced nonexistent check:lint with lint, check:type with typecheck — both confirmed in package.json scripts. (2) Removed check:seeds (does not exist in package.json; the real script is check:seeds-integrity but it is not in CANONICAL_GATES and correctly omitted). (3) Replaced check:file-sizes with check:size — confirmed in package.json. (4) Replaced check:wire-types and check:layers (sub-gates of lint) with the actual top-level gate names (lint) that appear in CANONICAL_GATES. (5) Added check:agents, check:dups, check:deps, check:debt which were missing from the list. (6) Explicitly states gen:docs:check and gen:openapi:check are read-only verification and distinguishes them from gen:docs/gen:openapi regeneration. (7) Every listed script name exists in package.json (verified 12/12). (8) The full gate command remains bun run check:all. (9) Only CONTRIBUTING.md changed, no implementation files touched. (10) git diff --check passes clean.",
+  "checks": [
+    {
+      "command": "git diff 4dc0cba1^..4dc0cba1 --check",
+      "outcome": "passed"
+    }
+  ]
+}
